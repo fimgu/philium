@@ -431,8 +431,20 @@ async fn discover(ctx: &Arc<Ctx>, p: &Provider) -> Result<Vec<Discovered>, Strin
 
 /// Subscriptions: ask the desk HAL (which holds the real logins) to list.
 async fn discover_via_hal(ctx: &Arc<Ctx>, p: &Provider) -> Result<Vec<Discovered>, String> {
-    let hal = ctx.desk().ok_or("harness is not running")?;
-    let groups = hal.call(reqwest::Method::GET, "/models?discover=true", None).await?;
+    // The desk HAL restarts whenever provider config changes, which can race
+    // with discovery. Retry against the current instance before failing.
+    let mut groups = Err(String::from("harness is not running"));
+    for attempt in 0..4 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(750 * attempt)).await;
+        }
+        let Some(hal) = ctx.desk() else { continue };
+        groups = hal.call(reqwest::Method::GET, "/models?discover=true", None).await;
+        if groups.is_ok() {
+            break;
+        }
+    }
+    let groups = groups.map_err(|_| "could not reach the harness to list models. Try Refresh models.".to_string())?;
     let g = groups
         .as_array()
         .and_then(|a| a.iter().find(|g| g["name"] == p.id.as_str()))
@@ -452,6 +464,9 @@ async fn discover_via_hal(ctx: &Arc<Ctx>, p: &Provider) -> Result<Vec<Discovered
         .collect();
     out.sort_by(|a, b| a.id.cmp(&b.id));
     out.dedup_by(|a, b| a.id == b.id);
+    // Short aliases ("opus") duplicate full ids ("claude-opus-5-5"); keep the full ones.
+    let full: Vec<String> = out.iter().filter(|m| m.id.contains('-')).map(|m| m.id.clone()).collect();
+    out.retain(|m| m.id.contains('-') || !full.iter().any(|f| f.split('-').any(|part| part == m.id)));
     Ok(out)
 }
 
