@@ -232,7 +232,7 @@ classDiagram
 
 Enumerations:
 
-- `Provider.kind`: anthropic, openai, openai_compatible, claude_code_cli, codex_cli
+- `Provider.kind`: anthropic, openai, openai_compatible, chatgpt_subscription, claude_subscription
 - `Provider.trust`: trusted (Standard), untrusted (forces Strict)
 - `Provider.guard_mode`: off, redact, block
 - `Lease.kind`: task, path, port_block, browser
@@ -668,19 +668,20 @@ This also keeps a running "Philium backlog" on the board, so ideas you have mid-
 11. **Strict mode** is required and set per provider. Untrusted providers force it (section 9.1).
 12. The "Isolated" container level is not planned.
 
-### Subscriptions (researched 2026-11-16)
+### Subscriptions (decided 2026-11-16)
 
-You trust both providers, so they run in **Standard** mode (not Strict). Philium still logs their activity, token usage and TPS, read from the official CLIs' own output.
+Both subscriptions run **through HAL**, as normal Philium agents with full tools, board, mail, terminals and playbooks. You trust both providers, so they run in **Standard** mode. The user accepts the terms risk (see below).
 
-| Subscription | Can Philium use it directly? | How Philium does it |
+| Subscription | How it works | Observation |
 |---|---|---|
-| **Claude (Pro/Max)** | **No.** Anthropic's terms restrict subscription logins to Claude Code and claude.ai. Third-party harnesses using them have been blocked and accounts banned. | Philium runs the **official `claude` CLI** as a worker agent, with your normal login. Philium starts it, shows its terminal, gives it a worktree, and tracks it like any agent. Its model traffic goes straight to Anthropic from the official client (Philium sees its activity and token usage from the CLI's own output, not from the gateway). Alternatively, use an Anthropic API key through the gateway like any provider. |
-| **ChatGPT / Codex (Plus/Pro)** | **Unclear for us today.** OpenAI's "Sign in with ChatGPT" lets third-party apps use your plan, but it is a limited preview for listed partners and open-source clients. Reusing the Codex login inside another client has been called not approved. | Same pattern: Philium runs the **official `codex` CLI** as a worker agent with your normal login. If Philium is open source, revisit Sign in with ChatGPT through the gateway later. Or use an OpenAI API key through the gateway. |
+| **ChatGPT / Codex (Plus/Pro)** | Philium owns the ChatGPT sign-in (device login, tokens in the Keychain) and injects it in the gateway, like an API key. HAL only has its gateway token. Model list fetched live from the Codex backend. | Full: every request through the gateway, streaming, tokens, TPS. |
+| **Claude (Pro/Max)** | HAL's `claude_code` route: the official `claude` CLI, signed in with your normal login, used only as the model transport. HAL runs all tools. Philium does not hold or touch the Claude login. | Partial: requests do not pass through the gateway. Philium records each call, its duration and token counts from the CLI's output. Replies arrive whole, so TPS is an average, not live. |
 
-This means Philium supports two kinds of agents:
+API keys (Anthropic, OpenAI, OpenRouter, any compatible endpoint) go through the gateway as before. Untrusted ones force Strict mode.
 
-- **HAL agents** (any API key, through the gateway, full Strict support).
-- **CLI agents** (official `claude` and `codex` CLIs on your subscriptions). Same worktrees, terminals, board, mail (through Philium's MCP tools, which both CLIs support), playbooks and teardown. The gateway does not sit in their model traffic.
+### Terms risk (accepted)
+
+Anthropic's terms restrict subscription logins to Claude Code and claude.ai, and accounts using third-party harnesses were restricted in 2026. OpenAI does not officially approve ChatGPT sign-in in third-party clients outside partners and open-source tools. The user already uses both this way and accepts the risk. The Providers screen states it in one line on each subscription card.
 
 No item is still open.
 
