@@ -10,13 +10,14 @@ export default function Screen() {
   const [addr, setAddr] = createSignal("");
   const [err, setErr] = createSignal("");
   let view;
+  let gone = false;
 
   const cur = () => tabs().find((t) => t.id === active());
   const upsert = (t) => setTabs((l) => (l.some((x) => x.id === t.id) ? l.map((x) => (x.id === t.id ? { ...x, ...t } : x)) : [...l, t]));
 
   const place = async () => {
     const t = cur();
-    if (!t || !view) return;
+    if (gone || !t || !view) return;
     const r = view.getBoundingClientRect();
     try {
       await rpc("browser.set_bounds", { tab: t.id, x: r.left, y: r.top, w: r.width, h: r.height });
@@ -63,7 +64,13 @@ export default function Screen() {
     onCleanup(() => { ro.disconnect(); window.removeEventListener("resize", place); });
   });
   // The native webview floats above the DOM: hide it whenever this screen goes away.
-  onCleanup(() => { rpc("browser.hide", {}).catch(() => {}); });
+  // Hide every known tab explicitly (the backend may ignore an empty tab id) and
+  // once more with no id, so no native webview stays on screen after navigating away.
+  onCleanup(() => {
+    gone = true;
+    for (const t of tabs()) rpc("browser.hide", { tab: t.id }).catch(() => {});
+    rpc("browser.hide", {}).catch(() => {});
+  });
 
   const go = (e) => { e.preventDefault(); const t = cur(); t ? rpc("browser.navigate", { tab: t.id, url: addr() }).catch((x) => setErr(String(x))) : open(addr()); };
   const act = (m) => cur() && rpc(`browser.${m}`, { tab: cur().id }).catch((x) => setErr(String(x)));
@@ -72,7 +79,7 @@ export default function Screen() {
     <Page title="Browser" sub="Shared browser for you and your agents. Pages cannot reach Philium." flush
       actions={<Button onClick={() => open("https://duckduckgo.com")}><Icon name="plus" /> New tab</Button>}>
       <div class="br">
-        <div class="br-tabs">
+        <div class="br-tabs" classList={{ none: !tabs().length }}>
           <For each={tabs()}>{(t) => (
             <div class="br-tab" classList={{ on: t.id === active() }} onClick={() => select(t.id)}>
               <span>{t.title || t.url}</span>
@@ -91,7 +98,7 @@ export default function Screen() {
         <Show when={err()}><div class="br-note" style="color:#e5484d">{err()}</div></Show>
         <div class="br-view" ref={view}>
           <Show when={!cur()}>
-            <div class="br-empty"><Empty title="No tab open" body="Open a page to browse alongside your agents. Agents can open tabs here too." /></div>
+            <div class="br-empty"><Empty icon={<Icon name="globe" size={28} />} title="No tab open" action={<Button onClick={() => open("https://duckduckgo.com")}>Open a tab</Button>} body="Open a page to browse alongside your agents. Agents can open tabs here too." /></div>
           </Show>
         </div>
       </div>

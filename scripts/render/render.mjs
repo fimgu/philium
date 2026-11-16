@@ -83,14 +83,14 @@ for (const setName of sets) {
       const page = await open(fx, setName, w, h, s);
       await shot(page, s);
       if (s === "agents") {
-        if (await clickText(page, ".agent-row, .list-row, [class*=agent]", "lion")) { await sleep(500); await shot(page, "agents-detail"); }
+        if (await clickText(page, ".list-item", "lion")) { await sleep(500); await shot(page, "agents-detail"); }
         if (await clickText(page, "button", "New agent")) { await sleep(300); await shot(page, "modal-new-agent"); }
       }
       if (s === "providers") {
         if (await clickText(page, "button", "Add provider")) { await sleep(300); await shot(page, "modal-add-provider"); }
       }
       if (s === "chat" && setName === "populated") {
-        if (await clickText(page, "[class*=session], .list-row, button", "Gateway retry")) { await sleep(600); await shot(page, "chat-conversation"); }
+        if (await clickText(page, ".list-item", "Gateway retry")) { await sleep(600); await shot(page, "chat-conversation"); }
       }
       if (s === "board" && setName === "populated") {
         if (await clickText(page, "[class*=card], article", "Refactor worktree")) { await sleep(400); await shot(page, "board-detail"); }

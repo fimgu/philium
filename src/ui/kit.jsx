@@ -113,9 +113,9 @@ export function Stat(props) {
 export function Empty(props) {
   return (
     <div class="empty">
-      <Show when={props.icon}><div style={{ opacity: 0.5 }}>{props.icon}</div></Show>
+      <Show when={props.icon}><div class="empty-icon">{props.icon}</div></Show>
       <h3>{props.title}</h3>
-      <Show when={props.children}><p>{props.children}</p></Show>
+      <Show when={props.children ?? props.body}><p>{props.children ?? props.body}</p></Show>
       <Show when={props.action}>{props.action}</Show>
     </div>
   );

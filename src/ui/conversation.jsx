@@ -113,7 +113,7 @@ export function Conversation(props) {
     }}>
       <div class="timeline">
         <Show when={items().length === 0}>
-          <div class="faint small" style={{ "text-align": "center", padding: "40px 0" }}>{props.emptyText ?? "No messages yet."}</div>
+          <div class="conv-empty">{props.emptyText ?? "No messages yet."}</div>
         </Show>
         <Index each={items()}>
           {(it) => (

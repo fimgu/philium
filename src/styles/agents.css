@@ -25,3 +25,4 @@
 .caret { display: inline-block; width: 7px; height: 14px; margin-left: 2px; vertical-align: -2px; background: var(--accent); animation: pulse 1s infinite; }
 .perm.done { border-color: var(--line); background: transparent; opacity: 0.75; }
 details.msg summary { cursor: pointer; display: flex; align-items: center; gap: 6px; }
+.conv-empty { color: var(--text-faint); font-size: var(--fs-s); text-align: center; max-width: 360px; margin: 0 auto; padding: 120px 0 0; line-height: 1.5; }

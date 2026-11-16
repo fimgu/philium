@@ -1,4 +1,5 @@
 // Fixture sets for the render harness. EMPTY = fresh install, POPULATED = lived-in.
+import { Buffer } from "node:buffer";
 const now = Date.now();
 const min = 60000;
 const status = { root: "/Users/demo/Philium", desk: { ok: true }, version: "0.1.0" };
@@ -53,7 +54,6 @@ const tree = { files: ["src/main.rs", "src/db.rs", "src/gateway.rs", "src/agents
 
 const tev = (seq, type, o) => ({ seq, type, ...o });
 const chatEvents = [
-  tev(1, "turn.started", {}),
   tev(2, "message.created", { role: "user", content: "Summarise the failing test and show the screenshot I attached.", images: [{ mime: "image/png", name: "shot.png" }] }),
   tev(3, "tool.started", { call_id: "c1", tool: "mcp_philium_shell_run", arguments: { command: "cargo test --lib gateway" } }),
   tev(4, "tool.output", { call_id: "c1", data: "running 12 tests\ntest gateway::retry ... FAILED\n" }),
@@ -63,7 +63,6 @@ const chatEvents = [
   tev(8, "model.finished", { usage: {} }),
   tev(9, "file.changed", { path: "src-tauri/src/gateway.rs", diff: "@@ -10,3 +10,3 @@\n-const CAP: u64 = 100;\n+const CAP: u64 = 2000;" }),
   tev(10, "assistant.completed", { text: "" }),
-  tev(11, "turn.completed", {}),
 ];
 const sessions = [
   { id: "s1", title: "Gateway retry failing", model: "claude/claude-opus-5-5", updated_at: now - 5 * min },
@@ -89,9 +88,9 @@ const worktrees = [
   { id: "w2", repo_id: "r1", branch: "agent/otter", path: "/Users/demo/Philium/worktrees/otter", agent_name: "otter", created_at: now - 7200000, status: { unsaved: false, dirty_files: [], ahead: 0, behind: 1, unpushed_commits: 0, unmerged_commits: 0 } },
 ];
 const terms = [
-  { id: "term1", name: "lion: cargo test", agent_id: "a1", agent: "lion", state: "running", cmd: "cargo test", cwd: "/Users/demo/Philium/worktrees/lion", created_at: now - 600000 },
-  { id: "term2", name: "otter: npm run build", agent_id: "a2", agent: "otter", state: "exited", exit_code: 0, cmd: "npm run build", created_at: now - 900000 },
-  { id: "term3", name: "shell", state: "exited", exit_code: 1, cmd: "zsh", created_at: now - 1200000 },
+  { id: "term1", title: "cargo test", agent_id: "a1", agent: "lion", state: "running", cmd: "cargo test", cwd: "/Users/demo/Philium/worktrees/lion", created_at: now - 600000 },
+  { id: "term2", title: "npm run build", agent_id: "a2", agent: "otter", state: "exited", exit_code: 0, cmd: "npm run build", created_at: now - 900000 },
+  { id: "term3", title: "shell", state: "exited", exit_code: 1, cmd: "zsh", created_at: now - 1200000 },
 ];
 
 export const POPULATED = {
@@ -117,7 +116,7 @@ export const POPULATED = {
   "board.mail_threads": [],
   "board.mail_inbox": [],
   "terminals.list": terms,
-  "terminals.buffer": "$ cargo test\nrunning 12 tests\ntest result: ok. 12 passed\n",
+  "terminals.buffer": { data: Buffer.from("$ cargo test\r\nrunning 12 tests\r\ntest result: ok. 12 passed\r\n").toString("base64") },
   "workspace.repos_list": repos,
   "workspace.worktrees": worktrees,
   "workspace.branches": [{ name: "main" }, { name: "agent/lion" }, { name: "origin/main" }],
@@ -129,12 +128,12 @@ export const POPULATED = {
     totals: { requests: 342, tokens_in: 1.2e6, tokens_out: 3.4e5, cost: 12.8, error_rate: 0.012, avg_tps: 58, avg_ttft_ms: 410, guard_actions: 7, unpriced_requests: 12 },
     by_agent: ["lion", "otter", "heron"].map(statRow), by_provider: ["claude", "chatgpt", "local"].map(statRow), by_model: ["claude-opus-5-5", "gpt-6.1", "qwen3-coder"].map(statRow),
   },
-  "stats.timeseries": { points, series: points },
+  "stats.timeseries": points,
   "stats.efficiency": { cached_share: 0.42, cache_available: true, output_input_ratio: 0.28, cost_per_: 0.04 },
   "codeindex.status": { files: 5, symbols: 42, indexed_at: now - 60000, state: "ready" },
   "codeindex.tree": tree,
   "codeindex.graph": { nodes: tree.files.map((f, i) => ({ id: f.path, label: f.path.split("/").pop(), path: f.path, size: 5 + i })), edges: [{ source: "src/main.rs", target: "src/db.rs" }, { source: "src/main.rs", target: "src/gateway.rs" }, { source: "src/agents.rs", target: "src/db.rs" }] },
-  "codeindex.clashes": { clashes: [{ path: "src/gateway.rs", agents: ["lion", "otter"] }] },
+  "codeindex.clashes": { clashes: [{ a: "lion", b: "otter", detail: ["src/gateway.rs"] }] },
   "hal GET /sessions": sessions,
   "hal GET /sessions/s1/events": chatEvents,
   "hal GET /sessions/s2/events": [],

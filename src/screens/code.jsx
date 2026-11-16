@@ -226,7 +226,7 @@ export default function Code() {
   return (
     <Page title="Code" sub="Symbols and references, indexed locally" flush>
       <div class="code-wrap">
-        <div class="code-bar">
+        <div class="code-bar" style={repo() ? undefined : { display: "none" }}>
           <Select value={repo()} onValue={setRepoId} options={(repos() ?? []).map((r) => ({ value: r.id, label: r.name }))} />
           <Select value={viewId()} onValue={(v) => { setViewId(v); setSel(null); }}
             options={[{ value: "main", label: "Main (base commit)" }, ...(wts() ?? []).filter((w) => w.state === "active").map((w) => ({ value: w.id, label: `${agentName(w)} (worktree)` }))]} />

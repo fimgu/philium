@@ -91,7 +91,7 @@ export default function Chat() {
       </>}>
       <div class="split">
         <div class="agent-list">
-          <Show when={(sessions() ?? []).length} fallback={<div class="small faint" style={{ padding: "16px" }}>No chats yet.</div>}>
+          <Show when={(sessions() ?? []).length} fallback={<div class="small faint" style={{ padding: "16px", "line-height": "1.5" }}>No chats yet. Start one with New chat.</div>}>
             <For each={sessions()}>
               {(s) => (
                 <div class={`list-item ${s.id === selected() ? "on" : ""}`} onClick={() => go("chat", { session: s.id })}>
