@@ -1,15 +1,15 @@
-# Filium: Software Specification
+# Philium: Software Specification
 
 Status: **draft v0.1** (2026-11-16). Open decisions are marked **[OPEN]**.
 
 ## 1. Purpose
 
-Filium is a native, secure agent workstation. It replaces:
+Philium is a native, secure agent workstation. It replaces:
 
 | Replaces | With |
 |---|---|
-| jcode / pi (harness) | HAL runtime driven by Filium, with named agents, a shared todo board and messaging |
-| Herdr (terminals) | Persistent, live terminals owned by Filium |
+| jcode / pi (harness) | HAL runtime driven by Philium, with named agents, a shared todo board and messaging |
+| Herdr (terminals) | Persistent, live terminals owned by Philium |
 | Orca (browser) | One built-in, interactive browser panel |
 | Keys in env vars | A gateway that holds every credential and filters every request |
 
@@ -43,12 +43,13 @@ Design goals, in priority order:
 | F13 | Statistics: tokens, cost, TPS, latency, cache hits, errors, guard hits, by provider/model/agent/repo/day. |
 | F14 | Code graph (Graphify) per repo, exposed to agents as a cheap lookup tool. |
 | F15 | Approvals: risky actions (push, delete, network, writes outside the workspace) show what will happen before you allow them. |
+| F16 | Improve Philium from inside Philium: request a change on any screen, an agent builds it, you preview, accept or roll back. |
 
 ### Non-functional
 
 | ID | Requirement |
 |---|---|
-| N1 | Idle agent overhead: no OS process, no rendered DOM, < 1 MB RAM in Filium. |
+| N1 | Idle agent overhead: no OS process, no rendered DOM, < 1 MB RAM in Philium. |
 | N2 | UI renders only visible rows (virtualized). 1,000 agents in a list costs the same as 20. |
 | N3 | One HAL server process for all agents. |
 | N4 | macOS first. Windows and Linux follow without architectural change. |
@@ -68,7 +69,7 @@ flowchart LR
     V6[Providers]
   end
 
-  subgraph CORE["Filium core (Rust, Tauri)"]
+  subgraph CORE["Philium core (Rust, Tauri)"]
     SUP[Agent Supervisor]
     COORD[Coordination Service<br/>board, mail, leases]
     WS[Workspace Manager<br/>worktrees, branches, merge queue]
@@ -106,7 +107,7 @@ flowchart LR
   SUP --> DB
 ```
 
-Key choice: **Filium offers its services to agents as MCP tools**, served by the core over loopback with a per-agent token. HAL stays unmodified. The token tells Filium which agent is calling, so every tool call is attributed and scoped to that agent.
+Key choice: **Philium offers its services to agents as MCP tools**, served by the core over loopback with a per-agent token. HAL stays unmodified. The token tells Philium which agent is calling, so every tool call is attributed and scoped to that agent.
 
 ### 3.1 Components
 
@@ -275,39 +276,78 @@ A task can only be claimed when all of its `depends_on` tasks are Done.
 
 ## 6. Isolation: agents never step on each other
 
-Every shared thing that agents could fight over gets one of three treatments: **each agent gets its own copy**, **it is leased to one agent at a time**, or **Filium serializes access**.
+Every shared thing that agents could fight over gets one of three treatments: **each agent gets its own copy**, **it is leased to one agent at a time**, or **Philium serializes access**.
 
 | Shared thing | Typical collision | Rule | Mechanism |
 |---|---|---|---|
 | Working tree | Two agents edit the same files | Own copy | One worktree per agent. The agent starts there. Writes outside it require approval. |
-| Branches | Agents commit to the same branch | Own copy | Branch `filium/<agent>/<slug>`. Git refuses to check out one branch twice. Pushes to protected branches are denied. |
+| Branches | Agents commit to the same branch | Own copy | Branch `philium/<agent>/<slug>`. Git refuses to check out one branch twice. Pushes to protected branches are denied. |
 | Landing changes | Merge conflicts, broken main | Serialize | Merge queue: rebase on the integration branch, run checks, merge one at a time. Conflicts go back to the owning agent. |
 | Git metadata | `index.lock` races | Serialize | Worktree create/remove, fetch and gc run through one Workspace Manager queue. |
 | Tasks | Two agents do the same work | Lease | Claiming gives an exclusive lease with a heartbeat. An expired lease reopens the task. |
-| Ports | `EADDRINUSE`, or an agent hits another agent's server | Own copy | Each agent gets a block of 20 ports (`FILIUM_PORT_BASE`). `PORT` defaults inside it. |
-| Docker / compose | Name clashes, `down` kills others | Own copy | `COMPOSE_PROJECT_NAME=filium-<agent>`. A `docker` shim adds the label `filium.agent=<agent>`. |
-| kind / Kubernetes | Shared kubeconfig, wrong context, deleted cluster | Own copy | Per-agent `KUBECONFIG`. A `kind` shim prefixes cluster names with `filium-<agent>-`. |
+| Ports | `EADDRINUSE`, or an agent hits another agent's server | Own copy | Each agent gets a block of 20 ports (`PHILIUM_PORT_BASE`). `PORT` defaults inside it. |
+| Docker / compose | Name clashes, `down` kills others | Own copy | `COMPOSE_PROJECT_NAME=philium-<agent>`. A `docker` shim adds the label `philium.agent=<agent>`. |
+| kind / Kubernetes | Shared kubeconfig, wrong context, deleted cluster | Own copy | Per-agent `KUBECONFIG`. A `kind` shim prefixes cluster names with `philium-<agent>-`. |
 | Temp files | Overwrites | Own copy | Per-agent `TMPDIR`. Build caches stay shared (safe and fast). |
 | Browser | Two agents drive one page | Lease | One browser lease at a time. Others wait or get their own tab. |
 | Sibling worktrees | Agent reads or edits another agent's files | Deny | Path rules deny other agents' worktrees. |
 | Credentials | Agent reads `~/.ssh` or cloud credentials | Deny | Environment scrubbed. Strict mode sandboxes the filesystem (section 9). |
 | Model budget | One agent uses up all quota | Limit | Per-agent and per-provider token and rate budgets in the gateway. |
 
-The shims (`docker`, `kind`, `git`, `kubectl`) live in a Filium `bin` folder placed first on the agent's `PATH`. They record created resources in the ledger and enforce naming. They are a convenience, not a security boundary. Strict mode is the boundary.
+The shims (`docker`, `kind`, `git`, `kubectl`) live in a Philium `bin` folder placed first on the agent's `PATH`. They record created resources in the ledger and enforce naming. They are a convenience, not a security boundary. Strict mode is the boundary.
 
 ### 6.1 Agent environment
 
 Every agent process starts with exactly this. Nothing that carries credentials is inherited.
 
 ```
-FILIUM_AGENT=lion
-FILIUM_PORT_BASE=42100
+PHILIUM_AGENT=lion
+PHILIUM_PORT_BASE=42100
 PORT=42100
 TMPDIR=<state>/agents/lion/tmp
 KUBECONFIG=<state>/agents/lion/kubeconfig
-COMPOSE_PROJECT_NAME=filium-lion
+COMPOSE_PROJECT_NAME=philium-lion
 PATH=<state>/bin:<user PATH>
 ```
+
+### 6.2 Teardown policy
+
+Status: **proposed defaults, not yet confirmed by the user.**
+
+**When teardown runs**
+
+| Trigger | What happens |
+|---|---|
+| Agent finishes, work landed or discarded | Full teardown of that agent's resources |
+| Agent finishes, work waiting for review | Runtime resources torn down now (processes, containers, clusters, ports). Worktree and branch kept until you accept or discard |
+| Agent fails or is stopped | Same as above. Worktree kept for 24 h so you can inspect it, then removed |
+| Philium quits | All agent processes stopped. Containers and clusters kept, so agents can resume. Reaped at next start if their agent is gone |
+| Philium starts | Reconcile sweep (below) |
+| Idle timeout | A resource with no activity for N hours (default 4) is flagged, then torn down per the toggle |
+
+**The toggle** (Settings, with per-repo override): **Auto** tears down without asking. **Ask** shows the teardown plan (what will be removed) and waits for one click. Default: **Ask** for the first week, then you decide.
+
+**What gets torn down and how**
+
+| Resource | How it is found | How it is removed |
+|---|---|---|
+| Processes | Process group recorded at spawn | SIGTERM to the group, SIGKILL after 5 s |
+| Docker containers, volumes, networks | Label `philium.agent=<agent>` | `docker rm -f`, `docker volume rm`, `docker network rm` by label |
+| Compose projects | `COMPOSE_PROJECT_NAME=philium-<agent>` | `docker compose -p philium-<agent> down -v` |
+| kind clusters | Name prefix `philium-<agent>-` | `kind delete cluster --name ...` |
+| Colima / Docker runtime | Shared, never owned by one agent | Never stopped by teardown. Stopped only if Philium started it and no agent uses it (setting, default off) |
+| Ports | Port block in the ledger | Freed after the owning processes are gone |
+| Worktrees | Ledger and `git worktree list` | `git worktree remove`, refuse if there are uncommitted changes unless you confirm |
+| Branches | `philium/<agent>/*` | Deleted locally once merged or discarded. Remote branches deleted only if Philium pushed them |
+| Temp folders, kubeconfig | `agents/<name>/` | Deleted |
+
+**Safety rules for teardown**
+
+- Philium only removes things it can prove an agent created (label, name prefix or ledger record). Your own containers, clusters, branches and worktrees are never touched.
+- Unsaved work is never deleted silently. A dirty worktree or unmerged branch always asks, even in Auto.
+- Every teardown is logged. Anything that fails to delete is marked **leaked** and shown on Home until fixed.
+
+**Reconcile sweep (startup and every 15 min)** compares the ledger with reality: process table, `docker ps -a --filter label=philium.agent`, `kind get clusters`, `git worktree list` for every registered repo, and `philium/*` branches. Anything belonging to an agent that no longer exists is listed as an orphan and handled per the toggle.
 
 ## 7. Key flows
 
@@ -323,7 +363,7 @@ sequenceDiagram
   G->>G: verify token, identify agent, check budget
   G->>G: guard scan (redact or block)
   alt blocked
-    G-->>A: 403 Filium guard blocked
+    G-->>A: 403 Philium guard blocked
   else allowed
     G->>K: real key (cached)
     G->>P: request with real key
@@ -357,7 +397,7 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
   participant H as HAL (agent lion)
-  participant C as Filium MCP
+  participant C as Philium MCP
   participant T as Terminal Manager
   participant L as Ledger
   participant UI
@@ -387,9 +427,9 @@ sequenceDiagram
   L->>L: mark released, flag failures as leaked
 ```
 
-At startup the Reaper compares the ledger with reality (running processes, `docker ps --filter label=filium.agent`, `kind get clusters`, `git worktree list`) and offers to clean up anything orphaned.
+At startup the Reaper compares the ledger with reality (running processes, `docker ps --filter label=philium.agent`, `kind get clusters`, `git worktree list`) and offers to clean up anything orphaned.
 
-## 8. Agent tools (MCP, served by Filium)
+## 8. Agent tools (MCP, served by Philium)
 
 | Tool | Purpose |
 |---|---|
@@ -401,15 +441,15 @@ At startup the Reaper compares the ledger with reality (running processes, `dock
 | `graph.query` | Code graph lookups instead of reading whole files |
 | `resource.register` | Declare resources created outside the shims |
 
-**[OPEN]** HAL's built-in shell tool is disabled through its permission rules, so that all execution goes through Filium (visible, attributed, reapable).
+**[OPEN]** HAL's built-in shell tool is disabled through its permission rules, so that all execution goes through Philium (visible, attributed, reapable).
 
 ## 9. Security model
 
 Trust boundaries:
 
-1. **Provider** is untrusted. It sees only redacted requests and the key Filium injects.
-2. **Agent / HAL** is semi-trusted. It holds only its own Filium token. No provider keys, no logins.
-3. **Filium core** is trusted. It holds keys in the OS keychain.
+1. **Provider** is untrusted. It sees only redacted requests and the key Philium injects.
+2. **Agent / HAL** is semi-trusted. It holds only its own Philium token. No provider keys, no logins.
+3. **Philium core** is trusted. It holds keys in the OS keychain.
 
 | Level | What it adds | Cost |
 |---|---|---|
@@ -433,8 +473,8 @@ Strict mode is the recommended setting for untrusted providers.
 ## 11. Storage layout
 
 ```
-<app data dir>/            macOS: ~/Library/Application Support/dev.gunnarsson.filium
-  filium.db                SQLite: agents, tasks, messages, leases, ledger, stats
+<app data dir>/            macOS: ~/Library/Application Support/dev.gunnarsson.philium
+  philium.db                SQLite: agents, tasks, messages, leases, ledger, stats
   hal.yaml                 generated, 0600
   activity/                request metadata, rotated
   terminals/               spilled terminal buffers, rotated
@@ -461,6 +501,18 @@ Strict mode is the recommended setting for untrusted providers.
 
 Command palette (Cmd K) on every screen.
 
+### 12.1 Improve Philium from inside Philium
+
+Philium is registered as a repo in itself. Improving it uses the same agents, worktrees and merge queue as any other project, plus guard rails because it is the app you are running.
+
+1. **Ask from anywhere.** An "Improve Philium" action on every screen (and in Cmd K). It captures where you are: screen, selected element, recent errors, with secrets removed. You describe what you want.
+2. **An agent works on a copy.** It gets a worktree of the Philium source, never the running app. The running app keeps working while it builds.
+3. **Try it side by side.** The agent builds a preview copy with its own data folder and a fake gateway, so it cannot see your keys or agents. You try it in a separate window.
+4. **Accept or reject.** Accept merges the change, rebuilds and restarts Philium. The previous build is kept, so one click rolls back.
+5. **Security files need review.** Changes to the gateway, guard, provider, keychain or sandbox code are flagged and always need your explicit approval, even in Auto mode. Tests must pass first.
+
+This also keeps a running "Philium backlog" on the board, so ideas you have mid-task are captured without breaking your flow.
+
 ## 13. Phases
 
 | Phase | Scope |
@@ -470,13 +522,16 @@ Command palette (Cmd K) on every screen.
 | 3 | Workspace Manager, repo view, ledger and reaper (F7, F8, F11, F12) |
 | 4 | Named agents, board, mail, leases, merge queue (F4 to F6) |
 | 5 | Browser (F10), code graph (F14), strict mode |
+| 6 | Improve Philium from inside Philium (12.1) |
 
 ## 14. Open decisions
 
 1. UI framework: SolidJS (proposed) or Svelte.
 2. Default concurrency cap: 20?
 3. Finished work lands as a PR, a merge into an integration branch, or waits for review.
-4. Worktree location: `~/Filium/worktrees` or next to each repo.
-5. Disable HAL's built-in shell in favor of Filium's (section 8).
+4. Worktree location: `~/Philium/worktrees` or next to each repo.
+5. Disable HAL's built-in shell in favor of Philium's (section 8).
 6. Claude Code and Codex subscriptions through the gateway, subject to those providers' terms.
 7. Whether the "Isolated" level (containers) is needed at all.
+8. Teardown defaults in section 6.2: start in Ask mode, 4 h idle timeout, keep failed worktrees 24 h, keep containers on quit.
+9. Whether Philium may stop Colima when it started it and nothing uses it.
