@@ -80,18 +80,49 @@ const models = [
   { provider_id: "local", provider_name: "Local Ollama", model_id: "qwen3-coder", ref: "local/qwen3-coder", display: "Qwen3 Coder", enabled: 1, trust: "untrusted" },
 ];
 const repos = [
-  { id: "r1", name: "philium", path: "/Users/demo/Developer/philium", default_branch: "main", integration_branch: null, branch: "main", dirty: false, worktree_count: 2 },
+  { id: "r1", name: "philium", path: "/Users/demo/Developer/philium", default_branch: "main", integration_branch: null, branch: "main", dirty: false, worktree_count: 2, remote_url: "git@github.com:demo/philium.git" },
   { id: "r2", name: "hal", path: "/Users/demo/Developer/hal", default_branch: "main", branch: "main", dirty: true, worktree_count: 0 },
 ];
 const worktrees = [
-  { id: "w1", repo_id: "r1", branch: "agent/lion", path: "/Users/demo/Philium/worktrees/lion", agent_name: "lion", created_at: now - 3600000, status: { unsaved: true, dirty_files: ["src/a.jsx", "src/b.css"], ahead: 2, behind: 0, unpushed_commits: 2, unmerged_commits: 2 } },
-  { id: "w2", repo_id: "r1", branch: "agent/otter", path: "/Users/demo/Philium/worktrees/otter", agent_name: "otter", created_at: now - 7200000, status: { unsaved: false, dirty_files: [], ahead: 0, behind: 1, unpushed_commits: 0, unmerged_commits: 0 } },
+  { id: "w1", repo_id: "r1", agent_id: "a1", branch: "agent/lion", path: "/Users/demo/Philium/worktrees/lion", agent_name: "lion", created_at: now - 3600000, status: { unsaved: true, dirty_files: ["src/a.jsx", "src/b.css"], ahead: 2, behind: 0, unpushed_commits: 2, unmerged_commits: 2 } },
+  { id: "w2", repo_id: "r1", agent_id: "a2", branch: "agent/otter", path: "/Users/demo/Philium/worktrees/otter", agent_name: "otter", created_at: now - 7200000, status: { unsaved: false, dirty_files: [], ahead: 0, behind: 1, unpushed_commits: 0, unmerged_commits: 0 } },
 ];
 const terms = [
   { id: "term1", title: "cargo test", agent_id: "a1", agent: "lion", state: "running", cmd: "cargo test", cwd: "/Users/demo/Philium/worktrees/lion", created_at: now - 600000 },
   { id: "term2", title: "npm run build", agent_id: "a2", agent: "otter", state: "exited", exit_code: 0, cmd: "npm run build", created_at: now - 900000 },
   { id: "term3", title: "shell", state: "exited", exit_code: 1, cmd: "zsh", created_at: now - 1200000 },
 ];
+
+// Realistic code graph: ~300 files across modules, weighted edges, a couple of agent changes.
+const codeGraph = (() => {
+  let s = 7; const rnd = () => ((s = Math.imul(s ^ (s >>> 15), 2246822507) + 0x6d2b79f5 | 0) >>> 0) / 4294967296;
+  const mods = [["src-tauri/src", 70, "rs"], ["src/screens", 40, "jsx"], ["src/ui", 34, "jsx"], ["src/lib", 26, "js"], ["src/styles", 22, "css"], ["crates/hal", 38, "rs"], ["crates/gateway", 30, "rs"], ["scripts/render", 12, "mjs"], ["docs", 10, "md"], ["tests", 18, "rs"]];
+  const words = ["agent", "board", "chat", "code", "db", "gateway", "hal", "index", "kit", "nav", "rpc", "sandbox", "shell", "stats", "terminal", "worktree", "provider", "guard", "events", "session", "router", "layout", "theme", "cache", "store", "auth", "config", "util", "model", "graph"];
+  const nodes = [];
+  for (const [dir, n, ext] of mods) for (let i = 0; i < n; i++) {
+    const name = `${words[(i * 7 + dir.length) % words.length]}${i >= words.length ? "_" + i : ""}.${ext}`;
+    nodes.push({ id: `${dir}/${name}`, label: name, kind: "file", path: `${dir}/${name}`, group: dir, rank: rnd(), syms: 2 + Math.floor(rnd() ** 2 * 60), changed_by: [] });
+  }
+  const edges = [], seen = new Set();
+  const hubs = nodes.filter((_, i) => i % 9 === 0);
+  for (const a of nodes) {
+    const k = 1 + Math.floor(rnd() * 4);
+    for (let j = 0; j < k; j++) {
+      const same = rnd() < 0.7;
+      const pool = same ? nodes.filter((b) => b.group === a.group) : hubs;
+      const b = pool[Math.floor(rnd() ** 1.6 * pool.length)];
+      if (!b || b === a || seen.has(a.id + b.id)) continue;
+      seen.add(a.id + b.id);
+      edges.push({ source: a.id, target: b.id, weight: 1 + Math.floor(rnd() ** 3 * 24), kind: "uses" });
+    }
+  }
+  const deg = new Map();
+  for (const e of edges) { const s0 = deg.get(e.source) ?? [0, 0], t0 = deg.get(e.target) ?? [0, 0]; s0[1] += e.weight; t0[0] += e.weight; deg.set(e.source, s0); deg.set(e.target, t0); }
+  for (const n of nodes) { const [i, o] = deg.get(n.id) ?? [0, 0]; n.refs_in = i; n.refs_out = o; n.weight = i + o; }
+  nodes[3].changed_by = [{ worktree_id: "w1", agent: "lion" }];
+  nodes[75].changed_by = [{ worktree_id: "w2", agent: "otter" }];
+  return { nodes, edges, truncated: false, level: "file" };
+})();
 
 export const POPULATED = {
   ...EMPTY,
@@ -124,8 +155,10 @@ export const POPULATED = {
   "terminals.buffer": { data: Buffer.from("$ cargo test\r\nrunning 12 tests\r\ntest result: ok. 12 passed\r\n").toString("base64") },
   "workspace.repos_list": repos,
   "workspace.worktrees": worktrees,
-  "workspace.branches": [{ name: "main" }, { name: "agent/lion" }, { name: "origin/main" }],
+  "workspace.branches": [{ name: "main", current: true, commit: "a1b2c3d4e5", date: now - 3600000 }, { name: "agent/lion", commit: "b2c3d4e5f6", date: now - 600000 }, { name: "agent/otter", commit: "c3d4e5f6a7" }, { name: "origin/main", commit: "a1b2c3d4e5" }, { name: "origin/HEAD" }],
   "workspace.worktree_status": worktrees[0].status,
+  "sandbox.grants_get": { grants: [{ path: "/Users/demo/Documents/Parts", write: false }], private: [] },
+  "agents.get_effort": "default",
   "reaper.proposals": [{ id: "p1", kind: "worktree", handle: "/Users/demo/Philium/worktrees/old", reason: "Agent removed", state: "proposed" }],
   "reaper.ledger": [{ id: "l1", kind: "worktree", handle: "/Users/demo/Philium/worktrees/lion", state: "live", created_at: now - 3600000 }],
   "activity.list": rows,
@@ -137,7 +170,7 @@ export const POPULATED = {
   "stats.efficiency": { cached_share: 0.42, cache_available: true, output_input_ratio: 0.28, cost_per_: 0.04 },
   "codeindex.status": { files: 5, symbols: 42, indexed_at: now - 60000, state: "ready" },
   "codeindex.tree": tree,
-  "codeindex.graph": { nodes: tree.files.map((f, i) => ({ id: f.path, label: f.path.split("/").pop(), path: f.path, size: 5 + i })), edges: [{ source: "src/main.rs", target: "src/db.rs" }, { source: "src/main.rs", target: "src/gateway.rs" }, { source: "src/agents.rs", target: "src/db.rs" }] },
+  "codeindex.graph": codeGraph,
   "codeindex.clashes": { clashes: [{ a: "lion", b: "otter", severity: "high", detail: ["src/gateway.rs"] }] },
   "hal GET /sessions": sessions,
   "hal GET /sessions/s1/events": chatEvents,

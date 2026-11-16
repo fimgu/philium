@@ -288,3 +288,36 @@ export function Guard(props) {
 export function NotFound(props) {
   return <Empty title={props.title ?? "Not found"} action={props.action}>{props.children ?? "It may have been removed."}</Empty>;
 }
+
+/** Compact overflow menu. items: [{label, onClick, danger?, disabled?}]. Rendered in a portal so lists never clip it. */
+export function Menu(props) {
+  const [pos, setPos] = createSignal(null);
+  let btn;
+  const close = () => setPos(null);
+  const open = (e) => {
+    e.stopPropagation();
+    if (pos()) return close();
+    const r = btn.getBoundingClientRect();
+    setPos({ top: Math.min(r.bottom + 4, window.innerHeight - 40 - (props.items?.length ?? 0) * 30), right: Math.max(8, window.innerWidth - r.right) });
+  };
+  const onDoc = () => close();
+  onMount(() => { document.addEventListener("click", onDoc); window.addEventListener("resize", onDoc); });
+  onCleanup(() => { document.removeEventListener("click", onDoc); window.removeEventListener("resize", onDoc); });
+  return (
+    <>
+      <button ref={btn} type="button" class="btn ghost sm menu-btn" title={props.title ?? "More actions"} aria-haspopup="menu" aria-expanded={!!pos()} onClick={open}>
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><circle cx="3" cy="8" r="1.4" /><circle cx="8" cy="8" r="1.4" /><circle cx="13" cy="8" r="1.4" /></svg>
+      </button>
+      <Show when={pos()}>
+        <Portal>
+          <div class="menu" role="menu" style={{ top: `${pos().top}px`, right: `${pos().right}px` }} onClick={(e) => e.stopPropagation()}>
+            <For each={props.items}>{(it) => (
+              <button type="button" role="menuitem" class={`menu-item ${it.danger ? "danger" : ""}`} disabled={it.disabled}
+                onClick={() => { close(); try { const r = it.onClick?.(); r?.catch?.((x) => toast(cleanError(x), "bad")); } catch (x) { toast(cleanError(x), "bad"); } }}>{it.label}</button>
+            )}</For>
+          </div>
+        </Portal>
+      </Show>
+    </>
+  );
+}
