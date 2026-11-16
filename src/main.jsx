@@ -5,6 +5,7 @@ import { render } from "solid-js/web";
 import { For, Show, createSignal, createMemo, lazy, Suspense, onMount, onCleanup } from "solid-js";
 import { Dynamic } from "solid-js/web";
 import { ToastHost, ConfirmHost } from "./ui/kit.jsx";
+import { ImproveHost } from "./ui/improve.jsx";
 import { Icon } from "./ui/icons.jsx";
 import { rpc } from "./lib/rpc.js";
 import { route, go, commands, improve } from "./lib/nav.js";
@@ -109,6 +110,7 @@ function App() {
       <Show when={palette()}><Palette onClose={() => setPalette(false)} /></Show>
       <ToastHost />
       <ConfirmHost />
+      <ImproveHost />
     </div>
   );
 }

@@ -165,7 +165,11 @@ fn philium_root() -> std::path::PathBuf {
 fn main() {
     let tauri_app = tauri::Builder::default()
         .setup(|app| {
-            let data_dir = app.path().app_data_dir().expect("app data dir");
+            // PHILIUM_DATA_DIR isolates Improve-Philium previews from real data.
+            let data_dir = match std::env::var("PHILIUM_DATA_DIR") {
+                Ok(d) if !d.is_empty() => std::path::PathBuf::from(d),
+                _ => app.path().app_data_dir().expect("app data dir"),
+            };
             std::fs::create_dir_all(&data_dir)?;
 
             // Gateway on an ephemeral loopback port, inside this process.

@@ -118,7 +118,12 @@ pub fn valid_model_id(m: &str) -> Result<(), String> {
 
 // ---------- keychain ----------
 
+/// Improve-Philium previews run with PHILIUM_PREVIEW=1 and must never see
+/// the user's real keys.
 fn entry(id: &str) -> Result<keyring::Entry, String> {
+    if std::env::var_os("PHILIUM_PREVIEW").is_some() {
+        return Err("keychain is disabled in preview builds".into());
+    }
     keyring::Entry::new(KEYCHAIN_SERVICE, &format!("provider:{id}")).map_err(|e| e.to_string())
 }
 
@@ -494,6 +499,9 @@ pub fn models(ctx: &Ctx, provider: Option<&str>) -> Result<Vec<Value>, String> {
 
 /// Which subscription CLIs are signed in on this machine.
 pub fn detect_logins() -> Value {
+    if std::env::var_os("PHILIUM_PREVIEW").is_some() {
+        return json!({ "chatgpt": false, "claude_code": false });
+    }
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default();
     let codex = std::env::var_os("CODEX_HOME").map(Into::into).unwrap_or_else(|| home.join(".codex"));
     let claude_dir = std::env::var_os("CLAUDE_CONFIG_DIR").map(Into::into).unwrap_or_else(|| home.join(".claude"));
