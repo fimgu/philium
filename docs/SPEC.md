@@ -491,6 +491,8 @@ At startup the Reaper compares the ledger with reality (running processes, `dock
 
 **[DECIDED]** HAL's built-in shell tool is disabled through its permission rules, so that all execution goes through Philium (visible, attributed, reapable).
 
+**[DECIDED] Browser approval:** Agent messages expose Philium's browser MCP tools to HAL's permission engine. Before a `philium/browser_*` call runs, the agent chat asks the human with the tool name and arguments. Choices are Deny, Allow once, or Allow for session. Session approval covers that exact tool in that agent's HAL session, not every browser tool or other agents. The card warns that page content may reach the agent's provider. HAL's separate built-in browser remains denied.
+
 ## 9. Security model
 
 Trust boundaries:

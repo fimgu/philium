@@ -14,6 +14,8 @@ mod agents;
 mod agentshell;
 mod board;
 mod browser;
+#[cfg(test)]
+mod browser_permission_tests;
 mod ctx;
 mod db;
 mod gateway;
