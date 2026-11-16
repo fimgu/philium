@@ -232,7 +232,8 @@ classDiagram
 
 Enumerations:
 
-- `Provider.kind`: anthropic, openai, openai_compatible, claude_code, codex
+- `Provider.kind`: anthropic, openai, openai_compatible, claude_code_cli, codex_cli
+- `Provider.trust`: trusted (Standard), untrusted (forces Strict)
 - `Provider.guard_mode`: off, redact, block
 - `Lease.kind`: task, path, port_block, browser
 - `Resource.kind`: process, container, compose_project, kind_cluster, port_block, worktree, branch, tmpdir
@@ -588,15 +589,26 @@ Status: **decided.** Worktrees, and optionally your repos, live in one Philium f
 ~/Philium/
   repos/<owner>/<repo>/            main checkouts (optional, you choose per repo)
   worktrees/<repo>/<agent>/        agent worktrees, always here, managed by Philium
-  scratch/                         throwaway workspaces for quick tasks
-  archive/                         repos you are not using, kept out of the way
 ```
+
+There is **no archive folder and no shared scratch folder.** Both grow forever.
 
 Rules:
 
 - Philium never moves an existing repo by itself. Adding a repo offers two choices: **use it where it is**, or **move it into `~/Philium/repos`** (Philium moves it, fixes its worktree links and updates its records).
 - Worktrees always go in `~/Philium/worktrees`, wherever the repo lives.
 - A wider laptop reorganization is a separate, one-off project (section 15), done with a dry-run plan you approve first.
+
+### 11.2 Scratch space that cleans itself
+
+Agents need throwaway space (downloads, experiments, evidence, build output). In jcode this is one shared `scratch` folder that only grows (108 GB, 2,591 entries on this machine on 2026-11-16).
+
+In Philium, scratch is **owned by an agent and dies with it**:
+
+- Each agent gets `agents/<name>/scratch` inside Philium's app data folder. It is a ledger resource like any other (section 6.2) and is deleted on teardown.
+- Anything worth keeping must be **promoted** explicitly: attached to a task or PR as an artifact (with a size shown), or saved to a path you choose. Promoted artifacts expire after 30 days unless pinned.
+- **Quota:** 2 GB per agent scratch by default. Going over pauses the agent and asks.
+- The Home screen shows total disk used by Philium (worktrees, scratch, artifacts, logs, terminal buffers) with one "Clean up" button that lists exactly what will be deleted.
 
 ## 12. UI map
 
@@ -656,16 +668,29 @@ This also keeps a running "Philium backlog" on the board, so ideas you have mid-
 11. **Strict mode** is required and set per provider. Untrusted providers force it (section 9.1).
 12. The "Isolated" container level is not planned.
 
-### Still open
+### Subscriptions (researched 2026-11-16)
 
-1. Claude Code and Codex subscriptions through the gateway, subject to those providers' terms.
+You trust both providers, so they run in **Standard** mode (not Strict). Their traffic still goes through the gateway for logging and stats.
+
+| Subscription | Can Philium use it directly? | How Philium does it |
+|---|---|---|
+| **Claude (Pro/Max)** | **No.** Anthropic's terms restrict subscription logins to Claude Code and claude.ai. Third-party harnesses using them have been blocked and accounts banned. | Philium runs the **official `claude` CLI** as a worker agent, with your normal login. Philium starts it, shows its terminal, gives it a worktree, and tracks it like any agent. Its model traffic goes straight to Anthropic from the official client (Philium sees its activity and token usage from the CLI's own output, not from the gateway). Alternatively, use an Anthropic API key through the gateway like any provider. |
+| **ChatGPT / Codex (Plus/Pro)** | **Unclear for us today.** OpenAI's "Sign in with ChatGPT" lets third-party apps use your plan, but it is a limited preview for listed partners and open-source clients. Reusing the Codex login inside another client has been called not approved. | Same pattern: Philium runs the **official `codex` CLI** as a worker agent with your normal login. If Philium is open source, revisit Sign in with ChatGPT through the gateway later. Or use an OpenAI API key through the gateway. |
+
+This means Philium supports two kinds of agents:
+
+- **HAL agents** (any API key, through the gateway, full Strict support).
+- **CLI agents** (official `claude` and `codex` CLIs on your subscriptions). Same worktrees, terminals, board, mail (through Philium's MCP tools, which both CLIs support), playbooks and teardown. The gateway does not sit in their model traffic.
+
+No item is still open.
 
 ## 15. Laptop folder reorganization (separate project)
 
 Not part of Philium itself. A one-off cleanup of your folders, done carefully:
 
 1. **Inventory (read-only).** List every repo, its remote, last commit, uncommitted changes, unpushed branches and size. Same for loose folders in your home folder.
-2. **Proposal.** A table: each item, where it should go (`~/Philium/repos`, `archive`, delete candidate), and why. Nothing moves yet.
+2. **Proposal.** A table: each item, where it should go (`~/Philium/repos`, keep, delete), and why. Nothing moves yet.
 3. **You approve.** Item by item or in groups.
 4. **Move safely.** Uncommitted or unpushed work is never deleted. Git worktree links are repaired after moves. A log of every move allows undo.
-5. **Leftovers.** Old work folders and backups go to `archive`, not the trash.
+5. **Delete, not archive.** Items you approve for deletion are deleted (no archive folder). A repo is only deletable if everything in it is pushed to its remote, or you explicitly accept losing the unpushed part. The proposal shows this per item.
+6. **jcode leftovers.** `~/.jcode/scratch` (108 GB) and `~/.jcode/review-evidence` (7.8 GB) are included, once Philium has replaced jcode.
