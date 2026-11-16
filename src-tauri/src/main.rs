@@ -64,6 +64,31 @@ fn start_hal() -> Result<Hal, String> {
     })
 }
 
+/// Only API paths the UI needs; maintenance/admin routes stay unreachable.
+fn validate_path(path: &str) -> Result<(), String> {
+    let route = path.split('?').next().unwrap_or("");
+    let ok_chars = path
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "/-_.?=&%".contains(c));
+    if !path.starts_with('/')
+        || path.starts_with("//")
+        || !ok_chars
+        || route.split('/').any(|seg| seg == ".." || seg == ".")
+        || path.to_ascii_lowercase().contains("%2e")
+        || path.to_ascii_lowercase().contains("%2f")
+    {
+        return Err("invalid path".into());
+    }
+    const ALLOWED: [&str; 4] = ["/health", "/models", "/sessions", "/providers"];
+    if !ALLOWED
+        .iter()
+        .any(|p| route == *p || route.starts_with(&format!("{p}/")))
+    {
+        return Err(format!("route not allowed: {route}"));
+    }
+    Ok(())
+}
+
 /// Proxy one request to HAL. `path` must be an absolute API path.
 #[tauri::command]
 async fn hal(
@@ -72,9 +97,7 @@ async fn hal(
     path: String,
     body: Option<Value>,
 ) -> Result<Value, String> {
-    if !path.starts_with('/') || path.contains("://") || path.contains("..") {
-        return Err("invalid path".into());
-    }
+    validate_path(&path)?;
     let method = match method.as_str() {
         "GET" => reqwest::Method::GET,
         "POST" => reqwest::Method::POST,
@@ -130,4 +153,42 @@ fn main() {
             shutdown(handle);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_path;
+
+    #[test]
+    fn allows_ui_routes() {
+        for p in [
+            "/health",
+            "/models",
+            "/sessions",
+            "/sessions/abc-123/events?after=5&limit=500",
+            "/sessions/abc/permissions/r1/approve",
+        ] {
+            assert!(validate_path(p).is_ok(), "{p}");
+        }
+    }
+
+    #[test]
+    fn rejects_escape_and_admin_routes() {
+        for p in [
+            "",
+            "health",
+            "//evil.example/x",
+            "http://evil.example/sessions",
+            "/sessions/../maintenance/shutdown",
+            "/sessions/%2e%2e/maintenance/shutdown",
+            "/sessions%2f..%2fmaintenance",
+            "/maintenance/shutdown",
+            "/maintenance/freeze",
+            "/sessions@evil",
+            "/sessions\n/x",
+            "/sessionsX",
+        ] {
+            assert!(validate_path(p).is_err(), "{p:?} should be rejected");
+        }
+    }
 }
