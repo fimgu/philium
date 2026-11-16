@@ -1795,3 +1795,49 @@ mod tests {
         assert!(x.contains("def src/a.rs:3"), "{x}");
     }
 }
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+
+    /// `BENCH_REPO=/path BENCH_SYMS=a,b,c cargo test bench_repo -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_repo() {
+        let Ok(repo) = std::env::var("BENCH_REPO") else { return };
+        let syms: Vec<String> = std::env::var("BENCH_SYMS").unwrap_or_default().split(',').map(str::to_string).collect();
+        let ctx = Ctx::test();
+        ctx.db.with(|c| c.execute_batch(SCHEMA)).unwrap();
+        let repo = PathBuf::from(repo);
+        let br = git(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap();
+        let t = Instant::now();
+        let (v, _) = index_target(&ctx, "b", &repo, &br, None, true).unwrap();
+        println!("index: {} files-syms {} refs {} in {:?}", v.syms.len(), v.syms.len(), v.refs.len(), t.elapsed());
+        let map = render_map(&v, None, 2, 60000);
+        println!("MAP tokens {}", map.len() / 4);
+        let (mut tp, mut tr, mut tn) = (0usize, 0usize, 0usize);
+        for s in syms.iter().filter(|s| !s.is_empty()) {
+            let out = render_refs(&v, s, 60000);
+            let (defs, hits) = refs_of(&v, s);
+            let ex: Vec<&RefHit> = hits.iter().filter(|h| h.exact).collect();
+            // ground truth proxy: rg -w lines excluding definitions
+            let rg = Command::new("rg").args(["-n", "-w", "--no-heading", "-g", "*.{rs,ts,tsx,js,jsx,py,go}", "-g", "!node_modules", "-g", "!target", s]).current_dir(&repo).output().unwrap();
+            let rgs = String::from_utf8_lossy(&rg.stdout).to_string();
+            let rg_lines = rgs.lines().count();
+            let rg_files: HashSet<&str> = rgs.lines().filter_map(|l| l.split(':').next()).collect();
+            let mut read_chars = 0usize;
+            for f in &rg_files {
+                read_chars += std::fs::metadata(repo.join(f)).map(|m| m.len() as usize).unwrap_or(0);
+            }
+            let rgset: HashSet<(String, u32)> = rgs.lines().filter_map(|l| { let mut p = l.splitn(3, ':'); Some((p.next()?.to_string(), p.next()?.parse().ok()?)) }).collect();
+            let idx: HashSet<(String, u32)> = hits.iter().map(|h| (h.r.path.clone(), h.r.line)).chain(defs.iter().map(|d| (d.path.clone(), d.line))).collect();
+            let recall_hit = rgset.iter().filter(|x| idx.contains(*x)).count();
+            let extra = idx.iter().filter(|x| !rgset.contains(*x)).count();
+            println!("{s}: defs {} exact {} possible {} | rg lines {rg_lines} files {} | rg-recall {}/{} idx-not-in-rg {extra} | refs tokens {} vs grep {} / read-all {}", defs.len(), ex.len(), hits.len() - ex.len(), rg_files.len(), recall_hit, rgset.len(), out.len() / 4, rgs.len() / 4, read_chars / 4);
+            tp += ex.len();
+            tr += rg_lines;
+            tn += out.len() / 4;
+        }
+        println!("TOTAL exact {tp} rg lines {tr} refs tokens {tn}");
+    }
+}
