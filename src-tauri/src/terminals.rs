@@ -269,6 +269,30 @@ fn bytes(ctx: &Arc<Ctx>, id: &str) -> Option<Vec<u8>> {
             .collect(),
     )
 }
+/// Total bytes ever produced (the exclusive end offset of the stream).
+pub fn total(ctx: &Arc<Ctx>, id: &str) -> Option<u64> {
+    Some(get(ctx, id).ok()?.output.lk().total)
+}
+/// Retained bytes from stream offset `from` onwards (clamped to scrollback).
+pub fn since(ctx: &Arc<Ctx>, id: &str, from: u64) -> Option<Vec<u8>> {
+    let t = get(ctx, id).ok()?;
+    let out = t.output.lk();
+    let start = out.total - out.ring.len() as u64;
+    let skip = from.saturating_sub(start).min(out.ring.len() as u64) as usize;
+    Some(out.ring.iter().skip(skip).copied().collect())
+}
+/// Still attached and its process has not exited.
+pub fn alive(ctx: &Arc<Ctx>, id: &str) -> bool {
+    get(ctx, id).is_ok_and(|t| t.output.lk().exit.is_none())
+}
+/// Strip terminal escape sequences and carriage returns.
+pub fn clean(text: &str) -> String {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-?]*[ -/]*[@-~]|\x1b[@-_]").unwrap()
+    });
+    re.replace_all(text, "").replace("\r\n", "\n").replace('\r', "")
+}
 pub fn snapshot(ctx: &Arc<Ctx>, id: &str, max_bytes: usize) -> Option<String> {
     let data = bytes(ctx, id)?;
     let text = String::from_utf8_lossy(&data);
