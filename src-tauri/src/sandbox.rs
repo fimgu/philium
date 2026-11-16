@@ -123,10 +123,14 @@ pub fn profile(p: &Policy) -> String {
     // System paths needed to run binaries and toolchains.
     for sys in [
         "/usr", "/bin", "/sbin", "/System", "/Library/Frameworks", "/Library/Developer", "/private/etc", "/etc",
-        "/opt/homebrew", "/private/var/db", "/Applications/Xcode.app", "/var/db/timezone",
+        "/opt/homebrew", "/private/var/db", "/Applications", "/var/db/timezone",
     ] {
         s.push_str(&format!("(allow file-read* (subpath \"{sys}\"))\n"));
     }
+    // Xcode command line tools: the license check and xcrun's cache. Without these
+    // /usr/bin/python3, git and clang refuse to run inside the sandbox.
+    s.push_str("(allow file-read* (literal \"/Library/Preferences/com.apple.dt.Xcode.plist\"))\n");
+    s.push_str("(allow file-read* file-write* (regex #\"^/private/var/folders/[^/]+/[^/]+/(T|C)/xcrun_db\"))\n");
     s.push_str("(allow file-read* (literal \"/\") (literal \"/dev/null\") (literal \"/dev/zero\") (literal \"/dev/random\") (literal \"/dev/urandom\"))\n");
     s.push_str("(allow file-read* file-write* (regex #\"^/dev/(tty|pty|ttys)\"))\n");
     s.push_str("(allow file-write* (literal \"/dev/null\") (literal \"/dev/dtracehelper\"))\n");
@@ -641,5 +645,34 @@ mod tests {
         let r = test_profile(&ctx).await.unwrap();
         let bad: Vec<_> = r["probes"].as_array().unwrap().iter().filter(|p| p["ok"] != true).collect();
         assert!(bad.is_empty(), "{bad:?}");
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod toolchain_probe {
+    use super::*;
+    #[test]
+    fn toolchains_run_but_home_stays_private() {
+        let dir = std::env::temp_dir().join(format!("sbx-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = Policy { workdir: dir.clone(), scratch: dir.clone(), hal_dir: dir.clone(), read_only: vec![], allow_hosts: vec![] };
+        let run = |cmd: &str| {
+            std::process::Command::new("/usr/bin/sandbox-exec")
+                .args(["-p", &profile(&p), "/bin/sh", "-c", cmd])
+                .env("TMPDIR", &dir)
+                .output()
+                .unwrap()
+        };
+        assert!(run("/usr/bin/python3 -V").status.success(), "python3 should run");
+        if std::path::Path::new("/Applications/KiCad/KiCad.app").exists() {
+            let o = run("/Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli version");
+            assert!(o.status.success(), "kicad-cli: {}", String::from_utf8_lossy(&o.stderr));
+        }
+        let home = home();
+        for secret in [".ssh", "Documents", "Library/Keychains"] {
+            let o = run(&format!("ls '{}'", home.join(secret).display()));
+            assert!(!o.status.success(), "{secret} must stay unreadable");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
