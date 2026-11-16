@@ -119,8 +119,6 @@ fn set_state(ctx: &Ctx, id: &str, state: &str) {
     ctx.emit("agents:changed", json!({ "id": id, "state": state }));
 }
 
-/// States (SPEC 5.1). `idle` = running HAL, no turn in progress.
-pub const LIVE: &[&str] = &["provisioning", "running", "idle", "waiting"];
 
 /// Pick a free block of 20 ports, starting at 42000.
 fn port_base(ctx: &Ctx) -> i64 {

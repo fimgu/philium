@@ -122,6 +122,7 @@ async fn rpc(app: State<'_, App>, method: String, args: Option<Value>) -> Result
         "stats" => stats::call(&ctx, m, args).await,
         "reaper" => reaper::call(&ctx, m, args).await,
         "selfdev" => selfdev::call(&ctx, m, args).await,
+        "mcp" => mcp::call(&ctx, m, args).await,
         _ => Err(format!("unknown module {module}")),
     }
 }
