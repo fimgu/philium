@@ -17,7 +17,8 @@
 //! `browser:opened` `{id,opener}` (target=_blank / window.open became a new tab),
 //! `browser:download` `{tab,name,path,state:"started"|"done"|"failed"}`.
 //! Stale tab ids (webview gone) are pruned from state and reported via `browser:closed`.
-//! Rust API for agents: `agent_open(ctx, agent, url)` -> tab id, `agent_snapshot(ctx, tab)` -> text.
+//! Agents get their own tabs (`owner` = agent id) driven by the MCP `browser_*` tools in browser_agent.rs.
+//! `open {url, owner}` / `tabs {owner}` / `select {tab}` serve the agent pane.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -37,6 +38,8 @@ pub struct Tab {
     pub url: String,
     pub title: String,
     pub agent: Option<String>,
+    /// Agent id owning this tab (agent browser pane). None = shared Browser screen.
+    pub owner: Option<String>,
     pub visible: bool,
     pub loading: bool,
     pub error: Option<String>,
@@ -46,6 +49,8 @@ pub struct Tab {
 struct State {
     tabs: Vec<Tab>,
     snaps: HashMap<String, oneshot::Sender<String>>,
+    /// Owner (agent id) -> the tab its tools act on by default.
+    current: HashMap<String, String>,
 }
 
 fn state() -> &'static Mutex<State> {
@@ -119,6 +124,7 @@ fn forget(id: &str) -> bool {
     let mut s = state().lock().unwrap();
     let n = s.tabs.len();
     s.tabs.retain(|t| t.id != id);
+    s.current.retain(|_, t| t != id);
     s.tabs.len() != n
 }
 
@@ -182,7 +188,7 @@ fn downloads_dir() -> std::path::PathBuf {
     std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir).join("Downloads")
 }
 
-fn open(ctx: &Arc<Ctx>, url: &str, agent: Option<String>) -> Result<Tab, String> {
+fn open(ctx: &Arc<Ctx>, url: &str, agent: Option<String>, owner: Option<String>) -> Result<Tab, String> {
     let url = normalize_url(url)?;
     let h = ctx.handle().ok_or("no app handle")?.clone();
     let win = h.get_window("main").ok_or("main window not found")?;
@@ -190,8 +196,17 @@ fn open(ctx: &Arc<Ctx>, url: &str, agent: Option<String>) -> Result<Tab, String>
     let parsed: tauri::Url = url.parse().map_err(|e: <tauri::Url as std::str::FromStr>::Err| e.to_string())?;
     let (c_nav, c_title, c_load, c_new, c_dl) = (ctx.clone(), ctx.clone(), ctx.clone(), ctx.clone(), ctx.clone());
     let (id_nav, id_title, id_load, id_new, id_dl) = (id.clone(), id.clone(), id.clone(), id.clone(), id.clone());
-    let agent_new = agent.clone();
-    let b = WebviewBuilder::new(label(&id), WebviewUrl::External(parsed))
+    let (agent_new, owner_new) = (agent.clone(), owner.clone());
+    let mut b = WebviewBuilder::new(label(&id), WebviewUrl::External(parsed));
+    if let Some(o) = &owner {
+        // Each agent gets its own persistent, isolated profile and a console recorder.
+        b = b.data_directory(profile_dir(&ctx.data_dir, o)).initialization_script(CONSOLE_JS);
+        #[cfg(target_os = "macos")]
+        {
+            b = b.data_store_identifier(profile_uuid(o));
+        }
+    }
+    let b = b
         .on_navigation(move |u| {
             let ok = allowed_scheme(u.scheme());
             if ok {
@@ -224,9 +239,12 @@ fn open(ctx: &Arc<Ctx>, url: &str, agent: Option<String>) -> Result<Tab, String>
         })
         .on_new_window(move |u, _| {
             if popup_allowed(u.as_str()) {
-                let (c, opener, agent, s) = (c_new.clone(), id_new.clone(), agent_new.clone(), u.to_string());
+                let (c, opener, agent, owner, s) = (c_new.clone(), id_new.clone(), agent_new.clone(), owner_new.clone(), u.to_string());
                 std::thread::spawn(move || {
-                    if let Ok(t) = open(&c, &s, agent) {
+                    if let Ok(t) = open(&c, &s, agent, owner.clone()) {
+                        if let Some(o) = owner {
+                            state().lock().unwrap().current.insert(o, t.id.clone());
+                        }
                         c.emit("browser:opened", json!({"id": t.id, "opener": opener}));
                     }
                 });
@@ -273,7 +291,7 @@ fn open(ctx: &Arc<Ctx>, url: &str, agent: Option<String>) -> Result<Tab, String>
         });
     // Start tiny and hidden until the UI sends bounds.
     win.add_child(b, LogicalPosition::new(0.0, 0.0), LogicalSize::new(1.0, 1.0)).map_err(|e| e.to_string())?;
-    let tab = Tab { id: id.clone(), url, title: String::new(), agent, visible: false, loading: true, error: None };
+    let tab = Tab { id: id.clone(), url, title: String::new(), agent, owner, visible: false, loading: true, error: None };
     if let Ok(w) = webview(ctx, &id) {
         let _ = w.hide();
     }
@@ -294,10 +312,6 @@ fn ids(args: &Value) -> Vec<String> {
         Some(t) => vec![t],
         None => state().lock().unwrap().tabs.iter().map(|t| t.id.clone()).collect(),
     }
-}
-
-pub async fn agent_open(ctx: &Arc<Ctx>, agent: &str, url: &str) -> Result<String, String> {
-    Ok(open(ctx, url, Some(agent.to_string()))?.id)
 }
 
 pub async fn agent_snapshot(ctx: &Arc<Ctx>, tab: &str) -> Result<String, String> {
@@ -321,7 +335,15 @@ pub async fn agent_snapshot(ctx: &Arc<Ctx>, tab: &str) -> Result<String, String>
 pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, String> {
     match method {
         "open" => {
-            let t = open(ctx, &arg_str(&args, "url")?, arg_opt_str(&args, "agent"))?;
+            let owner = arg_opt_str(&args, "owner");
+            let agent = match &owner {
+                Some(o) => crate::agents::get_row(ctx, o).and_then(|r| r["name"].as_str().map(str::to_string)),
+                None => arg_opt_str(&args, "agent"),
+            };
+            let t = open(ctx, &arg_str(&args, "url")?, agent, owner.clone())?;
+            if let Some(o) = owner {
+                state().lock().unwrap().current.insert(o, t.id.clone());
+            }
             Ok(json!(t))
         }
         "navigate" => {
@@ -379,7 +401,17 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
                     forget(&id);
                 }
             }
-            Ok(json!(state().lock().unwrap().tabs.clone()))
+            let owner = arg_opt_str(&args, "owner");
+            Ok(json!(state().lock().unwrap().tabs.iter().filter(|t| t.owner == owner).cloned().collect::<Vec<_>>()))
+        }
+        "select" => {
+            // The human picked a tab in an agent pane: agent tools follow it.
+            let id = arg_str(&args, "tab")?;
+            let mut s = state().lock().unwrap();
+            if let Some(o) = s.tabs.iter().find(|t| t.id == id).and_then(|t| t.owner.clone()) {
+                s.current.insert(o, id);
+            }
+            Ok(Value::Null)
         }
         "set_bounds" => {
             let id = arg_str(&args, "tab")?;
@@ -409,9 +441,15 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
     }
 }
 
+#[path = "browser_agent.rs"]
+pub mod agent;
+pub use agent::{forget_agent, mcp_call, mcp_tools};
+use agent::{profile_dir, profile_uuid, CONSOLE_JS};
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::browser::agent::*;
 
     #[test]
     fn url_rules() {
@@ -455,11 +493,84 @@ mod tests {
 
     #[test]
     fn stale_ids_are_forgotten() {
-        state().lock().unwrap().tabs.push(Tab { id: "zz1".into(), url: "about:blank".into(), title: String::new(), agent: None, visible: false, loading: false, error: None });
+        state().lock().unwrap().tabs.push(Tab { id: "zz1".into(), url: "about:blank".into(), title: String::new(), agent: None, owner: None, visible: false, loading: false, error: None });
         assert!(forget("zz1"));
         assert!(!forget("zz1"));
         assert!(!forget("never"));
         let ctx = Ctx::test();
         assert!(webview(&ctx, "never").is_err());
+    }
+
+    #[test]
+    fn profiles_are_stable_and_isolated() {
+        let d = std::path::Path::new("/data");
+        assert_eq!(profile_dir(d, "a1b2"), d.join("browser-profiles").join("a1b2"));
+        assert_eq!(profile_dir(d, "../evil").parent(), Some(d.join("browser-profiles").as_path()));
+        assert!(!profile_dir(d, "../evil").to_string_lossy().contains(".."));
+        assert_ne!(profile_dir(d, "..").file_name().unwrap(), "..");
+        assert_eq!(profile_uuid("a1"), profile_uuid("a1"));
+        assert_ne!(profile_uuid("a1"), profile_uuid("a2"));
+        let u = profile_uuid("a1");
+        assert_eq!(u[6] >> 4, 4);
+        assert_eq!(u[8] >> 6, 2);
+    }
+
+    #[test]
+    fn element_targets() {
+        assert_eq!(parse_target(&json!({"ref": 3})).unwrap(), Target::Ref(3));
+        assert_eq!(parse_target(&json!({"ref": "[12]"})).unwrap(), Target::Ref(12));
+        assert!(parse_target(&json!({"ref": 0})).is_err());
+        assert!(parse_target(&json!({"ref": "x"})).is_err());
+        assert_eq!(parse_target(&json!({"selector": "#a", "text": "b"})).unwrap(), Target::Selector("#a".into()));
+        assert_eq!(parse_target(&json!({"text": "Sign in"})).unwrap(), Target::Text("Sign in".into()));
+        assert!(parse_target(&json!({"text": "  "})).is_err());
+        // Strings are JSON-escaped so they cannot break out of the script.
+        let js = Target::Text("a\"};alert(1);//".into()).js();
+        assert_eq!(js, r#"{text:"a\"};alert(1);//"}"#);
+    }
+
+    #[test]
+    fn snapshot_format_numbers_elements() {
+        let v = json!({"url": "https://x.y/", "title": "X", "text": "Hello", "elements": [
+            {"ref": 1, "tag": "a", "type": "", "label": "Home", "href": "https://x.y/home", "value": "", "disabled": false},
+            {"ref": 2, "tag": "input", "type": "email", "label": "Email", "href": "", "value": "a@b", "disabled": false},
+            {"ref": 3, "tag": "button", "type": "", "label": "Sign in", "href": "", "value": "", "disabled": true},
+        ]});
+        let out = format_snapshot(&v, 10_000);
+        assert!(out.contains("[1] a \"Home\" -> https://x.y/home"));
+        assert!(out.contains("[2] input email \"Email\" value=\"a@b\""));
+        assert!(out.contains("[3] button \"Sign in\" (disabled)"));
+        assert!(out.ends_with("Hello"));
+        assert!(format_snapshot(&json!({}), 1000).contains("(none)"));
+    }
+
+    #[test]
+    fn strict_agents_stay_local() {
+        assert!(strict_url_ok("http://localhost:3000/"));
+        assert!(strict_url_ok("http://127.0.0.1/x"));
+        assert!(!strict_url_ok("http://localhost.evil.com/"));
+        assert!(!strict_url_ok("https://example.com/"));
+        assert!(!strict_url_ok("http://127.0.0.1.nip.io/"));
+    }
+
+    #[test]
+    fn agent_tabs_are_private() {
+        {
+            let mut s = state().lock().unwrap();
+            for (id, o) in [("p1", "ag1"), ("p2", "ag1"), ("p3", "ag2")] {
+                s.tabs.push(Tab { id: id.into(), url: "about:blank".into(), title: String::new(), agent: None, owner: Some(o.into()), visible: false, loading: false, error: None });
+            }
+            s.current.insert("ag1".into(), "p1".into());
+        }
+        assert_eq!(agent::tab_for("ag1", &json!({})).unwrap(), "p1");
+        assert_eq!(agent::tab_for("ag1", &json!({"tab": "p2"})).unwrap(), "p2");
+        assert!(agent::tab_for("ag1", &json!({"tab": "p3"})).is_err());
+        assert_eq!(agent::tab_for("ag2", &json!({})).unwrap(), "p3");
+        assert!(agent::tab_for("nobody", &json!({})).is_err());
+        forget("p1");
+        assert_eq!(agent::tab_for("ag1", &json!({})).unwrap(), "p2");
+        for id in ["p2", "p3"] {
+            forget(id);
+        }
     }
 }

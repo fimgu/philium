@@ -118,6 +118,9 @@ pub async fn dispatch(ctx: &Arc<Ctx>, agent: &str, req: Value) -> Option<Value> 
             );
             let r = call_tool(ctx, agent, &name, args).await;
             Ok(match r {
+                Ok(v) if v.get("__mcp_content").is_some() => {
+                    json!({ "content": v["__mcp_content"].clone(), "isError": false })
+                }
                 Ok(v) => {
                     let text = match v {
                         Value::String(s) => s,
@@ -173,15 +176,13 @@ pub fn tool_list() -> Vec<Value> {
         t("shell_read", "Recent output of one of your terminals.", json!({ "id": s, "max_bytes": i }), &["id"]),
         t("shell_write", "Send input to one of your terminals (include \\n to press Enter).", json!({ "id": s, "data": s }), &["id", "data"]),
         t("shell_kill", "Stop one of your terminals.", json!({ "id": s }), &["id"]),
-        t("browser_open", "Open a URL in Philium's shared browser (visible to the human). Returns a tab id.", json!({ "url": s }), &["url"]),
-        t("browser_snapshot", "Text content of a browser tab.", json!({ "tab": s }), &["tab"]),
         t("graph_query", "Code graph of your repo: which files import which. Cheaper than reading files. Optional `path` focuses on one file's neighbours.",
           json!({ "path": s }), &[]),
         t("playbook_get", "The standard steps and checks for a job: commit, open_pr, test_pr, review_pr, docs, release, teardown.",
           json!({ "job": s }), &["job"]),
         t("resource_register", "Declare something you created outside Philium's tools (container, cluster, process, temp dir) so it is cleaned up with you.",
           json!({ "kind": s, "handle": s, "note": s }), &["kind", "handle"]),
-    ].into_iter().chain(crate::codeindex::mcp_tools()).collect()
+    ].into_iter().chain(crate::browser::mcp_tools()).chain(crate::codeindex::mcp_tools()).collect()
 }
 
 fn arg<'a>(a: &'a Value, k: &str) -> Result<&'a str, String> {
@@ -352,19 +353,8 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
             crate::terminals::kill(ctx, id)?;
             Ok(json!("killed"))
         }
-        "browser_open" => {
-            let url = arg(&a, "url")?;
-            if !(url.starts_with("http://") || url.starts_with("https://")) {
-                return Err("only http(s) URLs".into());
-            }
-            if row["strict"].as_i64() == Some(1) && !url.starts_with("http://localhost") && !url.starts_with("http://127.0.0.1") {
-                return Err("Strict agents can only open local pages".into());
-            }
-            Ok(json!(crate::browser::agent_open(ctx, &me, url).await?))
-        }
-        "browser_snapshot" => {
-            let text = crate::browser::agent_snapshot(ctx, arg(&a, "tab")?).await?;
-            Ok(json!(trim_output(&text, 20000)))
+        n if n.starts_with("browser_") => {
+            crate::browser::mcp_call(ctx, agent, &me, row["strict"].as_i64() == Some(1), n, a).await
         }
         "graph_query" => {
             let path = crate::agents::runtime(agent).map(|r| r.cwd.clone()).ok_or("agent not running")?;
