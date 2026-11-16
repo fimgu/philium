@@ -498,6 +498,12 @@ mod e2e {
         std::fs::create_dir_all(&ws).unwrap();
         let s = h.call(reqwest::Method::POST, "/sessions", Some(chat_session_body(&ws, "e2e", None))).await.unwrap();
         let sid = s["id"].as_str().or(s["session"]["id"].as_str()).expect("session id").to_string();
+        // Exercise the same session PATCH used by the effort controls against
+        // the real bundled HAL, then observe its outbound gateway request.
+        h.call(reqwest::Method::PATCH, &format!("/sessions/{sid}"), Some(json!({"effort":"low"}))).await.unwrap();
+        let saved = h.call(reqwest::Method::GET, &format!("/sessions/{sid}"), None).await.unwrap();
+        assert_eq!(saved["effort"], "low", "effort PATCH did not persist: {saved}");
+        assert!(h.call(reqwest::Method::PATCH, &format!("/sessions/{sid}"), Some(json!({"effort":"unsupported-effort"}))).await.is_err());
         h.call(reqwest::Method::POST, &format!("/sessions/{sid}/messages"),
             Some(json!({"text": "deploy using AKIAABCDEFGHIJKLMNOP and DB_PASSWORD=hunter2hunter2"}))).await.unwrap();
         let evs = wait_turn(&h, &sid).await;
@@ -515,7 +521,13 @@ mod e2e {
             assert_eq!(auth, "Bearer REAL-KEY-ONLY-IN-GATEWAY");
             assert!(!body.contains("AKIAABCDEFGHIJKLMNOP") && !body.contains("hunter2hunter2"), "secret left: {body}");
             assert!(!body.contains(&gw.token), "gateway token forwarded");
+            let request: Value = serde_json::from_str(body).unwrap();
+            assert_eq!(request["reasoning_effort"], "low", "saved effort was not forwarded");
         }
+        h.call(reqwest::Method::PATCH, &format!("/sessions/{sid}"), Some(json!({"effort":"default"}))).await.unwrap();
+        let reset = h.call(reqwest::Method::GET, &format!("/sessions/{sid}"), None).await.unwrap();
+        assert!(reset["effort"].is_null(), "default did not clear session effort: {reset}");
+        println!("real HAL effort: low persisted, invalid rejected, gateway forwarded low, default cleared");
         assert!(seen_now.iter().any(|(_, b)| b.contains("[REDACTED:aws_access_key]")));
 
         tokio::time::sleep(Duration::from_millis(200)).await;
