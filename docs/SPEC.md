@@ -550,7 +550,7 @@ Command palette (Cmd K) on every screen.
 
 ### 12.1 Improve Philium from inside Philium
 
-Philium is registered as a repo in itself. Improving it uses the same agents, worktrees and merge queue as any other project, plus guard rails because it is the app you are running.
+Philium is registered as a repo in itself. Improving it uses the same agents, worktrees, playbooks and PR flow as any other project, plus guard rails because it is the app you are running.
 
 1. **Ask from anywhere.** An "Improve Philium" action on every screen (and in Cmd K). It captures where you are: screen, selected element, recent errors, with secrets removed. You describe what you want.
 2. **An agent works on a copy.** It gets a worktree of the Philium source, never the running app. The running app keeps working while it builds.
