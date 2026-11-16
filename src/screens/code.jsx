@@ -261,7 +261,7 @@ export default function Code() {
                 <VirtualList items={rows()} rowHeight={24}>
                   {(r) => r.t === "file" ? (
                     <div class={`code-row file ${sel()?.id === r.f.path ? "on" : ""}`} onClick={() => { toggle(r.f.path); setSel({ id: r.f.path, file: r.f.path, label: basename(r.f.path) }); }}>
-                      <span class="caret">{open().has(r.f.path) ? "v" : ">"}</span>
+                      <span class="cv">{open().has(r.f.path) ? "v" : ">"}</span>
                       <span class="name" title={r.f.path}><span class="dir">{dirname(r.f.path)}</span>{basename(r.f.path)}</span>
                       <span class="xs faint">{r.f.syms.length}</span>
                     </div>

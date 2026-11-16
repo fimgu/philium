@@ -7,6 +7,7 @@ import { Conversation, Composer } from "../ui/conversation.jsx";
 import { rpc, useEvent, fmt } from "../lib/rpc.js";
 import { go, params, registerCommands } from "../lib/nav.js";
 import "../styles/agents.css";
+import "../styles/code.css";
 
 const STATE = {
   provisioning: ["busy", "Starting"],
