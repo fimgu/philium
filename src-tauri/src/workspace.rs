@@ -1,7 +1,10 @@
 //! Workspace RPC: repos_list, repo_add {path}, repo_clone {url,name?}, repo_remove {id},
 //! repo_set {id,integration_branch?,default_branch?}, branches {repo_id}, worktrees {repo_id?},
 //! worktree_status {id}, worktree_create {repo_id,name}, worktree_remove {id,force?},
-//! diff {worktree_id}, log {repo_id|worktree_id,limit?}, open_in {path,app}.
+//! diff {worktree_id}, log {repo_id|worktree_id,limit?}, open_in {path,app},
+//! relocate {repo_id,path} (moved/renamed repo; must share a root commit or origin).
+//! branches rows: {name, commit, upstream, current, date (ms), subject, remote}.
+//! repos_list rows add: branch, dirty, remote_url, worktree_count, missing?, error?.
 //! All Git mutations share one queue. Events: workspace:changed, plus the workspace change signal.
 use crate::{
     ctx::{arg_opt_str, arg_str, Ctx},
@@ -30,6 +33,12 @@ pub struct Worktree {
 pub fn init(ctx: &Arc<Ctx>) -> Result<(), String> {
     for dir in [ctx.root.join("repos"), ctx.root.join("worktrees")] {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    // Root commits identify a repo after it is moved (see `relocate`).
+    if let Err(e) = ctx.db.exec("ALTER TABLE repos ADD COLUMN root_commits TEXT", []) {
+        if !e.contains("duplicate column") {
+            return Err(e);
+        }
     }
     Ok(())
 }
@@ -72,6 +81,54 @@ pub fn repo(ctx: &Arc<Ctx>, id: &str) -> Option<Value> {
         .ok()?
         .into_iter()
         .next()
+}
+/// The repo's folder, or a clear error when it was deleted, renamed or moved.
+pub fn repo_dir(r: &Value) -> Result<PathBuf, String> {
+    let p = PathBuf::from(text(r, "path")?);
+    if p.is_dir() {
+        Ok(p)
+    } else {
+        Err(format!("Repo folder {} is missing. Remove it or pick its new location", p.display()))
+    }
+}
+/// Identity of a repository: its root commit(s) and origin URL.
+fn repo_identity(path: &Path) -> (Vec<String>, Option<String>) {
+    let roots = git(path, &["rev-list", "--max-parents=0", "HEAD"])
+        .map(|s| s.lines().map(str::to_owned).collect())
+        .unwrap_or_default();
+    (roots, git(path, &["remote", "get-url", "origin"]).ok())
+}
+/// Point a moved/renamed repo at its new folder. Only accepted when it is the
+/// same repository: a shared root commit, or the same origin remote.
+fn relocate(ctx: &Arc<Ctx>, id: &str, path: &str) -> Result<Value, String> {
+    let r = repo(ctx, id).ok_or("Unknown repository")?;
+    let wanted = expand_home(path);
+    let dir = std::fs::canonicalize(&wanted).map_err(|_| format!("No folder at {}", wanted.display()))?;
+    let top = git(&dir, &["rev-parse", "--show-toplevel"]).map_err(|_| format!("{} is not inside a Git repository", dir.display()))?;
+    let dir = std::fs::canonicalize(top).map_err(|e| e.to_string())?;
+    let (roots, remote) = repo_identity(&dir);
+    let old_remote = r["remote_url"].as_str().filter(|s| !s.is_empty());
+    let same_remote = old_remote.is_some() && old_remote == remote.as_deref();
+    let old_roots: Vec<String> = r["root_commits"].as_str().unwrap_or("").split(',').filter(|s| !s.is_empty()).map(str::to_owned).collect();
+    let old_path = PathBuf::from(text(&r, "path")?);
+    // If the old folder still exists, compare against it directly.
+    let old_roots = if old_roots.is_empty() && old_path.is_dir() { repo_identity(&old_path).0 } else { old_roots };
+    let same_root = roots.iter().any(|c| old_roots.contains(c));
+    if !same_remote && !same_root {
+        return Err(format!("{} is a different repository (no shared first commit or origin remote)", dir.display()));
+    }
+    let ds = dir.to_string_lossy().to_string();
+    if ctx.db.query("SELECT id FROM repos WHERE path=?1 AND id!=?2", params![ds, id])?.first().is_some() {
+        return Err("Another repo already uses that folder".into());
+    }
+    ctx.db.exec(
+        "UPDATE repos SET path=?2, remote_url=COALESCE(?3, remote_url), root_commits=?4 WHERE id=?1",
+        params![id, ds, remote, roots.join(",")],
+    )?;
+    ctx.log_event("repo_relocated", None, &json!({"id":id,"from":old_path,"to":ds}));
+    ctx.emit("workspace:changed", json!({"repo_id":id}));
+    ctx.notify("workspace");
+    repo(ctx, id).ok_or_else(|| "Unknown repository".into())
 }
 fn worktree(ctx: &Arc<Ctx>, id: &str) -> Result<Value, String> {
     ctx.db.query("SELECT w.*,a.name AS agent_name FROM worktrees w LEFT JOIN agents a ON a.id=w.agent_id WHERE w.id=?1", [id])?.into_iter().next().ok_or_else(|| "Unknown worktree".into())
@@ -116,6 +173,7 @@ fn add_repo(ctx: &Arc<Ctx>, path: &str) -> Result<Value, String> {
     let id = new_id();
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     ctx.db.exec("INSERT INTO repos(id,name,path,default_branch,remote_url,added_at) VALUES(?1,?2,?3,?4,?5,?6)", params![id,name,path_str,branch,remote,now()])?;
+    let _ = ctx.db.exec("UPDATE repos SET root_commits=?2 WHERE id=?1", params![id, repo_identity(&path).0.join(",")]);
     changed(ctx);
     repo(ctx, &id).ok_or_else(|| "Repository registration failed".into())
 }
@@ -138,7 +196,8 @@ pub fn create_worktree(
         }
     }
     let r = repo(ctx, repo_id).ok_or("Unknown repository")?;
-    let repo_path = Path::new(text(&r, "path")?);
+    let repo_dir = repo_dir(&r)?;
+    let repo_path = repo_dir.as_path();
     let base = base
         .or(r["integration_branch"].as_str())
         .unwrap_or(text(&r, "default_branch")?);
@@ -311,7 +370,8 @@ pub fn remove_worktree(ctx: &Arc<Ctx>, id: &str, force: bool) -> Result<(), Stri
         return Err("Refusing to remove a worktree outside Philium".into());
     }
     let r = repo(ctx, text(&w, "repo_id")?).ok_or("Unknown repository")?;
-    let repo_path = Path::new(text(&r, "path")?);
+    let repo_dir = repo_dir(&r)?;
+    let repo_path = repo_dir.as_path();
     if path.exists() {
         if !force && worktree_status(ctx, id)?["unsaved"] == true {
             return Err("Worktree has unsaved work (dirty, unpushed or unmerged). Explicit confirmation required".into());
@@ -456,15 +516,56 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
         .await
         .map_err(|e| e.to_string())?
 }
+/// Rows from `for-each-ref` (see `branches`). Skips symbolic `<remote>/HEAD`.
+fn parse_branches(out: &str) -> Vec<Value> {
+    out.lines()
+        .filter_map(|l| {
+            let p: Vec<&str> = l.splitn(7, '\t').collect();
+            let full = *p.first()?;
+            let remote = full.starts_with("refs/remotes/");
+            if remote && full.ends_with("/HEAD") {
+                return None;
+            }
+            Some(json!({
+                "name": p.get(1),
+                "commit": p.get(2),
+                "upstream": p.get(3).filter(|s| !s.is_empty()),
+                "current": p.get(4) == Some(&"*"),
+                "date": p.get(5).and_then(|s| s.parse::<i64>().ok()).map(|s| s * 1000),
+                "subject": p.get(6).copied().unwrap_or(""),
+                "remote": remote,
+            }))
+        })
+        .collect()
+}
 fn dispatch(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, String> {
     match method {
         "repos_list" => {
             let mut rows=ctx.db.query("SELECT r.*,(SELECT count(*) FROM worktrees w WHERE w.repo_id=r.id) AS worktree_count FROM repos r ORDER BY name",[])?;
             for r in &mut rows {
-                let p = Path::new(text(r, "path")?);
+                let p = match repo_dir(r) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        r["missing"] = json!(true);
+                        r["dirty"] = json!(false);
+                        r["error"] = json!(e);
+                        continue;
+                    }
+                };
+                let p = p.as_path();
+                if let Ok(u) = git(p, &["remote", "get-url", "origin"]) {
+                    r["remote_url"] = json!(u);
+                }
+                if r["root_commits"].is_null() {
+                    let roots = repo_identity(p).0.join(",");
+                    if !roots.is_empty() {
+                        let _ = ctx.db.exec("UPDATE repos SET root_commits=?2 WHERE id=?1", params![text(r, "id")?, roots]);
+                    }
+                }
                 let branch = git(p, &["branch", "--show-current"]);
-                let dirty = git(p, &["status", "--porcelain"]);
+                let dirty = git(p, &["status", "--porcelain", "-uno"]);
                 r["branch"] = json!(branch.unwrap_or_default());
+                // -uno: skip the untracked-file walk; cheap even on big repos.
                 r["dirty"] = json!(dirty.as_ref().map(|s| !s.is_empty()).unwrap_or(true));
                 if let Err(e) = dirty {
                     r["error"] = json!(e);
@@ -544,16 +645,18 @@ fn dispatch(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, String> 
         "branches" => {
             let r = repo(ctx, &arg_str(&args, "repo_id")?).ok_or("Unknown repository")?;
             let s = git(
-                Path::new(text(&r, "path")?),
+                &repo_dir(&r)?,
                 &[
                     "for-each-ref",
-                    "--format=%(refname:short)%09%(objectname)%09%(upstream:short)%09%(HEAD)",
+                    "--sort=-committerdate",
+                    "--format=%(refname)%09%(refname:short)%09%(objectname)%09%(upstream:short)%09%(HEAD)%09%(committerdate:unix)%09%(contents:subject)",
                     "refs/heads",
                     "refs/remotes",
                 ],
             )?;
-            Ok(json!(s.lines().map(|l|{let p=l.split('\t').collect::<Vec<_>>();json!({"name":p.first(),"commit":p.get(1),"upstream":p.get(2),"current":p.get(3)==Some(&"*")})}).collect::<Vec<_>>()))
+            Ok(json!(parse_branches(&s)))
         }
+        "relocate" => relocate(ctx, &arg_str(&args, "repo_id")?, &arg_str(&args, "path")?),
         "worktrees" => list_worktrees(ctx, args["repo_id"].as_str()),
         "worktree_status" => worktree_status(ctx, &arg_str(&args, "id")?),
         "worktree_create" => Ok(json!(create_worktree(
@@ -639,6 +742,47 @@ mod tests {
         git(&p, &["commit", "-m", "initial"]).unwrap();
         let r = add_repo(&ctx, &p.to_string_lossy()).unwrap();
         (ctx, r["id"].as_str().unwrap().into())
+    }
+    #[test]
+    fn branch_rows_and_origin_head_skipped() {
+        let out = "refs/heads/main\tmain\tabc\torigin/main\t*\t1700000000\tfix: a\tb\n\
+                   refs/remotes/origin/HEAD\torigin\tabc\t\t \t1700000000\tx\n\
+                   refs/remotes/origin/dev\torigin/dev\tdef\t\t \t1600000000\t";
+        let b = parse_branches(out);
+        assert_eq!(b.len(), 2);
+        assert_eq!(b[0]["current"], true);
+        assert_eq!(b[0]["date"], 1_700_000_000_000i64);
+        assert_eq!(b[0]["subject"], "fix: a\tb");
+        assert_eq!((b[1]["remote"].clone(), b[1]["current"].clone()), (json!(true), json!(false)));
+        assert!(b[1]["upstream"].is_null());
+    }
+    #[test]
+    fn moved_repo_errors_then_relocates_only_to_same_repo() {
+        let (ctx, id) = setup();
+        let rows = dispatch(&ctx, "repos_list", json!({})).unwrap();
+        assert_eq!(rows[0]["dirty"], false);
+        assert_eq!(rows[0]["branch"], "main");
+        let b = dispatch(&ctx, "branches", json!({"repo_id":id})).unwrap();
+        assert_eq!(b[0]["subject"], "initial");
+        assert!(b[0]["date"].as_i64().unwrap() > 0);
+        let old = ctx.root.join("fixture");
+        let new = ctx.root.join("moved");
+        std::fs::rename(&old, &new).unwrap();
+        let e = create_worktree(&ctx, &id, None, "lion", None).unwrap_err();
+        assert!(e.contains("is missing. Remove it or pick its new location"), "{e}");
+        assert!(dispatch(&ctx, "branches", json!({"repo_id":id})).unwrap_err().contains("missing"));
+        assert_eq!(dispatch(&ctx, "repos_list", json!({})).unwrap()[0]["missing"], true);
+        // A different repo is refused.
+        let other = ctx.root.join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        git(&other, &["init", "-b", "main"]).unwrap();
+        git(&other, &["-c", "user.name=T", "-c", "user.email=t@e.t", "commit", "--allow-empty", "-m", "x"]).unwrap();
+        let e = dispatch(&ctx, "relocate", json!({"repo_id":id,"path":other})).unwrap_err();
+        assert!(e.contains("different repository"), "{e}");
+        let r = dispatch(&ctx, "relocate", json!({"repo_id":id,"path":new})).unwrap();
+        assert_eq!(r["path"], json!(std::fs::canonicalize(&new).unwrap()));
+        assert!(create_worktree(&ctx, &id, None, "lion", None).is_ok());
+        std::fs::remove_dir_all(ctx.root.parent().unwrap()).unwrap();
     }
     #[test]
     fn create_status_remove() {
