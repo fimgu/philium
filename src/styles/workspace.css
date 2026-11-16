@@ -32,3 +32,8 @@
 .ws-section code { overflow-wrap: anywhere; }
 @media (max-width: 1100px) { .ws-layout { grid-template-columns: 220px minmax(0, 1fr); gap: 16px; } .ws-detail > .ws-row { flex-wrap: wrap; } }
 @media (max-width: 800px) { .ws-layout { grid-template-columns: minmax(0, 1fr); } .ws-repos { height: 230px; } .ws-row { flex-wrap: wrap; } .ws-tree { font-size: 12px; gap: 6px; } }
+.ws-grants { display: flex; flex-direction: column; gap: 8px; padding: 14px 0; border-top: 1px solid var(--line); }
+.ws-grants h3 { margin: 0 0 4px; }
+.ws-grants .ws-muted { margin: 0; max-width: 60ch; }
+.ws-grant { padding: 6px 10px; border: 1px solid var(--line); border-radius: var(--radius-s); background: var(--bg-sunken); }
+.ws-grant code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }

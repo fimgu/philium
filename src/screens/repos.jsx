@@ -1,7 +1,34 @@
-import { createSignal, createMemo, onMount, Show } from "solid-js";
-import { Page, Empty, Button, Input, Field, Badge, Modal, Select, VirtualList, confirm, toast } from "../ui/kit.jsx";
+import { createSignal, createMemo, createEffect, on, onMount, Show, For } from "solid-js";
+import { Page, Empty, Button, Input, Field, Badge, Modal, Select, Segmented, VirtualList, confirm, toast } from "../ui/kit.jsx";
+import { Icon } from "../ui/icons.jsx";
 import { rpc, useEvent, fmt } from "../lib/rpc.js";
 import "../styles/workspace.css";
+
+function Grants(props) {
+  const [list, setList] = createSignal([]);
+  const [err, setErr] = createSignal("");
+  const load = (id) => rpc("sandbox.grants_get", { repo_id: id }).then((r) => setList(r.grants)).catch((e) => setErr(String(e)));
+  createEffect(on(() => props.repoId, load));
+  const save = async (next) => {
+    setErr("");
+    try { const r = await rpc("sandbox.grants_set", { repo_id: props.repoId, grants: next }); setList(r.grants); } catch (e) { setErr(String(e)); }
+  };
+  const addFolder = async () => {
+    try {
+      const r = await rpc("app.pick_folder", { prompt: "Choose a folder agents may use for this repository" });
+      if (r.path && !list().some((g) => g.path === r.path)) save([...list(), { path: r.path, write: false }]);
+    } catch (e) { setErr(String(e)); }
+  };
+  return <section class="ws-grants">
+    <div class="ws-row"><div><h3>Shared with strict agents</h3><p class="ws-muted">Strict agents can read and run every app and tool on this Mac, but never your keys, logins, mail, messages or personal folders. Add folders this repository needs from those places, such as a parts library in Documents.</p></div><Button onClick={addFolder}><Icon name="plus" size={12} /> Add folder</Button></div>
+    <Show when={err()}><p class="ws-alert">{err()}</p></Show>
+    <For each={list()} fallback={<p class="ws-muted">Nothing extra shared. The agent's own worktree is always writable.</p>}>{(g, i) =>
+      <div class="ws-row ws-grant"><code title={g.path}>{g.path}</code><div class="ws-actions">
+        <Segmented value={g.write ? "rw" : "ro"} options={[{ value: "ro", label: "Read" }, { value: "rw", label: "Read and write" }]} onChange={(v) => save(list().map((x, j) => (j === i() ? { ...x, write: v === "rw" } : x)))} />
+        <Button variant="ghost" title="Stop sharing" onClick={() => save(list().filter((_, j) => j !== i()))}><Icon name="trash" size={12} /></Button>
+      </div></div>}</For>
+  </section>;
+}
 
 export default function Repos() {
   const [repos, setRepos] = createSignal([]), [selected, setSelected] = createSignal(null);
@@ -48,6 +75,7 @@ export default function Repos() {
             <Show when={trees().length} fallback={<p class="ws-muted">No managed worktrees yet. Create one here or assign an agent to this repository. Your main checkout remains untouched.</p>}>
               <div class="ws-tree-list"><VirtualList items={trees()} rowHeight={188}>{w => <article class="ws-tree"><div class="ws-row"><strong class="ws-mono">{w.branch}</strong><Badge tone={w.status.unsaved ? "strict" : "secure"}>{w.status.error ? "Status unavailable, keep safe" : w.status.unsaved ? "Unsaved work" : "Clean and landed"}</Badge></div><p>Owner: <strong>{w.agent_name ?? "Manual worktree"}</strong> · Created {fmt.ago(w.created_at)} · {w.status.ahead ?? "?"} ahead / {w.status.behind ?? "?"} behind</p><p>{w.status.dirty_files?.length ?? "?"} dirty entries · {w.status.unpushed_commits ?? "?"} unpushed · {w.status.unmerged_commits ?? "?"} unmerged</p><code class="ws-path">{w.path}</code><div class="ws-actions"><Button onClick={() => act(async () => { const d = await rpc("workspace.diff", { worktree_id: w.id }); setDiff({ ...d, branch: w.branch, files: w.status.dirty_files }); })}>View diff</Button><Button onClick={() => open(w.path, "finder")}>Finder</Button><Button onClick={() => open(w.path, "terminal")}>Terminal</Button><Button onClick={() => open(w.path, "editor")}>Editor</Button><Button disabled={busy()} onClick={() => remove(w)}>Remove</Button></div></article>}</VirtualList></div>
             </Show>
+            <Grants repoId={r().id} />
             <h3>Branches</h3><div class="ws-branch-list"><VirtualList items={branches()} rowHeight={34}>{b => <div class="ws-row ws-branch"><code>{b.name}</code><span>{b.current ? "Current checkout" : b.upstream || b.commit?.slice(0, 8)}</span></div>}</VirtualList></div>
           </section>}</Show>
         </div>

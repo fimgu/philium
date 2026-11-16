@@ -159,6 +159,15 @@ const readImage = (file) => new Promise((resolve, reject) => {
   r.readAsDataURL(file);
 });
 
+/** Speed presets mapped to HAL reasoning effort. `normal` leaves it to the model. */
+export const SPEEDS = [
+  { value: "fast", label: "Fast", effort: "low", hint: "Low reasoning effort: quick answers" },
+  { value: "normal", label: "Normal", effort: "default", hint: "The model's default effort" },
+  { value: "deep", label: "Deep", effort: "high", hint: "High reasoning effort: slower, more thorough" },
+];
+export const speedEffort = (v) => SPEEDS.find((s) => s.value === v)?.effort ?? "default";
+export const effortSpeed = (e) => (e === "low" || e === "minimal" || e === "none" ? "fast" : e === "high" || e === "xhigh" || e === "max" ? "deep" : "normal");
+
 export function Composer(props) {
   const [text, setText] = createSignal("");
   const [images, setImages] = createSignal([]);
@@ -200,6 +209,13 @@ export function Composer(props) {
         onPaste={(e) => { const f = [...e.clipboardData.files]; if (f.some((x) => x.type.startsWith("image/"))) { e.preventDefault(); add(f); } }}
         onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
       />
+      <Show when={props.onSpeed}>
+        <div class="speed" title="How hard the model thinks before answering. Fast is quickest and cheapest.">
+          <For each={SPEEDS}>{(s) => (
+            <button type="button" classList={{ on: (props.speed || "normal") === s.value }} onClick={() => props.onSpeed(s.value)} title={s.hint}>{s.label}</button>
+          )}</For>
+        </div>
+      </Show>
       <Show when={props.busy} fallback={<Button variant="primary" onClick={send} disabled={props.disabled}>Send</Button>}>
         <Button onClick={props.onCancel}><Icon name="stop" size={12} /> Stop</Button>
       </Show>

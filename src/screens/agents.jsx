@@ -3,7 +3,7 @@
 import { For, Show, createSignal, createResource, createMemo, createEffect, on, onCleanup } from "solid-js";
 import { Page, Button, Badge, Dot, Empty, Modal, Field, Input, TextArea, Select, Toggle, Segmented, confirm, toast } from "../ui/kit.jsx";
 import { Icon } from "../ui/icons.jsx";
-import { Conversation, Composer } from "../ui/conversation.jsx";
+import { Conversation, Composer, speedEffort, effortSpeed } from "../ui/conversation.jsx";
 import { rpc, useEvent, fmt } from "../lib/rpc.js";
 import { go, params, registerCommands } from "../lib/nav.js";
 import "../styles/agents.css";
@@ -255,6 +255,8 @@ function AgentView(props) {
   useEvent("agents:changed", (p) => { if (p.id === props.id) refetch(); });
 
   const a = () => info() ?? props.agent;
+  const [effort, setEffort] = createSignal("default");
+  createEffect(on(() => props.id, (id) => rpc("agents.get_effort", { id }).then(setEffort).catch(() => setEffort("default"))));
   const live = () => a()?.live;
   const busy = () => ["running", "waiting"].includes(a()?.state);
 
@@ -297,6 +299,7 @@ function AgentView(props) {
         <Conversation events={events()} emptyText={live() ? "Send the first message to start." : "This agent is stopped. Resume it to continue."}
           onApprove={(id, scope) => decide(id, "approve", scope)} onDeny={(id) => decide(id, "deny")} />
         <Composer onSend={send} busy={busy()} disabled={!live()} onCancel={() => rpc("agents.cancel", { id: props.id })}
+          speed={effortSpeed(effort())} onSpeed={(v) => rpc("agents.set_effort", { id: props.id, effort: speedEffort(v) }).then(setEffort).catch((e) => toast(String(e), "danger"))}
           placeholder={live() ? `Message ${a()?.name ?? ""}` : "Agent is stopped"} />
       </Show>
       <Show when={tab() === "terms"}><Terminals id={props.id} /></Show>

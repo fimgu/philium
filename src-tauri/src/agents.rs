@@ -23,6 +23,7 @@
 //!   permissions {id}                          -> pending approvals
 //!   permission {id, request_id, decision: approve|deny, scope?}
 //!   set_model {id, model}
+//!   set_effort {id, effort} / get_effort {id}  -> reasoning effort (default|low|medium|high|...), persisted
 //!   diff {id}                                 -> git diff of the agent's workspace
 //!   names {}                                  -> suggested free names
 //! events: `agents:changed` {id}, `agents:events` {id, events:[...]} (batched ~10 Hz)
@@ -158,8 +159,8 @@ pub fn permission_rules(strict: bool) -> Value {
         json!({"action": "browser", "resource": "*", "effect": "deny"}),
     ];
     if strict {
-        // Untrusted provider: anything leaving the worktree always asks.
-        rules.push(json!({"action": "read", "resource": "/**", "effect": "ask"}));
+        // Untrusted provider: the OS sandbox already hides private data, so
+        // reads stay open (tooling, libraries). No nested agents.
         rules.push(json!({"action": "subagent", "resource": "*", "effect": "deny"}));
     }
     json!({ "default": "ask", "ask_timeout_secs": 3600, "rules": rules })
@@ -180,7 +181,7 @@ fn instructions(name: &str, strict: bool, worktree: Option<&Path>) -> String {
         s.push_str(&format!("- Your git worktree is {} on your own branch. Stay inside it.\n", w.display()));
     }
     if strict {
-        s.push_str("- You run in Strict mode: sandboxed, network only through Philium's proxy to allowed hosts.\n");
+        s.push_str("- You run in Strict mode: sandboxed. You can read and run every tool on this machine except private data (credentials, personal folders). You can write your worktree, $TMPDIR and folders granted for this repo. Network goes only through Philium's proxy to allowed hosts.\n");
     }
     s
 }
@@ -342,18 +343,20 @@ async fn provision(ctx: &Arc<Ctx>, id: &str, fresh: bool, brief: Option<String>)
     let mut launch_env = env.clone();
     launch_env.extend(setup.env);
 
-    let policy = strict.then(|| crate::sandbox::Policy {
-        workdir: cwd.clone(),
-        scratch: dir.clone(),
-        hal_dir: hal_dir.clone(),
-        read_only: worktree
+    let policy = strict.then(|| {
+        let repo_id = row["repo_id"].as_str().map(str::to_string);
+        let repo_path = worktree
             .as_ref()
-            .and_then(|_| row["repo_id"].as_str())
+            .and(repo_id.as_deref())
             .and_then(|r| crate::workspace::repo(ctx, r))
-            .and_then(|r| r["path"].as_str().map(PathBuf::from))
-            .into_iter()
-            .collect(),
-        allow_hosts: vec![],
+            .and_then(|r| r["path"].as_str().map(PathBuf::from));
+        let (mut ro, mut rw) = repo_id.as_deref().map(|r| crate::sandbox::grant_paths(ctx, r)).unwrap_or_default();
+        if let Some(p) = repo_path {
+            // Source checkout read-only; its .git writable so worktree commits land.
+            rw.push(p.join(".git"));
+            ro.push(p);
+        }
+        crate::sandbox::Policy { workdir: cwd.clone(), scratch: dir.clone(), hal_dir: hal_dir.clone(), read_only: ro, read_write: rw, allow_hosts: vec![] }
     });
 
     let (cfg, hd, cwd2, allow_logins) = (config, hal_dir.clone(), cwd.clone(), setup.allow_logins);
@@ -392,6 +395,10 @@ async fn provision(ctx: &Arc<Ctx>, id: &str, fresh: bool, brief: Option<String>)
             s["id"].as_str().ok_or("HAL returned no session id")?.to_string()
         }
     };
+    // Re-apply the saved speed (effort) after every start.
+    if let Some(e) = ctx.db.kv_get(&format!("agent.effort.{id}")).filter(|e| e != "default") {
+        let _ = hal.call(reqwest::Method::PATCH, &format!("/sessions/{session}"), Some(json!({ "effort": e }))).await;
+    }
     ctx.db.exec(
         "UPDATE agents SET hal_session_id=?2, token_hash=?3 WHERE id=?1",
         rusqlite::params![id, session, short_hash(&mcp_token)],
@@ -708,6 +715,18 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
                 .call(reqwest::Method::POST, &format!("/sessions/{}/permissions/{rid}/{path}", r.session), body)
                 .await
         }
+        "set_effort" => {
+            let id = id()?;
+            let effort = ctx::arg_str(&args, "effort")?;
+            if !["default", "none", "minimal", "low", "medium", "high", "xhigh", "max"].contains(&effort.as_str()) {
+                return Err(format!("unknown effort `{effort}`"));
+            }
+            let rt = runtime(&id).ok_or("agent is not running")?;
+            rt.hal.call(reqwest::Method::PATCH, &format!("/sessions/{}", rt.session), Some(json!({ "effort": effort }))).await?;
+            ctx.db.kv_set(&format!("agent.effort.{id}"), &effort)?;
+            Ok(json!(effort))
+        }
+        "get_effort" => Ok(json!(ctx.db.kv_get(&format!("agent.effort.{}", id()?)).unwrap_or_else(|| "default".into()))),
         "set_model" => {
             let id = id()?;
             let model = ctx::arg_str(&args, "model")?;
@@ -810,6 +829,9 @@ mod tests {
         let s = permission_rules(true);
         let last_sub = s["rules"].as_array().unwrap().iter().rev().find(|r| r["action"] == "subagent").unwrap();
         assert_eq!(last_sub["effect"], "deny");
+        // The secret denies must be the last read rule touching .env (nothing re-opens it).
+        let last_read = s["rules"].as_array().unwrap().iter().rev().find(|r| r["action"] == "read").unwrap();
+        assert_eq!(last_read["effect"], "deny");
     }
 
     #[tokio::test]

@@ -6,6 +6,8 @@
 //! - `allowlist_get {agent?}` -> `{hosts, custom}` (global list, or the agent override if set)
 //! - `allowlist_set {hosts, agent?}` -> `{hosts}` (global key `strict.allow_hosts`)
 //! - `test_profile {}` -> `{ok, probes:[{name, ok, detail}]}` real sandbox-exec probes (macOS)
+//! - `grants_get {repo_id}` -> `{grants:[{path, write}], private:[home-relative]}`
+//! - `grants_set {repo_id, grants:[{path, write?}]}` -> `{grants}` extra folders strict agents on that repo may use
 //!
 //! Events: `sandbox:egress` `{agent, host, port, allowed, bytes, ts}` per connection.
 //!
@@ -23,7 +25,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::ctx::{arg_opt_str, Ctx};
+use crate::ctx::{arg_opt_str, arg_str, Ctx};
 
 pub const DEFAULT_ALLOW: &[&str] = &[
     "registry.npmjs.org",
@@ -38,6 +40,55 @@ pub const DEFAULT_ALLOW: &[&str] = &[
 ];
 
 const ALLOW_KEY: &str = "strict.allow_hosts";
+const GRANTS_KEY: &str = "setting.strict.grants";
+
+fn expand(raw: &str) -> PathBuf {
+    let t = raw.trim();
+    match t.strip_prefix("~/") {
+        Some(rest) => home().join(rest),
+        None if t == "~" => home(),
+        None => PathBuf::from(t),
+    }
+}
+
+/// The private entry a grant would expose: a grant may sit inside a private
+/// folder (e.g. ~/Documents/kicad-libs) but may not contain a secret store
+/// (e.g. ~ or ~/.ssh itself) or point inside one of the credential stores.
+fn private_hit(p: &Path) -> Option<&'static str> {
+    let h = home();
+    let personal = ["Documents", "Desktop", "Downloads", "Developer", "Pictures", "Movies", "Music", "Philium"];
+    for d in PRIVATE {
+        let priv_path = h.join(d);
+        if priv_path.starts_with(p) {
+            return Some(d);
+        }
+        if !personal.contains(d) && p.starts_with(&priv_path) {
+            return Some(d);
+        }
+    }
+    None
+}
+
+/// Repo grants as stored: `[{path, write}]`.
+pub fn grants(ctx: &Ctx, repo_id: &str) -> Vec<Value> {
+    ctx.db
+        .kv_get(&format!("{GRANTS_KEY}.{repo_id}"))
+        .and_then(|s| serde_json::from_str::<Vec<Value>>(&s).ok())
+        .unwrap_or_default()
+}
+
+/// (read_only, read_write) paths granted to agents working on `repo_id`.
+pub fn grant_paths(ctx: &Ctx, repo_id: &str) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let (mut ro, mut rw) = (Vec::new(), Vec::new());
+    for g in grants(ctx, repo_id) {
+        let Some(p) = g.get("path").and_then(Value::as_str).map(expand) else { continue };
+        if private_hit(&p).is_some() {
+            continue;
+        }
+        if g.get("write").and_then(Value::as_bool).unwrap_or(false) { rw.push(p) } else { ro.push(p) }
+    }
+    (ro, rw)
+}
 
 #[derive(Clone, Debug)]
 pub struct Policy {
@@ -45,6 +96,8 @@ pub struct Policy {
     pub scratch: PathBuf,
     pub hal_dir: PathBuf,
     pub read_only: Vec<PathBuf>,
+    /// Extra read+write folders (the repo's git dir, writable repo grants).
+    pub read_write: Vec<PathBuf>,
     /// Informational: enforcement is done by the egress proxy (the kernel only
     /// permits loopback). The proxy reads the live list from settings.
     pub allow_hosts: Vec<String>,
@@ -91,6 +144,17 @@ fn esc(p: &Path) -> String {
     p.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+fn regex_esc(p: &Path) -> String {
+    let mut o = String::new();
+    for c in p.to_string_lossy().chars() {
+        if "\\.^$|?*+()[]{}\"".contains(c) {
+            o.push('\\');
+        }
+        o.push(c);
+    }
+    o
+}
+
 /// Real path (macOS: /var -> /private/var) plus the original, deduped.
 fn variants(p: &Path) -> Vec<PathBuf> {
     let mut v = vec![p.to_path_buf()];
@@ -112,44 +176,64 @@ fn subpaths(rule: &str, paths: &[PathBuf]) -> String {
     s
 }
 
-/// Seatbelt (SBPL) profile. Later rules win, so denies come after the broad
-/// read allows and before the explicit workdir/scratch/hal_dir allows.
+/// Home-relative paths an agent on an untrusted provider must never see:
+/// credentials, personal data, browsers, shell history and personal folders.
+/// Anything an agent reads can end up in a provider request.
+pub const PRIVATE: &[&str] = &[
+    // credentials
+    ".ssh", ".aws", ".azure", ".kube", ".gnupg", ".docker", ".netrc", ".git-credentials", ".npmrc", ".pypirc",
+    ".config/gh", ".config/gcloud", ".config/hub", ".password-store", ".terraform.d", ".vault-token",
+    ".jcode", ".claude", ".codex", ".config/op",
+    // shell history
+    ".zsh_history", ".bash_history", ".python_history", ".node_repl_history", ".lesshst", ".zsh_sessions",
+    // personal data and app data that holds sessions or messages
+    "Library/Keychains", "Library/Mail", "Library/Messages", "Library/Safari", "Library/Cookies",
+    "Library/Containers", "Library/Group Containers", "Library/Mobile Documents", "Library/Accounts",
+    "Library/Calendars", "Library/Application Support/AddressBook", "Library/Application Support/CallHistoryDB",
+    "Library/Application Support/com.apple.TCC", "Library/Application Support/Google",
+    "Library/Application Support/Firefox", "Library/Application Support/BraveSoftware",
+    "Library/Application Support/Arc", "Library/Application Support/Microsoft Edge",
+    "Library/Application Support/Slack", "Library/Application Support/discord",
+    "Library/Application Support/dev.gunnarsson.philium",
+    // personal folders (share parts of them with repo grants)
+    "Documents", "Desktop", "Downloads", "Developer", "Pictures", "Movies", "Music", "Philium",
+];
+
+/// Seatbelt (SBPL) profile. Open by default: the agent can read and run
+/// everything on the machine except the `PRIVATE` list, so real tooling
+/// (KiCad, Xcode CLT, Homebrew, app libraries) just works. Writes are limited
+/// to its worktree, scratch, caches, the repo's git dir and granted folders.
+/// Later rules win, so the order is: broad allow, private deny, grants.
 pub fn profile(p: &Policy) -> String {
     let h = home();
     let mut s = String::new();
     s.push_str("(version 1)\n(deny default)\n");
     s.push_str("(allow process-exec)\n(allow process-fork)\n(allow signal (target self))\n");
     s.push_str("(allow sysctl-read)\n(allow mach-lookup)\n(allow ipc-posix-shm)\n(allow file-read-metadata)\n");
-    // System paths needed to run binaries and toolchains.
-    for sys in [
-        "/usr", "/bin", "/sbin", "/System", "/Library/Frameworks", "/Library/Developer", "/private/etc", "/etc",
-        "/opt/homebrew", "/private/var/db", "/Applications", "/var/db/timezone",
-    ] {
-        s.push_str(&format!("(allow file-read* (subpath \"{sys}\"))\n"));
-    }
-    // Xcode command line tools: the license check and xcrun's cache. Without these
-    // /usr/bin/python3, git and clang refuse to run inside the sandbox.
-    s.push_str("(allow file-read* (literal \"/Library/Preferences/com.apple.dt.Xcode.plist\"))\n");
-    s.push_str("(allow file-read* file-write* (regex #\"^/private/var/folders/[^/]+/[^/]+/(T|C)/xcrun_db\"))\n");
-    s.push_str("(allow file-read* (literal \"/\") (literal \"/dev/null\") (literal \"/dev/zero\") (literal \"/dev/random\") (literal \"/dev/urandom\"))\n");
-    s.push_str("(allow file-read* file-write* (regex #\"^/dev/(tty|pty|ttys)\"))\n");
+    s.push_str("(allow iokit-open)\n(allow user-preference-read)\n(allow file-ioctl)\n");
+    s.push_str("(allow file-read*)\n");
+    s.push_str("(allow file-read* file-write* (regex #\"^/dev/(tty|pty|ttys|fd/)\"))\n");
     s.push_str("(allow file-write* (literal \"/dev/null\") (literal \"/dev/dtracehelper\"))\n");
-    s.push_str(&subpaths("file-read*", &p.read_only));
-    // Secrets and the rest of the home dir stay out of reach.
-    for d in [".ssh", ".aws", ".kube", ".gnupg", ".config/gh", ".docker", ".netrc", "Library", "Documents", "Desktop", "Downloads", "Developer"] {
+    // Shared temp and the per-user temp/cache folders (xcrun, clang, kicad).
+    s.push_str("(allow file-read* file-write* (subpath \"/private/tmp\") (subpath \"/private/var/folders\"))\n");
+    // Private: never readable or writable.
+    for d in PRIVATE {
         s.push_str(&format!("(deny file-read* file-write* (subpath \"{}\"))\n", esc(&h.join(d))));
     }
     s.push_str("(deny file-read* file-write* (subpath \"/Library/Keychains\"))\n(deny file-read* file-write* (subpath \"/private/var/db/dslocal\"))\n");
-    // Toolchains (read + exec) and package caches (read/write), re-allowed after the denies.
-    let tool_ro: Vec<PathBuf> = [".cargo/bin", ".rustup", ".nvm", ".volta", ".pyenv", ".local/bin", ".bun/bin", ".gitconfig", ".config/git"]
+    // Package caches and tool state (read/write).
+    let caches: Vec<PathBuf> = [".npm", ".cargo/registry", ".cargo/git", ".cache", "Library/Caches", ".rustup", ".bun/install"]
         .iter()
         .map(|d| h.join(d))
         .collect();
-    s.push_str(&subpaths("file-read*", &tool_ro));
-    let caches: Vec<PathBuf> = [".npm", ".cargo/registry", ".cargo/git", ".cache", "Library/Caches"].iter().map(|d| h.join(d)).collect();
     s.push_str(&subpaths("file-read* file-write*", &caches));
-    // The only places the agent may read and write.
+    // Grants: the source repo (read, plus its .git so commits work) and repo grants.
+    s.push_str(&subpaths("file-read*", &p.read_only));
+    s.push_str(&subpaths("file-read* file-write*", &p.read_write));
+    // Own work areas, last so nothing above can take them away.
     s.push_str(&subpaths("file-read* file-write*", &[p.workdir.clone(), p.scratch.clone(), p.hal_dir.clone()]));
+    // .env files under home stay private even inside grants and the worktree.
+    s.push_str(&format!("(deny file-read* file-write* (regex #\"^{}/.*/\\.env(\\.[^/]*)?$\"))\n", regex_esc(&h)));
     // Network: loopback only (gateway, egress proxy, MCP).
     s.push_str("(allow network-outbound (remote ip \"localhost:*\"))\n");
     s.push_str("(allow network-bind (local ip \"localhost:*\"))\n(allow network-inbound (local ip \"localhost:*\"))\n");
@@ -433,7 +517,7 @@ async fn test_profile(ctx: &Arc<Ctx>) -> Result<Value, String> {
     for d in [&work, &scratch, &hal] {
         std::fs::create_dir_all(d).map_err(|e| e.to_string())?;
     }
-    let pol = Policy { workdir: work.clone(), scratch, hal_dir: hal, read_only: vec![], allow_hosts: vec![] };
+    let pol = Policy { workdir: work.clone(), scratch, hal_dir: hal, read_only: vec![], read_write: vec![], allow_hosts: vec![] };
     let prof = profile(&pol);
     // Local upstream so the "allowed host via proxy" probe works offline.
     let up = TcpListener::bind("127.0.0.1:0").await.map_err(|e| e.to_string())?;
@@ -519,6 +603,28 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
             Ok(json!({"hosts": hosts}))
         }
         "test_profile" => test_profile(ctx).await,
+        "grants_get" => Ok(json!({"grants": grants(ctx, &arg_str(&args, "repo_id")?), "private": PRIVATE})),
+        "grants_set" => {
+            let repo_id = arg_str(&args, "repo_id")?;
+            let list = args.get("grants").and_then(Value::as_array).ok_or("missing `grants`")?;
+            let mut out = Vec::new();
+            for g in list {
+                let raw = g.get("path").and_then(Value::as_str).ok_or("grant needs a path")?;
+                let path = expand(raw);
+                if !path.is_absolute() {
+                    return Err(format!("Use a full path: {raw}"));
+                }
+                if !path.exists() {
+                    return Err(format!("No folder at {}", path.display()));
+                }
+                if let Some(p) = private_hit(&path) {
+                    return Err(format!("{} holds private data ({p}) and cannot be shared", path.display()));
+                }
+                out.push(json!({"path": path.to_string_lossy(), "write": g.get("write").and_then(Value::as_bool).unwrap_or(false)}));
+            }
+            ctx.db.kv_set(&format!("{GRANTS_KEY}.{repo_id}"), &Value::Array(out.clone()).to_string())?;
+            Ok(json!({"grants": out}))
+        }
         _ => Err(format!("sandbox.{method}: unknown method")),
     }
 }
@@ -533,6 +639,7 @@ mod tests {
             scratch: base.join("scratch"),
             hal_dir: base.join("hal"),
             read_only: vec![PathBuf::from("/opt/tools")],
+            read_write: vec![],
             allow_hosts: vec![],
         }
     }
@@ -655,7 +762,12 @@ mod toolchain_probe {
     fn toolchains_run_but_home_stays_private() {
         let dir = std::env::temp_dir().join(format!("sbx-probe-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let p = Policy { workdir: dir.clone(), scratch: dir.clone(), hal_dir: dir.clone(), read_only: vec![], allow_hosts: vec![] };
+        // A granted folder inside Documents (like a KiCad library) and a .env inside it.
+        let grant = home().join("Documents").join(format!(".philium-grant-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&grant).unwrap();
+        std::fs::write(grant.join("lib.kicad_sym"), "ok").unwrap();
+        std::fs::write(grant.join(".env"), "SECRET=1").unwrap();
+        let p = Policy { workdir: dir.clone(), scratch: dir.clone(), hal_dir: dir.clone(), read_only: vec![grant.clone()], read_write: vec![], allow_hosts: vec![] };
         let run = |cmd: &str| {
             std::process::Command::new("/usr/bin/sandbox-exec")
                 .args(["-p", &profile(&p), "/bin/sh", "-c", cmd])
@@ -669,10 +781,34 @@ mod toolchain_probe {
             assert!(o.status.success(), "kicad-cli: {}", String::from_utf8_lossy(&o.stderr));
         }
         let home = home();
-        for secret in [".ssh", "Documents", "Library/Keychains"] {
-            let o = run(&format!("ls '{}'", home.join(secret).display()));
+        for secret in [".ssh", "Documents", "Library/Keychains", "Library/Messages", ".zsh_history", "Library/Application Support/dev.gunnarsson.philium"] {
+            let path = home.join(secret);
+            let cmd = if path.is_dir() { format!("ls '{}'", path.display()) } else { format!("cat '{}' >/dev/null", path.display()) };
+            let o = run(&cmd);
             assert!(!o.status.success(), "{secret} must stay unreadable");
         }
+        // Open by default: app support of tools (not on the private list) and /Applications read fine.
+        assert!(run("ls /Applications >/dev/null").status.success());
+        // Grants: readable, read-only, .env still hidden.
+        assert!(run(&format!("cat '{}'", grant.join("lib.kicad_sym").display())).status.success(), "grant readable");
+        assert!(!run(&format!("touch '{}'", grant.join("new").display())).status.success(), "read-only grant not writable");
+        assert!(!run(&format!("cat '{}'", grant.join(".env").display())).status.success(), ".env hidden");
+        // Writes outside work areas fail; inside succeed.
+        assert!(!run(&format!("touch '{}'", home.join(".philium-probe-write").display())).status.success());
+        assert!(run(&format!("touch '{}'", dir.join("x").display())).status.success());
+        let _ = std::fs::remove_dir_all(&grant);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn grant_validation() {
+        let h = home();
+        assert!(private_hit(&h).is_some(), "whole home exposes secrets");
+        assert!(private_hit(&h.join(".ssh/keys")).is_some());
+        assert!(private_hit(&h.join("Library")).is_some());
+        assert!(private_hit(&h.join("Documents/kicad-libs")).is_none());
+        assert!(private_hit(&h.join("Documents")).is_some());
+        assert!(private_hit(Path::new("/opt/kicad")).is_none());
+        assert_eq!(expand("~/x"), h.join("x"));
     }
 }

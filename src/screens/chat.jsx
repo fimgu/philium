@@ -3,7 +3,7 @@
 import { For, Show, createSignal, createResource, createMemo, createEffect, on, onCleanup } from "solid-js";
 import { Page, Button, Select, toast } from "../ui/kit.jsx";
 import { Icon } from "../ui/icons.jsx";
-import { Conversation, Composer } from "../ui/conversation.jsx";
+import { Conversation, Composer, speedEffort, effortSpeed } from "../ui/conversation.jsx";
 import { rpc, hal, fmt } from "../lib/rpc.js";
 import { go, params } from "../lib/nav.js";
 import "../styles/agents.css";
@@ -77,6 +77,12 @@ export default function Chat() {
     poll(id);
   };
 
+  const setSpeed = async (v) => {
+    const id = selected();
+    if (!id) return toast("Send a message first, then pick a speed", "info");
+    try { await hal("PATCH", `/sessions/${id}`, { effort: speedEffort(v) }); await refetch(); } catch (e) { toast(String(e), "danger"); }
+  };
+
   const remove = async (id) => {
     await hal("DELETE", `/sessions/${id}`).catch((e) => toast(String(e), "danger"));
     await refetch();
@@ -114,6 +120,7 @@ export default function Chat() {
           </Show>
           <Conversation events={events()} emptyText="Ask anything. This chat has no access to files, commands or the web." />
           <Composer onSend={send} busy={busy()} onCancel={() => hal("POST", `/sessions/${selected()}/cancel`)}
+            speed={effortSpeed(current()?.effort)} onSpeed={setSpeed}
             placeholder={`Message ${chosen() || "a model"}`} />
         </div>
       </div>
