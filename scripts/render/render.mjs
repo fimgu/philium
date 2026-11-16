@@ -9,6 +9,7 @@ import puppeteer from "puppeteer-core";
 import { EMPTY, POPULATED, FAILING, SLOW, HUGE } from "./fixtures.js";
 import { checkAgentMessaging, checkChatMessaging } from "./robustness.mjs";
 import { checkStoppedHistory } from "./stopped-history.mjs";
+import { checkEffortProgress } from "./effort-progress.mjs";
 import { checkCodeGraph } from "./code-review.mjs";
 const SETS = { empty: EMPTY, populated: POPULATED, failing: FAILING, slow: SLOW, huge: HUGE };
 
@@ -78,6 +79,12 @@ const stub = (fx, setName) => {
         throw fixtures.__fail[window.__n % fixtures.__fail.length];
       }
       if (cmd === "rpc") {
+        if (a.method === "agents.get_effort") return window.__test.efforts?.[a.args.id] ?? "default";
+        if (a.method === "agents.set_effort") {
+          if (window.__test.holdEffort) await new Promise((resolve) => { window.__test.releaseEffort = resolve; });
+          (window.__test.efforts ??= {})[a.args.id] = a.args.effort;
+          return a.args.effort;
+        }
         if (window.__test.historyMode) {
           const t = window.__test;
           if (a.method === "agents.get") return structuredClone(t.historyAgents[a.args.id]);
@@ -147,7 +154,7 @@ const stub = (fx, setName) => {
           const key = `hal GET ${a.path.replace(/\/messages$/, "/events")}`;
           const events = fixtures[key] ?? [];
           const seq = (events.at(-1)?.seq ?? 0) + 1;
-          fixtures[key] = [...events, { type: "turn.started", seq }, ...(window.__test.chatWorking ? [] : [{ type: "assistant.completed", seq: seq + 1, text: "Accepted" }])];
+          fixtures[key] = [...events, { type: "turn.started", seq }, ...(window.__test.chatWorking ? [{ type: "tool.started", seq: seq + 1, call_id: "chat-progress-fixture", tool: "fixture_tool", arguments: {} }] : [{ type: "assistant.completed", seq: seq + 1, text: "Accepted" }])];
           return {};
         }
         const key = `hal ${a.method} ${a.path.split("?")[0]}`;
@@ -235,6 +242,7 @@ for (const setName of sets) {
             });
             errors.forEach((e) => problems.push(`${w} browser approval: ${e}`));
             await shot(page, "agents-permissions-resolved");
+            for (const error of await checkEffortProgress(page, shot)) problems.push(`${w} effort/progress: ${error}`);
             for (const error of await checkAgentMessaging(page)) problems.push(`${w} messaging: ${error}`);
             await shot(page, "agents-messaging-checked");
             for (const error of await checkStoppedHistory(page, shot)) problems.push(`${w} stopped history: ${error}`);

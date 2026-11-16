@@ -84,6 +84,9 @@ export async function checkChatMessaging(page) {
     window.__test.failCancel = true;
     const stop = [...document.querySelectorAll('.composer button')].find((b) => b.textContent.trim() === 'Stop');
     if (!stop) errors.push('working chat has no Stop');
+    const activeTool = [...document.querySelectorAll('.conv-tool')].find((el) => el.innerText.includes('fixture_tool'));
+    if (!activeTool?.querySelector('.dot.busy') || !activeTool.innerText.includes('Awaiting tool completion')) errors.push('chat busy state did not reach shared tool progress view');
+    if (activeTool?.innerText.includes('No tool completion recorded')) errors.push('active chat tool mislabeled as inactive history');
     stop?.click(); await new Promise((r) => setTimeout(r, 150));
     if (!document.body.innerText.includes('Cancellation unavailable')) errors.push('chat cancel failure not visible');
     if (document.body.innerText.includes('Some data could not load')) errors.push('chat cancel failure became data loading failure');
