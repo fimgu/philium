@@ -89,7 +89,7 @@ function Graph(props) {
     return [...m.entries()];
   });
   const zoomAt = (f, cx, cy) => setView((v) => { const k = Math.max(0.05, Math.min(6, v.k * f)); const r = k / v.k; return { k, x: cx - (cx - v.x) * r, y: cy - (cy - v.y) * r }; });
-  const showLabel = (nd) => view().k > 1.4 || props.selected === nd.id || hot().has(nd.id) || (nd.rank ?? 0) / maxRank() > 0.5 || nd.changed_by?.length;
+  const showLabel = (nd) => view().k > 1.4 || props.selected === nd.id || hot().has(nd.id) || (nd.rank ?? 0) / maxRank() > (view().k > 0.9 ? 0.5 : 0.75) || nd.changed_by?.length;
   return (
     <div class="code-graph">
       <svg ref={svg}
