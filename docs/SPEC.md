@@ -662,6 +662,8 @@ In Philium, scratch is **owned by an agent and dies with it**:
 
 Command palette (Cmd K) on every screen.
 
+**Saved agent conversations.** Viewing an agent reads its current session's persisted history without starting HAL, opening a shell, or resuming the agent. A never-started agent may have no history. Missing, unreadable or corrupt recorded history produces an error and retry control inside that conversation, not a global application loading warning. Already loaded messages and drafts remain on a failed reload. Large histories use bounded pages with an explicit Load more history control. Fetches and live events are merged by sequence, and switching agents discards stale responses. Permission requests shown while the agent is stopped are historical/read-only; Resume remains an explicit user action.
+
 ### 12.1 Improve Philium from inside Philium
 
 Philium is registered as a repo in itself. Improving it uses the same agents, worktrees, playbooks and PR flow as any other project, plus guard rails because it is the app you are running.
