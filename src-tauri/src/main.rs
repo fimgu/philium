@@ -41,6 +41,24 @@ struct App {
     ctx: Arc<Ctx>,
 }
 
+/// Session body for plain chat: every action denied, whatever the model asks.
+fn chat_session_body(ws: &std::path::Path, title: &str, model: Option<&str>) -> Value {
+    let rules: Vec<Value> = ["*", "**", "/**"]
+        .iter()
+        .map(|r| json!({ "action": "*", "resource": r, "effect": "deny" }))
+        .collect();
+    let mut body = json!({
+        "workspace": ws,
+        "title": title,
+        "permission_mode": "auto_deny",
+        "permission_rules": rules,
+    });
+    if let Some(m) = model.filter(|m| !m.is_empty()) {
+        body["model"] = json!(m);
+    }
+    body
+}
+
 /// Start (or restart if its config changed) the desk HAL that backs the
 /// plain chat view and subscription model discovery.
 pub fn refresh_desk(ctx: &Arc<Ctx>) {
@@ -149,20 +167,7 @@ async fn app_call(app: &App, m: &str, args: Value) -> Result<Value, String> {
             let h = ctx.desk().ok_or("HAL is not running")?;
             let ws = ctx.data_dir.join("desk").join("chat");
             std::fs::create_dir_all(&ws).map_err(|e| e.to_string())?;
-            let rules = vec![
-                json!({ "action": "*", "resource": "*", "effect": "deny" }),
-                json!({ "action": "*", "resource": "**", "effect": "deny" }),
-                json!({ "action": "*", "resource": "/**", "effect": "deny" }),
-            ];
-            let mut body = json!({
-                "workspace": ws,
-                "title": args["title"].as_str().unwrap_or("Chat"),
-                "permission_mode": "auto_deny",
-                "permission_rules": rules,
-            });
-            if let Some(m) = args["model"].as_str().filter(|m| !m.is_empty()) {
-                body["model"] = json!(m);
-            }
+            let body = chat_session_body(&ws, args["title"].as_str().unwrap_or("Chat"), args["model"].as_str());
             h.call(reqwest::Method::POST, "/sessions", Some(body)).await
         }
         // Disk used by Philium, by area. Bounded walk so it stays fast.
@@ -316,4 +321,164 @@ fn main() {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod e2e {
+    //! Real HAL (bundled sidecar) + real gateway + fake upstream, with a
+    //! hostile parent environment. Proves the desk HAL reaches the model only
+    //! through the gateway, never sees the real key, secrets are redacted, and
+    //! Chat sessions cannot run tools even when the model asks.
+    use super::*;
+    use crate::gateway::Route;
+    use crate::guard::GuardMode;
+    use crate::providers::{Kind, Provider};
+    use std::sync::Mutex as M;
+    use std::time::Duration;
+
+    type Seen = Arc<M<Vec<(String, String)>>>;
+
+    async fn upstream(marker: std::path::PathBuf) -> (String, Seen) {
+        let seen: Seen = Default::default();
+        let s2 = seen.clone();
+        let app = axum::Router::new().route(
+            "/v1/{*rest}",
+            axum::routing::any(move |h: axum::http::HeaderMap, body: String| {
+                let s2 = s2.clone();
+                let marker = marker.clone();
+                async move {
+                    let auth = h.get("authorization").map(|v| v.to_str().unwrap().to_string()).unwrap_or_default();
+                    let first = { let mut s = s2.lock().unwrap(); s.push((auth, body.clone())); s.len() == 1 };
+                    if !body.contains("\"stream\":true") {
+                        return ([("content-type", "application/json")], r#"{"data":[{"id":"up-model"}]}"#.to_string());
+                    }
+                    // First turn: try to run a shell command. Later: plain text.
+                    let delta = if first && body.contains("\"tools\"") {
+                        let args = serde_json::to_string(&json!({"command": format!("touch {}", marker.display())})).unwrap();
+                        json!({"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"shell","arguments":args}}]})
+                    } else {
+                        json!({"role":"assistant","content":"done"})
+                    };
+                    let fin = if delta.get("tool_calls").is_some() { "tool_calls" } else { "stop" };
+                    let sse = format!(
+                        "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                        json!({"choices":[{"index":0,"delta":delta,"finish_reason":null}]}),
+                        json!({"choices":[{"index":0,"delta":{},"finish_reason":fin}],"usage":{"prompt_tokens":21,"completion_tokens":2}}),
+                    );
+                    ([("content-type", "text/event-stream")], sse)
+                }
+            }),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1", l.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        (url, seen)
+    }
+
+    async fn wait_turn(h: &Hal, sid: &str) -> Value {
+        for _ in 0..150 {
+            let evs = h.call(reqwest::Method::GET, &format!("/sessions/{sid}/events?after=0&limit=1000"), None).await.unwrap();
+            if evs.as_array().unwrap().iter().any(|e| e["type"] == "assistant.completed" || e["type"] == "turn.failed") {
+                return evs;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("turn never finished");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn desk_hal_goes_only_through_gateway() {
+        if !hal::server_path().exists() {
+            eprintln!("skipping: no sidecar at {}", hal::server_path().display());
+            return;
+        }
+        // Hostile env: if HAL used any of these, the upstream would see them.
+        std::env::set_var("OPENAI_API_KEY", "sk-LEAKED-FROM-ENV-000000000000000000");
+        std::env::set_var("OPENAI_BASE_URL", "http://127.0.0.1:9/v1");
+        std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-LEAKED-FROM-ENV-0000000000");
+
+        let dir = std::env::temp_dir().join(format!("philium-e2e-{}", hal::random_token()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("PWNED");
+        let (up_url, seen) = upstream(marker.clone()).await;
+
+        let gw = Gateway::new(hal::random_token(), Some(dir.join("activity.jsonl")));
+        let gl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gateway_url = format!("http://{}", gl.local_addr().unwrap());
+        let r = gw.router();
+        tokio::spawn(async move { axum::serve(gl, r).await.unwrap() });
+
+        let ctx = Ctx::new(db::Db::memory(), dir.join("data"), dir.join("root"), gw.clone(), gateway_url);
+        let p = Provider {
+            id: "cn".into(),
+            name: "CN".into(),
+            kind: Kind::OpenaiChat,
+            base_url: up_url,
+            trusted: false,
+            guard: GuardMode::Redact,
+            enabled: true,
+            default_model: Some("up-model".into()),
+        };
+        providers::upsert(&ctx, &p).unwrap();
+        // Same as sync_routes(), with a test key instead of the keychain.
+        gw.set_routes(vec![Route { provider: p.clone(), api_key: Some("REAL-KEY-ONLY-IN-GATEWAY".into()) }]);
+        let c2 = ctx.clone();
+        tokio::task::spawn_blocking(move || refresh_desk(&c2)).await.unwrap();
+        let h = ctx.desk().expect("desk HAL starts");
+
+        let cfg = std::fs::read_to_string(dir.join("data/desk/hal.yaml")).unwrap();
+        assert!(!cfg.contains("REAL-KEY") && !cfg.contains("LEAKED") && !cfg.contains("/v1\""), "{cfg}");
+
+        let models = h.call(reqwest::Method::GET, "/models", None).await.unwrap().to_string();
+        assert!(models.contains("\"cn\""), "{models}");
+        assert!(!models.contains("LEAKED") && !models.contains("127.0.0.1:9/v1"), "env model leaked in: {models}");
+
+        // A Chat session: the model asks for a shell command, which must be denied.
+        let ws = dir.join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let s = h.call(reqwest::Method::POST, "/sessions", Some(chat_session_body(&ws, "e2e", None))).await.unwrap();
+        let sid = s["id"].as_str().or(s["session"]["id"].as_str()).expect("session id").to_string();
+        h.call(reqwest::Method::POST, &format!("/sessions/{sid}/messages"),
+            Some(json!({"text": "deploy using AKIAABCDEFGHIJKLMNOP and DB_PASSWORD=hunter2hunter2"}))).await.unwrap();
+        let evs = wait_turn(&h, &sid).await;
+        let text = evs.to_string();
+        assert!(!text.contains("\"turn.failed\""), "{text}");
+        assert!(!marker.exists(), "Chat ran a shell command");
+        assert!(!text.contains("permission.requested"), "Chat asked instead of denying: {text}");
+        let denied = evs.as_array().unwrap().iter().find(|e| e["type"] == "tool.finished" && e["tool"] == "shell").expect("model tried shell");
+        assert_eq!(denied["ok"], false);
+        assert!(denied["result"].as_str().unwrap().starts_with("Permission denied"), "{denied}");
+
+        let seen_now = seen.lock().unwrap().clone();
+        assert!(!seen_now.is_empty(), "upstream got nothing");
+        for (auth, body) in &seen_now {
+            assert_eq!(auth, "Bearer REAL-KEY-ONLY-IN-GATEWAY");
+            assert!(!body.contains("AKIAABCDEFGHIJKLMNOP") && !body.contains("hunter2hunter2"), "secret left: {body}");
+            assert!(!body.contains(&gw.token), "gateway token forwarded");
+        }
+        assert!(seen_now.iter().any(|(_, b)| b.contains("[REDACTED:aws_access_key]")));
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let acts = gw.recent();
+        let chat = acts.iter().find(|a| a.path == "/chat/completions").expect("logged");
+        assert_eq!((chat.guard, chat.status), ("redacted", Some(200)));
+        let disk = std::fs::read_to_string(dir.join("activity.jsonl")).unwrap();
+        assert!(disk.contains("\"redacted\"") && !disk.contains("AKIA") && !disk.contains("REAL-KEY"));
+
+        // Block mode, hot-switched (no HAL restart): nothing reaches upstream.
+        let mut blocking = p.clone();
+        blocking.guard = GuardMode::Block;
+        gw.set_routes(vec![Route { provider: blocking, api_key: Some("REAL-KEY-ONLY-IN-GATEWAY".into()) }]);
+        let before = seen.lock().unwrap().len();
+        let s = h.call(reqwest::Method::POST, "/sessions", Some(chat_session_body(&ws, "e2e2", None))).await.unwrap();
+        let sid = s["id"].as_str().or(s["session"]["id"].as_str()).unwrap().to_string();
+        h.call(reqwest::Method::POST, &format!("/sessions/{sid}/messages"), Some(json!({"text": "key AKIAABCDEFGHIJKLMNOP"}))).await.unwrap();
+        let evs = wait_turn(&h, &sid).await;
+        let failed = evs.as_array().unwrap().iter().find(|e| e["type"] == "turn.failed").cloned().expect("turn failed");
+        assert!(failed.to_string().contains("Philium guard blocked"), "{failed}");
+        assert_eq!(seen.lock().unwrap().len(), before, "blocked request reached upstream");
+
+        h.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

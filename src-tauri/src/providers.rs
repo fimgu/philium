@@ -169,7 +169,7 @@ pub fn get(ctx: &Ctx, id: &str) -> Option<Provider> {
     all(ctx).into_iter().find(|p| p.id == id)
 }
 
-fn upsert(ctx: &Ctx, p: &Provider) -> Result<(), String> {
+pub(crate) fn upsert(ctx: &Ctx, p: &Provider) -> Result<(), String> {
     let guard = serde_json::to_value(p.guard).unwrap();
     ctx.db.exec(
         "INSERT INTO providers(id,name,kind,base_url,trust,guard_mode,enabled,default_model,created_at)
