@@ -8,7 +8,7 @@
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 
@@ -35,6 +35,13 @@ pub struct Launch<'a> {
     /// Optional wrapper: given the HAL binary, returns program + args to run
     /// instead (used for Seatbelt: `sandbox-exec -p <profile> <hal>`).
     pub wrap: Option<Box<dyn Fn(&Path) -> (PathBuf, Vec<String>) + 'a>>,
+}
+
+/// Most useful line of HAL's stderr: the first mentioning an error, else the first.
+pub fn first_error_line(lines: &[String]) -> Option<String> {
+    let l = lines.iter().map(|l| l.trim()).filter(|l| !l.is_empty());
+    let pick = l.clone().find(|l| l.to_lowercase().contains("error")).or_else(|| l.clone().next())?;
+    Some(pick.chars().take(300).collect())
 }
 
 pub fn random_token() -> String {
@@ -115,19 +122,47 @@ impl Hal {
         if let Some(cwd) = l.cwd {
             cmd.current_dir(cwd);
         }
-        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit());
+        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = cmd.spawn().map_err(|e| format!("failed to start {}: {e}", prog.display()))?;
         let pid = child.id();
         let stdin = child.stdin.take().ok_or("no stdin")?;
         let stdout = child.stdout.take().ok_or("no stdout")?;
+        // Keep the stderr tail so a failed start can explain itself, and keep
+        // echoing it to our own stderr.
+        let tail: Arc<Mutex<Vec<String>>> = Arc::default();
+        let reader = child.stderr.take().map(|err| {
+            let tail = tail.clone();
+            std::thread::spawn(move || {
+                for line in BufReader::new(err).lines().map_while(Result::ok) {
+                    eprintln!("hal: {line}");
+                    let mut t = tail.lock().unwrap();
+                    t.push(line);
+                    if t.len() > 20 {
+                        t.remove(0);
+                    }
+                }
+            })
+        });
         let mut line = String::new();
-        BufReader::new(stdout)
-            .read_line(&mut line)
-            .map_err(|e| format!("reading HAL handshake: {e}"))?;
-        let handshake: Value = serde_json::from_str(line.trim()).map_err(|e| {
+        let read = BufReader::new(stdout).read_line(&mut line);
+        let explain = |child: &mut Child, what: String| {
             let _ = child.kill();
-            format!("bad HAL handshake {line:?}: {e}")
-        })?;
+            let _ = child.wait();
+            if let Some(r) = reader {
+                let _ = r.join();
+            }
+            match first_error_line(&tail.lock().unwrap()) {
+                Some(l) => format!("HAL exited: {l}"),
+                None => what,
+            }
+        };
+        if let Err(e) = read {
+            return Err(explain(&mut child, format!("reading HAL handshake: {e}")));
+        }
+        let handshake: Value = match serde_json::from_str(line.trim()) {
+            Ok(v) => v,
+            Err(e) => return Err(explain(&mut child, format!("bad HAL handshake {line:?}: {e}"))),
+        };
         let base = handshake["address"].as_str().ok_or("handshake missing address")?.to_string();
         if !base.starts_with("http://127.0.0.1:") {
             let _ = child.kill();
@@ -227,6 +262,14 @@ mod tests {
         for v in ["PATH", "HOME", "LANG", "TMPDIR", "SHELL", "USER", "CARGO_HOME"] {
             assert!(!is_credential_var(v), "{v}");
         }
+    }
+
+    #[test]
+    fn picks_error_line() {
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(first_error_line(&v(&["", "boot", "config error: bad"])).unwrap(), "config error: bad");
+        assert_eq!(first_error_line(&v(&["panic"])).unwrap(), "panic");
+        assert!(first_error_line(&[]).is_none());
     }
 
     #[test]
