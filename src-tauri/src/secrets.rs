@@ -7,14 +7,12 @@
 //! and trusted agents alike (see `sandbox::deny_secrets`). Only Philium's own
 //! process reads it, and the gateway injects keys into model traffic.
 //!
-//! Older builds kept one Keychain item per secret. Those are copied into the
-//! file the first time they are asked for and then removed from the Keychain.
+//! Existing Keychain entries are left untouched. Missing file credentials
+//! require signing in again rather than triggering an automatic Keychain read.
 use crate::ctx::LockExt;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-
-const LEGACY_SERVICE: &str = "dev.gunnarsson.philium";
 
 type Map = BTreeMap<String, String>;
 
@@ -44,8 +42,13 @@ fn file() -> Option<PathBuf> {
     dir().map(|d| d.join("vault.json"))
 }
 
-fn load() -> Map {
-    file().and_then(|f| std::fs::read_to_string(f).ok()).and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+fn load() -> Result<Map, String> {
+    let path = file().ok_or("secrets not initialised")?;
+    match std::fs::read_to_string(path) {
+        Ok(text) => serde_json::from_str(&text).map_err(|_| "secret file is invalid; refusing to overwrite it".into()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Map::new()),
+        Err(e) => Err(format!("cannot read secret file: {e}")),
+    }
 }
 
 fn save(m: &Map) -> Result<(), String> {
@@ -53,7 +56,7 @@ fn save(m: &Map) -> Result<(), String> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let d = dir().ok_or("secrets not initialised")?;
     std::fs::create_dir_all(d).map_err(|e| format!("secrets: {e}"))?;
-    let _ = std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700));
+    std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700)).map_err(|e| format!("secrets permissions: {e}"))?;
     let tmp = d.join(".vault.tmp");
     let _ = std::fs::remove_file(&tmp);
     let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp).map_err(|e| format!("secrets: {e}"))?;
@@ -62,39 +65,19 @@ fn save(m: &Map) -> Result<(), String> {
     std::fs::rename(&tmp, d.join("vault.json")).map_err(|e| format!("secrets: {e}"))
 }
 
-fn with<R>(f: impl FnOnce(&mut Map) -> R) -> R {
+fn with<R>(f: impl FnOnce(&mut Map) -> R) -> Result<R, String> {
     let mut g = cache().lk();
-    let m = g.get_or_insert_with(load);
-    f(m)
-}
-
-/// Pre-file builds: one Keychain item per secret. Read once, move, delete.
-#[cfg(target_os = "macos")]
-fn take_legacy(key: &str, m: &mut Map) -> Option<String> {
-    let e = keyring::Entry::new(LEGACY_SERVICE, key).ok()?;
-    let v = e.get_password().ok()?;
-    m.insert(key.to_string(), v.clone());
-    if save(m).is_ok() {
-        let _ = e.delete_credential();
+    if g.is_none() {
+        *g = Some(load()?);
     }
-    Some(v)
-}
-#[cfg(not(target_os = "macos"))]
-fn take_legacy(_key: &str, _m: &mut Map) -> Option<String> {
-    let _ = LEGACY_SERVICE;
-    None
+    Ok(f(g.as_mut().expect("loaded secret cache")))
 }
 
 pub fn get(key: &str) -> Option<String> {
     if disabled() {
         return None;
     }
-    with(|m| {
-        if let Some(v) = m.get(key) {
-            return Some(v.clone());
-        }
-        take_legacy(key, m)
-    })
+    with(|m| m.get(key).cloned()).ok().flatten()
 }
 
 pub fn set(key: &str, value: &str) -> Result<(), String> {
@@ -105,18 +88,22 @@ pub fn set(key: &str, value: &str) -> Result<(), String> {
         if m.get(key).map(String::as_str) == Some(value) {
             return Ok(());
         }
-        m.insert(key.to_string(), value.to_string());
-        save(m)
-    })
+        let mut next = m.clone();
+        next.insert(key.to_string(), value.to_string());
+        save(&next)?;
+        *m = next;
+        Ok(())
+    })?
 }
 
 pub fn delete(key: &str) {
     if disabled() {
         return;
     }
-    with(|m| {
-        if m.remove(key).is_some() {
-            let _ = save(m);
+    let _ = with(|m| {
+        let mut next = m.clone();
+        if next.remove(key).is_some() && save(&next).is_ok() {
+            *m = next;
         }
     });
 }
@@ -154,6 +141,20 @@ mod tests {
 
         super::delete("provider:t");
         assert_eq!(super::cache().lock().unwrap().as_ref().unwrap().get("provider:t"), None);
+        assert_eq!(super::get("provider:t"), None);
+        assert_eq!(super::get("oauth:missing"), None);
+        assert_eq!(super::get("oauth:missing"), None);
+        // Failed writes must not poison the cache or masquerade as success.
+        std::fs::create_dir(dir.join(".vault.tmp")).unwrap();
+        assert!(super::set("provider:t", "new-value").is_err());
+        assert_eq!(super::get("provider:t"), None);
+        assert!(super::set("provider:t", "new-value").is_err());
+        std::fs::remove_dir(dir.join(".vault.tmp")).unwrap();
+        // Invalid storage must not be treated as empty and overwritten.
+        std::fs::write(&f, "invalid-json").unwrap();
+        *super::cache().lock().unwrap() = None;
+        assert!(super::set("provider:t", "new-value").is_err());
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "invalid-json");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
