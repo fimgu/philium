@@ -170,7 +170,7 @@ fn instructions(name: &str, strict: bool, worktree: Option<&Path>) -> String {
     let mut s = format!(
         "You are agent \"{name}\" inside Philium, a workstation where many agents work in parallel.\n\
          Rules:\n\
-         - Run every command with the philium shell_run tool (it opens a visible terminal). The built-in shell is disabled.\n\
+         - Run commands with the philium shell_run tool: it types into your own persistent shell, which the human watches live (cd and exports persist). For dev servers and watchers use background=true; if you need a second interactive shell, open one with shell_open. The built-in shell is disabled.\n\
          - Coordinate through the master board (board_* tools) and mail (mail_* tools). Claim a task before working on it and keep its lease alive.\n\
          - Follow the playbook for each job (playbook_get). Finished work lands as a GitHub pull request.\n\
          - Never add Co-authored-by trailers, \"Generated with\" lines or agent signatures to commits or PRs.\n\
@@ -742,6 +742,7 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
                     let _ = std::fs::remove_dir_all(ctx.agent_dir(n));
                 }
             }
+            crate::browser::forget_agent(ctx, &id);
             ctx.db.exec("DELETE FROM agents WHERE id=?1", [&id])?;
             for k in ["agent_error", "agent_seq"] {
                 let _ = ctx.db.exec("DELETE FROM kv WHERE k=?1", [format!("{k}.{id}")]);
@@ -786,6 +787,8 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
             ctx.db.kv_set(&format!("agent.effort.{id}"), &effort)?;
             Ok(json!(effort))
         }
+        // The agent's main shell (opened on demand while it runs). Null when stopped.
+        "shell" => Ok(json!(crate::agentshell::current(ctx, &id()?, crate::agentshell::MAIN, args["open"].as_bool() == Some(true)).await)),
         "get_effort" => Ok(json!(ctx.db.kv_get(&format!("agent.effort.{}", id()?)).unwrap_or_else(|| "default".into()))),
         "set_model" => {
             let id = id()?;

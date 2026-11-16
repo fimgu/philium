@@ -165,8 +165,11 @@ pub fn tool_list() -> Vec<Value> {
           json!({ "name": s, "brief": s, "model": s, "role": s, "task_id": s }), &["brief"]),
         t("agent_status", "Status of agents: everyone, or one by name.", json!({ "name": s }), &[]),
         t("agent_stop", "Stop a helper agent you spawned.", json!({ "name": s }), &["name"]),
-        t("shell_run", "Run a shell command in a visible, persistent terminal in your workspace. Waits for it to finish (up to timeout_secs, default 120) and returns the trimmed output and exit code. With background=true it returns the terminal id immediately (use for servers and watchers).",
-          json!({ "command": s, "cwd": s, "timeout_secs": i, "background": b, "title": s }), &["command"]),
+        t("shell_run", "Run a command in your persistent interactive shell (bash), which the human watches live. State carries over between calls (cd, exports, venvs). Waits for it to finish (up to timeout_secs, default 120) and returns the trimmed output and exit code. Pass shell to use another of your shells (see shell_open). With background=true it runs in its own new terminal and returns the id immediately: use that for dev servers, watchers and anything that never exits.",
+          json!({ "command": s, "cwd": s, "timeout_secs": i, "background": b, "title": s, "shell": s }), &["command"]),
+        t("shell_open", "Open another persistent shell by name (for example \"dev\" or \"tests\") when your main shell is busy or you want a separate session. Use the name with shell_run's shell argument. Returns the terminal id.",
+          json!({ "name": s }), &["name"]),
+        t("shell_list", "Your terminals: shells and background commands, with state.", json!({}), &[]),
         t("shell_read", "Recent output of one of your terminals.", json!({ "id": s, "max_bytes": i }), &["id"]),
         t("shell_write", "Send input to one of your terminals (include \\n to press Enter).", json!({ "id": s, "data": s }), &["id", "data"]),
         t("shell_kill", "Stop one of your terminals.", json!({ "id": s }), &["id"]),
@@ -322,6 +325,15 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
             Ok(json!("stopped"))
         }
         "shell_run" => shell_run(ctx, agent, &me, &a).await,
+        "shell_open" => {
+            let name = crate::agentshell::shell_name(a["name"].as_str())?;
+            let id = crate::agentshell::open(ctx, agent, &name).await?;
+            Ok(json!({ "shell": name, "terminal": id }))
+        }
+        "shell_list" => Ok(json!(ctx.db.query(
+            "SELECT id,title,state,exit_code,created_at FROM terminals WHERE agent_id=?1 ORDER BY created_at DESC LIMIT 50",
+            [agent],
+        )?)),
         "shell_read" => {
             let id = arg(&a, "id")?;
             own_terminal(ctx, agent, id)?;
@@ -402,6 +414,12 @@ async fn shell_run(ctx: &Arc<Ctx>, agent: &str, me: &str, a: &Value) -> Result<V
     let rt = crate::agents::runtime(agent).ok_or("agent not running")?;
     let command = arg(a, "command")?.to_string();
     let cwd = inside(&rt.cwd, a["cwd"].as_str())?;
+    let timeout = a["timeout_secs"].as_u64().unwrap_or(120).clamp(1, 3600);
+    if a["background"].as_bool() != Some(true) {
+        let shell = crate::agentshell::shell_name(a["shell"].as_str())?;
+        let dir = a["cwd"].as_str().filter(|s| !s.is_empty()).map(|_| cwd);
+        return crate::agentshell::run(ctx, agent, &shell, &command, dir, std::time::Duration::from_secs(timeout)).await;
+    }
     let mut argv = vec!["/bin/sh".to_string(), "-lc".to_string(), command.clone()];
     if let Some(p) = &rt.policy {
         let mut wrapped = vec!["/usr/bin/sandbox-exec".to_string(), "-p".to_string(), crate::sandbox::profile(p)];
@@ -416,27 +434,10 @@ async fn shell_run(ctx: &Arc<Ctx>, agent: &str, me: &str, a: &Value) -> Result<V
         ctx,
         crate::terminals::Opts { title, command: Some(argv), cwd, env: rt.env.clone(), agent_id: Some(agent.to_string()) },
     )?;
-    if a["background"].as_bool() == Some(true) {
-        return Ok(json!({ "terminal": id, "running": true }));
-    }
-    let timeout = a["timeout_secs"].as_u64().unwrap_or(120).clamp(1, 3600);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
-    loop {
-        let rows = ctx.db.query("SELECT state, exit_code FROM terminals WHERE id=?1", [&id])?;
-        let r = rows.first().cloned().unwrap_or(Value::Null);
-        let done = r["state"].as_str().is_some_and(|s| s != "running");
-        if done || std::time::Instant::now() >= deadline {
-            let out = crate::terminals::snapshot(ctx, &id, 65536).unwrap_or_default();
-            return Ok(json!({
-                "terminal": id,
-                "exit_code": r["exit_code"],
-                "finished": done,
-                "output": trim_output(&out, 12000),
-                "note": if done { Value::Null } else { json!("still running: use shell_read / shell_kill") },
-            }));
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-    }
+    // Give fast failures (bad command, port in use) a moment to show up.
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    let out = crate::terminals::snapshot(ctx, &id, 4096).unwrap_or_default();
+    Ok(json!({ "terminal": id, "running": crate::terminals::alive(ctx, &id), "output": trim_output(&out, 4000) }))
 }
 
 pub async fn call(_ctx: &Arc<Ctx>, method: &str, _args: Value) -> Result<Value, String> {

@@ -11,6 +11,7 @@
 //! The web UI never sees a token or key.
 
 mod agents;
+mod agentshell;
 mod board;
 mod browser;
 mod ctx;
