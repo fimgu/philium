@@ -4,6 +4,7 @@
 import { For, Index, Show, Switch, Match, createSignal, createMemo, createEffect, on } from "solid-js";
 import { Badge, Button, toast } from "./kit.jsx";
 import { Icon } from "./icons.jsx";
+import { draftFor, newDraft } from "../lib/drafts.js";
 
 /** Fold a list of HAL events into display items. Pure, incremental-safe. */
 export function fold(events) {
@@ -177,27 +178,34 @@ export const speedEffort = (v) => SPEEDS.find((s) => s.value === v)?.effort ?? "
 export const effortSpeed = (e) => (e === "low" || e === "minimal" || e === "none" ? "fast" : e === "high" || e === "xhigh" || e === "max" ? "deep" : "normal");
 
 export function Composer(props) {
-  const [text, setText] = createSignal("");
-  const [images, setImages] = createSignal([]);
+  const localDraft = newDraft();
+  const record = () => props.draftKey ? draftFor(props.draftKey) : localDraft;
+  const text = () => record().text(), setText = (value) => record().setText(value);
+  const images = () => record().images(), setImages = (value) => record().setImages(value);
+  const sending = () => record().sending();
   const [over, setOver] = createSignal(false);
-  const [sending, setSending] = createSignal(false);
   const add = async (files) => {
+    const target = record();
     const imgs = [...files].filter((f) => f.type.startsWith("image/"));
-    if (imgs.length) setImages([...images(), ...(await Promise.all(imgs.map(readImage)))].slice(0, 8));
+    if (imgs.length) {
+      const loaded = await Promise.all(imgs.map(readImage));
+      target.setImages((current) => [...current, ...loaded].slice(0, 8));
+    }
   };
   const send = async () => {
-    const draft = text(), attached = images();
+    const target = record();
+    const draft = target.text(), attached = target.images();
     const t = draft.trim();
     if ((!t && !attached.length) || props.disabled || props.busy || sending()) return;
-    setSending(true);
+    target.setSending(true);
     try {
       const accepted = await props.onSend(t, attached.map(({ data, media_type, name }) => ({ data, media_type, name })));
       if (accepted !== false) {
-        if (text() === draft) setText("");
-        setImages((current) => current.filter((im) => !attached.includes(im)));
+        if (target.text() === draft) target.setText("");
+        target.setImages((current) => current.filter((im) => !attached.includes(im)));
       }
     } catch (e) { toast(String(e), "danger"); }
-    finally { setSending(false); }
+    finally { target.setSending(false); }
   };
   return (
     <div class="composer" style={{ "flex-wrap": "wrap", outline: over() ? "1px dashed var(--accent, #7aa2ff)" : "none" }}

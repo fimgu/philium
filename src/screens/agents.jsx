@@ -322,7 +322,7 @@ function AgentView(props) {
           <Show when={tab() === "chat"}>
             <Conversation events={events()} emptyText={live() ? "Send the first message to start." : "This agent is stopped. Resume it to continue."}
               onApprove={(id, scope) => decide(id, "approve", scope)} onDeny={(id) => decide(id, "deny")} />
-            <Composer onSend={send} busy={busy()} disabled={!live()} onCancel={() => rpc("agents.cancel", { id: props.id }, { action: true }).catch((e) => toast(String(e), "danger"))}
+            <Composer draftKey={`agent:${props.id}`} onSend={send} busy={busy()} disabled={!live()} onCancel={() => rpc("agents.cancel", { id: props.id }, { action: true }).catch((e) => toast(String(e), "danger"))}
               speed={effortSpeed(effort())} onSpeed={(v) => rpc("agents.set_effort", { id: props.id, effort: speedEffort(v) }).then(setEffort).catch((e) => toast(String(e), "danger"))}
               placeholder={live() ? `Message ${a()?.name ?? ""}` : "Agent is stopped"} />
           </Show>

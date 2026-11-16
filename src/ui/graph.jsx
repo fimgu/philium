@@ -7,9 +7,10 @@
 //   settings?: {link, repel, center, size, thickness, arrows}  (all ~0..2, 1 = default)
 //   onSelect?(node|null)  onOpen?(node)  onHover?(node|null)  api?(handle)
 // The handle: {fit(ids?), zoomTo(id), zoom(f), reheat()}.
-// Wheel / pinch zoom, two-finger scroll pans, drag background to pan,
+// Wheel, trackpad scroll and pinch zoom; drag background to pan,
 // drag a node to move it (pinned while dragging), click selects, double click opens.
 import { onMount, onCleanup, createEffect } from "solid-js";
+import { wheelZoomFactor, zoomCamera } from "../lib/graph-navigation.js";
 
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const hash = (s) => { let h = 2166136261; for (const c of String(s)) h = Math.imul(h ^ c.charCodeAt(0), 16777619); return (h >>> 0) / 4294967296; };
@@ -61,7 +62,7 @@ export default function Graph(props) {
   let canvas, wrap, raf = 0, ro;
   let sim = { ns: [], es: [], byId: new Map(), adj: new Map(), maxW: 1, maxE: 1 };
   const cache = new Map(); // id -> {x, y} so rebuilds and local mode do not jump
-  let cam = { x: 0, y: 0, k: 1 }, goal = null, alpha = 1, drag = null, hover = null, focus = 0, focusNode = null, lastClick = 0;
+  let cam = { x: 0, y: 0, k: 1 }, goal = null, alpha = 1, drag = null, hover = null, focus = 0, focusNode = null, lastClick = 0, lastClickId = null;
   const S = () => ({ link: 1, repel: 1, center: 1, size: 1, thickness: 1, arrows: false, ...(props.settings || {}) });
 
   const kick = () => { if (!raf) raf = requestAnimationFrame(loop); };
@@ -155,8 +156,7 @@ export default function Graph(props) {
   const zoomTo = (id) => { const n = sim.byId.get(id); if (!n) return; const k = Math.max(cam.k, 1.6); goal = { k, x: -n.x * k, y: -n.y * k }; kick(); };
   const zoomAt = (f, sx, sy) => {
     const { w, h } = size(); sx ??= w / 2; sy ??= h / 2;
-    const k = clamp(cam.k * f, 0.04, 8), r = k / cam.k, ox = sx - w / 2, oy = sy - h / 2;
-    cam = { k, x: ox - (ox - cam.x) * r, y: oy - (oy - cam.y) * r }; goal = null; kick();
+    cam = zoomCamera(cam, f, sx - w / 2, sy - h / 2); goal = null; kick();
   };
 
   const draw = () => {
@@ -282,9 +282,10 @@ export default function Graph(props) {
     const up = () => {
       if (drag && !drag.moved) {
         const now = performance.now();
-        if (drag.n && now - lastClick < 320) { props.onOpen?.(drag.n); zoomTo(drag.n.id); }
+        if (drag.n && drag.n.id === lastClickId && now - lastClick < 320) { props.onOpen?.(drag.n); zoomTo(drag.n.id); }
         else props.onSelect?.(drag.n || null);
         lastClick = drag.n ? now : 0;
+        lastClickId = drag.n?.id ?? null;
       }
       if (drag?.n) drag.n.pin = false;
       drag = null; canvas.style.cursor = hover ? "pointer" : "grab"; kick();
@@ -293,11 +294,8 @@ export default function Graph(props) {
     const wheel = (e) => {
       e.preventDefault();
       const r = canvas.getBoundingClientRect(), sx = e.clientX - r.left, sy = e.clientY - r.top;
-      const lines = e.deltaMode === 1 ? 16 : 1;
-      // Pinch (ctrlKey) and mouse wheels zoom; two-finger trackpad scroll pans.
-      const trackpadPan = !e.ctrlKey && e.deltaMode === 0 && (Math.abs(e.deltaX) > 0 || !Number.isInteger(e.deltaY) || Math.abs(e.deltaY) < 40);
-      if (trackpadPan) { cam = { ...cam, x: cam.x - e.deltaX, y: cam.y - e.deltaY }; goal = null; kick(); }
-      else zoomAt(Math.exp(-e.deltaY * lines * (e.ctrlKey ? 0.012 : 0.0018)), sx, sy);
+      // No device guessing: scrolling the graph always zooms at the pointer.
+      zoomAt(wheelZoomFactor(e, r.height), sx, sy);
     };
     canvas.addEventListener("pointerdown", down); canvas.addEventListener("pointermove", move);
     canvas.addEventListener("pointerup", up); canvas.addEventListener("pointerleave", leave);
