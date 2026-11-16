@@ -31,6 +31,7 @@ const port = server.address().port;
 
 const stub = (fx, setName) => {
   const fixtures = fx;
+  window.__permissionCalls = [];
   let cb = 1;
   window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener() {} };
   window.__TAURI_INTERNALS__ = {
@@ -46,6 +47,7 @@ const stub = (fx, setName) => {
         throw fixtures.__fail[window.__n % fixtures.__fail.length];
       }
       if (cmd === "rpc") {
+        if (a.method === "agents.permission") window.__permissionCalls.push(a.args);
         const v = fixtures[a.method];
         if (v !== undefined) return JSON.parse(JSON.stringify(v));
         if (/\.(list|tabs|names|proposals|ledger|inbox|threads|playbooks|branches|worktrees|models)$|repos_list/.test(a.method)) return [];
@@ -103,7 +105,33 @@ for (const setName of sets) {
       });
       for (const b of bad) problems.push(`${setName} ${w}x${h} ${s}: ${b}`);
       if (s === "agents") {
-        if (await clickText(page, ".list-item", "lion")) { await sleep(500); await shot(page, "agents-detail"); }
+        if (await clickText(page, ".list-item", "lion")) {
+          await sleep(500); await shot(page, "agents-detail");
+          if (setName === "populated") {
+            const errors = await page.evaluate(async () => {
+              const errors = [];
+              const cards = [...document.querySelectorAll(".perm")];
+              if (cards.length !== 3) return [`expected three browser permission cards, got ${cards.length}`];
+              if (!cards[0].innerText.includes("https://example.com/permission-test")) errors.push("browser target URL missing");
+              for (const [i, label] of ["Allow once", "Deny", "Allow for session"].entries()) {
+                if (!cards[i].innerText.includes("Browser permission")) errors.push("browser permission title missing");
+                const button = [...cards[i].querySelectorAll("button")].find((b) => b.textContent.trim() === label);
+                if (!button) errors.push(`missing ${label}`);
+                else button.click();
+              }
+              await new Promise((r) => setTimeout(r, 50));
+              const calls = window.__permissionCalls;
+              const expected = [["approve", "once"], ["deny", undefined], ["approve", "session"]];
+              if (calls.length !== 3) errors.push(`expected three decisions, got ${calls.length}`);
+              expected.forEach(([decision, scope], i) => {
+                const c = calls[i];
+                if (!c || c.id !== "a1" || c.request_id !== `browser-perm-${i}` || c.decision !== decision || c.scope !== scope) errors.push(`wrong approval payload ${i}`);
+              });
+              return errors;
+            });
+            errors.forEach((e) => problems.push(`${w} browser approval: ${e}`));
+          }
+        } else if (setName === "populated") problems.push(`${w} browser approval: agent detail did not open`);
         if (await clickText(page, "button", "New agent")) { await sleep(300); await shot(page, "modal-new-agent"); }
       }
       if (s === "providers") {

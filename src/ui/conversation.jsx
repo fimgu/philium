@@ -43,7 +43,7 @@ export function fold(events) {
       }
       case "file.changed": items.push({ kind: "file", path: e.path, diff: e.diff, seq: e.seq }); break;
       case "permission.requested":
-        items.push({ kind: "perm", id: e.request_id, action: e.action, resource: e.resource, seq: e.seq, open: true });
+        items.push({ kind: "perm", id: e.request_id, action: e.action, resource: e.resource, args: tools.get(e.call_id)?.args, seq: e.seq, open: true });
         break;
       case "permission.resolved": {
         const p = items.find((i) => i.kind === "perm" && i.id === e.request_id);
@@ -130,13 +130,21 @@ export function Conversation(props) {
                 </details>
               </Match>
               <Match when={it().kind === "perm"}>
-                <div class={`perm ${it().open ? "" : "done"}`} style={{ margin: 0 }}>
+                <div class={`perm ${it().open ? "" : "done"}`} style={{ margin: 0, "flex-wrap": "wrap", "align-items": "flex-start" }}>
                   <Icon name="shield" size={14} />
-                  <span class="grow">Wants to <b>{it().action}</b> <code class="mono">{it().resource}</code></span>
+                  <div class="grow" style={{ "min-width": 0, "flex-basis": "calc(100% - 28px)" }}>
+                    <Show when={it().action === "mcp" && it().resource?.startsWith("philium/browser_")} fallback={<>Wants to <b>{it().action}</b> <code class="mono">{it().resource}</code></>}>
+                      <b>Browser permission</b>: <code class="mono">{it().resource?.replace("philium/", "")}</code>
+                      <Show when={it().args}><pre class="conv-pre">{JSON.stringify(it().args, null, 2)}</pre></Show>
+                      <span class="dim xs">Page content may be sent to this agent's provider. Session approval applies only to this tool.</span>
+                    </Show>
+                  </div>
                   <Show when={it().open} fallback={<Badge tone={/^(appr|allow)/.test(it().decision ?? "") ? "secure" : "danger"}>{it().decision ?? "resolved"}</Badge>}>
-                    <Button size="sm" onClick={() => props.onDeny?.(it().id)}>Deny</Button>
-                    <Button size="sm" onClick={() => props.onApprove?.(it().id, "once")}>Allow once</Button>
-                    <Button size="sm" variant="primary" onClick={() => props.onApprove?.(it().id, "session")}>Always</Button>
+                    <div class="row" style={{ width: "100%", "justify-content": "flex-end", "flex-wrap": "wrap" }}>
+                      <Button size="sm" onClick={() => props.onDeny?.(it().id)}>Deny</Button>
+                      <Button size="sm" onClick={() => props.onApprove?.(it().id, "once")}>Allow once</Button>
+                      <Button size="sm" variant="primary" onClick={() => props.onApprove?.(it().id, "session")}>Allow for session</Button>
+                    </div>
                   </Show>
                 </div>
               </Match>

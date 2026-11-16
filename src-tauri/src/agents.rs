@@ -155,6 +155,9 @@ pub fn permission_rules(strict: bool) -> Value {
         // All execution goes through Philium (shell_run): visible and reapable.
         json!({"action": "shell", "resource": "*", "effect": "deny"}),
         json!({"action": "mcp", "resource": "philium/*", "effect": "allow"}),
+        // Browser capability makes tools callable, not pre-approved. The
+        // specific rule must follow the broad MCP allow (last match wins).
+        json!({"action": "mcp", "resource": "philium/browser_*", "effect": "ask"}),
         json!({"action": "subagent", "resource": "*", "effect": "allow"}),
         json!({"action": "browser", "resource": "*", "effect": "deny"}),
     ];
@@ -175,7 +178,7 @@ fn instructions(name: &str, strict: bool, worktree: Option<&Path>) -> String {
          ## Pick the right tool\n\
          - Web pages (\"open X\", \"go to google.com\", check a site, sign-in flows, test a web app): use YOUR browser. \
          browser_open {{url}}, then browser_snapshot to read the page and get numbered refs, then browser_click / browser_type / browser_press with those refs. \
-         Snapshot again after every navigation. browser_screenshot when layout matters. Never use curl or wget to \"visit\" a page for the human.\n\
+         Snapshot again after every navigation. browser_screenshot when layout matters. Philium asks the human to approve browser tool calls; wait for that decision, and respect a denial. Never use curl or wget to \"visit\" a page for the human.\n\
          - Commands: shell_run types into your persistent shell (cd and exports persist). Dev servers and watchers: shell_run with background=true, then open the URL in your browser. \
          A second interactive session: shell_open {{name}}, then shell_run with shell={{name}}. The built-in shell tool is disabled.\n\
          - Code questions: code_map (what is where), code_find (locate a symbol), code_refs (callers and uses), code_impact (what your change touches). Use these before grep or reading whole files.\n\
@@ -591,11 +594,18 @@ pub async fn send(ctx: &Arc<Ctx>, id: &str, text: &str) -> Result<Value, String>
     send_with_images(ctx, id, text, json!([])).await
 }
 
+/// Let HAL expose browser tools so its permission engine can ask the human.
+/// This is not approval: permission_rules requires consent for Philium browser
+/// MCP calls and still denies HAL's built-in browser implementation.
+pub(crate) fn message_body(text: &str, images: Value) -> Value {
+    json!({ "text": text, "images": images, "allow_browser": true })
+}
+
 pub async fn send_with_images(ctx: &Arc<Ctx>, id: &str, text: &str, images: Value) -> Result<Value, String> {
     let r = rt(id)?;
     set_state(ctx, id, "running");
     r.hal
-        .call(reqwest::Method::POST, &format!("/sessions/{}/messages", r.session), Some(json!({ "text": text, "images": images })))
+        .call(reqwest::Method::POST, &format!("/sessions/{}/messages", r.session), Some(message_body(text, images)))
         .await
 }
 
@@ -907,6 +917,24 @@ mod tests {
         // The secret denies must be the last read rule touching .env (nothing re-opens it).
         let last_read = s["rules"].as_array().unwrap().iter().rev().find(|r| r["action"] == "read").unwrap();
         assert_eq!(last_read["effect"], "deny");
+    }
+
+    #[test]
+    fn browser_capability_requires_mcp_approval() {
+        for strict in [false, true] {
+            let p = permission_rules(strict);
+            let rules = p["rules"].as_array().unwrap();
+            let broad = rules.iter().position(|r| r["action"] == "mcp" && r["resource"] == "philium/*").unwrap();
+            let browser = rules.iter().position(|r| r["action"] == "mcp" && r["resource"] == "philium/browser_*").unwrap();
+            assert!(browser > broad);
+            assert_eq!(rules[browser]["effect"], "ask");
+            assert_eq!(rules.iter().rev().find(|r| r["action"] == "browser").unwrap()["effect"], "deny");
+        }
+        let images = json!([{ "data": "test", "media_type": "image/png" }]);
+        let body = message_body("open a page", images.clone());
+        assert_eq!(body["allow_browser"], true);
+        assert_eq!(body["text"], "open a page");
+        assert_eq!(body["images"], images);
     }
 
     #[tokio::test]

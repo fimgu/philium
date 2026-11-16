@@ -145,7 +145,10 @@ export const POPULATED = {
   ],
   "agents.get": agents[0],
   "agents.names": ["badger", "wren", "ibis", "newt"],
-  "agents.events": chatEvents,
+  "agents.events": [...chatEvents, ...["browser_open", "browser_navigate", "browser_snapshot"].flatMap((tool, i) => [
+    { type: "tool.started", seq: 1001 + i * 2, call_id: `browser-call-${i}`, tool: `mcp_philium_${tool}`, arguments: tool === "browser_snapshot" ? {} : { url: "https://example.com/permission-test" } },
+    { type: "permission.requested", seq: 1002 + i * 2, request_id: `browser-perm-${i}`, call_id: `browser-call-${i}`, action: "mcp", resource: `philium/${tool}` },
+  ])],
   "agents.diff": { diff: "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n" },
   "board.list": tasks,
   "board.get": { ...tasks[1], check_results: [], playbook_progress: null },
