@@ -50,9 +50,9 @@ Design goals, in priority order:
 
 | ID | Requirement |
 |---|---|
-| N1 | Idle agent overhead: no OS process, no rendered DOM, < 1 MB RAM in Philium. |
+| N1 | Idle agent overhead in Philium itself: no rendered DOM, < 1 MB RAM. Each agent's own HAL process is about 5 to 10 MB. |
 | N2 | UI renders only visible rows (virtualized). 1,000 agents in a list costs the same as 20. |
-| N3 | One HAL server process for all agents. |
+| N3 | One HAL process per agent (about 5 to 10 MB each). Agents share nothing at runtime, so a crash or sandbox only affects one agent. |
 | N4 | macOS first. Windows and Linux follow without architectural change. |
 | N5 | No secret is ever written to disk outside the OS keychain. Logs on disk hold metadata only. |
 | N6 | No agent limit. Every agent you start runs immediately. Philium handles provider rate limits (backoff on 429, per-provider request pacing) and shows CPU, memory, disk and rate-limit headroom so you can see when the machine is saturated. |
@@ -85,7 +85,7 @@ flowchart LR
     KC[(OS Keychain)]
   end
 
-  HAL[HAL server<br/>one process, many sessions]
+  HAL[HAL processes<br/>one per agent, sandboxed if Strict]
   P1[Providers]
 
   UI <-->|Tauri IPC + events| CORE
@@ -114,7 +114,7 @@ Key choice: **Philium offers its services to agents as MCP tools**, served by th
 
 | Component | Responsibility |
 |---|---|
-| Agent Supervisor | Creates HAL sessions, assigns names, tracks state. No concurrency cap. |
+| Agent Supervisor | Starts one HAL process per agent (sandboxed for Strict agents), assigns names, tracks state, restarts crashed agents. No concurrency cap. |
 | Coordination Service | Todo board, mailboxes, leases. Offered to agents as MCP tools. |
 | Workspace Manager | Repo registry, worktree and branch lifecycle, PR creation, serialized git operations. |
 | Resource Ledger | Records every resource an agent creates. The Reaper tears them down. |
@@ -503,7 +503,7 @@ Trust boundaries:
 |---|---|---|
 | Standard (default) | Gateway, environment scrubbing, path rules, approvals, shims | None |
 | Strict | Agent processes run in an OS sandbox. macOS: Seatbelt profile (files limited to the worktree and caches, network only to the gateway and an allowlist). Linux: Landlock and namespaces. | Low |
-| Isolated | Agent in a container or VM, OpenShell-style. Not planned. Revisit only if Strict proves insufficient. | High, per agent |
+| Isolated | Agent in a Linux VM (devbox), OpenShell-style. Not planned for local use. The design allows a remote devbox later (section 9.3). | High, per agent |
 
 Strict mode is the recommended setting for untrusted providers.
 
@@ -556,11 +556,40 @@ In Strict mode full request and response bodies are kept locally (encrypted, def
 
 **Honest limits.** Strict mode cannot stop the provider from reading what you deliberately send it. If a file is in the request, the provider has seen it. The defense is keeping secrets and sensitive files out of reach, and seeing exactly what was sent.
 
+### 9.3 How the sandbox is built (no devboxes)
+
+Strict mode uses the **operating system's own sandbox**, not VMs, containers or devboxes.
+
+| | OS sandbox (chosen) | Devbox / VM / container |
+|---|---|---|
+| What it is | The OS kernel limits what one process may touch | A whole separate Linux machine per agent |
+| Startup | Instant | Seconds to minutes |
+| Memory per agent | Nothing extra beyond HAL (5 to 10 MB) | Hundreds of MB to GBs |
+| Your tools (Xcode, Homebrew, kind, Colima) | Work as normal | Must be installed in the VM image |
+| Used by | Codex, Claude Code, Chrome, App Store apps | OpenShell, cloud devboxes |
+
+**Per platform**
+
+- **macOS:** Seatbelt (`sandbox-exec` with a generated profile). Read access to the system, toolchains and caches. Write access only to the agent's worktree, scratch and caches. Network only to Philium's local proxy.
+- **Linux:** Landlock for files, network namespace for traffic, seccomp for dangerous system calls.
+- **Windows:** later. Likely an AppContainer or a restricted token.
+
+**How the network lock works.** A sandboxed agent cannot open any connection except to Philium on localhost. All its traffic goes through two Philium doors:
+
+1. The **gateway** for model requests (exists today).
+2. An **egress proxy** for everything else (npm, git, curl). It allows only hosts on the agent's allowlist, logs every attempt and asks you about new hosts.
+
+Tools inside the sandbox get `HTTPS_PROXY` pointing at the egress proxy. A tool that ignores it simply fails, because direct connections are blocked by the kernel.
+
+**Docker and kind under Strict.** The Docker socket gives full control of your machine, so Strict agents cannot use it directly. A Philium Docker broker on the agent's side allows only containers labeled for that agent, with no host mounts outside the worktree and no privileged mode. Until the broker exists, Strict agents cannot run Docker or kind.
+
+**Remote devbox (later, optional).** Because every agent is already its own HAL process, running one on another machine (a cloud VM, a home server) only changes where the process starts. Not planned now.
+
 ## 10. Performance budget (hundreds of agents)
 
 | Item | Approach |
 |---|---|
-| Agents | HAL sessions, not processes. An idle agent is DB rows plus one event subscription. |
+| Agents | One HAL process per agent, about 5 to 10 MB. 100 agents is about 1 GB, mostly idle. Idle agents cost no CPU. |
 | UI | SolidJS, virtualized lists, events batched at 10 Hz. Agents not on screen get no DOM. |
 | Terminals | Ring buffer in Rust (2 MB each, spilled to disk). Drawn only when open. |
 | Browser | One webview, created on first use. |
