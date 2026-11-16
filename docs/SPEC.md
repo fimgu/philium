@@ -44,6 +44,7 @@ Design goals, in priority order:
 | F14 | Code graph (Graphify) per repo, exposed to agents as a cheap lookup tool. |
 | F15 | Approvals: risky actions (push, delete, network, writes outside the workspace) show what will happen before you allow them. |
 | F16 | Improve Philium from inside Philium: request a change on any screen, an agent builds it, you preview, accept or roll back. |
+| F17 | Playbooks: one written standard per job (commit, PR, test, review, docs, release, teardown), enforced by checks and shown in the UI. |
 
 ### Non-functional
 
@@ -54,7 +55,7 @@ Design goals, in priority order:
 | N3 | One HAL server process for all agents. |
 | N4 | macOS first. Windows and Linux follow without architectural change. |
 | N5 | No secret is ever written to disk outside the OS keychain. Logs on disk hold metadata only. |
-| N6 | Concurrency cap with a queue (default 20 active, configurable). Provider rate limits respected. |
+| N6 | No agent limit. Every agent you start runs immediately. Philium handles provider rate limits (backoff on 429, per-provider request pacing) and shows CPU, memory, disk and rate-limit headroom so you can see when the machine is saturated. |
 
 ## 3. Architecture
 
@@ -72,7 +73,7 @@ flowchart LR
   subgraph CORE["Philium core (Rust, Tauri)"]
     SUP[Agent Supervisor]
     COORD[Coordination Service<br/>board, mail, leases]
-    WS[Workspace Manager<br/>worktrees, branches, merge queue]
+    WS[Workspace Manager<br/>worktrees, branches, PRs]
     LED[Resource Ledger and Reaper]
     PTY[Terminal Manager]
     BRW[Browser Manager]
@@ -113,9 +114,9 @@ Key choice: **Philium offers its services to agents as MCP tools**, served by th
 
 | Component | Responsibility |
 |---|---|
-| Agent Supervisor | Creates HAL sessions, assigns names, enforces the concurrency cap and queue, tracks state. |
+| Agent Supervisor | Creates HAL sessions, assigns names, tracks state. No concurrency cap. |
 | Coordination Service | Todo board, mailboxes, leases. Offered to agents as MCP tools. |
-| Workspace Manager | Repo registry, worktree and branch lifecycle, merge queue, serialized git operations. |
+| Workspace Manager | Repo registry, worktree and branch lifecycle, PR creation, serialized git operations. |
 | Resource Ledger | Records every resource an agent creates. The Reaper tears them down. |
 | Terminal Manager | Owns all agent shell processes in PTYs. Keeps a ring buffer per terminal. |
 | Browser Manager | One webview, created on first use. Agents take a lease to drive it. The user can take over. |
@@ -282,7 +283,7 @@ Every shared thing that agents could fight over gets one of three treatments: **
 |---|---|---|---|
 | Working tree | Two agents edit the same files | Own copy | One worktree per agent. The agent starts there. Writes outside it require approval. |
 | Branches | Agents commit to the same branch | Own copy | Branch `philium/<agent>/<slug>`. Git refuses to check out one branch twice. Pushes to protected branches are denied. |
-| Landing changes | Merge conflicts, broken main | Serialize | Merge queue: rebase on the integration branch, run checks, merge one at a time. Conflicts go back to the owning agent. |
+| Landing changes | Merge conflicts, broken main | Serialize | Every agent's work lands as a GitHub PR, following the playbooks (section 6.3). Before opening, the agent rebases on the default branch and runs checks. If PRs conflict, the later one goes back to its agent to rebase. |
 | Git metadata | `index.lock` races | Serialize | Worktree create/remove, fetch and gc run through one Workspace Manager queue. |
 | Tasks | Two agents do the same work | Lease | Claiming gives an exclusive lease with a heartbeat. An expired lease reopens the task. |
 | Ports | `EADDRINUSE`, or an agent hits another agent's server | Own copy | Each agent gets a block of 20 ports (`PHILIUM_PORT_BASE`). `PORT` defaults inside it. |
@@ -348,6 +349,52 @@ Status: **proposed defaults, not yet confirmed by the user.**
 - Every teardown is logged. Anything that fails to delete is marked **leaked** and shown on Home until fixed.
 
 **Reconcile sweep (startup and every 15 min)** compares the ledger with reality: process table, `docker ps -a --filter label=philium.agent`, `kind get clusters`, `git worktree list` for every registered repo, and `philium/*` branches. Anything belonging to an agent that no longer exists is listed as an orphan and handled per the toggle.
+
+### 6.3 Playbooks: one standard way to do each job
+
+Every recurring job has exactly one written standard, called a **playbook**. Agents must follow it, the UI shows where each piece of work is in it, and Philium checks the result before the work can move on. There is no hidden or improvised workflow.
+
+**Where they live**
+
+- Built-in defaults ship with Philium.
+- A repo can override or extend them in `.philium/playbooks/<job>.md` (checked into the repo, reviewed like code).
+- Your personal defaults live in Philium's settings and apply to every repo that does not override them.
+
+**Format.** Plain Markdown with a short header. Human-readable first, machine-checkable second:
+
+```markdown
+---
+job: open_pr
+checks: [tests_pass, lint_pass, no_secrets, no_coauthor, linked_task]
+---
+# Opening a PR
+1. Rebase on the default branch.
+2. Run the repo's test command. Stop if it fails.
+3. Title: imperative, under 70 characters.
+4. Body: What changed, Why, How it was tested, Risk.
+5. No Co-authored-by trailers, no agent signatures.
+```
+
+**Default playbooks**
+
+| Job | Standard (short form) | Checks Philium enforces |
+|---|---|---|
+| Commit | Small focused commits, conventional message, author is you | No co-author or agent trailer, no secrets in diff |
+| Open PR | Rebase, tests pass, fixed body template (What, Why, How tested, Risk), linked task | Tests and lint green, no co-author, template complete |
+| Test PR | Run the repo's tests, then the real user workflow the PR touches, record evidence | Evidence attached for each changed area |
+| Review PR | A different agent than the author. Read the diff with the code graph to find callers and affected areas, then a checklist: correctness, security, tests, docs | Reviewer is not the author, every checklist item answered |
+| Write docs | Update docs touched by the change, plain language, examples that run | Changed public behavior has a docs change |
+| Release | Version bump, changelog from merged PRs, tag | Changelog entry per PR |
+| Teardown | Section 6.2 | Ledger empty for the agent |
+
+**Where Graphify fits.** Graphify is a map of the code: which functions call which, and which files belong together. It does not hold the standards, but the playbooks use it:
+
+- Review: "what else does this change affect?" without reading whole files.
+- Test: pick the tests that cover the changed code.
+- Docs: find which docs describe the changed code.
+- Token efficiency: agents ask the graph instead of reading files.
+
+**In the UI.** Every task card shows its playbook as a short progress line (for example Commit, PR opened, Tested, Reviewed, Merged, Torn down) with the current step highlighted. A failed check shows one sentence on what is wrong and a button to send it back to the agent. Playbooks are editable in Settings, with a preview of the checks.
 
 ## 7. Key flows
 
@@ -435,13 +482,13 @@ At startup the Reaper compares the ledger with reality (running processes, `dock
 |---|---|
 | `board.list / create / claim / update / submit` | Master todo board with leases |
 | `mail.send / read / broadcast` | Messages between agents, guard-scanned |
-| `agent.spawn / status / stop` | Start helpers (respects the cap) |
+| `agent.spawn / status / stop` | Start helpers |
 | `shell.run / write / kill` | Commands in persistent, visible PTYs |
 | `browser.open / act / snapshot` | Drive the shared browser under a lease |
 | `graph.query` | Code graph lookups instead of reading whole files |
 | `resource.register` | Declare resources created outside the shims |
 
-**[OPEN]** HAL's built-in shell tool is disabled through its permission rules, so that all execution goes through Philium (visible, attributed, reapable).
+**[DECIDED]** HAL's built-in shell tool is disabled through its permission rules, so that all execution goes through Philium (visible, attributed, reapable).
 
 ## 9. Security model
 
@@ -468,7 +515,7 @@ Strict mode is the recommended setting for untrusted providers.
 | Terminals | Ring buffer in Rust (2 MB each, spilled to disk). Drawn only when open. |
 | Browser | One webview, created on first use. |
 | Stats | Counters aggregated in Rust, written to SQLite every few seconds. |
-| Concurrency | Cap with a queue (N6). Shows CPU, memory, disk and rate-limit headroom. |
+| Concurrency | No cap (N6). Rate-limit pacing in the gateway. Headroom meters for CPU, memory, disk and provider limits. |
 
 ## 11. Storage layout
 
@@ -491,13 +538,13 @@ Strict mode is the recommended setting for untrusted providers.
 | Home | Running agents, board summary, alerts (approvals, guard hits, leaked resources) |
 | Agents | Agent tree with name, model, state, task, resources. Conversation and terminals per agent |
 | Board | Master todo board, grouped by status, with dependencies |
-| Repos | Repos, worktrees, branches, owners, merge queue |
+| Repos | Repos, worktrees, branches, owners, open PRs and their playbook progress |
 | Terminals | Grid or tabs of live terminals |
 | Browser | Shared browser and the current lease holder |
 | Activity | Every model request (exists today) |
 | Stats | Usage, cost, TPS, efficiency by provider, model, agent, repo, day |
 | Providers | Provider cards, sign-in or key, live model list |
-| Settings | Teardown toggle, concurrency cap, security level, paths |
+| Settings | Teardown toggle, security level, paths, playbooks |
 
 Command palette (Cmd K) on every screen.
 
@@ -520,18 +567,26 @@ This also keeps a running "Philium backlog" on the board, so ideas you have mid-
 | 1 | SolidJS and design system, provider setup with live models (F1, F2), SQLite store |
 | 2 | Terminal Manager and MCP shell (F9), stats page (F13) |
 | 3 | Workspace Manager, repo view, ledger and reaper (F7, F8, F11, F12) |
-| 4 | Named agents, board, mail, leases, merge queue (F4 to F6) |
+| 4 | Named agents, board, mail, leases, PR landing and playbooks (F4 to F6, 6.3) |
 | 5 | Browser (F10), code graph (F14), strict mode |
 | 6 | Improve Philium from inside Philium (12.1) |
 
-## 14. Open decisions
+## 14. Decisions
 
-1. UI framework: SolidJS (proposed) or Svelte.
-2. Default concurrency cap: 20?
-3. Finished work lands as a PR, a merge into an integration branch, or waits for review.
-4. Worktree location: `~/Philium/worktrees` or next to each repo.
-5. Disable HAL's built-in shell in favor of Philium's (section 8).
-6. Claude Code and Codex subscriptions through the gateway, subject to those providers' terms.
-7. Whether the "Isolated" level (containers) is needed at all.
-8. Teardown defaults in section 6.2: start in Ask mode, 4 h idle timeout, keep failed worktrees 24 h, keep containers on quit.
-9. Whether Philium may stop Colima when it started it and nothing uses it.
+### Decided (2026-11-16)
+
+1. Name: **Philium**.
+2. UI framework: **SolidJS**.
+3. **No agent limit.** Rate limits and headroom are handled instead (N6).
+4. Finished work lands as a **GitHub PR**. Never a Co-authored-by trailer or agent signature, in commits or PR text.
+5. Every recurring job follows a **playbook** (section 6.3).
+6. All shell commands go through Philium's terminals (section 8).
+7. Teardown defaults (section 6.2): Ask mode to start, 4 h idle flag, failed worktrees kept 24 h, containers kept on quit.
+8. Colima: Philium may stop it only if Philium started it and nothing uses it. Off by default.
+9. UI principle: **self-explanatory and clean**. Every screen shows what is happening and what to do next, without needing docs.
+
+### Still open
+
+1. Worktree location: `~/Philium/worktrees` or next to each repo.
+2. Claude Code and Codex subscriptions through the gateway, subject to those providers' terms.
+3. Whether the "Isolated" level (containers) is needed at all.
