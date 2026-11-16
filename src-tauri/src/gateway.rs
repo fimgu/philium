@@ -24,6 +24,8 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
 
+mod translate;
+
 use crate::guard::{self, GuardMode};
 use crate::providers::{Kind, Provider};
 
@@ -450,11 +452,32 @@ async fn proxy(
         return error_response(StatusCode::FORBIDDEN, "philium_guard", msg);
     }
 
+    let mut rest = rest;
+    let mut outgoing = outgoing;
+    // HAL speaks chat.completions to Anthropic-family providers; convert.
+    let anthropic = matches!(p.kind, Kind::Anthropic | Kind::ClaudeOauth);
+    let translating = anthropic && method == Method::POST && rest == "chat/completions";
+    if translating {
+        match serde_json::from_slice::<Value>(&outgoing) {
+            Ok(v) => {
+                outgoing = Bytes::from(translate::request(&v, true).to_string());
+                rest = "messages".into();
+            }
+            Err(e) => {
+                let msg = format!("invalid chat.completions body: {e}");
+                gw.update(id, |r| {
+                    r.summary.state = "error";
+                    r.summary.status = Some(400);
+                    r.summary.error = Some(msg.clone());
+                });
+                return error_response(StatusCode::BAD_REQUEST, "philium_request", msg);
+            }
+        }
+    }
     let mut url = format!("{}/{}", p.base_url.trim_end_matches('/'), rest);
     if let Some(q) = query {
         url = format!("{url}?{q}");
     }
-    let mut outgoing = outgoing;
     let sub = p.kind.is_subscription();
     let mut oauth: Option<crate::oauth::Creds> = None;
     if sub {
@@ -510,6 +533,12 @@ async fn proxy(
             _ => req.bearer_auth(key),
         };
     }
+    if anthropic && headers.get("anthropic-version").is_none() && p.kind == Kind::Anthropic {
+        req = req.header("anthropic-version", "2023-06-01");
+    }
+    if translating {
+        req = req.header("content-type", "application/json");
+    }
     let resp = match req.send().await {
         Ok(r) => r,
         Err(e) => {
@@ -537,17 +566,51 @@ async fn proxy(
         total: 0,
         error: None,
     };
-    let body = resp.bytes_stream().map(move |item| {
-        match &item {
-            Ok(chunk) => fin.feed(chunk),
-            Err(e) => fin.error = Some(format!("upstream stream error: {e}")),
-        }
-        item
-    });
-    let mut out = Response::new(Body::from_stream(body));
+    let convert = translating && status.is_success();
+    let mut out = if convert && stream {
+        let tr = Arc::new(Mutex::new(translate::StreamTranslator::new()));
+        let tr2 = tr.clone();
+        let body = resp.bytes_stream().map(move |item| {
+            match item {
+                Ok(chunk) => {
+                    let s = tr.lock().unwrap().feed(&chunk);
+                    fin.feed(s.as_bytes());
+                    Ok(Bytes::from(s))
+                }
+                Err(e) => {
+                    fin.error = Some(format!("upstream stream error: {e}"));
+                    Err(e)
+                }
+            }
+        });
+        let tail = futures_util::stream::once(async move { Ok(Bytes::from(tr2.lock().unwrap().end())) });
+        Response::new(Body::from_stream(body.chain(tail)))
+    } else if convert {
+        let bytes = resp.bytes().await.unwrap_or_default();
+        let outb = match serde_json::from_slice::<Value>(&bytes) {
+            Ok(v) => translate::response(&v).to_string().into_bytes(),
+            Err(_) => bytes.to_vec(),
+        };
+        fin.feed(&outb);
+        Response::new(Body::from(outb))
+    } else {
+        let body = resp.bytes_stream().map(move |item| {
+            match &item {
+                Ok(chunk) => fin.feed(chunk),
+                Err(e) => fin.error = Some(format!("upstream stream error: {e}")),
+            }
+            item
+        });
+        Response::new(Body::from_stream(body))
+    };
     *out.status_mut() = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let h = out.headers_mut();
-    h.insert("content-type", content_type.unwrap_or(HeaderValue::from_static("application/json")));
+    let ct = match (convert, stream) {
+        (true, true) => HeaderValue::from_static("text/event-stream"),
+        (true, false) => HeaderValue::from_static("application/json"),
+        _ => content_type.unwrap_or(HeaderValue::from_static("application/json")),
+    };
+    h.insert("content-type", ct);
     if let Some(v) = retry_after {
         h.insert("retry-after", v);
     }

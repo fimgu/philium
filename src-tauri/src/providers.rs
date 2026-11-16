@@ -225,13 +225,34 @@ pub fn resolve(ctx: &Ctx, model_ref: Option<&str>) -> Result<(Provider, String),
     Ok((p, mid))
 }
 
+/// Never pick review/auto/mini-style variants as the implicit default.
+fn is_minor_variant(id: &str) -> bool {
+    let l = id.to_lowercase();
+    ["review", "auto", "mini", "nano", "lite", "haiku", "flash", "preview", "instruct", "embed", "search", "image", "audio", "tts", "realtime", "transcribe", "moderation"]
+        .iter()
+        .any(|w| l.contains(w))
+}
+
+/// Flagship pick: discovery order (as stored), skipping minor variants;
+/// falls back to the first enabled model.
+pub fn pick_default<'a>(ids: &'a [String]) -> Option<&'a String> {
+    ids.iter().find(|m| !is_minor_variant(m)).or_else(|| ids.first())
+}
+
 fn first_model(ctx: &Ctx, pid: &str) -> Option<String> {
-    ctx.db
-        .query("SELECT model_id FROM models WHERE provider_id=?1 AND enabled=1 ORDER BY model_id LIMIT 1", [pid])
-        .ok()?
-        .first()?["model_id"]
-        .as_str()
-        .map(str::to_string)
+    let rows = ctx.db.query("SELECT model_id FROM models WHERE provider_id=?1 AND enabled=1", [pid]).ok()?;
+    let enabled: Vec<String> = rows.iter().filter_map(|r| r["model_id"].as_str().map(str::to_string)).collect();
+    // Discovery order saved by refresh_models; alphabetical as a fallback.
+    let order: Vec<String> = ctx
+        .db
+        .kv_get(&format!("models_order.{pid}"))
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    let mut ids: Vec<String> = order.into_iter().filter(|m| enabled.contains(m)).collect();
+    let mut rest: Vec<String> = enabled.into_iter().filter(|m| !ids.contains(m)).collect();
+    rest.sort();
+    ids.extend(rest);
+    pick_default(&ids).cloned()
 }
 
 /// Push enabled API-key providers (with keys from the keychain) to the gateway.
@@ -285,15 +306,14 @@ pub fn hal_setup(ctx: &Ctx, hal_data: &Path, opts: &ConfigOpts) -> HalSetup {
         let mut m = {
             let k = p.kind;
             let mut m = json!({
-                "provider": if matches!(k, Kind::Anthropic | Kind::ClaudeOauth) { "anthropic" } else { "openai-compatible" },
-                "api": match k { Kind::OpenaiResponses | Kind::ChatgptOauth => "responses", Kind::Anthropic | Kind::ClaudeOauth => "anthropic", _ => "chat_completions" },
+                // HAL rejects `api: anthropic` behind a non-official base_url, so
+                // Anthropic kinds speak chat_completions; the gateway translates.
+                "provider": "openai-compatible",
+                "api": match k { Kind::OpenaiResponses | Kind::ChatgptOauth => "responses", _ => "chat_completions" },
                 "base_url": format!("{gw}/p/{}", p.id),
                 "api_key": token,
             });
             if matches!(k, Kind::Anthropic | Kind::ClaudeOauth) {
-                m["allow_anthropic_custom_endpoint"] = json!(true);
-            }
-            if k == Kind::ClaudeOauth {
                 m["vision"] = json!(true);
             }
             if let Some(cw) = model.as_ref().and_then(|mid| context_window(ctx, &p.id, mid)) {
@@ -367,6 +387,14 @@ pub struct Discovered {
 
 /// Parse an OpenAI/Anthropic/OpenRouter-style `/models` body.
 pub fn parse_models(body: &Value) -> Vec<Discovered> {
+    let mut out = parse_models_ordered(body);
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out.dedup_by(|a, b| a.id == b.id);
+    out
+}
+
+/// Same, but keeps the provider's own order (flagship first for most APIs).
+pub fn parse_models_ordered(body: &Value) -> Vec<Discovered> {
     let list = body.get("data").or_else(|| body.get("models")).unwrap_or(body);
     let Some(arr) = list.as_array() else { return vec![] };
     let mut out: Vec<Discovered> = arr
@@ -385,15 +413,15 @@ pub fn parse_models(body: &Value) -> Vec<Discovered> {
             })
         })
         .collect();
-    out.sort_by(|a, b| a.id.cmp(&b.id));
-    out.dedup_by(|a, b| a.id == b.id);
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|m| seen.insert(m.id.clone()));
     out
 }
 
 /// Short aliases ("opus") duplicate full ids ("claude-opus-5-5"); keep the full ones.
 pub fn dedupe_aliases(out: &mut Vec<Discovered>) {
-    out.sort_by(|a, b| a.id.cmp(&b.id));
-    out.dedup_by(|a, b| a.id == b.id);
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|m| seen.insert(m.id.clone()));
     let full: Vec<String> = out.iter().filter(|m| m.id.contains('-')).map(|m| m.id.clone()).collect();
     out.retain(|m| m.id.contains('-') || !full.iter().any(|f| f.split('-').any(|part| part == m.id)));
 }
@@ -437,7 +465,7 @@ async fn discover(_ctx: &Arc<Ctx>, p: &Provider) -> Result<Vec<Discovered>, Stri
         return Err(format!("HTTP {status} from {url}{hint}: {}", text.chars().take(300).collect::<String>()));
     }
     let body: Value = resp.json().await.map_err(|e| format!("bad /models JSON: {e}"))?;
-    let mut list = parse_models(&body);
+    let mut list = parse_models_ordered(&body);
     if p.kind.is_subscription() {
         dedupe_aliases(&mut list);
     }
@@ -476,6 +504,8 @@ pub async fn refresh_models(ctx: &Arc<Ctx>, id: &str) -> Result<Vec<Value>, Stri
         tx.execute("UPDATE providers SET models_cached_at=?2 WHERE id=?1", rusqlite::params![id, t])?;
         tx.commit()
     })?;
+    let order: Vec<&str> = found.iter().map(|m| m.id.as_str()).collect();
+    ctx.db.kv_set(&format!("models_order.{id}"), &serde_json::to_string(&order).unwrap_or_default())?;
     ctx.db.exec("DELETE FROM kv WHERE k=?1", [format!("models_error.{id}")])?;
     ctx.notify("providers");
     ctx.emit("providers:changed", json!({ "id": id }));
@@ -724,7 +754,7 @@ mod tests {
         assert_eq!(c["default_model"], "cn");
         assert_eq!(c["models"]["cn"]["base_url"], "http://127.0.0.1:9/p/cn");
         assert_eq!(c["models"]["cn"]["api_key"], "test-token");
-        assert_eq!(c["models"]["claude"]["api"], "anthropic");
+        assert_eq!(c["models"]["claude"]["api"], "chat_completions");
         assert!(!s.allow_logins);
         assert_eq!(s.env.len(), 2, "both logins hidden");
         assert!(c["models"][RESERVED_CLAUDE]["base_url"].as_str().unwrap().starts_with("http://127.0.0.1:9/"));
@@ -759,7 +789,7 @@ mod tests {
         let h = hal_setup(&ctx, Path::new("/d/hal"), &ConfigOpts::default());
         assert!(!h.allow_logins);
         assert_eq!(h.config["models"]["gpt"]["api"], "responses");
-        assert_eq!(h.config["models"]["claude"]["api"], "anthropic");
+        assert_eq!(h.config["models"]["claude"]["api"], "chat_completions");
         assert_eq!(h.config["models"]["claude"]["base_url"], "http://127.0.0.1:9/p/claude");
         assert_eq!(h.config["models"]["claude"]["api_key"], "test-token");
         let text = h.config.to_string();
@@ -775,6 +805,13 @@ mod tests {
         ctx.db.exec("INSERT INTO providers(id,name,kind,base_url,trust,guard_mode,enabled,created_at) VALUES('c','C','claude_code','','trusted','redact',1,1)", []).unwrap();
         migrate_legacy(&ctx);
         assert_eq!(get(&ctx, "c").unwrap().kind, Kind::ClaudeOauth);
+    }
+
+    #[test]
+    fn default_model_skips_minor_variants() {
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(pick_default(&v(&["codex-auto-review", "gpt-6-mini", "gpt-6"])).unwrap(), "gpt-6");
+        assert_eq!(pick_default(&v(&["only-mini"])).unwrap(), "only-mini");
     }
 
     #[test]
