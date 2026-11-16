@@ -87,6 +87,28 @@ pub struct Gateway {
     next_id: AtomicU64,
     pub events: broadcast::Sender<Activity>,
     log_file: Option<PathBuf>,
+    /// Source of OAuth access tokens for subscription routes.
+    pub tokens: TokenSource,
+}
+
+type TokenFn = dyn Fn(String, Kind) -> futures_util::future::BoxFuture<'static, Result<crate::oauth::Creds, String>> + Send + Sync;
+
+/// Where the gateway gets a fresh subscription token. Production reads the
+/// Keychain and refreshes; tests inject a fake.
+pub struct TokenSource(RwLock<Arc<TokenFn>>);
+
+impl TokenSource {
+    fn new() -> Self {
+        Self(RwLock::new(Arc::new(|id, kind| Box::pin(async move { crate::oauth::access(&id, kind).await }))))
+    }
+    #[cfg(test)]
+    pub fn set(&self, f: Arc<TokenFn>) {
+        *self.0.write().unwrap() = f;
+    }
+    async fn get(&self, id: &str, kind: Kind) -> Result<crate::oauth::Creds, String> {
+        let f = self.0.read().unwrap().clone();
+        f(id.to_string(), kind).await
+    }
 }
 
 fn now_ms() -> u64 {
@@ -119,6 +141,7 @@ impl Gateway {
             next_id: AtomicU64::new(1),
             events: broadcast::channel(256).0,
             log_file,
+            tokens: TokenSource::new(),
         })
     }
 
@@ -431,13 +454,57 @@ async fn proxy(
     if let Some(q) = query {
         url = format!("{url}?{q}");
     }
+    let mut outgoing = outgoing;
+    let sub = p.kind.is_subscription();
+    let mut oauth: Option<crate::oauth::Creds> = None;
+    if sub {
+        match gw.tokens.get(&p.id, p.kind).await {
+            Ok(c) => oauth = Some(c),
+            Err(e) => {
+                gw.update(id, |r| {
+                    r.summary.state = "error";
+                    r.summary.status = Some(401);
+                    r.summary.error = Some(e.clone());
+                });
+                return error_response(StatusCode::UNAUTHORIZED, "philium_signin", e);
+            }
+        }
+        // Shape after the guard so redaction still covers user content.
+        if let Ok(mut v) = serde_json::from_slice::<Value>(&outgoing) {
+            if p.kind == Kind::ClaudeOauth {
+                crate::oauth::shape_claude_body(&mut v);
+            } else {
+                crate::oauth::shape_chatgpt_body(&mut v);
+            }
+            outgoing = Bytes::from(serde_json::to_vec(&v).unwrap_or_default());
+        }
+    }
     let mut req = gw.client.request(method, &url).body(outgoing);
     for h in FORWARD_HEADERS {
+        if sub && matches!(h, "anthropic-beta" | "user-agent") {
+            continue;
+        }
         if let Some(v) = headers.get(h) {
             req = req.header(h, v);
         }
     }
-    if let Some(key) = route.api_key.as_deref().filter(|k| !k.is_empty()) {
+    if let Some(c) = &oauth {
+        req = req.bearer_auth(&c.access);
+        if p.kind == Kind::ClaudeOauth {
+            let beta = headers.get("anthropic-beta").and_then(|v| v.to_str().ok());
+            req = req
+                .header("anthropic-beta", crate::oauth::claude_beta(beta))
+                .header("user-agent", crate::oauth::CLAUDE_CLI_USER_AGENT);
+            if headers.get("anthropic-version").is_none() {
+                req = req.header("anthropic-version", "2023-06-01");
+            }
+        } else {
+            req = req.header("originator", crate::oauth::CHATGPT_ORIGINATOR);
+            if let Some(a) = &c.account_id {
+                req = req.header("chatgpt-account-id", a);
+            }
+        }
+    } else if let Some(key) = route.api_key.as_deref().filter(|k| !k.is_empty()) {
         req = match p.kind {
             Kind::Anthropic => req.header("x-api-key", key),
             _ => req.bearer_auth(key),
@@ -632,6 +699,55 @@ mod tests {
         assert_eq!(headers["x-api-key"], "REAL-UPSTREAM-KEY");
         assert_eq!(headers["anthropic-version"], "2023-06-01");
         assert!(headers.get("authorization").is_none());
+    }
+
+    #[tokio::test]
+    async fn subscription_swaps_in_oauth_and_hides_gateway_token() {
+        for (kind, expect_id) in [(Kind::ClaudeOauth, false), (Kind::ChatgptOauth, true)] {
+            let (base, seen) = upstream().await;
+            let (gw, url) = gateway(&base, kind, GuardMode::Redact).await;
+            gw.tokens.set(Arc::new(|_, _| {
+                Box::pin(async { Ok(crate::oauth::Creds { access: "OAUTH-ACCESS".into(), account_id: Some("acct-9".into()), ..Default::default() }) })
+            }));
+            let path = if kind == Kind::ClaudeOauth { "messages" } else { "responses" };
+            let tok = "t".repeat(48);
+            let resp = reqwest::Client::new()
+                .post(format!("{url}/{path}"))
+                .header("x-api-key", &tok)
+                .header("anthropic-beta", "custom-beta")
+                .json(&json!({"model":"m","stream":true,"system":"sys AKIAABCDEFGHIJKLMNOP","messages":[]}))
+                .send().await.unwrap();
+            assert_eq!(resp.status(), 200);
+            let (h, sent) = seen.lock().unwrap()[0].clone();
+            assert_eq!(h["authorization"], "Bearer OAUTH-ACCESS");
+            assert!(h.get("x-api-key").is_none(), "gateway token never forwarded");
+            assert!(!format!("{h:?}{sent}").contains(&tok));
+            assert!(!sent.contains("AKIAABCDEFGHIJKLMNOP"), "guard still applies");
+            if expect_id {
+                assert_eq!(h["chatgpt-account-id"], "acct-9");
+                assert_eq!(h["originator"], "codex_cli_rs");
+                assert!(sent.contains("\"store\":false"));
+            } else {
+                assert!(h["anthropic-beta"].to_str().unwrap().contains("oauth-2025-04-20"));
+                assert!(h["anthropic-beta"].to_str().unwrap().contains("custom-beta"));
+                assert!(h["user-agent"].to_str().unwrap().starts_with("claude-cli/"));
+                assert!(sent.contains("Claude Agent SDK"));
+            }
+            let a = settle(&gw).await;
+            assert_eq!((a.state, a.input_tokens), ("done", Some(12)));
+            assert!(!gw.detail(a.id).unwrap().to_string().contains("OAUTH-ACCESS"));
+        }
+    }
+
+    #[tokio::test]
+    async fn signed_out_subscription_is_a_clear_401() {
+        let (base, seen) = upstream().await;
+        let (gw, url) = gateway(&base, Kind::ClaudeOauth, GuardMode::Off).await;
+        gw.tokens.set(Arc::new(|_, _| Box::pin(async { Err("Signed out. Sign in again".into()) })));
+        let r = reqwest::Client::new().post(format!("{url}/messages")).bearer_auth("t".repeat(48)).json(&json!({})).send().await.unwrap();
+        assert_eq!(r.status(), 401);
+        assert!(r.text().await.unwrap().contains("Sign in again"));
+        assert!(seen.lock().unwrap().is_empty());
     }
 
     #[test]

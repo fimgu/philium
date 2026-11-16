@@ -21,6 +21,7 @@ mod graph;
 mod guard;
 mod hal;
 mod mcp;
+mod oauth;
 mod providers;
 mod reaper;
 mod sandbox;

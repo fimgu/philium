@@ -4,9 +4,10 @@
 //! - API-key providers (`openai_chat`, `openai_responses`, `anthropic`): the key
 //!   lives only in the OS keychain and is injected by the gateway. HAL only
 //!   ever sees `http://127.0.0.1:<gw>/p/<id>` plus a gateway token.
-//! - Subscriptions (`chatgpt`, `claude_code`): trusted logins owned by the
-//!   Codex/Claude CLIs. HAL talks to them directly (they never pass the
-//!   gateway, which is why they can only be marked trusted).
+//! - Subscriptions (`claude_oauth`, `chatgpt_oauth`): trusted sign-ins owned
+//!   by Philium (`oauth.rs`). Tokens live in the Keychain; HAL is configured
+//!   as a normal provider pointing at the gateway, which swaps in the OAuth
+//!   bearer token and the required headers. Strict agents never get them.
 //!
 //! Model lists are never hardcoded: they come from each provider's live
 //! `/models` (or HAL discovery for subscriptions) and are cached in SQLite.
@@ -25,6 +26,8 @@ use crate::gateway::Route;
 use crate::guard::GuardMode;
 
 const KEYCHAIN_SERVICE: &str = "dev.gunnarsson.philium";
+pub const CLAUDE_UPSTREAM: &str = "https://api.anthropic.com/v1";
+pub const CHATGPT_UPSTREAM: &str = "https://chatgpt.com/backend-api/codex";
 pub const RESERVED_CLAUDE: &str = "claude-code";
 const RESERVED: [&str; 5] = [RESERVED_CLAUDE, "none", "default", "chatgpt", "endpoint"];
 
@@ -37,10 +40,12 @@ pub enum Kind {
     OpenaiResponses,
     /// Anthropic Messages `/messages`.
     Anthropic,
-    /// ChatGPT subscription via the Codex CLI login.
-    Chatgpt,
-    /// Claude subscription via the Claude Code CLI.
-    ClaudeCode,
+    /// ChatGPT subscription, signed in through Philium.
+    #[serde(alias = "chatgpt")]
+    ChatgptOauth,
+    /// Claude subscription, signed in through Philium.
+    #[serde(alias = "claude_code")]
+    ClaudeOauth,
 }
 
 impl Kind {
@@ -52,12 +57,12 @@ impl Kind {
             Kind::OpenaiChat => "openai_chat",
             Kind::OpenaiResponses => "openai_responses",
             Kind::Anthropic => "anthropic",
-            Kind::Chatgpt => "chatgpt",
-            Kind::ClaudeCode => "claude_code",
+            Kind::ChatgptOauth => "chatgpt_oauth",
+            Kind::ClaudeOauth => "claude_oauth",
         }
     }
     pub fn is_subscription(self) -> bool {
-        matches!(self, Kind::Chatgpt | Kind::ClaudeCode)
+        matches!(self, Kind::ChatgptOauth | Kind::ClaudeOauth)
     }
 }
 
@@ -67,7 +72,7 @@ pub struct Provider {
     pub id: String,
     pub name: String,
     pub kind: Kind,
-    /// Real upstream URL for API-key kinds. Empty for subscriptions.
+    /// Real upstream URL (fixed for subscriptions).
     pub base_url: String,
     /// Untrusted providers only ever run agents in Strict mode.
     pub trusted: bool,
@@ -90,7 +95,7 @@ pub fn validate(p: &Provider) -> Result<(), String> {
     }
     if p.kind.is_subscription() {
         if !p.trusted {
-            return Err("Subscriptions bypass the gateway, so they must be trusted".into());
+            return Err("Subscriptions must be trusted".into());
         }
         return Ok(());
     }
@@ -233,8 +238,8 @@ fn first_model(ctx: &Ctx, pid: &str) -> Option<String> {
 pub fn sync_routes(ctx: &Ctx) {
     let routes = all(ctx)
         .into_iter()
-        .filter(|p| p.enabled && !p.kind.is_subscription())
-        .map(|p| Route { api_key: get_key(&p.id), provider: p })
+        .filter(|p| p.enabled)
+        .map(|p| Route { api_key: if p.kind.is_subscription() { None } else { get_key(&p.id) }, provider: p })
         .collect();
     ctx.gateway.set_routes(routes);
 }
@@ -257,7 +262,7 @@ pub struct ConfigOpts {
 
 pub struct HalSetup {
     pub config: Value,
-    /// Real Codex/Claude login dirs are needed (a subscription is included).
+    /// Always false now; kept for the launcher contract.
     pub allow_logins: bool,
     /// Env overrides that hide whichever login is not included.
     pub env: Vec<(String, String)>,
@@ -275,38 +280,30 @@ pub fn hal_setup(ctx: &Ctx, hal_data: &Path, opts: &ConfigOpts) -> HalSetup {
         .filter(|p| !(opts.no_subscriptions && p.kind.is_subscription()))
         .collect();
     let mut models = serde_json::Map::new();
-    let (mut chatgpt, mut claude) = (false, false);
     for p in &providers {
         let model = p.default_model.clone().or_else(|| first_model(ctx, &p.id));
-        let mut m = match p.kind {
-            Kind::Chatgpt => {
-                chatgpt = true;
-                json!({ "provider": "openai", "api": "responses", "auth": "chatgpt" })
+        let mut m = {
+            let k = p.kind;
+            let mut m = json!({
+                "provider": if matches!(k, Kind::Anthropic | Kind::ClaudeOauth) { "anthropic" } else { "openai-compatible" },
+                "api": match k { Kind::OpenaiResponses | Kind::ChatgptOauth => "responses", Kind::Anthropic | Kind::ClaudeOauth => "anthropic", _ => "chat_completions" },
+                "base_url": format!("{gw}/p/{}", p.id),
+                "api_key": token,
+            });
+            if matches!(k, Kind::Anthropic | Kind::ClaudeOauth) {
+                m["allow_anthropic_custom_endpoint"] = json!(true);
             }
-            Kind::ClaudeCode => {
-                claude = true;
-                json!({ "provider": "claude-code", "api": "claude_code", "auth": "claude_code",
-                        "base_url": "", "context_window": 200000, "vision": false })
+            if k == Kind::ClaudeOauth {
+                m["vision"] = json!(true);
             }
-            k => {
-                let mut m = json!({
-                    "provider": if k == Kind::Anthropic { "anthropic" } else { "openai-compatible" },
-                    "api": match k { Kind::OpenaiResponses => "responses", Kind::Anthropic => "anthropic", _ => "chat_completions" },
-                    "base_url": format!("{gw}/p/{}", p.id),
-                    "api_key": token,
-                });
-                if k == Kind::Anthropic {
-                    m["allow_anthropic_custom_endpoint"] = json!(true);
-                }
-                if let Some(cw) = model.as_ref().and_then(|mid| context_window(ctx, &p.id, mid)) {
-                    m["context_window"] = json!(cw);
-                }
-                m
+            if let Some(cw) = model.as_ref().and_then(|mid| context_window(ctx, &p.id, mid)) {
+                m["context_window"] = json!(cw);
             }
+            m
         };
         if let Some(mid) = model {
             m["model"] = json!(mid);
-        } else if !p.kind.is_subscription() {
+        } else {
             m["model"] = json!("unknown");
         }
         models.insert(p.id.clone(), m);
@@ -339,17 +336,12 @@ pub fn hal_setup(ctx: &Ctx, hal_data: &Path, opts: &ConfigOpts) -> HalSetup {
         );
         "none".into()
     });
+    // HAL never gets a real login: hide both CLI login dirs.
     let no_login = hal_data.parent().unwrap_or(hal_data).join("no-login").to_string_lossy().into_owned();
-    let mut env = vec![];
-    if !chatgpt {
-        env.push(("CODEX_HOME".into(), no_login.clone()));
-    }
-    if !claude {
-        env.push(("CLAUDE_CONFIG_DIR".into(), no_login));
-    }
+    let env = vec![("CODEX_HOME".into(), no_login.clone()), ("CLAUDE_CONFIG_DIR".into(), no_login)];
     HalSetup {
         config: json!({ "server": { "data_dir": hal_data }, "default_model": default, "models": models }),
-        allow_logins: chatgpt || claude,
+        allow_logins: false,
         env,
     }
 }
@@ -398,76 +390,61 @@ pub fn parse_models(body: &Value) -> Vec<Discovered> {
     out
 }
 
-async fn discover(ctx: &Arc<Ctx>, p: &Provider) -> Result<Vec<Discovered>, String> {
-    if p.kind.is_subscription() {
-        return discover_via_hal(ctx, p).await;
-    }
-    let key = get_key(&p.id).unwrap_or_default();
-    let url = format!("{}/models", p.base_url.trim_end_matches('/'));
+/// Short aliases ("opus") duplicate full ids ("claude-opus-5-5"); keep the full ones.
+pub fn dedupe_aliases(out: &mut Vec<Discovered>) {
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out.dedup_by(|a, b| a.id == b.id);
+    let full: Vec<String> = out.iter().filter(|m| m.id.contains('-')).map(|m| m.id.clone()).collect();
+    out.retain(|m| m.id.contains('-') || !full.iter().any(|f| f.split('-').any(|part| part == m.id)));
+}
+
+async fn discover(_ctx: &Arc<Ctx>, p: &Provider) -> Result<Vec<Discovered>, String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .map_err(|e| e.to_string())?;
-    let mut req = client.get(&url);
-    if !key.is_empty() {
-        req = match p.kind {
-            Kind::Anthropic => req.header("x-api-key", &key).header("anthropic-version", "2023-06-01"),
-            _ => req.bearer_auth(&key),
-        };
+    let base = p.base_url.trim_end_matches('/');
+    let mut url = format!("{base}/models");
+    let mut req;
+    if p.kind.is_subscription() {
+        let c = crate::oauth::access(&p.id, p.kind).await?;
+        if p.kind == Kind::ClaudeOauth {
+            url.push_str("?limit=1000");
+            req = client.get(&url).bearer_auth(&c.access).header("anthropic-version", "2023-06-01")
+                .header("anthropic-beta", crate::oauth::claude_beta(None)).header("user-agent", crate::oauth::CLAUDE_CLI_USER_AGENT);
+        } else {
+            url.push_str("?client_version=1.0.0");
+            req = client.get(&url).bearer_auth(&c.access).header("originator", crate::oauth::CHATGPT_ORIGINATOR);
+            if let Some(a) = &c.account_id {
+                req = req.header("chatgpt-account-id", a);
+            }
+        }
+    } else {
+        let key = get_key(&p.id).unwrap_or_default();
+        req = client.get(&url);
+        if !key.is_empty() {
+            req = match p.kind {
+                Kind::Anthropic => req.header("x-api-key", &key).header("anthropic-version", "2023-06-01"),
+                _ => req.bearer_auth(&key),
+            };
+        }
     }
     let resp = req.send().await.map_err(|e| format!("{url}: {}", e.without_url()))?;
     let status = resp.status();
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
-        return Err(format!("HTTP {status} from {url}: {}", text.chars().take(300).collect::<String>()));
+        let hint = if p.kind.is_subscription() && matches!(status.as_u16(), 401 | 403) { " (sign in again)" } else { "" };
+        return Err(format!("HTTP {status} from {url}{hint}: {}", text.chars().take(300).collect::<String>()));
     }
     let body: Value = resp.json().await.map_err(|e| format!("bad /models JSON: {e}"))?;
-    let list = parse_models(&body);
+    let mut list = parse_models(&body);
+    if p.kind.is_subscription() {
+        dedupe_aliases(&mut list);
+    }
     if list.is_empty() {
         return Err("provider returned no models".into());
     }
     Ok(list)
-}
-
-/// Subscriptions: ask the desk HAL (which holds the real logins) to list.
-async fn discover_via_hal(ctx: &Arc<Ctx>, p: &Provider) -> Result<Vec<Discovered>, String> {
-    // The desk HAL restarts whenever provider config changes, which can race
-    // with discovery. Retry against the current instance before failing.
-    let mut groups = Err(String::from("harness is not running"));
-    for attempt in 0..4 {
-        if attempt > 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(750 * attempt)).await;
-        }
-        let Some(hal) = ctx.desk() else { continue };
-        groups = hal.call(reqwest::Method::GET, "/models?discover=true", None).await;
-        if groups.is_ok() {
-            break;
-        }
-    }
-    let groups = groups.map_err(|_| "could not reach the harness to list models. Try Refresh models.".to_string())?;
-    let g = groups
-        .as_array()
-        .and_then(|a| a.iter().find(|g| g["name"] == p.id.as_str()))
-        .ok_or("the harness does not see this subscription; is the CLI signed in?")?;
-    if let Some(e) = g["error"].as_str() {
-        return Err(e.to_string());
-    }
-    let prefix = format!("{}/", p.id);
-    let mut out: Vec<Discovered> = g["choices"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .map(|c| if c == p.id { g["model"].as_str().unwrap_or(c) } else { c.strip_prefix(&prefix).unwrap_or(c) })
-        .filter(|id| valid_model_id(id).is_ok())
-        .map(|id| Discovered { id: id.to_string(), display: None, context_window: None, price_in: None, price_out: None })
-        .collect();
-    out.sort_by(|a, b| a.id.cmp(&b.id));
-    out.dedup_by(|a, b| a.id == b.id);
-    // Short aliases ("opus") duplicate full ids ("claude-opus-5-5"); keep the full ones.
-    let full: Vec<String> = out.iter().filter(|m| m.id.contains('-')).map(|m| m.id.clone()).collect();
-    out.retain(|m| m.id.contains('-') || !full.iter().any(|f| f.split('-').any(|part| part == m.id)));
-    Ok(out)
 }
 
 /// Refresh one provider's models into SQLite. User edits (enabled, prices,
@@ -512,29 +489,38 @@ pub fn models(ctx: &Ctx, provider: Option<&str>) -> Result<Vec<Value>, String> {
     ctx.db.query(sql, [provider])
 }
 
-/// Which subscription CLIs are signed in on this machine.
-pub fn detect_logins() -> Value {
-    if std::env::var_os("PHILIUM_PREVIEW").is_some() {
-        return json!({ "chatgpt": false, "claude_code": false });
-    }
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default();
-    let codex = std::env::var_os("CODEX_HOME").map(Into::into).unwrap_or_else(|| home.join(".codex"));
-    let claude_dir = std::env::var_os("CLAUDE_CONFIG_DIR").map(Into::into).unwrap_or_else(|| home.join(".claude"));
-    let claude_bin = ["/opt/homebrew/bin/claude", "/usr/local/bin/claude"]
-        .iter()
-        .map(std::path::PathBuf::from)
-        .chain(std::iter::once(home.join(".local/bin/claude")))
-        .chain(std::iter::once(home.join(".claude/local/claude")))
-        .any(|p| p.exists());
-    json!({
-        "chatgpt": codex.join("auth.json").exists(),
-        "claude_code": claude_bin && claude_dir.exists(),
-    })
-}
-
 // ---------- module ----------
 
+/// Create or fix the provider row for a signed-in subscription.
+pub fn ensure_oauth_provider(ctx: &Ctx, id: &str, kind: Kind) -> Result<(), String> {
+    let existing = get(ctx, id);
+    let claude = kind == Kind::ClaudeOauth;
+    let p = Provider {
+        id: id.into(),
+        name: existing.as_ref().map(|e| e.name.clone()).unwrap_or_else(|| if claude { "Claude".into() } else { "ChatGPT".into() }),
+        kind,
+        base_url: if claude { CLAUDE_UPSTREAM } else { CHATGPT_UPSTREAM }.into(),
+        trusted: true,
+        guard: existing.as_ref().map(|e| e.guard).unwrap_or_default(),
+        enabled: true,
+        default_model: existing.and_then(|e| e.default_model),
+    };
+    upsert(ctx, &p)?;
+    if ctx.setting("default_model", "").is_empty() {
+        ctx.db.kv_set("setting.default_model", &p.id)?;
+    }
+    Ok(())
+}
+
+/// Old CLI-wrapped providers become OAuth kinds that need a fresh sign-in.
+pub fn migrate_legacy(ctx: &Ctx) {
+    for (old, new, url) in [("claude_code", "claude_oauth", CLAUDE_UPSTREAM), ("chatgpt", "chatgpt_oauth", CHATGPT_UPSTREAM)] {
+        let _ = ctx.db.exec("UPDATE providers SET kind=?2, base_url=?3, trust='trusted' WHERE kind=?1", rusqlite::params![old, new, url]);
+    }
+}
+
 pub fn init(ctx: &Arc<Ctx>) -> Result<(), String> {
+    migrate_legacy(ctx);
     sync_routes(ctx);
     // Refresh stale model lists in the background (6h TTL).
     let c = ctx.clone();
@@ -569,18 +555,25 @@ fn public(ctx: &Ctx, p: &Provider) -> Value {
         .and_then(|r| r.first().map(|x| x["models_cached_at"].clone()))
         .unwrap_or(Value::Null);
     let mut v = serde_json::to_value(p).unwrap();
-    v["has_key"] = json!(p.kind.is_subscription() || get_key(&p.id).is_some_and(|k| !k.is_empty()));
+    if p.kind.is_subscription() {
+        let c = crate::oauth::Store::load(&crate::oauth::Keychain, &p.id);
+        v["signed_in"] = json!(c.is_some());
+        v["account"] = json!(c.as_ref().map(|c| json!({ "email": c.email, "plan": c.plan, "account_id": c.account_id })));
+        v["has_key"] = json!(c.is_some());
+    } else {
+        v["has_key"] = json!(get_key(&p.id).is_some_and(|k| !k.is_empty()));
+    }
     v["model_count"] = json!(count);
     v["models_cached_at"] = cached;
     v["models_error"] = json!(ctx.db.kv_get(&format!("models_error.{}", p.id)));
-    v["via_gateway"] = json!(!p.kind.is_subscription());
+    v["via_gateway"] = json!(true);
     v
 }
 
 pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, String> {
     match method {
         "list" => Ok(json!(all(ctx).iter().map(|p| public(ctx, p)).collect::<Vec<_>>())),
-        "logins" => Ok(detect_logins()),
+        m if m.starts_with("oauth_") => crate::oauth::call(ctx, m, args).await,
         "save" => {
             let kind = Kind::parse(&arg_str(&args, "kind")?)?;
             let id = arg_str(&args, "id")?;
@@ -591,7 +584,7 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
             let p = Provider {
                 name: arg_str(&args, "name")?,
                 kind,
-                base_url: if kind.is_subscription() { String::new() } else { arg_str(&args, "base_url")?.trim().to_string() },
+                base_url: if kind == Kind::ClaudeOauth { CLAUDE_UPSTREAM.into() } else if kind == Kind::ChatgptOauth { CHATGPT_UPSTREAM.into() } else { arg_str(&args, "base_url")?.trim().to_string() },
                 trusted: args["trusted"].as_bool().unwrap_or(kind.is_subscription()),
                 guard: serde_json::from_value(args["guard"].clone()).unwrap_or(existing.as_ref().map(|e| e.guard).unwrap_or_default()),
                 enabled: args["enabled"].as_bool().unwrap_or(true),
@@ -626,6 +619,7 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
             ctx.db.exec("DELETE FROM providers WHERE id=?1", [&id])?;
             ctx.db.exec("DELETE FROM models WHERE provider_id=?1", [&id])?;
             delete_key(&id);
+            crate::oauth::Store::delete(&crate::oauth::Keychain, &id);
             if split_ref(&ctx.setting("default_model", "")).map(|x| x.0).unwrap_or(&ctx.setting("default_model", "")) == id {
                 let next = all(ctx).first().map(|p| p.id.clone()).unwrap_or_default();
                 ctx.db.kv_set("setting.default_model", &next)?;
@@ -710,7 +704,7 @@ mod tests {
             assert!(validate(&p(id, url)).is_err(), "{id} {url}");
         }
         let mut s = p("sub", "");
-        s.kind = Kind::Chatgpt;
+        s.kind = Kind::ChatgptOauth;
         assert!(validate(&s).is_err(), "untrusted subscription rejected");
         s.trusted = true;
         assert!(validate(&s).is_ok());
@@ -752,19 +746,43 @@ mod tests {
     }
 
     #[test]
-    fn subscriptions_enable_only_their_login() {
+    fn subscriptions_go_through_gateway_and_hide_logins() {
         let ctx = Ctx::test();
-        let mut s = p("gpt", "");
-        s.kind = Kind::Chatgpt;
+        let mut s = p("gpt", "https://chatgpt.com/backend-api/codex");
+        s.kind = Kind::ChatgptOauth;
         s.trusted = true;
         upsert(&ctx, &s).unwrap();
+        let mut c = p("claude", CLAUDE_UPSTREAM);
+        c.kind = Kind::ClaudeOauth;
+        c.trusted = true;
+        upsert(&ctx, &c).unwrap();
         let h = hal_setup(&ctx, Path::new("/d/hal"), &ConfigOpts::default());
-        assert!(h.allow_logins);
-        assert_eq!(h.config["models"]["gpt"]["auth"], "chatgpt");
-        assert!(h.env.iter().any(|(k, _)| k == "CLAUDE_CONFIG_DIR"));
-        assert!(!h.env.iter().any(|(k, _)| k == "CODEX_HOME"));
+        assert!(!h.allow_logins);
+        assert_eq!(h.config["models"]["gpt"]["api"], "responses");
+        assert_eq!(h.config["models"]["claude"]["api"], "anthropic");
+        assert_eq!(h.config["models"]["claude"]["base_url"], "http://127.0.0.1:9/p/claude");
+        assert_eq!(h.config["models"]["claude"]["api_key"], "test-token");
+        let text = h.config.to_string();
+        assert!(!text.contains("chatgpt.com") && !text.contains("anthropic.com"));
+        assert_eq!(h.env.len(), 2);
         let strict = hal_setup(&ctx, Path::new("/d/hal"), &ConfigOpts { no_subscriptions: true, ..Default::default() });
-        assert!(!strict.allow_logins && strict.config["models"].get("gpt").is_none());
+        assert!(strict.config["models"].get("gpt").is_none() && strict.config["models"].get("claude").is_none());
+    }
+
+    #[test]
+    fn legacy_kinds_migrate() {
+        let ctx = Ctx::test();
+        ctx.db.exec("INSERT INTO providers(id,name,kind,base_url,trust,guard_mode,enabled,created_at) VALUES('c','C','claude_code','','trusted','redact',1,1)", []).unwrap();
+        migrate_legacy(&ctx);
+        assert_eq!(get(&ctx, "c").unwrap().kind, Kind::ClaudeOauth);
+    }
+
+    #[test]
+    fn alias_dedupe() {
+        let d = |id: &str| Discovered { id: id.into(), display: None, context_window: None, price_in: None, price_out: None };
+        let mut v = vec![d("opus"), d("claude-opus-5-5"), d("gpt-6"), d("gpt-6")];
+        dedupe_aliases(&mut v);
+        assert_eq!(v.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["claude-opus-5-5", "gpt-6"]);
     }
 
     #[test]
