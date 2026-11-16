@@ -9,6 +9,8 @@ export function formatCodeContext(context) {
   return [
     c.intent === "change" ? "I want to request a change to the selected code. Please ask what change I want before editing." : "Explain the selected code or diff, including its role and affected callers. Do not modify files.",
     `File: ${field(c.path)}${lines}`,
+    ...(c.old_path ? [`Previous path: ${field(c.old_path)}`] : []),
+    ...(c.kind === "diff" ? [`Line coordinates: ${c.line_side === "old" ? "old side (comparison base, before change)" : c.line_side === "new" ? "new side (selected target, after change)" : "see diff hunk headers"}`] : []),
     `Repository: ${field(c.repo_id) || "not specified"}`,
     `Worktree: ${field(c.worktree_id) || "repository base/local checkout (see revision)"}`,
     `Revision: ${field(c.revision) || "not specified"}`,

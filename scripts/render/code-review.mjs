@@ -50,6 +50,18 @@ export async function checkCodeGraph(page, shot) {
   await page.focus('[aria-label="Resize code inspector"]'); await page.keyboard.press('ArrowUp');
   if (await page.$eval('.code-main', (e) => e.style.getPropertyValue('--inspector-size')) === oldSize) errors.push('keyboard resize did not change inspector');
   await shot(page, 'code-source-inspector');
+  await page.click('.code-source-line[data-line="3"] .line-number');
+  await page.keyboard.down('Shift');
+  await page.click('.code-source-line[data-line="4"] .line-number');
+  await page.keyboard.up('Shift');
+  await click('.code-selection button', 'Request a change'); await wait();
+  await page.select('.code-agent-chooser select', 'a1');
+  await click('.code-agent-chooser button', 'Open draft'); await wait();
+  const sourceDraft = await page.$eval('.composer textarea', (e) => e.value);
+  for (const needed of ['My existing instructions', 'src/review.py:3-4', 'return 1', 'ask what change I want before editing']) if (!sourceDraft.includes(needed)) errors.push(`source draft missing ${needed}`);
+  if (await page.evaluate(() => window.__test.sends.length)) errors.push('source selection sent a message');
+  await click('.nav-item', 'Code'); await wait();
+  await page.waitForSelector('.pgraph canvas');
   await target('local');
   await click('.code-bar label, .code-bar button', 'Changes'); await wait();
   if (!(await click('.changed-file', 'src/review.py'))) return [...errors, 'changed-file list missing'];

@@ -395,6 +395,10 @@ checks: [tests_pass, lint_pass, no_secrets, no_coauthor, linked_task]
 - Docs: find which docs describe the changed code.
 - Token efficiency: agents ask the graph instead of reading files.
 
+**Code inspection.** Scroll over the graph to zoom around the pointer and drag the background to pan. Select a file or symbol to open the read-only, numbered Source / Diff / References inspector. Its split is resizable and expandable, and scrolling inside the inspector does not move the graph. Choose the indexed base commit, local checkout, or a named agent's worktree explicitly. Base source comes from the indexed Git blob. Working views read current disk content and compare net committed, staged, unstaged and untracked changes against the graph's base. The working revision identifies HEAD plus a working-tree label, not an immutable content hash. Changes includes deleted, renamed and binary files with explicit empty/missing/binary states.
+
+Select source lines or a diff hunk, choose Explain or Request a change, then choose an agent to open an **unsent** draft. Context includes the path, line coordinates, repository/worktree, revision, comparison base and selected snippet. Existing text and attachments remain. Drafts are isolated per agent and survive navigation, but are held only in memory and do not survive restarting Philium. Request a change asks the agent to clarify the desired edit before modifying files. Source/patch reads and rendered rows are bounded with visible truncation notices. Private paths and symlink escapes are rejected, not treated as normal source files.
+
 **In the UI.** Every task card shows its playbook as a short progress line (for example Commit, PR opened, Tested, Reviewed, Merged, Torn down) with the current step highlighted. A failed check shows one sentence on what is wrong and a button to send it back to the agent. Playbooks are editable in Settings, with a preview of the checks.
 
 ## 7. Key flows
