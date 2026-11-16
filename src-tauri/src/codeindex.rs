@@ -20,7 +20,9 @@
 //! - `clashes {repo_id?}` -> `{text, clashes:[{a,b,severity,detail}]}`
 //! - `tree {}` -> `{files:[{path,rank,syms:[{name,kind,line,end,parent}]}], truncated}` (for the UI)
 //! - `graph {level?: "file"|"symbol", path?, worktrees?: bool}` -> `{nodes, edges, truncated}`;
-//!   nodes carry `changed_by:[{worktree_id, agent}]` when `worktrees` is true.
+//!   nodes carry `changed_by:[{worktree_id, agent}]` when `worktrees` is true, plus
+//!   `weight` (= `refs_in` + `refs_out`, summed edge weights) and, for files, `syms` (symbol count).
+//!   Edges carry `weight` (number of references between the two nodes).
 //! - `reindex {}`
 //!
 //! Events: `codeindex:clashes` (list) when the clash set changes; audit event `code_clash`.
@@ -1469,15 +1471,31 @@ fn build_graph(ctx: &Ctx, l: &Loaded, args: &Value) -> Value {
             .iter()
             .map(|s| json!({ "id": format!("{}:{}", s.path, s.name), "label": s.name, "kind": s.kind, "path": s.path, "line": s.line, "group": dir_of(&s.path), "rank": rank.get(s.name.as_str()).unwrap_or(&0.0), "changed_by": mark_for(&s.path, Some(&s.name)) }))
             .collect();
-        let mut edges = vec![];
-        let mut seen = HashSet::new();
+        // Edge weight = number of references between the two symbols.
+        let mut w: BTreeMap<(String, String), (u32, String)> = BTreeMap::new();
         for r in &v.refs {
             if let (Some(to), Some(from)) = (ids.get(r.name.as_str()), ids.get(r.from.as_str())) {
-                if from != to && seen.insert((from.clone(), to.clone())) && edges.len() < 1500 {
-                    edges.push(json!({ "source": from, "target": to, "kind": r.kind }));
+                if from != to {
+                    w.entry((from.clone(), to.clone())).or_insert((0, r.kind.clone())).0 += 1;
                 }
             }
         }
+        let mut es: Vec<_> = w.into_iter().collect();
+        es.sort_by(|a, b| b.1 .0.cmp(&a.1 .0).then(a.0.cmp(&b.0)));
+        es.truncate(1500);
+        let mut deg: HashMap<&str, (u32, u32)> = HashMap::new();
+        for ((a, b), (n, _)) in &es {
+            deg.entry(a.as_str()).or_default().1 += n;
+            deg.entry(b.as_str()).or_default().0 += n;
+        }
+        let nodes: Vec<Value> = nodes.into_iter().map(|mut n| {
+            let (i, o) = n["id"].as_str().and_then(|id| deg.get(id)).copied().unwrap_or_default();
+            n["refs_in"] = json!(i);
+            n["refs_out"] = json!(o);
+            n["weight"] = json!(i + o);
+            n
+        }).collect();
+        let edges: Vec<Value> = es.iter().map(|((a, b), (n, k))| json!({ "source": a, "target": b, "weight": n, "kind": k })).collect();
         return json!({ "nodes": nodes, "edges": edges, "truncated": truncated, "level": "symbol" });
     }
     let mut frank: HashMap<&str, f64> = HashMap::new();
@@ -1506,6 +1524,24 @@ fn build_graph(ctx: &Ctx, l: &Loaded, args: &Value) -> Value {
     es.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     let truncated = truncated || es.len() > 1500;
     es.truncate(1500);
+    let mut deg: HashMap<&str, (u32, u32)> = HashMap::new();
+    for ((a, b), w) in &es {
+        deg.entry(a).or_default().1 += w;
+        deg.entry(b).or_default().0 += w;
+    }
+    let mut nsyms: HashMap<&str, u32> = HashMap::new();
+    for s in &v.syms {
+        *nsyms.entry(&s.path).or_default() += 1;
+    }
+    let nodes: Vec<Value> = nodes.into_iter().map(|mut n| {
+        let id = n["id"].as_str().unwrap_or("").to_string();
+        let (i, o) = deg.get(id.as_str()).copied().unwrap_or_default();
+        n["refs_in"] = json!(i);
+        n["refs_out"] = json!(o);
+        n["weight"] = json!(i + o);
+        n["syms"] = json!(nsyms.get(id.as_str()).copied().unwrap_or(0));
+        n
+    }).collect();
     let edges: Vec<Value> = es.iter().map(|((a, b), w)| json!({ "source": a, "target": b, "weight": w, "kind": "uses" })).collect();
     json!({ "nodes": nodes, "edges": edges, "truncated": truncated, "level": "file" })
 }
@@ -1728,6 +1764,25 @@ mod tests {
         assert!(deps.iter().any(|d| d.name == "top" && d.depth == 2), "{deps:?}");
         let txt = render_impact(&v2, &cs, 1500);
         assert!(txt.contains("src/b.rs") && txt.contains("helper"), "{txt}");
+    }
+
+    #[test]
+    fn graph_weights() {
+        let ctx = fresh_ctx();
+        let r = repo();
+        let (view, base) = index_target(&ctx, "r1", &r, "main", None, true).unwrap();
+        let l = Loaded { header: String::new(), t: Target { repo_id: "r1".into(), repo_path: r.clone(), branch: "main".into(), wt: None }, view, base };
+        let g = build_graph(&ctx, &l, &json!({}));
+        let e = g["edges"].as_array().unwrap().iter().find(|e| e["source"] == "src/b.rs" && e["target"] == "src/a.rs").expect("b uses a");
+        assert!(e["weight"].as_u64().unwrap() >= 2, "import + call: {e}");
+        let a = g["nodes"].as_array().unwrap().iter().find(|n| n["id"] == "src/a.rs").unwrap();
+        assert!(a["refs_in"].as_u64().unwrap() >= 2 && a["weight"].as_u64().unwrap() >= 2, "{a}");
+        assert!(a["syms"].as_u64().unwrap() >= 4, "{a}");
+        let g = build_graph(&ctx, &l, &json!({ "level": "symbol" }));
+        let e = g["edges"].as_array().unwrap().iter().find(|e| e["source"] == "src/b.rs:top" && e["target"] == "src/b.rs:caller").expect("top calls caller");
+        assert_eq!(e["weight"], 1);
+        let c = g["nodes"].as_array().unwrap().iter().find(|n| n["id"] == "src/b.rs:caller").unwrap();
+        assert!(c["refs_in"].as_u64().unwrap() >= 1 && c["refs_out"].as_u64().unwrap() >= 1, "{c}");
     }
 
     #[test]
