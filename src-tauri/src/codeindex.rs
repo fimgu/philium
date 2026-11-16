@@ -472,7 +472,7 @@ fn flush(ctx: &Ctx, scope: &str, batch: &mut Vec<(String, String, Parsed)>) -> R
 }
 
 fn rev_parse(repo: &Path, branch: &str) -> Result<String, String> {
-    git(repo, &["rev-parse", "--verify", &format!("{branch}^{{commit}}")]).or_else(|_| git(repo, &["rev-parse", "--verify", "HEAD"]))
+    inspect::inspect_revision(repo, branch).or_else(|_| inspect::inspect_revision(repo, "HEAD"))
 }
 
 fn read_blobs(repo: &Path, shas: &[String], mut f: impl FnMut(usize, Vec<u8>)) -> Result<(), String> {

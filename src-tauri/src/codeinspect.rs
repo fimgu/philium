@@ -6,43 +6,141 @@ const TEXT_CAP: usize = 256 * 1024;
 const PATCH_CAP: usize = 512 * 1024;
 const META_CAP: usize = 8 * 1024 * 1024;
 
-// Never use workspace::git here: it trims output and is not byte preserving.
+const GIT_DEADLINE: Duration = Duration::from_secs(15);
+
+// Own a fresh process group, never the application's group. Kill descendants too:
+// a helper may retain stdout after the Git parent exits.
+struct OwnedProcess(Option<std::process::Child>);
+impl OwnedProcess {
+    fn terminate(&mut self) {
+        if let Some(child) = self.0.as_mut() {
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(-(child.id() as i32), libc::SIGKILL);
+            }
+            #[cfg(windows)]
+            {
+                // taskkill targets only the owned PID and its descendants. It is
+                // itself bounded, and the direct child is killed below as well.
+                if let Ok(mut killer) = Command::new("taskkill")
+                    .args(["/PID", &child.id().to_string(), "/T", "/F"])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                {
+                    let until = Instant::now() + Duration::from_millis(500);
+                    while matches!(killer.try_wait(), Ok(None)) && Instant::now() < until {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    let _ = killer.kill();
+                    std::thread::spawn(move || {
+                        let _ = killer.wait();
+                    });
+                }
+            }
+            let _ = child.kill();
+        }
+    }
+}
+impl Drop for OwnedProcess {
+    fn drop(&mut self) {
+        self.terminate();
+        if let Some(mut child) = self.0.take() {
+            // Reap without an unbounded wait on the request's blocking worker.
+            if !matches!(child.try_wait(), Ok(Some(_))) {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+            }
+        }
+    }
+}
+
+fn run_command(
+    mut command: Command,
+    cap: usize,
+    diff: bool,
+    timeout: Duration,
+) -> Result<(Vec<u8>, bool), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let deadline = Instant::now() + timeout;
+    let child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    let mut owned = OwnedProcess(Some(child));
+    let stdout = owned
+        .0
+        .as_mut()
+        .unwrap()
+        .stdout
+        .take()
+        .ok_or("missing git stdout")?;
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut out = Vec::new();
+        let result = stdout
+            .take(cap as u64 + 1)
+            .read_to_end(&mut out)
+            .map(|_| out);
+        let _ = tx.send(result);
+    });
+    let mut out = rx
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .map_err(|_| "git inspection exceeded its execution deadline")?
+        .map_err(|e| e.to_string())?;
+    let truncated = out.len() > cap;
+    if truncated {
+        owned.terminate();
+    }
+    let status = loop {
+        if let Some(status) = owned
+            .0
+            .as_mut()
+            .unwrap()
+            .try_wait()
+            .map_err(|e| e.to_string())?
+        {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            return Err("git inspection exceeded its execution deadline".into());
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    out.truncate(cap);
+    if !truncated && !status.success() && !(diff && status.code() == Some(1)) {
+        return Err("git inspection failed (repository or revision unavailable)".into());
+    }
+    Ok((out, truncated))
+}
+
+// Never use workspace::git here: it trims output and has no execution deadline.
+// All inspection Git entry points, including revision fallback, use this wrapper.
 fn run(root: &Path, args: &[&str], cap: usize, diff: bool) -> Result<(Vec<u8>, bool), String> {
-    let mut child = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(root)
         .args([
             "--literal-pathspecs",
+            "-c",
+            "core.fsmonitor=false",
             "-c",
             "core.quotepath=false",
             "-c",
             "color.ui=false",
         ])
         .args(args)
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| e.to_string())?;
-    let mut out = Vec::new();
-    let read = child
-        .stdout
-        .take()
-        .ok_or("missing git stdout")?
-        .take(cap as u64 + 1)
-        .read_to_end(&mut out);
-    let truncated = out.len() > cap;
-    if truncated || read.is_err() {
-        let _ = child.kill();
-    }
-    let status = child.wait().map_err(|e| e.to_string())?;
-    read.map_err(|e| e.to_string())?;
-    out.truncate(cap);
-    if !truncated && !status.success() && !(diff && status.code() == Some(1)) {
-        return Err("git inspection failed (repository or revision unavailable)".into());
-    }
-    Ok((out, truncated))
+        .env("GIT_OPTIONAL_LOCKS", "0");
+    run_command(command, cap, diff, GIT_DEADLINE)
 }
 
 fn metadata(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
@@ -51,6 +149,25 @@ fn metadata(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
         return Err("repository change metadata exceeds inspection limit".into());
     }
     Ok(bytes)
+}
+
+pub(super) fn inspect_revision(root: &Path, reference: &str) -> Result<String, String> {
+    let bytes = metadata(
+        root,
+        &[
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            &format!("{reference}^{{commit}}"),
+        ],
+    )?;
+    let value = std::str::from_utf8(&bytes)
+        .map_err(|_| "invalid revision output")?
+        .trim();
+    if !(value.len() == 40 || value.len() == 64) || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("invalid revision output".into());
+    }
+    Ok(value.to_owned())
 }
 
 pub(super) fn private_name(path: &Path) -> bool {
@@ -202,13 +319,16 @@ fn base_for(ctx: &Ctx, t: &Target) -> Result<String, String> {
     {
         return Ok(b);
     }
-    rev_parse(&t.repo_path, &t.branch)
+    inspect_revision(&t.repo_path, &t.branch).or_else(|_| inspect_revision(&t.repo_path, "HEAD"))
 }
 
 fn revision(t: &Target, base: &str) -> Result<String, String> {
     match &t.wt {
         None => Ok(base.to_owned()),
-        Some(w) => Ok(format!("{}:working-tree", rev_parse(&w.path, "HEAD")?)),
+        Some(w) => Ok(format!(
+            "{}:working-tree",
+            inspect_revision(&w.path, "HEAD")?
+        )),
     }
 }
 
@@ -795,6 +915,125 @@ mod tests {
                 .find(|c| c["path"] == "a.py")
                 .unwrap()["status"],
             "M"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fsmonitor_helper_is_disabled_for_inspection_and_revision_fallback() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = Fixture::new();
+        let helper = f.root.join("fsmonitor-helper");
+        std::fs::write(
+            &helper,
+            "#!/bin/sh\nprintf called > \"$0.marker\"\nexit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        sh(
+            &f.root,
+            &["config", "core.fsmonitor", helper.to_str().unwrap()],
+        );
+        // Positive control: ordinary Git really invokes this repository helper.
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(&f.wt)
+            .args(["ls-files", "--others", "--exclude-standard"])
+            .output()
+            .unwrap()
+            .status
+            .success());
+        let actual_marker = helper.with_file_name("fsmonitor-helper.marker");
+        assert!(actual_marker.exists());
+        std::fs::remove_file(&actual_marker).unwrap();
+        f.get(&f.disk, "changes", "");
+        f.get(&f.disk, "file_diff", "a.py");
+        f.ctx
+            .db
+            .with(|c| c.execute("DELETE FROM ci_snap", []))
+            .unwrap();
+        assert!(f.get(&f.base, "source", "a.py")["exists"]
+            .as_bool()
+            .unwrap());
+        assert_eq!(
+            super::super::rev_parse(&f.root, "missing-branch").unwrap(),
+            inspect_revision(&f.root, "HEAD").unwrap()
+        );
+        assert!(!actual_marker.exists());
+    }
+
+    #[cfg(unix)]
+    fn assert_stopped(pid: i32) {
+        let until = Instant::now() + Duration::from_secs(2);
+        loop {
+            let output = Command::new("ps")
+                .args(["-p", &pid.to_string(), "-o", "stat="])
+                .output()
+                .unwrap();
+            let state = String::from_utf8_lossy(&output.stdout);
+            // A killed orphan can briefly await the OS init process's reap.
+            if state.trim().is_empty() || state.trim().starts_with('Z') {
+                return;
+            }
+            assert!(
+                Instant::now() < until,
+                "owned process {pid} remains live: {state}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn subprocess_deadline_covers_silent_reads_wait_and_inherited_stdout() {
+        let f = Fixture::new();
+        for (name, script) in [
+            ("silent", "echo $$ > \"$1\"; exec sleep 30"),
+            ("closed", "echo $$ > \"$1\"; exec 1>&-; exec sleep 30"),
+            ("inherited", "sleep 30 & echo $! > \"$1\"; exit 0"),
+        ] {
+            let pidfile = f.root.join(name);
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", script, "fixture", pidfile.to_str().unwrap()]);
+            let start = Instant::now();
+            let err = run_command(command, 1024, false, Duration::from_millis(200)).unwrap_err();
+            assert!(err.contains("deadline"), "{name}: {err}");
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "{name} exceeded bound"
+            );
+            let pid = std::fs::read_to_string(pidfile)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            assert_stopped(pid);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_cap_kills_and_reaps_owned_writer() {
+        let f = Fixture::new();
+        let pidfile = f.root.join("writer-pid");
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "echo $$ > \"$1\"; while :; do printf '0123456789'; done",
+            "fixture",
+            pidfile.to_str().unwrap(),
+        ]);
+        let start = Instant::now();
+        let (bytes, truncated) = run_command(command, 100, false, Duration::from_secs(2)).unwrap();
+        assert_eq!(bytes.len(), 100);
+        assert!(truncated);
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert_stopped(
+            std::fs::read_to_string(pidfile)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap(),
         );
     }
 
