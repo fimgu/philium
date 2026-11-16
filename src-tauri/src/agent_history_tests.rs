@@ -133,7 +133,11 @@ async fn busy_corrupt_payload_and_size_limits() {
         [],
     )
     .unwrap();
-    assert_eq!(f.get("saved", 0, 10).await.unwrap(), json!([]));
+    let error = f.get("saved", 0, 10).await.unwrap_err();
+    assert!(error.contains("sequence 1"));
+    assert!(error.contains("Retry"));
+    assert!(!error.contains("not json"));
+    db.execute("DELETE FROM events WHERE seq=1", []).unwrap();
     db.execute(
         "INSERT INTO events VALUES('session',2,'ts','large',?1)",
         ["x".repeat(MAX_EVENT_BYTES + 1)],
@@ -157,6 +161,40 @@ fn legacy_child_envelope_and_parent_isolation() {
     value["child_session_id"] = json!("leaf");
     assert!(decode(&value.to_string(), "parent", 1).is_none());
     assert!(decode(&event(1, "peer").to_string(), "parent", 1).is_none());
+}
+
+#[tokio::test]
+async fn malformed_saved_events_error_without_rejecting_forward_types() {
+    let f = Fixture::new();
+    f.agent("saved", "saved", Some("session"));
+    let db = f.db("saved");
+    let mut future = event(1, "session");
+    future["type"] = json!("future.valid.event");
+    future["data"] = json!({"custom":true});
+    db.execute(
+        "INSERT INTO events VALUES('session',1,'ts','future.valid.event',?1)",
+        [future.to_string()],
+    )
+    .unwrap();
+    assert_eq!(f.get("saved", 0, 10).await.unwrap(), json!([future]));
+    for payload in [
+        "{\"private-body\":",
+        "[]",
+        "{}",
+        "null",
+        &event(2, "wrong-parent").to_string(),
+        &event(3, "session").to_string(),
+    ] {
+        db.execute(
+            "INSERT OR REPLACE INTO events VALUES('session',2,'ts','test',?1)",
+            [payload],
+        )
+        .unwrap();
+        let error = f.get("saved", 0, 10).await.unwrap_err();
+        assert!(error.contains("sequence 2"));
+        assert!(!error.contains("private-body"));
+        assert!(!error.contains("wrong-parent"));
+    }
 }
 
 #[tokio::test]

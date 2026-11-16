@@ -149,9 +149,10 @@ fn read(path: &Path, session: &str, after: i64, limit: i64) -> Result<Value, Str
             }
             bytes += size as usize;
             let payload: String = row.get(2).map_err(|e| e.to_string())?;
-            if let Some(event) = decode(&payload, session, seq) {
-                out.push(event);
-            }
+            let event = decode(&payload, session, seq).ok_or_else(|| {
+                format!("saved event at sequence {seq} is malformed or has an invalid identity")
+            })?;
+            out.push(event);
         }
         Ok(Value::Array(out))
     })();
