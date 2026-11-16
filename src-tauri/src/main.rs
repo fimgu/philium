@@ -544,6 +544,7 @@ mod tests {
         }
         assert!(done, "turn never completed");
 
+        let seen_handle = seen.clone();
         let seen = seen.lock().unwrap().clone();
         assert!(!seen.is_empty(), "upstream got nothing");
         for (auth, body) in &seen {
@@ -560,6 +561,30 @@ mod tests {
         assert_eq!(chat.input_tokens, Some(21));
         let disk = std::fs::read_to_string(dir.join("activity.jsonl")).unwrap();
         assert!(disk.contains("\"redacted\"") && !disk.contains("AKIA") && !disk.contains("REAL-KEY"));
+
+        // Block mode, hot-switched (no HAL restart): nothing reaches upstream,
+        // and HAL surfaces the guard's reason to the user.
+        let mut blocking = store.providers[0].clone();
+        blocking.guard = guard::GuardMode::Block;
+        gateway.set_routes(vec![Route { provider: blocking, api_key: Some("REAL-KEY-ONLY-IN-GATEWAY".into()) }]);
+        let before = seen.len();
+        let s = rt.block_on(call(reqwest::Method::POST, "/sessions", Some(json!({"workspace": ws, "permission_mode": "auto_deny"}))));
+        let sid = s["id"].as_str().or(s["session"]["id"].as_str()).unwrap().to_string();
+        rt.block_on(call(reqwest::Method::POST, &format!("/sessions/{sid}/messages"), Some(json!({"text": "key AKIAABCDEFGHIJKLMNOP"}))));
+        let mut failed = None;
+        for _ in 0..100 {
+            let evs = rt.block_on(call(reqwest::Method::GET, &format!("/sessions/{sid}/events?after=0&limit=500"), None));
+            if let Some(e) = evs.as_array().unwrap().iter().find(|e| e["type"] == "turn.failed" || e["type"] == "assistant.completed") {
+                failed = Some(e.clone());
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let failed = failed.expect("turn ended");
+        assert_eq!(failed["type"], "turn.failed", "{failed}");
+        assert!(failed.to_string().contains("Filium guard blocked"), "{failed}");
+        assert_eq!(seen_handle.lock().unwrap().len(), before, "blocked request reached upstream");
+        assert!(gateway.recent().iter().any(|a| a.guard == "blocked"));
         let hal_log_dir = std::fs::read_dir(dir.join("hal")).map(|d| d.count()).unwrap_or(0);
         eprintln!("ok: {} upstream calls, {} activity rows, hal data entries {hal_log_dir}", seen.len(), acts.len());
 

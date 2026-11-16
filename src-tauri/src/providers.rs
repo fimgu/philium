@@ -215,6 +215,19 @@ mod tests {
         }
     }
 
+    /// Touches the real OS keychain; run with `--ignored`.
+    #[test]
+    #[ignore]
+    fn keychain_roundtrip() {
+        let id = "filium-selftest";
+        set_key(id, "k-123").unwrap();
+        assert_eq!(get_key(id).as_deref(), Some("k-123"));
+        set_key(id, "k-456").unwrap();
+        assert_eq!(get_key(id).as_deref(), Some("k-456"));
+        delete_key(id);
+        assert_eq!(get_key(id), None);
+    }
+
     #[test]
     fn validation() {
         assert!(validate(&p("cn-1", "https://api.example.cn/v1")).is_ok());
