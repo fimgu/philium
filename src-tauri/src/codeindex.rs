@@ -8,7 +8,7 @@
 //! worktrees), serialized by one lock, incremental by file stamp (mtime+len), and debounced.
 //!
 //! Target args (all methods): `worktree_id` | `agent` (id or name) | `repo_id`.
-//! Query results carry `text`, compact and compact by design (`max_tokens` is only a safety limit, default 12000)
+//! Query results carry `text`, compact and compact by design (`max_tokens` is only a safety limit, default 60000)
 //! with "N more, narrow with ..." hints.
 //!
 //! rpc `codeindex.*`:
@@ -43,7 +43,7 @@ const MAX_FILE: u64 = 400 * 1024;
 const MAX_FILES: usize = 20000;
 const SKIP_DIRS: &[&str] = &["node_modules", "target", "dist", "build", "vendor", ".git", "__pycache__", ".next", "venv", ".venv"];
 /// Safety limit only (pathological cases); answers are compact by design, not budgeted.
-const DEFAULT_TOKENS: usize = 12000;
+const DEFAULT_TOKENS: usize = 60000;
 const DEBOUNCE: Duration = Duration::from_secs(1);
 const STOP_METHODS: &[&str] = &["new", "default", "main", "init", "from", "get", "set", "run", "call", "len", "clone", "fmt", "test", "drop", "next", "build", "close", "open", "read", "write"];
 
@@ -962,34 +962,127 @@ fn split_symbol(sym: &str) -> (Option<&str>, &str) {
     (None, s)
 }
 
-pub fn refs_of<'a>(v: &'a View, sym: &str) -> (Vec<&'a Sym>, Vec<&'a Ref>) {
+/// Resolution of name matches to a definition. A reference is `exact` when it can be tied to
+/// the definition through its own file, an import/use line naming the defining module, a
+/// qualified path (`mod::name`, `Type::name`, `mod.name`) or a `self.`/`this.` receiver inside
+/// the defining file. Everything else is a name match only ("possible").
+pub struct Resolver<'a> {
+    imports: HashMap<(&'a str, &'a str), Vec<&'a str>>,
+}
+
+fn stems(path: &str) -> Vec<String> {
+    let mut v = vec![];
+    let mut it = path.rsplit('/');
+    let file = it.next().unwrap_or("");
+    let stem = file.rsplit_once('.').map(|x| x.0).unwrap_or(file);
+    if !matches!(stem, "mod" | "index" | "__init__" | "lib" | "main") {
+        v.push(stem.to_string());
+    }
+    if matches!(stem, "mod" | "index" | "__init__" | "lib" | "main") {
+        if let Some(d) = it.next() {
+            v.push(d.to_string());
+        }
+    }
+    v
+}
+
+fn has_word(text: &str, w: &str) -> bool {
+    text.match_indices(w).any(|(i, _)| {
+        let before = text[..i].chars().next_back();
+        let after = text[i + w.len()..].chars().next();
+        !before.map(|c| c.is_alphanumeric() || c == '_').unwrap_or(false) && !after.map(|c| c.is_alphanumeric() || c == '_').unwrap_or(false)
+    })
+}
+
+impl<'a> Resolver<'a> {
+    pub fn new(v: &'a View) -> Resolver<'a> {
+        let mut imports: HashMap<(&str, &str), Vec<&str>> = HashMap::new();
+        for r in &v.refs {
+            if r.kind == "import" {
+                imports.entry((r.path.as_str(), r.name.as_str())).or_default().push(r.text.as_str());
+            }
+        }
+        Resolver { imports }
+    }
+
+    /// Is `r` (a name match for `d.name`) provably a use of definition `d`?
+    pub fn exact(&self, d: &Sym, r: &Ref) -> bool {
+        if r.name != d.name {
+            return false;
+        }
+        if r.path == d.path {
+            if d.parent.is_empty() {
+                return true;
+            }
+            return r.text.contains(&format!("self.{}", d.name)) || r.text.contains(&format!("this.{}", d.name)) || r.text.contains(&format!("{}::{}", d.parent, d.name)) || r.text.contains(&format!("{}.{}", d.parent, d.name));
+        }
+        if !d.parent.is_empty() && (r.text.contains(&format!("{}::{}", d.parent, d.name)) || r.text.contains(&format!("{}.{}", d.parent, d.name))) {
+            return true;
+        }
+        let st = stems(&d.path);
+        for m in &st {
+            if r.text.contains(&format!("{m}::{}", d.name)) || r.text.contains(&format!("{m}.{}", d.name)) {
+                return true;
+            }
+        }
+        if d.parent.is_empty() || r.kind == "import" {
+            if let Some(texts) = self.imports.get(&(r.path.as_str(), r.name.as_str())) {
+                if texts.iter().any(|t| st.iter().any(|m| has_word(t, m))) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct RefHit<'a> {
+    pub r: &'a Ref,
+    pub exact: bool,
+}
+
+/// Definitions matching `sym` and every name match, exact ones first.
+pub fn refs_of<'a>(v: &'a View, sym: &str) -> (Vec<&'a Sym>, Vec<RefHit<'a>>) {
     let (parent, name) = split_symbol(sym);
     let defs: Vec<&Sym> = v.syms.iter().filter(|s| s.name == name && parent.map(|p| s.parent == p).unwrap_or(true)).collect();
     let def_lines: HashSet<(&str, u32)> = v.syms.iter().filter(|s| s.name == name).map(|s| (s.path.as_str(), s.line)).collect();
-    let mut refs: Vec<&Ref> = v.refs.iter().filter(|r| r.name == name && !def_lines.contains(&(r.path.as_str(), r.line))).collect();
-    refs.sort_by(|a, b| a.path.cmp(&b.path).then(a.line.cmp(&b.line)));
-    (defs, refs)
+    let res = Resolver::new(v);
+    let mut hits: Vec<RefHit> = v
+        .refs
+        .iter()
+        .filter(|r| r.name == name && !def_lines.contains(&(r.path.as_str(), r.line)))
+        .map(|r| RefHit { r, exact: defs.iter().any(|d| res.exact(d, r)) })
+        .collect();
+    hits.sort_by(|a, b| b.exact.cmp(&a.exact).then(a.r.path.cmp(&b.r.path)).then(a.r.line.cmp(&b.r.line)));
+    (defs, hits)
 }
 
 pub fn render_refs(v: &View, sym: &str, cap: usize) -> String {
-    let (defs, refs) = refs_of(v, sym);
+    let (defs, hits) = refs_of(v, sym);
     let mut out = Out::new(cap);
-    if defs.is_empty() && refs.is_empty() {
+    if defs.is_empty() && hits.is_empty() {
         return format!("no symbol named \"{sym}\". Try code_find with part of the name.\n");
     }
     for d in &defs {
         out.line(format!("def {}:{} {} {}", d.path, d.line, d.kind, d.sig));
     }
-    let files: HashSet<&str> = refs.iter().map(|r| r.path.as_str()).collect();
-    out.line(format!("{} refs in {} files:", refs.len(), files.len()));
-    let mut last = "";
-    for r in refs {
-        if r.path != last {
-            out.line(format!("{}:", r.path));
-            last = &r.path;
+    if defs.len() > 1 {
+        out.line(format!("note: {} definitions share this name. Qualify as Parent.name to separate them.", defs.len()));
+    }
+    for (label, exact, note) in [("exact", true, "resolved through the file, an import or a qualified path"), ("possible", false, "same name only, NOT confirmed. Verify before relying on it")] {
+        let list: Vec<&RefHit> = hits.iter().filter(|h| h.exact == exact).collect();
+        let files: HashSet<&str> = list.iter().map(|h| h.r.path.as_str()).collect();
+        out.line(format!("{label}: {} refs in {} files ({note})", list.len(), files.len()));
+        let mut last = "";
+        for h in list {
+            if h.r.path != last {
+                out.line(format!("{}:", h.r.path));
+                last = &h.r.path;
+            }
+            let inn = if h.r.from.is_empty() { String::new() } else { format!(" [{}]", h.r.from) };
+            out.line(format!("  {}{} {}", h.r.line, inn, h.r.text));
         }
-        let inn = if r.from.is_empty() { String::new() } else { format!(" [{}]", r.from) };
-        out.line(format!("  {}{} {}", r.line, inn, r.text));
     }
     out.finish("Parent.name or a more specific symbol")
 }
@@ -1005,32 +1098,47 @@ pub struct Dependent {
     pub line: u32,
     pub via: String,
     pub depth: u8,
+    pub exact: bool,
 }
 
 pub fn dependents(v: &View, changed: &[&Sym]) -> Vec<Dependent> {
-    let kinds: HashMap<&str, &str> = v.syms.iter().map(|s| (s.name.as_str(), s.kind.as_str())).collect();
+    let res = Resolver::new(v);
     let mut by_name: HashMap<&str, Vec<&Ref>> = HashMap::new();
     for r in &v.refs {
         by_name.entry(&r.name).or_default().push(r);
     }
-    let mut frontier: Vec<String> = changed.iter().filter(|s| !is_noise(&s.kind, &s.name)).map(|s| s.name.clone()).collect();
-    let mut seen: HashSet<(String, String)> = changed.iter().map(|s| (s.path.clone(), s.name.clone())).collect();
-    let mut out = vec![];
+    let mut frontier: Vec<(Sym, bool)> = changed.iter().filter(|s| !is_noise(&s.kind, &s.name)).map(|s| ((*s).clone(), true)).collect();
+    let mut seen: HashMap<(String, String), usize> = HashMap::new();
+    for s in changed {
+        seen.insert((s.path.clone(), s.name.clone()), usize::MAX);
+    }
+    let mut out: Vec<Dependent> = vec![];
     for depth in 1..=2u8 {
         let mut next = vec![];
-        for name in &frontier {
-            for r in by_name.get(name.as_str()).map(|v| v.as_slice()).unwrap_or(&[]) {
-                if r.from.is_empty() || is_noise(kinds.get(r.from.as_str()).copied().unwrap_or(""), &r.from) {
+        for (d, d_exact) in &frontier {
+            for r in by_name.get(d.name.as_str()).map(|v| v.as_slice()).unwrap_or(&[]) {
+                if r.from.is_empty() {
                     continue;
                 }
-                if !seen.insert((r.path.clone(), r.from.clone())) {
+                let Some(from) = v.syms.iter().find(|s| s.path == r.path && s.name == r.from && s.line == r.from_line) else { continue };
+                if is_noise(&from.kind, &from.name) {
                     continue;
                 }
-                out.push(Dependent { path: r.path.clone(), name: r.from.clone(), line: r.from_line, via: name.clone(), depth });
-                next.push(r.from.clone());
-                if out.len() >= 400 {
-                    return out;
+                let exact = *d_exact && res.exact(d, r);
+                let key = (r.path.clone(), r.from.clone());
+                match seen.get(&key) {
+                    Some(&i) if i == usize::MAX => continue,
+                    Some(&i) => {
+                        if exact && !out[i].exact {
+                            out[i].exact = true;
+                        }
+                        continue;
+                    }
+                    None => {}
                 }
+                seen.insert(key, out.len());
+                out.push(Dependent { path: r.path.clone(), name: r.from.clone(), line: r.from_line, via: d.name.clone(), depth, exact });
+                next.push((from.clone(), exact));
             }
         }
         frontier = next;
@@ -1049,15 +1157,18 @@ pub fn render_impact(v: &View, cs: &ChangeSet, cap: usize) -> String {
         out.line(format!("  {}:{} {} {}", s.path, s.line, s.kind, s.name));
     }
     let deps = dependents(v, &ch);
-    let (d1, d2) = (deps.iter().filter(|d| d.depth == 1).count(), deps.iter().filter(|d| d.depth == 2).count());
-    out.line(format!("dependents: {d1} direct, {d2} indirect"));
-    let mut by_file: BTreeMap<&str, Vec<&Dependent>> = BTreeMap::new();
-    for d in &deps {
-        by_file.entry(&d.path).or_default().push(d);
-    }
-    for (p, ds) in by_file {
-        let list: Vec<String> = ds.iter().map(|d| format!("{}:{} d{} <- {}", d.name, d.line, d.depth, d.via)).collect();
-        out.line(format!("  {p}  {}", list.join(", ")));
+    for (label, exact) in [("exact", true), ("possible (name match only, verify)", false)] {
+        let list: Vec<&Dependent> = deps.iter().filter(|d| d.exact == exact).collect();
+        let (d1, d2) = (list.iter().filter(|d| d.depth == 1).count(), list.iter().filter(|d| d.depth == 2).count());
+        out.line(format!("dependents {label}: {d1} direct, {d2} indirect"));
+        let mut by_file: BTreeMap<&str, Vec<&&Dependent>> = BTreeMap::new();
+        for d in &list {
+            by_file.entry(&d.path).or_default().push(d);
+        }
+        for (p, ds) in by_file {
+            let l: Vec<String> = ds.iter().map(|d| format!("{}:{} d{} <- {}", d.name, d.line, d.depth, d.via)).collect();
+            out.line(format!("  {p}  {}", l.join(", ")));
+        }
     }
     out.finish("a smaller change set or code_refs <symbol>")
 }
@@ -1214,6 +1325,7 @@ pub fn resolve_agent(ctx: &Ctx, agent: &str) -> Result<Target, String> {
 }
 
 pub struct Loaded {
+    pub header: String,
     pub t: Target,
     pub view: View,
     pub base: String,
@@ -1223,11 +1335,12 @@ async fn load(ctx: &Arc<Ctx>, t: Target) -> Result<Loaded, String> {
     let c = ctx.clone();
     let tt = t.clone();
     let (view, base) = tokio::task::spawn_blocking(move || {
-        index_target(&c, &tt.repo_id, &tt.repo_path, &tt.branch, tt.wt.as_ref().map(|w| (w.id.as_str(), w.path.as_path())), false)
+        index_target(&c, &tt.repo_id, &tt.repo_path, &tt.branch, tt.wt.as_ref().map(|w| (w.id.as_str(), w.path.as_path())), true)
     })
     .await
     .map_err(|e| e.to_string())??;
-    Ok(Loaded { t, view, base })
+    let header = format!("index {} up to date (checked {} changed files on disk)\n", &base[..base.len().min(8)], t.wt.as_ref().map(|w| delta_files(&w.path, &base).len()).unwrap_or(0));
+    Ok(Loaded { header, t, view, base })
 }
 
 fn cap_of(args: &Value) -> usize {
@@ -1433,19 +1546,19 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
                     });
                     Ok(json!({ "repo_id": l.t.repo_id, "base_commit": l.base, "files": c("ci_files"), "syms": c("ci_syms"), "refs": c("ci_refs"), "built_at": built, "worktree": wt }))
                 }
-                "map" => Ok(json!({ "text": render_map(&l.view, args["path"].as_str(), args["depth"].as_u64().unwrap_or(2) as usize, cap) })),
+                "map" => Ok(json!({ "text": l.header.clone() + &render_map(&l.view, args["path"].as_str(), args["depth"].as_u64().unwrap_or(2) as usize, cap) })),
                 "find" => {
                     let q = args["query"].as_str().ok_or("missing `query`")?;
-                    let items: Vec<Value> = find_items(&l.view, q, args["kind"].as_str()).into_iter().take(200).map(sym_json).collect();
-                    Ok(json!({ "text": render_find(&l.view, q, args["kind"].as_str(), cap), "items": items }))
+                    let items: Vec<Value> = find_items(&l.view, q, args["kind"].as_str()).into_iter().map(sym_json).collect();
+                    Ok(json!({ "text": l.header.clone() + &render_find(&l.view, q, args["kind"].as_str(), cap), "items": items }))
                 }
                 "refs" => {
                     let s = args["symbol"].as_str().ok_or("missing `symbol`")?;
                     let (defs, refs) = refs_of(&l.view, s);
                     Ok(json!({
-                        "text": render_refs(&l.view, s, cap),
+                        "text": l.header.clone() + &render_refs(&l.view, s, cap),
                         "defs": defs.into_iter().map(sym_json).collect::<Vec<_>>(),
-                        "refs": refs.into_iter().take(300).map(|r| json!({ "path": r.path, "line": r.line, "kind": r.kind, "from": r.from, "text": r.text })).collect::<Vec<_>>(),
+                        "refs": refs.into_iter().map(|h| json!({ "path": h.r.path, "line": h.r.line, "kind": h.r.kind, "from": h.r.from, "text": h.r.text, "exact": h.exact })).collect::<Vec<_>>(),
                     }))
                 }
                 "impact" => {
@@ -1453,9 +1566,9 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
                     let ch = changed_syms(&l.view, &cs);
                     let deps = dependents(&l.view, &ch);
                     Ok(json!({
-                        "text": render_impact(&l.view, &cs, cap),
+                        "text": l.header.clone() + &render_impact(&l.view, &cs, cap),
                         "changed": ch.into_iter().map(sym_json).collect::<Vec<_>>(),
-                        "dependents": deps.iter().map(|d| json!({ "path": d.path, "name": d.name, "line": d.line, "via": d.via, "depth": d.depth })).collect::<Vec<_>>(),
+                        "dependents": deps.iter().map(|d| json!({ "path": d.path, "name": d.name, "line": d.line, "via": d.via, "depth": d.depth, "exact": d.exact })).collect::<Vec<_>>(),
                     }))
                 }
                 "tree" => {
@@ -1495,13 +1608,13 @@ pub fn mcp_tools() -> Vec<Value> {
         json!({ "name": name, "description": desc, "inputSchema": { "type": "object", "properties": props, "required": req } })
     };
     vec![
-        t("code_map", "USE FIRST for 'what is in this repo/dir' questions, before ls, grep or reading files. Returns a small ranked outline of directories, files and their key symbols for your worktree. Pass `path` to zoom into a directory.",
+        t("code_map", "USE FIRST for 'what is in this repo/dir' questions, before ls, grep or reading files. Returns a small ranked outline of directories, files and their key symbols for your worktree. Pass `path` to zoom into a directory. Verify by reading the cited lines before editing.",
           json!({ "path": s, "depth": i }), &[]),
-        t("code_find", "USE BEFORE grep to locate a function, class, struct or type by name. Returns `path:line kind name signature` lines (ranked, fuzzy). Then read only the lines you need.",
+        t("code_find", "USE BEFORE grep to locate a function, class, struct or type by name. Returns `path:line kind name signature` lines (ranked, fuzzy). Results are index hits: read the cited lines to verify before editing.",
           json!({ "query": s, "kind": s }), &["query"]),
-        t("code_refs", "USE BEFORE grep to see where a symbol is defined and who calls or uses it. Returns the definition and every caller with path:line and the source line. Accepts `Parent.name`.",
+        t("code_refs", "USE BEFORE grep to see where a symbol is defined and who calls or uses it. Returns the definition and every caller with path:line and the source line. Accepts `Parent.name`. Each ref is labelled exact (resolved via file/import/qualified path) or possible (same name only, unconfirmed). Read the cited lines to verify before editing.",
           json!({ "symbol": s }), &["symbol"]),
-        t("code_impact", "What your uncommitted and committed changes touch: changed symbols vs merge-base plus the code that depends on them (2 levels). Use before finishing to check what might break.",
+        t("code_impact", "What your uncommitted and committed changes touch: changed symbols vs merge-base plus the code that depends on them (2 levels). Dependents are labelled exact or possible (name match only). Use before finishing, then read the cited lines to verify.",
           json!({}), &[]),
     ]
 }
@@ -1517,7 +1630,7 @@ pub async fn mcp_call(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Resu
         "code_impact" => render_impact(&l.view, &changes_of(&l)?, cap),
         _ => return Err(format!("unknown tool {name}")),
     };
-    Ok(Value::String(text))
+    Ok(Value::String(l.header.clone() + &text))
 }
 
 // ---------------------------------------------------------------- tests
@@ -1592,7 +1705,7 @@ mod tests {
         assert!(v.syms.iter().any(|s| s.name == "helper"));
         let (defs, refs) = refs_of(&v, "helper");
         assert_eq!(defs.len(), 1);
-        assert!(refs.iter().any(|x| x.path == "src/b.rs" && x.from == "caller"));
+        assert!(refs.iter().any(|x| x.r.path == "src/b.rs" && x.r.from == "caller" && x.exact));
 
         let w = worktree(&r, "feat");
         std::fs::write(w.join("src/a.rs"), "pub struct Cfg { x: u32 }\nimpl Cfg {\n    pub fn load(&self) -> u32 {\n        helper(self.x)\n    }\n}\npub fn helper(n: u32) -> u32 {\n    n + 2\n}\n").unwrap();
@@ -1643,6 +1756,28 @@ mod tests {
         let w4 = mk("four", &format!("{base_a}pub fn zed() {{}}\n"), None);
         let cl = clashes_from(&[w1, w4]);
         assert_eq!(cl[0].severity, "same_file", "{cl:?}");
+    }
+
+    #[test]
+    fn exact_vs_possible() {
+        let mut v = View::default();
+        for (p, src) in [
+            ("src/a.rs", "pub fn load() {}\n"),
+            ("src/other.rs", "pub fn load() {}\n"),
+            ("src/b.rs", "use crate::a::load;\npub fn go() {\n    load();\n}\n"),
+            ("src/c.rs", "pub fn y() {\n    load();\n}\n"),
+            ("src/d.rs", "pub fn z() {\n    a::load();\n}\n"),
+        ] {
+            let (s, r) = parse(p, src);
+            v.syms.extend(s);
+            v.refs.extend(r);
+        }
+        let (_, hits) = refs_of(&v, "load");
+        let ex = |p: &str| hits.iter().find(|h| h.r.path == p && h.r.kind != "import").map(|h| h.exact);
+        assert_eq!(ex("src/d.rs"), Some(true));
+        assert_eq!(ex("src/c.rs"), Some(false), "no import: possible only");
+        let t = render_refs(&v, "load", 100000);
+        assert!(t.find("exact:").unwrap() < t.find("possible:").unwrap(), "{t}");
     }
 
     #[test]
