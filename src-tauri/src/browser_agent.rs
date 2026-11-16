@@ -331,13 +331,11 @@ fn status(ctx: &Ctx, owner: &str, tab: &str, me: &str, text: &str) {
 /// Entry from `mcp::call_tool` for every `browser_*` tool. `agent` is the agent id.
 /// Image results are returned as `{"__mcp_content": [...]}`.
 pub async fn mcp_call(ctx: &Arc<Ctx>, agent: &str, me: &str, strict: bool, name: &str, a: Value) -> Result<Value, String> {
-    let check = |url: &str| -> Result<String, String> {
-        let u = normalize_url(url)?;
-        if strict && !strict_url_ok(&u) {
-            return Err("Strict agents can only open local pages (http://localhost or 127.0.0.1)".into());
-        }
-        Ok(u)
-    };
+    // Strict agents may browse anywhere: the pane warns that page content
+    // reaches their provider, and each agent's profile holds only the logins
+    // the human chose to make in it.
+    let _ = strict;
+    let check = |url: &str| -> Result<String, String> { normalize_url(url) };
     match name {
         "browser_open" => {
             let url = check(super::arg_str(&a, "url")?.as_str())?;
