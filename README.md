@@ -1,4 +1,4 @@
-# Filium
+# Philium
 
 A lightweight, cross-platform agent workspace (Tauri 2) with [HAL](HAL) as its harness.
 
@@ -6,7 +6,7 @@ A lightweight, cross-platform agent workspace (Tauri 2) with [HAL](HAL) as its h
 - The token stays in the Rust process; the web UI can only reach HAL through a path-checked `hal` command.
 - Timeline shows every user message, model output, tool call (arguments + result) and token count per model request.
 - Tool permissions: ask (approve/deny in the UI), auto-deny, or auto-allow.
-- HAL shuts down when Filium quits (stdin EOF).
+- HAL shuts down when Philium quits (stdin EOF).
 
 ## Build
 

@@ -1,0 +1,66 @@
+/* Philium design tokens. Dark, quiet, precise. One accent, one danger,
+   and a dedicated "secure" hue so security state is always visible. */
+:root {
+  --bg: #0b0c0e;
+  --bg-raised: #111317;
+  --bg-sunken: #08090b;
+  --surface: #15171c;
+  --surface-hover: #1b1e24;
+  --surface-active: #21252d;
+  --line: #22262e;
+  --line-strong: #2e333d;
+
+  --text: #e8eaee;
+  --text-dim: #9aa1ad;
+  --text-faint: #6b7280;
+
+  --accent: #8b9cff;
+  --accent-dim: rgba(139, 156, 255, 0.14);
+  --secure: #4fd1a5;          /* trusted / sandboxed / protected */
+  --secure-dim: rgba(79, 209, 165, 0.12);
+  --strict: #f5b454;          /* untrusted provider, strict mode */
+  --strict-dim: rgba(245, 180, 84, 0.12);
+  --danger: #ff6b6b;
+  --danger-dim: rgba(255, 107, 107, 0.12);
+
+  --radius-s: 6px;
+  --radius: 10px;
+  --radius-l: 14px;
+  --shadow: 0 1px 0 rgba(255, 255, 255, 0.03) inset, 0 8px 24px rgba(0, 0, 0, 0.35);
+
+  --font: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  --mono: "JetBrains Mono", "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+  --fs-xs: 11px;
+  --fs-s: 12px;
+  --fs: 13px;
+  --fs-m: 15px;
+  --fs-l: 20px;
+
+  --sidebar-w: 216px;
+  --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+html, body, #root { height: 100%; margin: 0; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: var(--fs)/1.5 var(--font);
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+  user-select: none;
+}
+input, textarea, [contenteditable], pre, code, .selectable { user-select: text; }
+button, input, textarea, select { font: inherit; color: inherit; }
+::selection { background: var(--accent-dim); }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: var(--line-strong); border-radius: 10px; border: 3px solid var(--bg); }
+::-webkit-scrollbar-track { background: transparent; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+code, pre, .mono { font-family: var(--mono); font-size: var(--fs-s); }
+h1, h2, h3 { margin: 0; font-weight: 600; letter-spacing: -0.01em; }
+h1 { font-size: var(--fs-l); }
+h2 { font-size: var(--fs-m); }
+h3 { font-size: var(--fs); }
+a { color: var(--accent); text-decoration: none; }

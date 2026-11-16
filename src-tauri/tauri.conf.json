@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Filium",
+  "productName": "Philium",
   "version": "0.1.0",
-  "identifier": "dev.gunnarsson.filium",
+  "identifier": "dev.gunnarsson.philium",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:1420",
@@ -11,7 +11,7 @@
   },
   "app": {
     "windows": [
-      { "title": "Filium", "width": 1200, "height": 800, "minWidth": 800, "minHeight": 500 }
+      { "title": "Philium", "width": 1200, "height": 800, "minWidth": 800, "minHeight": 500 }
     ],
     "security": {
       "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; connect-src ipc: http://ipc.localhost"

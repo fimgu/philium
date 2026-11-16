@@ -59,6 +59,10 @@ pub struct Activity {
     pub resp_bytes: usize,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    /// Time to first response byte.
+    pub ttft_ms: Option<u64>,
+    /// Agent whose token made the request; None = desk chat.
+    pub agent: Option<String>,
     pub error: Option<String>,
 }
 
@@ -74,6 +78,11 @@ pub struct Gateway {
     pub token: String,
     client: reqwest::Client,
     routes: RwLock<HashMap<String, Route>>,
+    /// Extra tokens (one per agent) -> agent name, for attribution and
+    /// per-agent revocation. The desk token is `token`.
+    agent_tokens: RwLock<HashMap<String, String>>,
+    /// Agents restricted to a provider set (Strict agents on untrusted ones).
+    agent_providers: RwLock<HashMap<String, Vec<String>>>,
     log: Mutex<VecDeque<Record>>,
     next_id: AtomicU64,
     pub events: broadcast::Sender<Activity>,
@@ -104,6 +113,8 @@ impl Gateway {
                 .build()
                 .expect("http client"),
             routes: RwLock::new(HashMap::new()),
+            agent_tokens: RwLock::new(HashMap::new()),
+            agent_providers: RwLock::new(HashMap::new()),
             log: Mutex::new(VecDeque::new()),
             next_id: AtomicU64::new(1),
             events: broadcast::channel(256).0,
@@ -114,6 +125,22 @@ impl Gateway {
     pub fn set_routes(&self, routes: Vec<Route>) {
         *self.routes.write().unwrap() =
             routes.into_iter().map(|r| (r.provider.id.clone(), r)).collect();
+    }
+
+    /// Issue a gateway token for an agent. Optional provider allowlist.
+    pub fn issue_token(&self, agent: &str, providers: Option<Vec<String>>) -> String {
+        self.revoke_agent(agent);
+        let t = crate::hal::random_token();
+        self.agent_tokens.write().unwrap().insert(t.clone(), agent.to_string());
+        if let Some(p) = providers {
+            self.agent_providers.write().unwrap().insert(agent.to_string(), p);
+        }
+        t
+    }
+
+    pub fn revoke_agent(&self, agent: &str) {
+        self.agent_tokens.write().unwrap().retain(|_, a| a != agent);
+        self.agent_providers.write().unwrap().remove(agent);
     }
 
     pub fn router(self: &Arc<Self>) -> Router {
@@ -172,16 +199,21 @@ impl Gateway {
         }
     }
 
-    fn authorized(&self, headers: &HeaderMap) -> bool {
+    /// `Some(None)` = desk token, `Some(Some(agent))` = agent token.
+    fn who(&self, headers: &HeaderMap) -> Option<Option<String>> {
         let presented = headers
             .get("authorization")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "))
-            .or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()));
-        presented.is_some_and(|p| {
-            p.len() == self.token.len()
-                && p.bytes().zip(self.token.bytes()).fold(0u8, |a, (x, y)| a | (x ^ y)) == 0
-        })
+            .or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()))?;
+        let eq = |t: &str| {
+            presented.len() == t.len() && presented.bytes().zip(t.bytes()).fold(0u8, |a, (x, y)| a | (x ^ y)) == 0
+        };
+        if eq(&self.token) {
+            return Some(None);
+        }
+        let agents = self.agent_tokens.read().unwrap();
+        agents.iter().find(|(t, _)| eq(t)).map(|(_, a)| Some(a.clone()))
     }
 }
 
@@ -196,6 +228,7 @@ struct Finalizer {
     gw: Arc<Gateway>,
     id: u64,
     started: Instant,
+    first: Option<u64>,
     head: Vec<u8>,
     tail: VecDeque<u8>,
     total: usize,
@@ -204,6 +237,9 @@ struct Finalizer {
 
 impl Finalizer {
     fn feed(&mut self, chunk: &[u8]) {
+        if self.first.is_none() && !chunk.is_empty() {
+            self.first = Some(self.started.elapsed().as_millis() as u64);
+        }
         self.total += chunk.len();
         let room = HEAD_CAP.saturating_sub(self.head.len());
         self.head.extend_from_slice(&chunk[..room.min(chunk.len())]);
@@ -223,8 +259,10 @@ impl Drop for Finalizer {
         let total = self.total;
         let elapsed = self.started.elapsed().as_millis() as u64;
         let error = self.error.take();
+        let ttft = self.first;
         self.gw.update(self.id, |r| {
             let s = &mut r.summary;
+            s.ttft_ms = ttft;
             s.duration_ms = Some(elapsed);
             s.resp_bytes = total;
             s.input_tokens = input.or(s.input_tokens);
@@ -296,14 +334,21 @@ async fn proxy(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if !gw.authorized(&headers) {
-        return error_response(StatusCode::UNAUTHORIZED, "filium_auth", "invalid gateway token".into());
+    let Some(agent) = gw.who(&headers) else {
+        return error_response(StatusCode::UNAUTHORIZED, "philium_auth", "invalid gateway token".into());
+    };
+    if let Some(a) = &agent {
+        if let Some(allowed) = gw.agent_providers.read().unwrap().get(a) {
+            if !allowed.contains(&provider) {
+                return error_response(StatusCode::FORBIDDEN, "philium_route", format!("agent {a} may not use provider {provider}"));
+            }
+        }
     }
     let Some(route) = gw.routes.read().unwrap().get(&provider).cloned() else {
-        return error_response(StatusCode::NOT_FOUND, "filium_route", format!("unknown provider {provider}"));
+        return error_response(StatusCode::NOT_FOUND, "philium_route", format!("unknown provider {provider}"));
     };
     if rest.split('/').any(|s| s == ".." || s == ".") {
-        return error_response(StatusCode::BAD_REQUEST, "filium_route", "invalid path".into());
+        return error_response(StatusCode::BAD_REQUEST, "philium_route", "invalid path".into());
     }
     let p = &route.provider;
     let id = gw.next_id.fetch_add(1, Ordering::Relaxed);
@@ -355,6 +400,8 @@ async fn proxy(
         resp_bytes: 0,
         input_tokens: None,
         output_tokens: None,
+        ttft_ms: None,
+        agent,
         error: None,
     };
     gw.push(Record {
@@ -369,7 +416,7 @@ async fn proxy(
     });
     if blocked {
         let msg = format!(
-            "Filium guard blocked this request: it contains {}. Remove the secret or switch the provider's guard to redact.",
+            "Philium guard blocked this request: it contains {}. Remove the secret or switch the provider's guard to redact.",
             guard::summarize(&findings)
         );
         gw.update(id, |r| {
@@ -377,7 +424,7 @@ async fn proxy(
             r.summary.duration_ms = Some(0);
             r.summary.error = Some(msg.clone());
         });
-        return error_response(StatusCode::FORBIDDEN, "filium_guard", msg);
+        return error_response(StatusCode::FORBIDDEN, "philium_guard", msg);
     }
 
     let mut url = format!("{}/{}", p.base_url.trim_end_matches('/'), rest);
@@ -405,7 +452,7 @@ async fn proxy(
                 r.summary.error = Some(msg.clone());
                 r.summary.duration_ms = Some(started.elapsed().as_millis() as u64);
             });
-            return error_response(StatusCode::BAD_GATEWAY, "filium_upstream", msg);
+            return error_response(StatusCode::BAD_GATEWAY, "philium_upstream", msg);
         }
     };
     let status = resp.status();
@@ -417,6 +464,7 @@ async fn proxy(
         gw: gw.clone(),
         id,
         started,
+        first: None,
         head: Vec::new(),
         tail: VecDeque::new(),
         total: 0,
@@ -477,9 +525,10 @@ mod tests {
                 name: "CN".into(),
                 kind,
                 base_url: base.into(),
-                model: "m".into(),
-                context_window: 128000,
+                trusted: false,
                 guard,
+                enabled: true,
+                default_model: None,
             },
             api_key: Some("REAL-UPSTREAM-KEY".into()),
         }]);

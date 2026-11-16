@@ -1,15 +1,32 @@
-//! Provider settings. Metadata lives in `providers.json` in the app data dir;
-//! API keys live only in the OS keychain (macOS Keychain, Windows Credential
-//! Manager, Secret Service on Linux) and are read by the gateway, never by HAL.
+//! Provider accounts and live model discovery.
+//!
+//! Two families:
+//! - API-key providers (`openai_chat`, `openai_responses`, `anthropic`): the key
+//!   lives only in the OS keychain and is injected by the gateway. HAL only
+//!   ever sees `http://127.0.0.1:<gw>/p/<id>` plus a gateway token.
+//! - Subscriptions (`chatgpt`, `claude_code`): trusted logins owned by the
+//!   Codex/Claude CLIs. HAL talks to them directly (they never pass the
+//!   gateway, which is why they can only be marked trusted).
+//!
+//! Model lists are never hardcoded: they come from each provider's live
+//! `/models` (or HAL discovery for subscriptions) and are cached in SQLite.
+//! A model reference everywhere in Philium is `<provider id>/<model id>`,
+//! which is also exactly what HAL accepts as a session model selector.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
+use crate::ctx::{arg_opt_str, arg_str, Ctx};
+use crate::db::now;
+use crate::gateway::Route;
 use crate::guard::GuardMode;
 
-const KEYCHAIN_SERVICE: &str = "dev.gunnarsson.filium";
+const KEYCHAIN_SERVICE: &str = "dev.gunnarsson.philium";
 pub const RESERVED_CLAUDE: &str = "claude-code";
+const RESERVED: [&str; 5] = [RESERVED_CLAUDE, "none", "default", "chatgpt", "endpoint"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -20,43 +37,44 @@ pub enum Kind {
     OpenaiResponses,
     /// Anthropic Messages `/messages`.
     Anthropic,
+    /// ChatGPT subscription via the Codex CLI login.
+    Chatgpt,
+    /// Claude subscription via the Claude Code CLI.
+    ClaudeCode,
 }
 
 impl Kind {
-    pub fn hal_api(self) -> &'static str {
+    pub fn parse(s: &str) -> Result<Kind, String> {
+        serde_json::from_value(json!(s)).map_err(|_| format!("unknown provider kind {s}"))
+    }
+    pub fn as_str(self) -> &'static str {
         match self {
-            Kind::OpenaiChat => "chat_completions",
-            Kind::OpenaiResponses => "responses",
+            Kind::OpenaiChat => "openai_chat",
+            Kind::OpenaiResponses => "openai_responses",
             Kind::Anthropic => "anthropic",
+            Kind::Chatgpt => "chatgpt",
+            Kind::ClaudeCode => "claude_code",
         }
+    }
+    pub fn is_subscription(self) -> bool {
+        matches!(self, Kind::Chatgpt | Kind::ClaudeCode)
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Provider {
-    /// Stable slug; also the HAL model name and the gateway route segment.
+    /// Stable slug; HAL model key and gateway route segment.
     pub id: String,
     pub name: String,
     pub kind: Kind,
-    /// Real upstream URL, e.g. `https://api.example.cn/v1`.
+    /// Real upstream URL for API-key kinds. Empty for subscriptions.
     pub base_url: String,
-    /// Upstream model id.
-    pub model: String,
-    #[serde(default = "default_context")]
-    pub context_window: usize,
-    #[serde(default)]
+    /// Untrusted providers only ever run agents in Strict mode.
+    pub trusted: bool,
     pub guard: GuardMode,
-}
-
-fn default_context() -> usize {
-    128_000
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct Store {
-    pub providers: Vec<Provider>,
-    #[serde(default)]
-    pub default: Option<String>,
+    pub enabled: bool,
+    /// Model id used when a caller names just the provider.
+    pub default_model: Option<String>,
 }
 
 pub fn validate(p: &Provider) -> Result<(), String> {
@@ -64,8 +82,17 @@ pub fn validate(p: &Provider) -> Result<(), String> {
         && p.id.len() <= 40
         && p.id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
         && !p.id.starts_with('-');
-    if !id_ok || matches!(p.id.as_str(), RESERVED_CLAUDE | "none" | "default") {
-        return Err("ID must be lowercase letters, digits and dashes".into());
+    if !id_ok || RESERVED.contains(&p.id.as_str()) {
+        return Err("ID must be lowercase letters, digits and dashes (and not a reserved name)".into());
+    }
+    if p.name.trim().is_empty() {
+        return Err("Name is required".into());
+    }
+    if p.kind.is_subscription() {
+        if !p.trusted {
+            return Err("Subscriptions bypass the gateway, so they must be trusted".into());
+        }
+        return Ok(());
     }
     let url = reqwest::Url::parse(&p.base_url).map_err(|_| "Base URL is not a valid URL")?;
     let local = matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"));
@@ -75,52 +102,21 @@ pub fn validate(p: &Provider) -> Result<(), String> {
     if !url.username().is_empty() || url.password().is_some() || url.query().is_some() {
         return Err("Put credentials in the API key field, not the URL".into());
     }
-    // `$` would be env-expanded by HAL's config loader.
-    if p.model.trim().is_empty() || p.model.contains(['\n', '\r', '$', '"', '\\']) {
-        return Err("Model is required".into());
-    }
-    if p.name.trim().is_empty() {
-        return Err("Name is required".into());
+    if let Some(m) = &p.default_model {
+        valid_model_id(m)?;
     }
     Ok(())
 }
 
-impl Store {
-    pub fn path(dir: &Path) -> PathBuf {
-        dir.join("providers.json")
+/// `$` would be env-expanded by HAL's config loader; quotes/newlines break it.
+pub fn valid_model_id(m: &str) -> Result<(), String> {
+    if m.trim().is_empty() || m.len() > 200 || m.contains(['\n', '\r', '$', '"', '\\']) {
+        return Err(format!("invalid model id {m:?}"));
     }
-
-    pub fn load(dir: &Path) -> Store {
-        std::fs::read_to_string(Self::path(dir))
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
-    }
-
-    pub fn save(&self, dir: &Path) -> Result<(), String> {
-        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-        let tmp = dir.join("providers.json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(self).unwrap()).map_err(|e| e.to_string())?;
-        std::fs::rename(&tmp, Self::path(dir)).map_err(|e| e.to_string())
-    }
-
-    pub fn upsert(&mut self, p: Provider) {
-        match self.providers.iter_mut().find(|x| x.id == p.id) {
-            Some(x) => *x = p,
-            None => self.providers.push(p),
-        }
-        if self.default.as_ref().is_none_or(|d| !self.providers.iter().any(|p| &p.id == d)) {
-            self.default = self.providers.first().map(|p| p.id.clone());
-        }
-    }
-
-    pub fn remove(&mut self, id: &str) {
-        self.providers.retain(|p| p.id != id);
-        if self.default.as_deref() == Some(id) {
-            self.default = self.providers.first().map(|p| p.id.clone());
-        }
-    }
+    Ok(())
 }
+
+// ---------- keychain ----------
 
 fn entry(id: &str) -> Result<keyring::Entry, String> {
     keyring::Entry::new(KEYCHAIN_SERVICE, &format!("provider:{id}")).map_err(|e| e.to_string())
@@ -140,63 +136,510 @@ pub fn delete_key(id: &str) {
     }
 }
 
-/// The HAL config Filium launches HAL with. Every model points at the local
-/// gateway and carries only the per-launch gateway token, never a real key.
-pub fn hal_config(store: &Store, gateway: &str, token: &str, data_dir: &Path) -> serde_json::Value {
-    use serde_json::json;
+// ---------- storage ----------
+
+fn from_row(r: &Value) -> Option<Provider> {
+    Some(Provider {
+        id: r["id"].as_str()?.into(),
+        name: r["name"].as_str()?.into(),
+        kind: Kind::parse(r["kind"].as_str()?).ok()?,
+        base_url: r["base_url"].as_str().unwrap_or("").into(),
+        trusted: r["trust"].as_str() != Some("untrusted"),
+        guard: serde_json::from_value(r["guard_mode"].clone()).unwrap_or_default(),
+        enabled: r["enabled"].as_i64() != Some(0),
+        default_model: r["default_model"].as_str().map(str::to_string),
+    })
+}
+
+pub fn all(ctx: &Ctx) -> Vec<Provider> {
+    ctx.db
+        .query("SELECT * FROM providers ORDER BY created_at", [])
+        .unwrap_or_default()
+        .iter()
+        .filter_map(from_row)
+        .collect()
+}
+
+pub fn get(ctx: &Ctx, id: &str) -> Option<Provider> {
+    all(ctx).into_iter().find(|p| p.id == id)
+}
+
+fn upsert(ctx: &Ctx, p: &Provider) -> Result<(), String> {
+    let guard = serde_json::to_value(p.guard).unwrap();
+    ctx.db.exec(
+        "INSERT INTO providers(id,name,kind,base_url,trust,guard_mode,enabled,default_model,created_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)
+         ON CONFLICT(id) DO UPDATE SET name=?2,kind=?3,base_url=?4,trust=?5,guard_mode=?6,enabled=?7,default_model=?8",
+        rusqlite::params![
+            p.id,
+            p.name,
+            p.kind.as_str(),
+            p.base_url,
+            if p.trusted { "trusted" } else { "untrusted" },
+            guard.as_str().unwrap_or("redact"),
+            p.enabled as i64,
+            p.default_model,
+            now()
+        ],
+    )?;
+    Ok(())
+}
+
+/// Split `provider/model` (model ids may themselves contain `/`).
+pub fn split_ref(r: &str) -> Option<(&str, &str)> {
+    r.split_once('/').filter(|(p, m)| !p.is_empty() && !m.is_empty())
+}
+
+/// Resolve a model reference (or the global default) to (provider, model id).
+pub fn resolve(ctx: &Ctx, model_ref: Option<&str>) -> Result<(Provider, String), String> {
+    let wanted = match model_ref {
+        Some(r) if !r.is_empty() => r.to_string(),
+        _ => ctx.setting("default_model", ""),
+    };
+    let (pid, mid) = match split_ref(&wanted) {
+        Some((p, m)) => (p.to_string(), Some(m.to_string())),
+        None if !wanted.is_empty() => (wanted.clone(), None),
+        None => {
+            let p = all(ctx).into_iter().find(|p| p.enabled).ok_or("Add a provider first")?;
+            (p.id, None)
+        }
+    };
+    let p = get(ctx, &pid).ok_or_else(|| format!("unknown provider {pid}"))?;
+    if !p.enabled {
+        return Err(format!("provider {pid} is disabled"));
+    }
+    let mid = mid
+        .or_else(|| p.default_model.clone())
+        .or_else(|| first_model(ctx, &p.id))
+        .ok_or_else(|| format!("no models known for {pid}; refresh its model list"))?;
+    Ok((p, mid))
+}
+
+fn first_model(ctx: &Ctx, pid: &str) -> Option<String> {
+    ctx.db
+        .query("SELECT model_id FROM models WHERE provider_id=?1 AND enabled=1 ORDER BY model_id LIMIT 1", [pid])
+        .ok()?
+        .first()?["model_id"]
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Push enabled API-key providers (with keys from the keychain) to the gateway.
+pub fn sync_routes(ctx: &Ctx) {
+    let routes = all(ctx)
+        .into_iter()
+        .filter(|p| p.enabled && !p.kind.is_subscription())
+        .map(|p| Route { api_key: get_key(&p.id), provider: p })
+        .collect();
+    ctx.gateway.set_routes(routes);
+}
+
+// ---------- HAL config ----------
+
+/// What a HAL launch may see.
+#[derive(Default, Clone)]
+pub struct ConfigOpts {
+    /// Gateway token to embed (per-agent tokens give attribution). Defaults to
+    /// the gateway's own desk token.
+    pub token: Option<String>,
+    /// Restrict to these provider ids. `None` = every enabled provider.
+    pub only: Option<Vec<String>>,
+    /// Exclude subscription providers (Strict agents never get them).
+    pub no_subscriptions: bool,
+    /// Default model ref for new sessions.
+    pub default_ref: Option<String>,
+}
+
+pub struct HalSetup {
+    pub config: Value,
+    /// Real Codex/Claude login dirs are needed (a subscription is included).
+    pub allow_logins: bool,
+    /// Env overrides that hide whichever login is not included.
+    pub env: Vec<(String, String)>,
+}
+
+/// The HAL config for one launch. API-key models point at the local gateway
+/// with only a gateway token; subscriptions are HAL's own login transports.
+pub fn hal_setup(ctx: &Ctx, hal_data: &Path, opts: &ConfigOpts) -> HalSetup {
+    let token = opts.token.clone().unwrap_or_else(|| ctx.gateway.token.clone());
+    let gw = &ctx.gateway_url;
+    let providers: Vec<Provider> = all(ctx)
+        .into_iter()
+        .filter(|p| p.enabled)
+        .filter(|p| opts.only.as_ref().is_none_or(|o| o.contains(&p.id)))
+        .filter(|p| !(opts.no_subscriptions && p.kind.is_subscription()))
+        .collect();
     let mut models = serde_json::Map::new();
-    for p in &store.providers {
-        let mut m = json!({
-            "provider": "openai-compatible",
-            "api": p.kind.hal_api(),
-            "base_url": format!("{gateway}/p/{}", p.id),
-            "api_key": token,
-            "model": p.model,
-            "context_window": p.context_window,
-        });
-        if p.kind == Kind::Anthropic {
-            m["provider"] = json!("anthropic");
-            m["allow_anthropic_custom_endpoint"] = json!(true);
+    let (mut chatgpt, mut claude) = (false, false);
+    for p in &providers {
+        let model = p.default_model.clone().or_else(|| first_model(ctx, &p.id));
+        let mut m = match p.kind {
+            Kind::Chatgpt => {
+                chatgpt = true;
+                json!({ "provider": "openai", "api": "responses", "auth": "chatgpt" })
+            }
+            Kind::ClaudeCode => {
+                claude = true;
+                json!({ "provider": "claude-code", "api": "claude_code", "auth": "claude_code",
+                        "base_url": "", "context_window": 200000, "vision": false })
+            }
+            k => {
+                let mut m = json!({
+                    "provider": if k == Kind::Anthropic { "anthropic" } else { "openai-compatible" },
+                    "api": match k { Kind::OpenaiResponses => "responses", Kind::Anthropic => "anthropic", _ => "chat_completions" },
+                    "base_url": format!("{gw}/p/{}", p.id),
+                    "api_key": token,
+                });
+                if k == Kind::Anthropic {
+                    m["allow_anthropic_custom_endpoint"] = json!(true);
+                }
+                if let Some(cw) = model.as_ref().and_then(|mid| context_window(ctx, &p.id, mid)) {
+                    m["context_window"] = json!(cw);
+                }
+                m
+            }
+        };
+        if let Some(mid) = model {
+            m["model"] = json!(mid);
+        } else if !p.kind.is_subscription() {
+            m["model"] = json!("unknown");
         }
         models.insert(p.id.clone(), m);
     }
-    // HAL adds a `claude-code` model (local Claude CLI subscription, which
-    // would bypass the gateway) unless that name is already configured.
-    // Occupy it with a route the gateway does not serve: fails closed.
+    // HAL would add a `claude-code` model (local Claude CLI) on its own.
+    // Occupy that name with a route the gateway does not serve: fails closed.
     models.entry(RESERVED_CLAUDE.to_string()).or_insert_with(|| {
-        json!({
-            "provider": "openai-compatible",
-            "api": "chat_completions",
-            "base_url": format!("{gateway}/p/{RESERVED_CLAUDE}"),
-            "api_key": token,
-            "model": "disabled-in-filium",
-        })
+        json!({ "provider": "openai-compatible", "api": "chat_completions",
+                "base_url": format!("{gw}/p/{RESERVED_CLAUDE}"), "api_key": token,
+                "model": "disabled-in-philium" })
     });
-    if store.providers.is_empty() {
+    let mut default = None;
+    if let Some(r) = opts.default_ref.clone().or_else(|| Some(ctx.setting("default_model", ""))) {
+        let (pid, mid) = split_ref(&r).map(|(a, b)| (a, Some(b))).unwrap_or((r.as_str(), None));
+        if providers.iter().any(|p| p.id == pid) {
+            if let Some(mid) = mid {
+                models.get_mut(pid).unwrap()["model"] = json!(mid);
+            }
+            default = Some(pid.to_string());
+        }
+    }
+    let default = default.or_else(|| providers.first().map(|p| p.id.clone())).unwrap_or_else(|| {
         // HAL needs one model; this one has no gateway route, so it fails
         // closed with "unknown provider" instead of auto-detecting logins.
         models.insert(
             "none".into(),
-            json!({
-                "provider": "openai-compatible",
-                "api": "chat_completions",
-                "base_url": format!("{gateway}/p/none"),
-                "api_key": token,
-                "model": "add-a-provider-in-filium",
-            }),
+            json!({ "provider": "openai-compatible", "api": "chat_completions",
+                    "base_url": format!("{gw}/p/none"), "api_key": token,
+                    "model": "add-a-provider-in-philium" }),
         );
+        "none".into()
+    });
+    let no_login = hal_data.parent().unwrap_or(hal_data).join("no-login").to_string_lossy().into_owned();
+    let mut env = vec![];
+    if !chatgpt {
+        env.push(("CODEX_HOME".into(), no_login.clone()));
     }
-    let default = store
-        .default
-        .clone()
-        .filter(|d| models.contains_key(d))
-        .or_else(|| store.providers.first().map(|p| p.id.clone()))
-        .unwrap_or_else(|| "none".into());
+    if !claude {
+        env.push(("CLAUDE_CONFIG_DIR".into(), no_login));
+    }
+    HalSetup {
+        config: json!({ "server": { "data_dir": hal_data }, "default_model": default, "models": models }),
+        allow_logins: chatgpt || claude,
+        env,
+    }
+}
+
+fn context_window(ctx: &Ctx, pid: &str, mid: &str) -> Option<i64> {
+    ctx.db
+        .query("SELECT context_window FROM models WHERE provider_id=?1 AND model_id=?2", [pid, mid])
+        .ok()?
+        .first()?["context_window"]
+        .as_i64()
+}
+
+// ---------- discovery ----------
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Discovered {
+    pub id: String,
+    pub display: Option<String>,
+    pub context_window: Option<i64>,
+    pub price_in: Option<f64>,
+    pub price_out: Option<f64>,
+}
+
+/// Parse an OpenAI/Anthropic/OpenRouter-style `/models` body.
+pub fn parse_models(body: &Value) -> Vec<Discovered> {
+    let list = body.get("data").or_else(|| body.get("models")).unwrap_or(body);
+    let Some(arr) = list.as_array() else { return vec![] };
+    let mut out: Vec<Discovered> = arr
+        .iter()
+        .filter_map(|m| {
+            let id = m.get("id").or_else(|| m.get("slug")).or_else(|| m.get("name"))?.as_str()?.to_string();
+            valid_model_id(&id).ok()?;
+            let num = |v: Option<&Value>| v.and_then(|v| v.as_f64().or_else(|| v.as_str()?.parse().ok()));
+            Some(Discovered {
+                display: m.get("display_name").or_else(|| m.get("name")).and_then(Value::as_str).map(str::to_string).filter(|d| *d != id),
+                context_window: num(m.get("context_length").or_else(|| m.get("context_window")).or_else(|| m.pointer("/top_provider/context_length"))).map(|x| x as i64),
+                // OpenRouter reports $/token as strings; store $/1M tokens.
+                price_in: num(m.pointer("/pricing/prompt")).map(|x| x * 1e6),
+                price_out: num(m.pointer("/pricing/completion")).map(|x| x * 1e6),
+                id,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out.dedup_by(|a, b| a.id == b.id);
+    out
+}
+
+async fn discover(ctx: &Arc<Ctx>, p: &Provider) -> Result<Vec<Discovered>, String> {
+    if p.kind.is_subscription() {
+        return discover_via_hal(ctx, p).await;
+    }
+    let key = get_key(&p.id).unwrap_or_default();
+    let url = format!("{}/models", p.base_url.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut req = client.get(&url);
+    if !key.is_empty() {
+        req = match p.kind {
+            Kind::Anthropic => req.header("x-api-key", &key).header("anthropic-version", "2023-06-01"),
+            _ => req.bearer_auth(&key),
+        };
+    }
+    let resp = req.send().await.map_err(|e| format!("{url}: {}", e.without_url()))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("HTTP {status} from {url}: {}", text.chars().take(300).collect::<String>()));
+    }
+    let body: Value = resp.json().await.map_err(|e| format!("bad /models JSON: {e}"))?;
+    let list = parse_models(&body);
+    if list.is_empty() {
+        return Err("provider returned no models".into());
+    }
+    Ok(list)
+}
+
+/// Subscriptions: ask the desk HAL (which holds the real logins) to list.
+async fn discover_via_hal(ctx: &Arc<Ctx>, p: &Provider) -> Result<Vec<Discovered>, String> {
+    let hal = ctx.desk().ok_or("harness is not running")?;
+    let groups = hal.call(reqwest::Method::GET, "/models?discover=true", None).await?;
+    let g = groups
+        .as_array()
+        .and_then(|a| a.iter().find(|g| g["name"] == p.id.as_str()))
+        .ok_or("the harness does not see this subscription; is the CLI signed in?")?;
+    if let Some(e) = g["error"].as_str() {
+        return Err(e.to_string());
+    }
+    let prefix = format!("{}/", p.id);
+    let mut out: Vec<Discovered> = g["choices"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(|c| if c == p.id { g["model"].as_str().unwrap_or(c) } else { c.strip_prefix(&prefix).unwrap_or(c) })
+        .filter(|id| valid_model_id(id).is_ok())
+        .map(|id| Discovered { id: id.to_string(), display: None, context_window: None, price_in: None, price_out: None })
+        .collect();
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out.dedup_by(|a, b| a.id == b.id);
+    Ok(out)
+}
+
+/// Refresh one provider's models into SQLite. User edits (enabled, prices,
+/// context window) survive; vanished models are removed.
+pub async fn refresh_models(ctx: &Arc<Ctx>, id: &str) -> Result<Vec<Value>, String> {
+    let p = get(ctx, id).ok_or("unknown provider")?;
+    let found = match discover(ctx, &p).await {
+        Ok(f) => f,
+        Err(e) => {
+            ctx.db.kv_set(&format!("models_error.{id}"), &e)?;
+            ctx.notify("providers");
+            return Err(e);
+        }
+    };
+    let t = now();
+    ctx.db.with(|c| {
+        let tx = c.unchecked_transaction()?;
+        for m in &found {
+            tx.execute(
+                "INSERT INTO models(provider_id,model_id,display,context_window,price_in,price_out,discovered_at)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7)
+                 ON CONFLICT(provider_id,model_id) DO UPDATE SET discovered_at=?7,
+                   display=COALESCE(display,?3), context_window=COALESCE(context_window,?4),
+                   price_in=COALESCE(price_in,?5), price_out=COALESCE(price_out,?6)",
+                rusqlite::params![id, m.id, m.display, m.context_window, m.price_in, m.price_out, t],
+            )?;
+        }
+        tx.execute("DELETE FROM models WHERE provider_id=?1 AND discovered_at<?2", rusqlite::params![id, t])?;
+        tx.execute("UPDATE providers SET models_cached_at=?2 WHERE id=?1", rusqlite::params![id, t])?;
+        tx.commit()
+    })?;
+    ctx.db.exec("DELETE FROM kv WHERE k=?1", [format!("models_error.{id}")])?;
+    ctx.notify("providers");
+    ctx.emit("providers:changed", json!({ "id": id }));
+    models(ctx, Some(id))
+}
+
+pub fn models(ctx: &Ctx, provider: Option<&str>) -> Result<Vec<Value>, String> {
+    let sql = "SELECT m.*, p.name AS provider_name, p.trust, p.kind, p.provider_id || '/' || m.model_id AS ref
+               FROM models m JOIN (SELECT id AS provider_id, name, trust, kind, enabled FROM providers) p USING(provider_id)
+               WHERE p.enabled=1 AND (?1 IS NULL OR m.provider_id=?1) ORDER BY p.provider_id, m.model_id";
+    ctx.db.query(sql, [provider])
+}
+
+/// Which subscription CLIs are signed in on this machine.
+pub fn detect_logins() -> Value {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default();
+    let codex = std::env::var_os("CODEX_HOME").map(Into::into).unwrap_or_else(|| home.join(".codex"));
+    let claude_dir = std::env::var_os("CLAUDE_CONFIG_DIR").map(Into::into).unwrap_or_else(|| home.join(".claude"));
+    let claude_bin = ["/opt/homebrew/bin/claude", "/usr/local/bin/claude"]
+        .iter()
+        .map(std::path::PathBuf::from)
+        .chain(std::iter::once(home.join(".local/bin/claude")))
+        .chain(std::iter::once(home.join(".claude/local/claude")))
+        .any(|p| p.exists());
     json!({
-        "server": { "data_dir": data_dir },
-        "default_model": default,
-        "models": models,
+        "chatgpt": codex.join("auth.json").exists(),
+        "claude_code": claude_bin && claude_dir.exists(),
     })
+}
+
+// ---------- module ----------
+
+pub fn init(ctx: &Arc<Ctx>) -> Result<(), String> {
+    sync_routes(ctx);
+    // Refresh stale model lists in the background (6h TTL).
+    let c = ctx.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        for p in all(&c).into_iter().filter(|p| p.enabled) {
+            let fresh = c
+                .db
+                .query("SELECT models_cached_at FROM providers WHERE id=?1", [&p.id])
+                .ok()
+                .and_then(|r| r.first()?["models_cached_at"].as_i64())
+                .is_some_and(|t| now() - t < 6 * 3600 * 1000);
+            if !fresh {
+                let _ = refresh_models(&c, &p.id).await;
+            }
+        }
+    });
+    Ok(())
+}
+
+fn public(ctx: &Ctx, p: &Provider) -> Value {
+    let count = ctx
+        .db
+        .query("SELECT COUNT(*) AS n FROM models WHERE provider_id=?1", [&p.id])
+        .ok()
+        .and_then(|r| r.first()?["n"].as_i64())
+        .unwrap_or(0);
+    let cached = ctx
+        .db
+        .query("SELECT models_cached_at FROM providers WHERE id=?1", [&p.id])
+        .ok()
+        .and_then(|r| r.first().map(|x| x["models_cached_at"].clone()))
+        .unwrap_or(Value::Null);
+    let mut v = serde_json::to_value(p).unwrap();
+    v["has_key"] = json!(p.kind.is_subscription() || get_key(&p.id).is_some_and(|k| !k.is_empty()));
+    v["model_count"] = json!(count);
+    v["models_cached_at"] = cached;
+    v["models_error"] = json!(ctx.db.kv_get(&format!("models_error.{}", p.id)));
+    v["via_gateway"] = json!(!p.kind.is_subscription());
+    v
+}
+
+pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, String> {
+    match method {
+        "list" => Ok(json!(all(ctx).iter().map(|p| public(ctx, p)).collect::<Vec<_>>())),
+        "logins" => Ok(detect_logins()),
+        "save" => {
+            let kind = Kind::parse(&arg_str(&args, "kind")?)?;
+            let id = arg_str(&args, "id")?;
+            let existing = get(ctx, &id);
+            if args["create"].as_bool() == Some(true) && existing.is_some() {
+                return Err(format!("a provider with id {id} already exists"));
+            }
+            let p = Provider {
+                name: arg_str(&args, "name")?,
+                kind,
+                base_url: if kind.is_subscription() { String::new() } else { arg_str(&args, "base_url")?.trim().to_string() },
+                trusted: args["trusted"].as_bool().unwrap_or(kind.is_subscription()),
+                guard: serde_json::from_value(args["guard"].clone()).unwrap_or(existing.as_ref().map(|e| e.guard).unwrap_or_default()),
+                enabled: args["enabled"].as_bool().unwrap_or(true),
+                default_model: arg_opt_str(&args, "default_model").filter(|s| !s.is_empty()).or(existing.and_then(|e| e.default_model)),
+                id,
+            };
+            validate(&p)?;
+            if let Some(k) = arg_opt_str(&args, "api_key").filter(|k| !k.trim().is_empty()) {
+                if k.contains(['\n', '\r']) {
+                    return Err("API key contains a line break".into());
+                }
+                set_key(&p.id, k.trim())?;
+            }
+            upsert(ctx, &p)?;
+            if ctx.setting("default_model", "").is_empty() {
+                ctx.db.kv_set("setting.default_model", &p.id)?;
+            }
+            sync_routes(ctx);
+            ctx.log_event("provider_saved", None, &json!({ "id": p.id, "kind": p.kind, "trusted": p.trusted }));
+            ctx.notify("providers");
+            ctx.emit("providers:changed", json!({ "id": p.id }));
+            // Discovery runs after the desk HAL picks up a new subscription.
+            let (c, id) = (ctx.clone(), p.id.clone());
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                let _ = refresh_models(&c, &id).await;
+            });
+            Ok(public(ctx, &p))
+        }
+        "remove" => {
+            let id = arg_str(&args, "id")?;
+            ctx.db.exec("DELETE FROM providers WHERE id=?1", [&id])?;
+            ctx.db.exec("DELETE FROM models WHERE provider_id=?1", [&id])?;
+            delete_key(&id);
+            if split_ref(&ctx.setting("default_model", "")).map(|x| x.0).unwrap_or(&ctx.setting("default_model", "")) == id {
+                let next = all(ctx).first().map(|p| p.id.clone()).unwrap_or_default();
+                ctx.db.kv_set("setting.default_model", &next)?;
+            }
+            sync_routes(ctx);
+            ctx.log_event("provider_removed", None, &json!({ "id": id }));
+            ctx.notify("providers");
+            ctx.emit("providers:changed", json!({ "id": id }));
+            Ok(Value::Null)
+        }
+        "refresh_models" => Ok(json!(refresh_models(ctx, &arg_str(&args, "id")?).await?)),
+        "models" => Ok(json!(models(ctx, arg_opt_str(&args, "provider").as_deref())?)),
+        "set_model" => {
+            let pid = arg_str(&args, "provider")?;
+            let mid = arg_str(&args, "model")?;
+            for (col, v) in [("price_in", &args["price_in"]), ("price_out", &args["price_out"]), ("context_window", &args["context_window"])] {
+                if !v.is_null() {
+                    let sql = format!("UPDATE models SET {col}=?3 WHERE provider_id=?1 AND model_id=?2");
+                    ctx.db.exec(&sql, rusqlite::params![pid, mid, v.as_f64()])?;
+                }
+            }
+            if let Some(e) = args["enabled"].as_bool() {
+                ctx.db.exec("UPDATE models SET enabled=?3 WHERE provider_id=?1 AND model_id=?2", rusqlite::params![pid, mid, e as i64])?;
+            }
+            ctx.notify("providers");
+            Ok(Value::Null)
+        }
+        "set_default" => {
+            let r = arg_str(&args, "ref")?;
+            let (p, m) = resolve(ctx, Some(&r))?;
+            ctx.db.kv_set("setting.default_model", &format!("{}/{m}", p.id))?;
+            ctx.notify("providers");
+            Ok(json!(format!("{}/{m}", p.id)))
+        }
+        "default" => Ok(json!(resolve(ctx, None).ok().map(|(p, m)| format!("{}/{m}", p.id)))),
+        _ => Err(format!("unknown providers.{method}")),
+    }
 }
 
 #[cfg(test)]
@@ -209,9 +652,10 @@ mod tests {
             name: "X".into(),
             kind: Kind::OpenaiChat,
             base_url: url.into(),
-            model: "m".into(),
-            context_window: 1000,
+            trusted: false,
             guard: GuardMode::Redact,
+            enabled: true,
+            default_model: Some("m".into()),
         }
     }
 
@@ -219,11 +663,9 @@ mod tests {
     #[test]
     #[ignore]
     fn keychain_roundtrip() {
-        let id = "filium-selftest";
+        let id = "philium-selftest";
         set_key(id, "k-123").unwrap();
         assert_eq!(get_key(id).as_deref(), Some("k-123"));
-        set_key(id, "k-456").unwrap();
-        assert_eq!(get_key(id).as_deref(), Some("k-456"));
         delete_key(id);
         assert_eq!(get_key(id), None);
     }
@@ -239,33 +681,89 @@ mod tests {
             ("x", "https://user:pw@a/v1"),
             ("x", "https://a/v1?key=1"),
             ("x", "ftp://a"),
+            (RESERVED_CLAUDE, "https://a/v1"),
+            ("none", "https://a/v1"),
         ] {
             assert!(validate(&p(id, url)).is_err(), "{id} {url}");
         }
+        let mut s = p("sub", "");
+        s.kind = Kind::Chatgpt;
+        assert!(validate(&s).is_err(), "untrusted subscription rejected");
+        s.trusted = true;
+        assert!(validate(&s).is_ok());
     }
 
     #[test]
     fn hal_config_never_contains_real_endpoints_or_keys() {
-        let mut s = Store::default();
-        s.upsert(p("cn", "https://api.example.cn/v1"));
+        let ctx = Ctx::test();
+        upsert(&ctx, &p("cn", "https://api.example.cn/v1")).unwrap();
         let mut a = p("claude", "https://api.anthropic.com/v1");
         a.kind = Kind::Anthropic;
-        s.upsert(a);
-        let c = hal_config(&s, "http://127.0.0.1:9", "TOKEN", Path::new("/d"));
+        upsert(&ctx, &a).unwrap();
+        let s = hal_setup(&ctx, Path::new("/d/hal"), &ConfigOpts::default());
+        let c = &s.config;
         let text = c.to_string();
         assert!(!text.contains("example.cn") && !text.contains("anthropic.com"));
         assert_eq!(c["default_model"], "cn");
         assert_eq!(c["models"]["cn"]["base_url"], "http://127.0.0.1:9/p/cn");
+        assert_eq!(c["models"]["cn"]["api_key"], "test-token");
         assert_eq!(c["models"]["claude"]["api"], "anthropic");
-        assert_eq!(c["models"]["claude"]["allow_anthropic_custom_endpoint"], true);
-        let empty = hal_config(&Store::default(), "http://127.0.0.1:9", "T", Path::new("/d"));
-        assert_eq!(empty["default_model"], "none");
-        for c in [&c, &empty] {
-            assert!(c["models"][RESERVED_CLAUDE]["base_url"].as_str().unwrap().starts_with("http://127.0.0.1:9/"));
-        }
-        let mut bad = p(RESERVED_CLAUDE, "https://a/v1");
-        assert!(validate(&bad).is_err());
-        bad.id = "none".into();
-        assert!(validate(&bad).is_err());
+        assert!(!s.allow_logins);
+        assert_eq!(s.env.len(), 2, "both logins hidden");
+        assert!(c["models"][RESERVED_CLAUDE]["base_url"].as_str().unwrap().starts_with("http://127.0.0.1:9/"));
+
+        // Per-agent token, restricted provider set, explicit default model.
+        let s = hal_setup(&ctx, Path::new("/d/hal"), &ConfigOpts {
+            token: Some("AGENT".into()),
+            only: Some(vec!["claude".into()]),
+            default_ref: Some("claude/opus-x".into()),
+            ..Default::default()
+        });
+        assert!(s.config["models"].get("cn").is_none());
+        assert_eq!(s.config["default_model"], "claude");
+        assert_eq!(s.config["models"]["claude"]["model"], "opus-x");
+        assert_eq!(s.config["models"]["claude"]["api_key"], "AGENT");
+
+        let empty = hal_setup(&Ctx::test(), Path::new("/d/hal"), &ConfigOpts::default());
+        assert_eq!(empty.config["default_model"], "none");
+    }
+
+    #[test]
+    fn subscriptions_enable_only_their_login() {
+        let ctx = Ctx::test();
+        let mut s = p("gpt", "");
+        s.kind = Kind::Chatgpt;
+        s.trusted = true;
+        upsert(&ctx, &s).unwrap();
+        let h = hal_setup(&ctx, Path::new("/d/hal"), &ConfigOpts::default());
+        assert!(h.allow_logins);
+        assert_eq!(h.config["models"]["gpt"]["auth"], "chatgpt");
+        assert!(h.env.iter().any(|(k, _)| k == "CLAUDE_CONFIG_DIR"));
+        assert!(!h.env.iter().any(|(k, _)| k == "CODEX_HOME"));
+        let strict = hal_setup(&ctx, Path::new("/d/hal"), &ConfigOpts { no_subscriptions: true, ..Default::default() });
+        assert!(!strict.allow_logins && strict.config["models"].get("gpt").is_none());
+    }
+
+    #[test]
+    fn parses_model_lists() {
+        let openai = json!({"object":"list","data":[{"id":"b"},{"id":"a"},{"id":"a"},{"id":"bad$"}]});
+        let ids: Vec<_> = parse_models(&openai).into_iter().map(|m| m.id).collect();
+        assert_eq!(ids, ["a", "b"]);
+        let or = json!({"data":[{"id":"x/y","name":"Y","context_length":200000,"pricing":{"prompt":"0.000003","completion":"0.000015"}}]});
+        let m = &parse_models(&or)[0];
+        assert_eq!((m.context_window, m.display.as_deref()), (Some(200000), Some("Y")));
+        assert!((m.price_in.unwrap() - 3.0).abs() < 1e-9 && (m.price_out.unwrap() - 15.0).abs() < 1e-9);
+        let anthropic = json!({"data":[{"id":"claude-x","display_name":"Claude X","type":"model"}]});
+        assert_eq!(parse_models(&anthropic)[0].display.as_deref(), Some("Claude X"));
+    }
+
+    #[test]
+    fn resolve_refs() {
+        let ctx = Ctx::test();
+        upsert(&ctx, &p("cn", "https://a/v1")).unwrap();
+        assert_eq!(resolve(&ctx, Some("cn/glm/4")).unwrap().1, "glm/4");
+        assert_eq!(resolve(&ctx, Some("cn")).unwrap().1, "m");
+        assert_eq!(resolve(&ctx, None).unwrap().0.id, "cn");
+        assert!(resolve(&ctx, Some("nope/x")).is_err());
     }
 }

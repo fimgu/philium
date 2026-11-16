@@ -1,6 +1,6 @@
 //! Outbound secret guard. Pure functions over request JSON; no I/O.
 //!
-//! Runs inside Filium's gateway, so it inspects the exact bytes about to leave
+//! Runs inside Philium's gateway, so it inspects the exact bytes about to leave
 //! the machine regardless of which wire format HAL used (Chat Completions,
 //! Responses, Anthropic Messages). Only string values are scanned and
 //! rewritten, so JSON structure is always preserved.
