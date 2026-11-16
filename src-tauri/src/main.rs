@@ -16,6 +16,7 @@ mod browser;
 mod ctx;
 mod db;
 mod gateway;
+mod codeindex;
 mod graph;
 mod guard;
 mod hal;
@@ -118,6 +119,7 @@ async fn rpc(app: State<'_, App>, method: String, args: Option<Value>) -> Result
         "board" => board::call(&ctx, m, args).await,
         "browser" => browser::call(&ctx, m, args).await,
         "graph" => graph::call(&ctx, m, args).await,
+        "codeindex" => codeindex::call(&ctx, m, args).await,
         "sandbox" => sandbox::call(&ctx, m, args).await,
         "stats" => stats::call(&ctx, m, args).await,
         "reaper" => reaper::call(&ctx, m, args).await,
@@ -270,7 +272,7 @@ fn main() {
             });
 
             // Module init. Failures are logged, never fatal: the UI shows them.
-            let inits: [(&str, fn(&Arc<Ctx>) -> Result<(), String>); 12] = [
+            let inits: [(&str, fn(&Arc<Ctx>) -> Result<(), String>); 13] = [
                 ("providers", providers::init),
                 ("sandbox", sandbox::init),
                 ("mcp", mcp::init),
@@ -280,6 +282,7 @@ fn main() {
                 ("board", board::init),
                 ("browser", browser::init),
                 ("graph", graph::init),
+                ("codeindex", codeindex::init),
                 ("stats", stats::init),
                 ("reaper", reaper::init),
                 ("selfdev", selfdev::init),

@@ -178,7 +178,7 @@ pub fn tool_list() -> Vec<Value> {
           json!({ "job": s }), &["job"]),
         t("resource_register", "Declare something you created outside Philium's tools (container, cluster, process, temp dir) so it is cleaned up with you.",
           json!({ "kind": s, "handle": s, "note": s }), &["kind", "handle"]),
-    ]
+    ].into_iter().chain(crate::codeindex::mcp_tools()).collect()
 }
 
 fn arg<'a>(a: &'a Value, k: &str) -> Result<&'a str, String> {
@@ -362,6 +362,9 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
                 None => g,
             })
         }
+        // --- codeindex tools ---
+        "code_map" | "code_find" | "code_refs" | "code_impact" => crate::codeindex::mcp_call(ctx, agent, name, a).await,
+        // --- end codeindex tools ---
         "playbook_get" => {
             let repo = crate::agents::runtime(agent).map(|r| r.cwd.clone());
             crate::board::playbook(ctx, arg(&a, "job")?, repo.as_deref())
