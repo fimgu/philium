@@ -157,6 +157,25 @@ function Terminals(props) {
   );
 }
 
+function Impact(props) {
+  const [imp] = createResource(() => props.id, (id) => rpc("codeindex.impact", { agent: id }).catch(() => null));
+  const byFile = (list) => { const m = new Map(); for (const x of list ?? []) { if (!m.has(x.path)) m.set(x.path, []); m.get(x.path).push(x); } return [...m.entries()]; };
+  return (
+    <Show when={imp() && ((imp().changed ?? []).length || (imp().dependents ?? []).length)}>
+      <div class="impact">
+        <h3>Impact</h3>
+        <div class="xs faint">Symbols this agent changed, and code that uses them. "name match" means same name only, not confirmed.</div>
+        <div class="small dim" style={{ "margin-top": "8px" }}>Changed symbols ({imp().changed.length})</div>
+        <For each={byFile(imp().changed)}>{([path, xs]) => (<><div class="ifile">{path}</div><For each={xs}>{(x) => <div class="irow">{x.kind} {x.name} :{x.line}</div>}</For></>)}</For>
+        <Show when={(imp().dependents ?? []).length}>
+          <div class="small dim" style={{ "margin-top": "8px" }}>Used by ({imp().dependents.length})</div>
+          <For each={byFile(imp().dependents)}>{([path, xs]) => (<><div class="ifile">{path}</div><For each={xs}>{(x) => <div class={`irow ${x.exact ? "" : "possible"}`}>{x.name} :{x.line} uses {x.via}{x.exact ? "" : " (name match)"}</div>}</For></>)}</For>
+        </Show>
+      </div>
+    </Show>
+  );
+}
+
 function Changes(props) {
   const [diff, { refetch }] = createResource(() => props.id, (id) => rpc("agents.diff", { id }).catch((e) => ({ error: String(e) })));
   return (
@@ -165,6 +184,7 @@ function Changes(props) {
         <span class="small dim grow">Changes in this agent's worktree, compared with where it started.</span>
         <Button size="sm" onClick={refetch}><Icon name="refresh" size={12} /> Refresh</Button>
       </div>
+      <Impact id={props.id} />
       <Show when={diff()?.error}><div class="err small">{diff().error}</div></Show>
       <Show when={diff() && !diff().error && !(diff().patch || diff().stat)}><Empty title="No changes yet" /></Show>
       <Show when={diff()?.stat}><pre class="conv-pre">{diff().stat}</pre></Show>
