@@ -502,9 +502,58 @@ Trust boundaries:
 |---|---|---|
 | Standard (default) | Gateway, environment scrubbing, path rules, approvals, shims | None |
 | Strict | Agent processes run in an OS sandbox. macOS: Seatbelt profile (files limited to the worktree and caches, network only to the gateway and an allowlist). Linux: Landlock and namespaces. | Low |
-| Isolated **[OPEN]** | Agent in a container or VM, OpenShell-style | High, per agent |
+| Isolated | Agent in a container or VM, OpenShell-style. Not planned. Revisit only if Strict proves insufficient. | High, per agent |
 
 Strict mode is the recommended setting for untrusted providers.
+
+### 9.1 Strict mode for untrusted providers
+
+Status: **decided, required.** Strict is set **per provider**. A provider marked untrusted (for example OpenRouter or any OpenAI-compatible endpoint you do not control) forces Strict on every agent that uses it.
+
+**What an untrusted provider can actually do.** It cannot reach your machine. It can only:
+
+1. **Read everything you send it.** Prompts, file contents the agent includes, command output, paths, names.
+2. **Send back anything it wants.** Including instructions that try to make the agent leak data, download things, or run destructive commands (prompt injection).
+3. **Misreport.** Wrong token counts, a different model than the one you asked for, slow or padded responses.
+
+Strict mode answers each one: **see** everything, **limit** what goes out, **contain** what comes back.
+
+**See: full observation**
+
+| What you see | Where |
+|---|---|
+| Every request, exactly as it left your machine, after redaction | Activity, request detail |
+| Every response, full body (streamed responses reassembled) | Activity, request detail |
+| What the guard removed or blocked, and why | Highlighted in the request |
+| Which files and command outputs were included in the request | "Sources" list on the request |
+| Destination host, resolved IP, TLS certificate fingerprint | Request detail. A changed certificate raises an alert |
+| Model you asked for vs. model the provider says it used | Flagged when they differ |
+| Token counts: provider-reported vs. Philium's own count | Flagged when they differ by more than 10% |
+| Every action the agent took because of a response (tool calls, commands, file writes, network) | Linked from the response, so you can trace cause and effect |
+| Live view of all of the above | A "Watch" panel next to the agent's conversation |
+
+In Strict mode full request and response bodies are kept locally (encrypted, default 7 days) so you can review them later. Standard mode keeps metadata only.
+
+**Limit: what can leave**
+
+- Redaction is on and cannot be turned off for an untrusted provider. Block mode is available.
+- **Path rules for context.** Files matching `.env*`, `*.pem`, `*.key`, `id_*`, `~/.ssh`, `~/.aws`, `~/.kube`, `~/.config/gh` and your own list are never readable by the agent, so they cannot end up in a request.
+- **Size alarm.** A request much larger than the agent's usual (for example a whole folder pasted in) pauses and asks you.
+- **Optional first-send approval.** You approve the first request that includes each new file.
+
+**Contain: what a response can make the agent do**
+
+| Control | Effect |
+|---|---|
+| OS sandbox (macOS Seatbelt, Linux Landlock + namespaces) | The agent and every command it runs can only touch its worktree, caches and temp folder. Nothing else on disk. |
+| Network allowlist | Agent processes can only reach the Philium gateway and hosts you allow (for example your package registry). Everything else is blocked and logged. |
+| Approvals | Push, delete, install, network to a new host, and anything outside the worktree always ask, even with Auto settings. |
+| No secrets in reach | No keys, no logins, no SSH agent, no cloud credentials in the sandbox. |
+| Kill switch | One button stops the agent, its commands and its network instantly. |
+
+**Strict mode checks shown in the UI.** Each untrusted provider card shows a short scorecard: requests today, items redacted, items blocked, model mismatches, token mismatches, certificate changes, blocked network attempts. Green when everything matches, with one sentence explaining any red item.
+
+**Honest limits.** Strict mode cannot stop the provider from reading what you deliberately send it. If a file is in the request, the provider has seen it. The defense is keeping secrets and sensitive files out of reach, and seeing exactly what was sent.
 
 ## 10. Performance budget (hundreds of agents)
 
@@ -528,8 +577,26 @@ Strict mode is the recommended setting for untrusted providers.
   agents/<name>/           tmp, kubeconfig, scratch
   bin/                     shims
   graph/<repo>/            code graph indexes
-<worktree root>/<repo>/<agent>/   [OPEN] location
+<philium root>/              default ~/Philium (section 11.1)
 ```
+
+### 11.1 Philium folder
+
+Status: **decided.** Worktrees, and optionally your repos, live in one Philium folder.
+
+```
+~/Philium/
+  repos/<owner>/<repo>/            main checkouts (optional, you choose per repo)
+  worktrees/<repo>/<agent>/        agent worktrees, always here, managed by Philium
+  scratch/                         throwaway workspaces for quick tasks
+  archive/                         repos you are not using, kept out of the way
+```
+
+Rules:
+
+- Philium never moves an existing repo by itself. Adding a repo offers two choices: **use it where it is**, or **move it into `~/Philium/repos`** (Philium moves it, fixes its worktree links and updates its records).
+- Worktrees always go in `~/Philium/worktrees`, wherever the repo lives.
+- A wider laptop reorganization is a separate, one-off project (section 15), done with a dry-run plan you approve first.
 
 ## 12. UI map
 
@@ -585,8 +652,20 @@ This also keeps a running "Philium backlog" on the board, so ideas you have mid-
 8. Colima: Philium may stop it only if Philium started it and nothing uses it. Off by default.
 9. UI principle: **self-explanatory and clean**. Every screen shows what is happening and what to do next, without needing docs.
 
+10. Worktrees in `~/Philium/worktrees`. Repos may also live in `~/Philium/repos` (section 11.1).
+11. **Strict mode** is required and set per provider. Untrusted providers force it (section 9.1).
+12. The "Isolated" container level is not planned.
+
 ### Still open
 
-1. Worktree location: `~/Philium/worktrees` or next to each repo.
-2. Claude Code and Codex subscriptions through the gateway, subject to those providers' terms.
-3. Whether the "Isolated" level (containers) is needed at all.
+1. Claude Code and Codex subscriptions through the gateway, subject to those providers' terms.
+
+## 15. Laptop folder reorganization (separate project)
+
+Not part of Philium itself. A one-off cleanup of your folders, done carefully:
+
+1. **Inventory (read-only).** List every repo, its remote, last commit, uncommitted changes, unpushed branches and size. Same for loose folders in your home folder.
+2. **Proposal.** A table: each item, where it should go (`~/Philium/repos`, `archive`, delete candidate), and why. Nothing moves yet.
+3. **You approve.** Item by item or in groups.
+4. **Move safely.** Uncommitted or unpushed work is never deleted. Git worktree links are repaired after moves. A log of every move allows undo.
+5. **Leftovers.** Old work folders and backups go to `archive`, not the trash.
