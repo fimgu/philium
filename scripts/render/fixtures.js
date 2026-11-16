@@ -106,6 +106,11 @@ export const POPULATED = {
   "providers.list": provs,
   "providers.models": models,
   "agents.list": agents,
+  "browser.tabs": [
+    { id: "b1", url: "https://docs.rs/tauri/latest/tauri/", title: "tauri - Rust", agent: null, visible: false, loading: false, error: null },
+    { id: "b2", url: "https://github.com/tauri-apps/wry/issues", title: "Issues · tauri-apps/wry", agent: "lion", visible: false, loading: true, error: null },
+    { id: "b3", url: "http://localhost:5173/", title: "", agent: "otter", visible: false, loading: false, error: "Blocked a `file:` link. Only http and https pages can open here." },
+  ],
   "agents.get": agents[0],
   "agents.names": ["badger", "wren", "ibis", "newt"],
   "agents.events": chatEvents,
