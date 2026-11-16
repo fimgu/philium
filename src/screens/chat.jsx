@@ -60,7 +60,7 @@ export default function Chat() {
     } catch (e) { toast(String(e), "danger"); }
   };
 
-  const send = async (text) => {
+  const send = async (text, images = []) => {
     let id = selected();
     if (!id) {
       try {
@@ -72,7 +72,7 @@ export default function Chat() {
     }
     setBusy(true);
     try {
-      await hal("POST", `/sessions/${id}/messages`, { text });
+      await hal("POST", `/sessions/${id}/messages`, { text, images });
     } catch (e) { setBusy(false); return toast(String(e), "danger"); }
     poll(id);
   };

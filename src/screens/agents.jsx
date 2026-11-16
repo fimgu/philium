@@ -61,7 +61,7 @@ export function SpawnModal(props) {
   const chosen = () => model() || def() || "";
   const chosenProvider = () => provById()[(chosen() || "").split("/")[0]];
   const forcedStrict = () => chosenProvider() && !chosenProvider().trusted;
-  const isSub = () => ["chatgpt", "claude_code"].includes(chosenProvider()?.kind);
+  const isSub = () => ["chatgpt_oauth", "claude_oauth"].includes(chosenProvider()?.kind);
 
   createEffect(on(task, (t) => {
     const tk = (tasks() ?? []).find((x) => x.id === t);
@@ -258,8 +258,8 @@ function AgentView(props) {
   const live = () => a()?.live;
   const busy = () => ["running", "waiting"].includes(a()?.state);
 
-  const send = async (text) => {
-    try { await rpc("agents.send", { id: props.id, text }); } catch (e) { toast(String(e), "danger"); }
+  const send = async (text, images = []) => {
+    try { await rpc("agents.send", { id: props.id, text, images }); } catch (e) { toast(String(e), "danger"); }
   };
   const decide = (request_id, decision, scope) =>
     rpc("agents.permission", { id: props.id, request_id, decision, scope }).catch((e) => toast(String(e), "danger"));

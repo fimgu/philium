@@ -8,11 +8,10 @@ const KINDS = [
   { value: "openai_chat", label: "OpenAI-compatible (chat/completions)", url: "https://api.example.com/v1" },
   { value: "openai_responses", label: "OpenAI Responses API", url: "https://api.openai.com/v1" },
   { value: "anthropic", label: "Anthropic Messages API", url: "https://api.anthropic.com/v1" },
-  { value: "chatgpt", label: "ChatGPT subscription (Codex login)", sub: true },
-  { value: "claude_code", label: "Claude subscription (Claude Code login)", sub: true },
 ];
-const kindLabel = (k) => KINDS.find((x) => x.value === k)?.label ?? k;
-const isSub = (k) => KINDS.find((x) => x.value === k)?.sub;
+const SUB_LABEL = { chatgpt_oauth: "ChatGPT subscription (signed in through Philium)", claude_oauth: "Claude subscription (signed in through Philium)" };
+const kindLabel = (k) => SUB_LABEL[k] ?? KINDS.find((x) => x.value === k)?.label ?? k;
+const isSub = (k) => k in SUB_LABEL;
 
 function ProviderForm(props) {
   const editing = !!props.provider && !props.provider.preset;
@@ -45,16 +44,13 @@ function ProviderForm(props) {
     <Modal title={editing ? `Edit ${p.name}` : "Add provider"} onClose={() => props.onClose(false)}
       footer={<><Button onClick={() => props.onClose(false)}>Cancel</Button><Button variant="primary" busy={busy()} onClick={save}>Save</Button></>}>
       <Field label="Type">
-        <Select value={kind()} disabled={editing} onValue={(v) => { setKind(v); if (isSub(v)) { setTrusted(true); if (!name()) setName(v === "chatgpt" ? "ChatGPT" : "Claude"); } }} options={KINDS} />
+        <Select value={kind()} disabled={editing} onValue={(v) => { setKind(v); }} options={KINDS} />
       </Field>
       <div class="grid grid-2">
         <Field label="Name"><Input value={name()} onValue={(v) => { setName(v); if (!editing) setId(slug(v)); }} placeholder="e.g. Zhipu" /></Field>
         <Field label="ID" hint="Used in model refs: id/model"><Input mono value={id()} disabled={editing} onValue={setId} /></Field>
       </div>
-      <Show when={!sub()} fallback={
-        <Shield>
-          <Icon name="shield" /> Uses the CLI's own sign-in on this Mac. Requests go straight to {kind() === "chatgpt" ? "OpenAI" : "Anthropic"}, not through the gateway, so subscriptions are always trusted.
-        </Shield>}>
+      <Show when={!sub()}>
         <Field label="Base URL"><Input mono value={url()} onValue={setUrl} placeholder={KINDS.find((k) => k.value === kind())?.url} /></Field>
         <Field label="API key" hint={editing && p.has_key ? "Stored in the macOS Keychain. Leave empty to keep it." : "Stored only in the macOS Keychain. Agents never see it."}>
           <Input mono type="password" value={key()} onValue={setKey} placeholder={editing && p.has_key ? "••••••••" : "sk-…"} />
@@ -107,11 +103,63 @@ function ModelList(props) {
   );
 }
 
+function SignIn(props) {
+  const claude = props.kind === "claude_oauth";
+  const [st, setSt] = createSignal(null);
+  const [paste, setPaste] = createSignal("");
+  const [err, setErr] = createSignal("");
+  const [importable, setImportable] = createSignal(false);
+  if (claude) rpc("providers.oauth_import_check").then((r) => setImportable(!!r.available)).catch(() => {});
+  useEvent("oauth:done", (e) => {
+    const d = e?.payload ?? e;
+    if (!st() || (d.id && st().id !== d.id)) return;
+    setSt(null);
+    if (d.ok) { toast("Signed in", "good"); props.onDone(); } else setErr(String(d.error ?? "Sign-in failed"));
+  });
+  const start = async () => {
+    setErr("");
+    try { setSt(await rpc("providers.oauth_start", { kind: props.kind })); } catch (e) { setErr(String(e)); }
+  };
+  const submit = async () => {
+    try { await rpc("providers.oauth_paste", { id: st().id, input: paste() }); setSt(null); setPaste(""); props.onDone(); }
+    catch (e) { setErr(String(e)); }
+  };
+  const cancel = async () => { await rpc("providers.oauth_cancel", { kind: props.kind }).catch(() => {}); setSt(null); };
+  const doImport = async () => {
+    if (!(await confirm("Import your Claude Code login?", "Philium will read the Claude Code credentials stored on this Mac (macOS may ask for Keychain access) and keep its own copy. Nothing is changed in Claude Code.", { ok: "Import" }))) return;
+    try { await rpc("providers.oauth_import"); toast("Imported", "good"); props.onDone(); } catch (e) { setErr(String(e)); }
+  };
+  return (
+    <div class="col" style={{ gap: "8px" }}>
+      <Show when={!st()} fallback={
+        <div class="col" style={{ gap: "8px" }}>
+          <Show when={claude}>
+            <div class="small">Finish in your browser. It completes here by itself. If it does not, paste the code or the full callback URL:</div>
+            <div class="row"><Input mono value={paste()} onValue={setPaste} placeholder="code#state or callback URL" />
+              <Button variant="primary" onClick={submit} disabled={!paste().trim()}>Submit</Button></div>
+            <div class="xs faint">Different browser? <a href="#" onClick={(e) => { e.preventDefault(); navigator.clipboard?.writeText(st().manual_url); toast("Link copied", "good"); }}>Copy the sign-in link</a>, finish there, then paste the code above.</div>
+          </Show>
+          <Show when={!claude}>
+            <div class="small">Open <span class="mono">{st().verify_url}</span> and enter this code:</div>
+            <div class="mono" style={{ "font-size": "28px", "letter-spacing": "4px" }}>{st().user_code}</div>
+            <div class="xs faint">Waiting for you to approve. This page updates automatically.</div>
+          </Show>
+          <div><Button size="sm" onClick={cancel}>Cancel</Button></div>
+        </div>}>
+        <div class="row">
+          <Button variant="primary" onClick={start}>{claude ? "Sign in with Claude" : "Sign in with ChatGPT"}</Button>
+          <Show when={claude && importable()}><Button onClick={doImport}>Import existing Claude Code login</Button></Show>
+        </div>
+      </Show>
+      <Show when={err()}><Shield tone="danger">{err()}</Shield></Show>
+    </div>
+  );
+}
+
 export default function Providers() {
   const [version, setVersion] = createSignal(0);
   const [list, { refetch }] = createResource(version, () => rpc("providers.list"));
   const [def, { refetch: refetchDef }] = createResource(version, () => rpc("providers.default"));
-  const [logins] = createResource(() => rpc("providers.logins"));
   const [form, setForm] = createSignal(null);
   const [open, setOpen] = createSignal(null);
   const [busy, setBusy] = createSignal(null);
@@ -135,13 +183,23 @@ export default function Providers() {
       actions={<Button variant="primary" onClick={() => setForm({})}><Icon name="plus" /> Add provider</Button>}>
       <Show when={list() && list().length === 0}>
         <Empty icon={<Icon name="key" size={32} />} title="No providers yet"
-          action={<div class="row"><Button variant="primary" onClick={() => setForm({})}>Add an API provider</Button>
-            <Show when={logins()?.chatgpt}><Button onClick={() => setForm({ preset: "chatgpt" })}>Use ChatGPT login</Button></Show>
-            <Show when={logins()?.claude_code}><Button onClick={() => setForm({ preset: "claude_code" })}>Use Claude login</Button></Show></div>}>
-          Add an API key for any provider, or use the ChatGPT or Claude subscription you're already signed into. Models are discovered live.
+          action={<Button variant="primary" onClick={() => setForm({})}>Add an API provider</Button>}>
+          Add an API key for any provider, or sign in with a Claude or ChatGPT subscription below. Models are discovered live.
         </Empty>
       </Show>
       <div class="col" style={{ gap: "12px" }}>
+        <For each={[["claude_oauth", "Claude"], ["chatgpt_oauth", "ChatGPT"]].filter(([k]) => !(list() ?? []).some((p) => p.kind === k && p.signed_in))}>
+          {([k, label]) => (
+            <Card>
+              <div class="card-head"><h2>{label} subscription</h2>
+                <Show when={(list() ?? []).some((p) => p.kind === k)}><Badge tone="danger">Sign in again</Badge></Show></div>
+              <Show when={k === "claude_oauth"}>
+                <div class="small dim" style={{ "margin-bottom": "8px" }}>Using a Claude subscription outside Anthropic's own apps may be billed separately or flagged by Anthropic. An Anthropic API key (add it as a provider) is the risk-free alternative.</div>
+              </Show>
+              <SignIn kind={k} onDone={() => { refetch(); bump(); }} />
+            </Card>
+          )}
+        </For>
         <For each={list()}>
           {(p) => (
             <Card>
@@ -152,19 +210,19 @@ export default function Providers() {
                 <Show when={p.trusted} fallback={<Badge tone="strict" title="Agents on this provider always run in Strict mode"><Icon name="lock" size={12} /> Untrusted · Strict only</Badge>}>
                   <Badge tone="secure"><Icon name="shield" size={12} /> Trusted</Badge>
                 </Show>
-                <Show when={p.via_gateway} fallback={<Badge>Subscription login</Badge>}>
-                  <Badge tone={p.guard === "off" ? "danger" : "secure"}>Guard: {p.guard}</Badge>
-                </Show>
-                <Show when={p.via_gateway && !p.has_key}><Badge tone="danger">No API key</Badge></Show>
+                <Badge tone={p.guard === "off" ? "danger" : "secure"}>Guard: {p.guard}</Badge>
+                <Show when={isSub(p.kind)}><Badge tone={p.signed_in ? "secure" : "danger"}>{p.signed_in ? [p.account?.email, p.account?.plan].filter(Boolean).join(" · ") || "Signed in" : "Sign in again"}</Badge></Show>
+                <Show when={!isSub(p.kind) && !p.has_key}><Badge tone="danger">No API key</Badge></Show>
                 <div style={{ "margin-left": "auto" }} class="row">
                   <Button size="sm" busy={busy() === p.id} onClick={() => refresh(p)}><Icon name="refresh" size={13} /> Refresh models</Button>
+                  <Show when={isSub(p.kind) && p.signed_in}><Button size="sm" onClick={async () => { await rpc("providers.oauth_signout", { id: p.id }); bump(); }}>Sign out</Button></Show>
                   <Button size="sm" onClick={() => setForm({ provider: p })}>Edit</Button>
                   <Button size="sm" variant="danger" onClick={() => remove(p)}>Remove</Button>
                 </div>
               </div>
               <div class="row small dim">
                 <span>{kindLabel(p.kind)}</span>
-                <Show when={p.base_url}><span class="mono faint">· {p.base_url}</span></Show>
+                <Show when={p.base_url && !isSub(p.kind)}><span class="mono faint">· {p.base_url}</span></Show>
                 <span>· {p.model_count} models</span>
                 <Show when={p.models_cached_at}><span class="faint">· updated {fmt.ago(p.models_cached_at)}</span></Show>
                 <Button size="sm" variant="ghost" style={{ "margin-left": "auto" }} onClick={() => setOpen(open() === p.id ? null : p.id)}>{open() === p.id ? "Hide models" : "Show models"}</Button>
@@ -176,7 +234,7 @@ export default function Providers() {
         </For>
       </div>
       <Show when={form()}>
-        {(f) => <ProviderForm provider={f().provider ?? (f().preset ? { preset: true, kind: f().preset, trusted: true, name: f().preset === "chatgpt" ? "ChatGPT" : "Claude", id: f().preset === "chatgpt" ? "gpt" : "claude" } : null)}
+        {(f) => <ProviderForm provider={f().provider ?? null}
           onClose={(saved) => { setForm(null); if (saved) { refetch(); bump(); } }} />}
       </Show>
     </Page>

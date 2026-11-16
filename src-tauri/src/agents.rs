@@ -522,10 +522,14 @@ fn rt(id: &str) -> Result<Arc<Runtime>, String> {
 }
 
 pub async fn send(ctx: &Arc<Ctx>, id: &str, text: &str) -> Result<Value, String> {
+    send_with_images(ctx, id, text, json!([])).await
+}
+
+pub async fn send_with_images(ctx: &Arc<Ctx>, id: &str, text: &str, images: Value) -> Result<Value, String> {
     let r = rt(id)?;
     set_state(ctx, id, "running");
     r.hal
-        .call(reqwest::Method::POST, &format!("/sessions/{}/messages", r.session), Some(json!({ "text": text })))
+        .call(reqwest::Method::POST, &format!("/sessions/{}/messages", r.session), Some(json!({ "text": text, "images": images })))
         .await
 }
 
@@ -630,7 +634,7 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
                 strict: args["strict"].as_bool().unwrap_or(false),
             },
         ),
-        "send" => send(ctx, &id()?, &ctx::arg_str(&args, "text")?).await,
+        "send" => send_with_images(ctx, &id()?, &ctx::arg_str(&args, "text")?, args.get("images").cloned().unwrap_or(json!([]))).await,
         "cancel" => {
             let r = rt(&id()?)?;
             r.hal.call(reqwest::Method::POST, &format!("/sessions/{}/cancel", r.session), None).await

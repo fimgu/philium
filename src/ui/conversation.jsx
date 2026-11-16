@@ -1,7 +1,7 @@
 // Conversation view built from HAL session events. Used by Agents and Chat.
 // Events are folded into items: user / assistant (streamed) / tool / file /
 // permission / error. Text is always rendered as text, never HTML.
-import { Index, Show, Switch, Match, createSignal, createMemo, createEffect, on } from "solid-js";
+import { For, Index, Show, Switch, Match, createSignal, createMemo, createEffect, on } from "solid-js";
 import { Badge, Button } from "./kit.jsx";
 import { Icon } from "./icons.jsx";
 
@@ -150,23 +150,54 @@ export function Conversation(props) {
   );
 }
 
-/** Composer: Enter sends, Shift+Enter newline. */
+/** Composer: Enter sends, Shift+Enter newline. Images can be pasted or dropped;
+ * onSend(text, images) gets HAL image parts: [{ data: base64, media_type, name }]. */
+const readImage = (file) => new Promise((resolve, reject) => {
+  const r = new FileReader();
+  r.onload = () => resolve({ data: String(r.result).split(",")[1], media_type: file.type, name: file.name || "image", preview: r.result });
+  r.onerror = reject;
+  r.readAsDataURL(file);
+});
+
 export function Composer(props) {
   const [text, setText] = createSignal("");
+  const [images, setImages] = createSignal([]);
+  const [over, setOver] = createSignal(false);
+  const add = async (files) => {
+    const imgs = [...files].filter((f) => f.type.startsWith("image/"));
+    if (imgs.length) setImages([...images(), ...(await Promise.all(imgs.map(readImage)))].slice(0, 8));
+  };
   const send = () => {
     const t = text().trim();
-    if (!t || props.disabled) return;
-    props.onSend(t);
+    if ((!t && !images().length) || props.disabled) return;
+    props.onSend(t, images().map(({ data, media_type, name }) => ({ data, media_type, name })));
     setText("");
+    setImages([]);
   };
   return (
-    <div class="composer">
+    <div class="composer" style={{ "flex-wrap": "wrap", outline: over() ? "1px dashed var(--accent, #7aa2ff)" : "none" }}
+      onDragOver={(e) => { e.preventDefault(); setOver(true); }} onDragLeave={() => setOver(false)}
+      onDrop={(e) => { e.preventDefault(); setOver(false); add(e.dataTransfer.files); }}>
+      <Show when={images().length}>
+        <div class="row" style={{ width: "100%", gap: "8px" }}>
+          <For each={images()}>
+            {(im, i) => (
+              <div style={{ position: "relative" }}>
+                <img src={im.preview} alt={im.name} style={{ height: "56px", "border-radius": "6px" }} />
+                <button class="btn ghost sm" title="Remove image" style={{ position: "absolute", top: "-6px", right: "-6px" }}
+                  onClick={() => setImages(images().filter((_, j) => j !== i()))}>x</button>
+              </div>
+            )}
+          </For>
+        </div>
+      </Show>
       <textarea
         class="textarea grow"
         placeholder={props.placeholder ?? "Message"}
         value={text()}
         disabled={props.disabled}
         onInput={(e) => setText(e.currentTarget.value)}
+        onPaste={(e) => { const f = [...e.clipboardData.files]; if (f.some((x) => x.type.startsWith("image/"))) { e.preventDefault(); add(f); } }}
         onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
       />
       <Show when={props.busy} fallback={<Button variant="primary" onClick={send} disabled={props.disabled}>Send</Button>}>
