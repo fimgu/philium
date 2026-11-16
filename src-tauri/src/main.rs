@@ -486,4 +486,87 @@ mod e2e {
         h.stop();
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Anthropic provider through the real HAL: HAL validates its config, speaks
+    /// chat.completions, the gateway translates to Messages and back, and a tool
+    /// call round-trips (denied in Chat, result returned to the model).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn anthropic_provider_through_hal_and_gateway() {
+        if !hal::server_path().exists() {
+            eprintln!("skipping: no sidecar at {}", hal::server_path().display());
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("philium-e2e-ant-{}", hal::random_token()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let seen: Arc<M<Vec<(String, Value)>>> = Default::default();
+        let s2 = seen.clone();
+        let app = axum::Router::new().route(
+            "/v1/{*rest}",
+            axum::routing::any(move |h: axum::http::HeaderMap, body: String| {
+                let s2 = s2.clone();
+                async move {
+                    let key = h.get("x-api-key").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+                    let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+                    let has_result = body.contains("tool_result");
+                    s2.lock().unwrap().push((key, v));
+                    let ev = |t: &str, d: Value| format!("event: {t}\ndata: {d}\n\n");
+                    let mut sse = ev("message_start", json!({"type":"message_start","message":{"id":"m1","model":"claude-e2e","usage":{"input_tokens":30,"output_tokens":1}}}));
+                    if has_result {
+                        sse += &ev("content_block_start", json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}));
+                        sse += &ev("content_block_delta", json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"all done"}}));
+                        sse += &ev("message_delta", json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":4}}));
+                    } else {
+                        sse += &ev("content_block_start", json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"shell","input":{}}}));
+                        sse += &ev("content_block_delta", json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":"}}));
+                        sse += &ev("content_block_delta", json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"echo hi\"}"}}));
+                        sse += &ev("message_delta", json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":7}}));
+                    }
+                    sse += &ev("message_stop", json!({"type":"message_stop"}));
+                    ([("content-type", "text/event-stream")], sse)
+                }
+            }),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_url = format!("http://{}/v1", l.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+
+        let gw = Gateway::new(hal::random_token(), None);
+        let gl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gateway_url = format!("http://{}", gl.local_addr().unwrap());
+        let r = gw.router();
+        tokio::spawn(async move { axum::serve(gl, r).await.unwrap() });
+        let ctx = Ctx::new(db::Db::memory(), dir.join("data"), dir.join("root"), gw.clone(), gateway_url);
+        let p = Provider {
+            id: "claude".into(), name: "Claude".into(), kind: Kind::Anthropic, base_url: up_url,
+            trusted: false, guard: GuardMode::Redact, enabled: true, default_model: Some("claude-e2e".into()),
+        };
+        providers::upsert(&ctx, &p).unwrap();
+        gw.set_routes(vec![Route { provider: p.clone(), api_key: Some("sk-ant-REAL".into()) }]);
+        let c2 = ctx.clone();
+        tokio::task::spawn_blocking(move || refresh_desk(&c2)).await.unwrap();
+        let h = match ctx.desk() {
+            Some(h) => h,
+            None => panic!("desk HAL failed: {:?}", ctx.desk.read().unwrap().as_ref().err()),
+        };
+        let ws = dir.join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let s = h.call(reqwest::Method::POST, "/sessions", Some(chat_session_body(&ws, "ant", None))).await.unwrap();
+        let sid = s["id"].as_str().or(s["session"]["id"].as_str()).expect("session id").to_string();
+        h.call(reqwest::Method::POST, &format!("/sessions/{sid}/messages"), Some(json!({"text": "hello"}))).await.unwrap();
+        let evs = wait_turn(&h, &sid).await;
+        let text = evs.to_string();
+        assert!(!text.contains("\"turn.failed\""), "{text}");
+        assert!(text.contains("all done"), "{text}");
+        assert!(evs.as_array().unwrap().iter().any(|e| e["type"] == "tool.finished" && e["tool"] == "shell"), "{text}");
+        let s = seen.lock().unwrap().clone();
+        assert!(s.len() >= 2);
+        assert!(s.iter().all(|(k, _)| k == "sk-ant-REAL"));
+        assert!(s[0].1["tools"][0]["input_schema"].is_object(), "{}", s[0].1);
+        assert!(s.last().unwrap().1.to_string().contains("tool_result"));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let a = gw.recent().into_iter().find(|a| a.path == "/chat/completions").expect("logged");
+        assert_eq!((a.input_tokens, a.state), (Some(30), "done"));
+        h.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
