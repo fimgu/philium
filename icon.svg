@@ -1,1 +1,38 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024"><rect x="64" y="64" width="896" height="896" rx="200" fill="#5b5bd6"/><path d="M340 760V264h360M340 500h280" stroke="#fff" stroke-width="96" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1a1d26"/>
+      <stop offset="1" stop-color="#0a0b0e"/>
+    </linearGradient>
+    <linearGradient id="ring" x1="0.15" y1="0.1" x2="0.85" y2="0.95">
+      <stop offset="0" stop-color="#b4c0ff"/>
+      <stop offset="0.55" stop-color="#8b9cff"/>
+      <stop offset="1" stop-color="#4fd1a5"/>
+    </linearGradient>
+    <linearGradient id="stem" gradientUnits="userSpaceOnUse" x1="0" y1="228" x2="0" y2="796">
+      <stop offset="0" stop-color="#e9ecff"/>
+      <stop offset="1" stop-color="#9fb0ff"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#8b9cff" stop-opacity="0.28"/>
+      <stop offset="1" stop-color="#8b9cff" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="edge" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.14"/>
+      <stop offset="0.5" stop-color="#ffffff" stop-opacity="0.02"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0.06"/>
+    </linearGradient>
+  </defs>
+  <!-- macOS tile: 824 squircle on a 1024 canvas -->
+  <rect x="100" y="100" width="824" height="824" rx="186" fill="url(#bg)"/>
+  <rect x="101.5" y="101.5" width="821" height="821" rx="184.5" fill="none" stroke="url(#edge)" stroke-width="3"/>
+  <circle cx="512" cy="512" r="300" fill="url(#glow)"/>
+  <!-- Phi: a ring (the guarded boundary) crossed by one line (the gateway) -->
+  <circle cx="512" cy="512" r="196" fill="none" stroke="url(#ring)" stroke-width="64"/>
+  <path d="M512 228 V796" stroke="url(#stem)" stroke-width="58" stroke-linecap="round"/>
+  <!-- agents on the ring -->
+  <circle cx="373.4" cy="373.4" r="30" fill="#0f1116"/>
+  <circle cx="373.4" cy="373.4" r="14" fill="#e9ecff"/>
+  <circle cx="650.6" cy="650.6" r="30" fill="#0f1116"/>
+  <circle cx="650.6" cy="650.6" r="14" fill="#4fd1a5"/>
+</svg>

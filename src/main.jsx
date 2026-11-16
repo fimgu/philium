@@ -76,7 +76,16 @@ function App() {
   return (
     <div class="app">
       <nav class="sidebar">
-        <div class="brand"><span class="brand-mark" /> Philium</div>
+        <div class="brand">
+          <svg class="brand-mark" viewBox="0 0 64 64" aria-hidden="true">
+            <defs>
+              <linearGradient id="bm-ring" x1="0.15" y1="0.1" x2="0.85" y2="0.95"><stop offset="0" stop-color="#b4c0ff" /><stop offset="0.55" stop-color="#8b9cff" /><stop offset="1" stop-color="#4fd1a5" /></linearGradient>
+            </defs>
+            <circle cx="32" cy="32" r="19" fill="none" stroke="url(#bm-ring)" stroke-width="7" />
+            <path d="M32 5V59" stroke="#e9ecff" stroke-width="6" stroke-linecap="round" />
+          </svg>
+          Philium
+        </div>
         <For each={GROUPS}>
           {([g, label]) => (
             <>

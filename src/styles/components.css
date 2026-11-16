@@ -10,7 +10,7 @@
 }
 .sidebar > * { -webkit-app-region: no-drag; }
 .brand { display: flex; align-items: center; gap: 8px; padding: 18px 8px 14px; font-weight: 600; letter-spacing: 0.02em; }
-.brand-mark { width: 18px; height: 18px; border-radius: 5px; background: linear-gradient(135deg, var(--accent), var(--secure)); }
+.brand-mark { width: 20px; height: 20px; flex: none; }
 .nav-item {
   display: flex; align-items: center; gap: 10px; width: 100%;
   padding: 7px 10px; border: 0; border-radius: var(--radius-s);
