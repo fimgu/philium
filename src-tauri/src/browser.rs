@@ -8,12 +8,15 @@
 //! `document.title` (nonce protected) and `on_document_title_changed`.
 //!
 //! rpc methods (`browser.*`):
-//! - `open {url, agent?}` -> tab; `navigate {tab,url}`; `back|forward|reload {tab}`; `close {tab}`
+//! - `open {url, agent?}` -> tab; `navigate {tab,url}`; `back|forward|reload|stop {tab}`; `close {tab}`
 //! - `tabs {}` -> `[{id,url,title,agent,visible}]`
 //! - `set_bounds {tab,x,y,w,h}` (CSS px, relative to the window content); `hide {tab?}`, `show {tab?}` (no tab = all)
 //! - `snapshot {tab}` -> page text; `external {url}` opens in the system browser
 //!
-//! Events: `browser:tab` `{id,url,title,agent}` on any tab change, `browser:closed` `{id}`.
+//! Events: `browser:tab` `{id,url,title,agent,loading,error}` on any tab change, `browser:closed` `{id}`,
+//! `browser:opened` `{id,opener}` (target=_blank / window.open became a new tab),
+//! `browser:download` `{tab,name,path,state:"started"|"done"|"failed"}`.
+//! Stale tab ids (webview gone) are pruned from state and reported via `browser:closed`.
 //! Rust API for agents: `agent_open(ctx, agent, url)` -> tab id, `agent_snapshot(ctx, tab)` -> text.
 
 use std::collections::HashMap;
@@ -35,6 +38,8 @@ pub struct Tab {
     pub title: String,
     pub agent: Option<String>,
     pub visible: bool,
+    pub loading: bool,
+    pub error: Option<String>,
 }
 
 #[derive(Default)]
@@ -97,24 +102,163 @@ fn update(ctx: &Ctx, id: &str, f: impl FnOnce(&mut Tab)) {
 
 fn webview(ctx: &Ctx, id: &str) -> Result<tauri::Webview, String> {
     let h = ctx.handle().ok_or("no app handle")?;
-    h.get_webview(&label(id)).ok_or_else(|| format!("no such tab `{id}`"))
+    match h.get_webview(&label(id)) {
+        Some(w) => Ok(w),
+        None => {
+            // Stale id: the native webview is gone. Drop any leftover state.
+            if forget(id) {
+                ctx.emit("browser:closed", json!({"id": id}));
+            }
+            Err(format!("tab `{id}` is closed"))
+        }
+    }
 }
 
-async fn open(ctx: &Arc<Ctx>, url: &str, agent: Option<String>) -> Result<Tab, String> {
+/// Remove a tab from state. Returns true if it existed.
+fn forget(id: &str) -> bool {
+    let mut s = state().lock().unwrap();
+    let n = s.tabs.len();
+    s.tabs.retain(|t| t.id != id);
+    s.tabs.len() != n
+}
+
+/// Schemes a tab may navigate to. Everything else is blocked.
+pub fn allowed_scheme(scheme: &str) -> bool {
+    matches!(scheme, "http" | "https" | "about")
+}
+
+/// Only http(s) pages may become new tabs via target=_blank / window.open.
+pub fn popup_allowed(url: &str) -> bool {
+    let l = url.trim().to_lowercase();
+    l.starts_with("http://") || l.starts_with("https://")
+}
+
+/// A safe file name for a download: last path segment, no separators or
+/// leading dots, and a numbered suffix if it already exists in `dir`.
+pub fn download_target(dir: &std::path::Path, url: &str, exists: impl Fn(&std::path::Path) -> bool) -> std::path::PathBuf {
+    let path = url.parse::<tauri::Url>().map(|u| u.path().to_string()).unwrap_or_default();
+    let seg = path.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+    let seg = percent_decode(seg);
+    let mut name: String = seg.chars().filter(|c| !matches!(c, '/' | '\\' | ':' | '\0') && !c.is_control()).collect();
+    name = name.trim_start_matches('.').trim().to_string();
+    if name.is_empty() {
+        name = "download".into();
+    }
+    if name.len() > 120 {
+        name = name.chars().take(120).collect();
+    }
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) if i > 0 => (name[..i].to_string(), name[i..].to_string()),
+        _ => (name.clone(), String::new()),
+    };
+    let mut p = dir.join(&name);
+    let mut n = 1;
+    while exists(&p) {
+        p = dir.join(format!("{stem} ({n}){ext}"));
+        n += 1;
+    }
+    p
+}
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn downloads_dir() -> std::path::PathBuf {
+    std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir).join("Downloads")
+}
+
+fn open(ctx: &Arc<Ctx>, url: &str, agent: Option<String>) -> Result<Tab, String> {
     let url = normalize_url(url)?;
     let h = ctx.handle().ok_or("no app handle")?.clone();
     let win = h.get_window("main").ok_or("main window not found")?;
     let id = crate::db::new_id()[..8].to_string();
     let parsed: tauri::Url = url.parse().map_err(|e: <tauri::Url as std::str::FromStr>::Err| e.to_string())?;
-    let (c_nav, c_title, id_nav, id_title) = (ctx.clone(), ctx.clone(), id.clone(), id.clone());
+    let (c_nav, c_title, c_load, c_new, c_dl) = (ctx.clone(), ctx.clone(), ctx.clone(), ctx.clone(), ctx.clone());
+    let (id_nav, id_title, id_load, id_new, id_dl) = (id.clone(), id.clone(), id.clone(), id.clone(), id.clone());
+    let agent_new = agent.clone();
     let b = WebviewBuilder::new(label(&id), WebviewUrl::External(parsed))
         .on_navigation(move |u| {
-            let ok = matches!(u.scheme(), "http" | "https" | "about");
+            let ok = allowed_scheme(u.scheme());
             if ok {
                 let s = u.to_string();
-                update(&c_nav, &id_nav, |t| t.url = s);
+                update(&c_nav, &id_nav, |t| {
+                    t.url = s;
+                    t.error = None;
+                });
+            } else {
+                let msg = format!("Blocked a `{}:` link. Only http and https pages can open here.", u.scheme());
+                update(&c_nav, &id_nav, |t| {
+                    t.error = Some(msg);
+                    t.loading = false;
+                });
             }
             ok
+        })
+        .on_page_load(move |_, p| {
+            let started = matches!(p.event(), tauri::webview::PageLoadEvent::Started);
+            let s = p.url().to_string();
+            update(&c_load, &id_load, |t| {
+                t.loading = started;
+                if allowed_scheme(p.url().scheme()) {
+                    t.url = s;
+                }
+                if started {
+                    t.error = None;
+                }
+            });
+        })
+        .on_new_window(move |u, _| {
+            if popup_allowed(u.as_str()) {
+                let (c, opener, agent, s) = (c_new.clone(), id_new.clone(), agent_new.clone(), u.to_string());
+                std::thread::spawn(move || {
+                    if let Ok(t) = open(&c, &s, agent) {
+                        c.emit("browser:opened", json!({"id": t.id, "opener": opener}));
+                    }
+                });
+            } else {
+                update(&c_new, &id_new, |t| t.error = Some(format!("Blocked a popup to `{}:`. Only http and https pages can open.", u.scheme())));
+            }
+            tauri::webview::NewWindowResponse::Deny
+        })
+        .on_download(move |_, ev| {
+            match ev {
+                tauri::webview::DownloadEvent::Requested { url, destination } => {
+                    let dir = downloads_dir();
+                    if !dir.is_dir() {
+                        c_dl.emit("browser:download", json!({"tab": id_dl, "name": "", "path": "", "state": "failed"}));
+                        return false;
+                    }
+                    let p = download_target(&dir, url.as_str(), |p| p.exists());
+                    let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    c_dl.emit("browser:download", json!({"tab": id_dl, "name": name, "path": p, "state": "started"}));
+                    *destination = p;
+                    true
+                }
+                tauri::webview::DownloadEvent::Finished { path, success, .. } => {
+                    let name = path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    c_dl.emit(
+                        "browser:download",
+                        json!({"tab": id_dl, "name": name, "path": path, "state": if success { "done" } else { "failed" }}),
+                    );
+                    true
+                }
+                _ => true,
+            }
         })
         .on_document_title_changed(move |_, title| {
             if let Some(rest) = title.strip_prefix(SNAP_PREFIX) {
@@ -129,7 +273,7 @@ async fn open(ctx: &Arc<Ctx>, url: &str, agent: Option<String>) -> Result<Tab, S
         });
     // Start tiny and hidden until the UI sends bounds.
     win.add_child(b, LogicalPosition::new(0.0, 0.0), LogicalSize::new(1.0, 1.0)).map_err(|e| e.to_string())?;
-    let tab = Tab { id: id.clone(), url, title: String::new(), agent, visible: false };
+    let tab = Tab { id: id.clone(), url, title: String::new(), agent, visible: false, loading: true, error: None };
     if let Ok(w) = webview(ctx, &id) {
         let _ = w.hide();
     }
@@ -153,7 +297,7 @@ fn ids(args: &Value) -> Vec<String> {
 }
 
 pub async fn agent_open(ctx: &Arc<Ctx>, agent: &str, url: &str) -> Result<String, String> {
-    Ok(open(ctx, url, Some(agent.to_string())).await?.id)
+    Ok(open(ctx, url, Some(agent.to_string()))?.id)
 }
 
 pub async fn agent_snapshot(ctx: &Arc<Ctx>, tab: &str) -> Result<String, String> {
@@ -177,24 +321,45 @@ pub async fn agent_snapshot(ctx: &Arc<Ctx>, tab: &str) -> Result<String, String>
 pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, String> {
     match method {
         "open" => {
-            let t = open(ctx, &arg_str(&args, "url")?, arg_opt_str(&args, "agent")).await?;
+            let t = open(ctx, &arg_str(&args, "url")?, arg_opt_str(&args, "agent"))?;
             Ok(json!(t))
         }
         "navigate" => {
             let (id, url) = (arg_str(&args, "tab")?, normalize_url(&arg_str(&args, "url")?)?);
             let w = webview(ctx, &id)?;
             w.navigate(url.parse().map_err(|e: <tauri::Url as std::str::FromStr>::Err| e.to_string())?).map_err(|e| e.to_string())?;
-            update(ctx, &id, |t| t.url = url);
+            update(ctx, &id, |t| {
+                t.url = url;
+                t.error = None;
+                t.loading = true;
+            });
             Ok(Value::Null)
         }
-        "back" | "forward" | "reload" => {
-            let w = webview(ctx, &arg_str(&args, "tab")?)?;
+        "back" | "forward" | "reload" | "stop" => {
+            let id = arg_str(&args, "tab")?;
+            let w = webview(ctx, &id)?;
             let js = match method {
                 "back" => "history.back()",
                 "forward" => "history.forward()",
+                "stop" => "window.stop()",
                 _ => "location.reload()",
             };
+            if method == "reload" && state().lock().unwrap().tabs.iter().any(|t| t.id == id && t.error.is_some()) {
+                // A failed load leaves an error page: retry the last known url instead.
+                let url = state().lock().unwrap().tabs.iter().find(|t| t.id == id).map(|t| t.url.clone()).unwrap_or_default();
+                if let Ok(u) = normalize_url(&url).and_then(|u| u.parse::<tauri::Url>().map_err(|e| e.to_string())) {
+                    w.navigate(u).map_err(|e| e.to_string())?;
+                }
+                update(ctx, &id, |t| {
+                    t.error = None;
+                    t.loading = true;
+                });
+                return Ok(Value::Null);
+            }
             w.eval(js).map_err(|e| e.to_string())?;
+            if method == "stop" {
+                update(ctx, &id, |t| t.loading = false);
+            }
             Ok(Value::Null)
         }
         "close" => {
@@ -202,11 +367,20 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
             if let Ok(w) = webview(ctx, &id) {
                 let _ = w.close();
             }
-            state().lock().unwrap().tabs.retain(|t| t.id != id);
+            forget(&id);
             ctx.emit("browser:closed", json!({"id": id}));
             Ok(Value::Null)
         }
-        "tabs" => Ok(json!(state().lock().unwrap().tabs.clone())),
+        "tabs" => {
+            // Prune tabs whose native webview no longer exists (e.g. after a crash).
+            if let Some(h) = ctx.handle() {
+                let gone: Vec<String> = state().lock().unwrap().tabs.iter().filter(|t| h.get_webview(&label(&t.id)).is_none()).map(|t| t.id.clone()).collect();
+                for id in gone {
+                    forget(&id);
+                }
+            }
+            Ok(json!(state().lock().unwrap().tabs.clone()))
+        }
         "set_bounds" => {
             let id = arg_str(&args, "tab")?;
             let n = |k: &str| args.get(k).and_then(Value::as_f64).ok_or_else(|| format!("missing `{k}`"));
@@ -247,5 +421,45 @@ mod tests {
         for bad in ["file:///etc/passwd", "javascript:alert(1)", "data:text/html,hi", "tauri://localhost", "ftp://x.y", ""] {
             assert!(normalize_url(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn scheme_and_popup_rules() {
+        for ok in ["http", "https", "about"] {
+            assert!(allowed_scheme(ok));
+        }
+        for bad in ["file", "javascript", "data", "tauri", "ipc", "blob", "mailto"] {
+            assert!(!allowed_scheme(bad), "{bad}");
+        }
+        assert!(popup_allowed("https://a.b/c"));
+        assert!(popup_allowed("HTTP://a.b"));
+        for bad in ["about:blank", "javascript:x", "file:///x", "data:,x", ""] {
+            assert!(!popup_allowed(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn download_names() {
+        let d = std::path::Path::new("/dl");
+        let none = |_: &std::path::Path| false;
+        assert_eq!(download_target(d, "https://x.y/files/report.pdf?x=1#a", none), d.join("report.pdf"));
+        assert_eq!(download_target(d, "https://x.y/my%20file.txt", none), d.join("my file.txt"));
+        assert_eq!(download_target(d, "https://x.y/", none), d.join("download"));
+        let p = download_target(d, "https://x.y/..%2F..%2Fetc%2Fpasswd", none);
+        assert_eq!(p.parent(), Some(d));
+        assert!(!p.file_name().unwrap().to_string_lossy().contains('/'));
+        let taken = |p: &std::path::Path| p == d.join("a.zip") || p == d.join("a (1).zip");
+        assert_eq!(download_target(d, "https://x.y/a.zip", taken), d.join("a (2).zip"));
+        assert_eq!(download_target(d, "https://x.y/.bashrc", none), d.join("bashrc"));
+    }
+
+    #[test]
+    fn stale_ids_are_forgotten() {
+        state().lock().unwrap().tabs.push(Tab { id: "zz1".into(), url: "about:blank".into(), title: String::new(), agent: None, visible: false, loading: false, error: None });
+        assert!(forget("zz1"));
+        assert!(!forget("zz1"));
+        assert!(!forget("never"));
+        let ctx = Ctx::test();
+        assert!(webview(&ctx, "never").is_err());
     }
 }
