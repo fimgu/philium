@@ -37,7 +37,6 @@ pub const OPENAI_ISSUER: &str = "https://auth.openai.com";
 pub const OPENAI_VERIFY_URL: &str = "https://auth.openai.com/codex/device";
 pub const CHATGPT_ORIGINATOR: &str = "codex_cli_rs";
 
-const KEYCHAIN_SERVICE: &str = "dev.gunnarsson.philium";
 /// Refresh this long before expiry.
 const SKEW_MS: i64 = 5 * 60 * 1000;
 
@@ -68,24 +67,15 @@ pub trait Store: Send + Sync {
 
 pub struct Keychain;
 
-fn entry(id: &str) -> Result<keyring::Entry, String> {
-    if std::env::var_os("PHILIUM_PREVIEW").is_some() {
-        return Err("keychain is disabled in preview builds".into());
-    }
-    keyring::Entry::new(KEYCHAIN_SERVICE, &format!("oauth:{id}")).map_err(|e| e.to_string())
-}
-
 impl Store for Keychain {
     fn load(&self, id: &str) -> Option<Creds> {
-        serde_json::from_str(&entry(id).ok()?.get_password().ok()?).ok()
+        serde_json::from_str(&crate::secrets::get(&format!("oauth:{id}"))?).ok()
     }
     fn save(&self, id: &str, c: &Creds) -> Result<(), String> {
-        entry(id)?.set_password(&serde_json::to_string(c).unwrap()).map_err(|e| format!("keychain: {e}"))
+        crate::secrets::set(&format!("oauth:{id}"), &serde_json::to_string(c).unwrap_or_default())
     }
     fn delete(&self, id: &str) {
-        if let Ok(e) = entry(id) {
-            let _ = e.delete_credential();
-        }
+        crate::secrets::delete(&format!("oauth:{id}"))
     }
 }
 

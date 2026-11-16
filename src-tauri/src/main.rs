@@ -26,6 +26,7 @@ mod oauth;
 mod providers;
 mod reaper;
 mod sandbox;
+mod secrets;
 mod selfdev;
 mod stats;
 mod terminals;

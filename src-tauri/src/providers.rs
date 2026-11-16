@@ -25,7 +25,6 @@ use crate::db::now;
 use crate::gateway::Route;
 use crate::guard::GuardMode;
 
-const KEYCHAIN_SERVICE: &str = "dev.gunnarsson.philium";
 pub const CLAUDE_UPSTREAM: &str = "https://api.anthropic.com/v1";
 pub const CHATGPT_UPSTREAM: &str = "https://chatgpt.com/backend-api/codex";
 pub const RESERVED_CLAUDE: &str = "claude-code";
@@ -123,27 +122,16 @@ pub fn valid_model_id(m: &str) -> Result<(), String> {
 
 // ---------- keychain ----------
 
-/// Improve-Philium previews run with PHILIUM_PREVIEW=1 and must never see
-/// the user's real keys.
-fn entry(id: &str) -> Result<keyring::Entry, String> {
-    if std::env::var_os("PHILIUM_PREVIEW").is_some() {
-        return Err("keychain is disabled in preview builds".into());
-    }
-    keyring::Entry::new(KEYCHAIN_SERVICE, &format!("provider:{id}")).map_err(|e| e.to_string())
-}
-
 pub fn get_key(id: &str) -> Option<String> {
-    entry(id).ok()?.get_password().ok()
+    crate::secrets::get(&format!("provider:{id}"))
 }
 
 pub fn set_key(id: &str, key: &str) -> Result<(), String> {
-    entry(id)?.set_password(key).map_err(|e| format!("keychain: {e}"))
+    crate::secrets::set(&format!("provider:{id}"), key)
 }
 
 pub fn delete_key(id: &str) {
-    if let Ok(e) = entry(id) {
-        let _ = e.delete_credential();
-    }
+    crate::secrets::delete(&format!("provider:{id}"))
 }
 
 // ---------- storage ----------
