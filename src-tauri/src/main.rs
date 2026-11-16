@@ -20,6 +20,11 @@ struct Hal {
     proc: Mutex<Option<(Child, ChildStdin)>>,
 }
 
+enum Backend {
+    Ready(Hal),
+    Failed(String),
+}
+
 fn server_path() -> std::path::PathBuf {
     let exe = std::env::current_exe().expect("current exe");
     let dir = exe.parent().expect("exe dir");
@@ -92,11 +97,15 @@ fn validate_path(path: &str) -> Result<(), String> {
 /// Proxy one request to HAL. `path` must be an absolute API path.
 #[tauri::command]
 async fn hal(
-    state: State<'_, Hal>,
+    state: State<'_, Backend>,
     method: String,
     path: String,
     body: Option<Value>,
 ) -> Result<Value, String> {
+    let state = match &*state {
+        Backend::Ready(h) => h,
+        Backend::Failed(e) => return Err(format!("HAL failed to start: {e}")),
+    };
     validate_path(&path)?;
     let method = match method.as_str() {
         "GET" => reqwest::Method::GET,
@@ -124,7 +133,7 @@ async fn hal(
 }
 
 fn shutdown(app: &tauri::AppHandle) {
-    if let Some(state) = app.try_state::<Hal>() {
+    if let Some(Backend::Ready(state)) = app.try_state::<Backend>().as_deref() {
         if let Some((mut child, stdin)) = state.proc.lock().unwrap().take() {
             drop(stdin);
             for _ in 0..30 {
@@ -141,8 +150,15 @@ fn shutdown(app: &tauri::AppHandle) {
 fn main() {
     let app = tauri::Builder::default()
         .setup(|app| {
-            let hal = start_hal().map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-            app.manage(hal);
+            // Never abort: a missing/broken sidecar must show in the UI, not crash silently.
+            let backend = match start_hal() {
+                Ok(h) => Backend::Ready(h),
+                Err(e) => {
+                    eprintln!("filium: {e}");
+                    Backend::Failed(e)
+                }
+            };
+            app.manage(backend);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![hal])
