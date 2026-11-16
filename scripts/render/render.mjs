@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import puppeteer from "puppeteer-core";
 import { EMPTY, POPULATED, FAILING, SLOW, HUGE } from "./fixtures.js";
 import { checkAgentMessaging, checkChatMessaging } from "./robustness.mjs";
+import { checkCodeGraph } from "./code-review.mjs";
 const SETS = { empty: EMPTY, populated: POPULATED, failing: FAILING, slow: SLOW, huge: HUGE };
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -34,7 +35,14 @@ const stub = (fx, setName) => {
   const fixtures = fx;
   window.__permissionCalls = [];
   const listeners = new Map();
-  window.__test = { sends: [], mode: "reject", holdShell: false };
+  window.__test = { sends: [], mode: "reject", holdShell: false, codeCalls: [] };
+  if (setName === "populated") {
+    fixtures["workspace.worktrees"].forEach((w) => { w.state = "active"; });
+    fixtures["codeindex.tree"].files.unshift({ path: "src/review.py", syms: [{ name: "review", kind: "function", line: 3 }] });
+    fixtures["codeindex.graph"].nodes.push({ id: "src/review.py", path: "src/review.py", label: "review.py", kind: "file", group: "src", weight: 8, changed_by: [{ worktree_id: "w1", agent: "lion" }] });
+  }
+  const nativeScale = CanvasRenderingContext2D.prototype.scale;
+  CanvasRenderingContext2D.prototype.scale = function(x, y) { this.canvas.__graphScale = x; return nativeScale.call(this, x, y); };
   window.__emit = (topic, payload) => {
     for (const [id, subscribed] of listeners) {
       if (subscribed === topic) window[`_${id}`]?.({ event: topic, id, payload });
@@ -69,6 +77,22 @@ const stub = (fx, setName) => {
         throw fixtures.__fail[window.__n % fixtures.__fail.length];
       }
       if (cmd === "rpc") {
+        if (["codeindex.source", "codeindex.changes", "codeindex.file_diff"].includes(a.method)) {
+          window.__test.codeCalls.push({ method: a.method, ...a.args });
+          const live = !!(a.args.worktree_id || a.args.working_tree);
+          const base = { base_commit: "abc123base", revision: live ? `working-tree:${a.args.worktree_id || 'local'}` : "abc123base", worktree_id: a.args.worktree_id || null, path: a.args.path, truncated: false };
+          if (window.__test.slowSource && a.method === "codeindex.source") await new Promise((r) => setTimeout(r, 400));
+          if (a.method === "codeindex.changes") return { ...base, files: live ? [
+            { path: "src/review.py", status: "M", added: 1, removed: 1 },
+            { path: "src/new.py", status: "?", added: 2, removed: 0 },
+            { path: "src/deleted.py", status: "D", added: 0, removed: 3 },
+            { path: "image.bin", status: "M", added: null, removed: null },
+          ] : [], note: live ? "" : "Base commit has no working-tree changes." };
+          const deleted = a.args.path === "src/deleted.py";
+          const binary = a.args.path === "image.bin";
+          if (a.method === "codeindex.source") return { ...base, exists: !deleted, binary, language: "python", text: deleted || binary ? "" : `# ${base.revision}\n\ndef review():\n    return ${live ? 42 : 1}\n`, note: deleted ? "File was deleted in this worktree." : binary ? "Binary file." : "" };
+          return { ...base, binary, patch: !live || binary ? "" : `diff --git a/${a.args.path} b/${a.args.path}\n--- a/${a.args.path}\n+++ b/${a.args.path}\n@@ -3,2 +3,2 @@\n def review():\n-    return 1\n+    return 42\n`, note: binary ? "Binary files differ." : !live ? "No changes in base commit view." : "" };
+        }
         if (["agents.cancel", "agents.stop"].includes(a.method) && window.__test.failCancel) throw 'Cancellation unavailable';
         if (a.method === "agents.shell" && window.__test.holdShell) {
           await new Promise((resolve) => { window.__test.releaseShell = resolve; });
@@ -195,6 +219,9 @@ for (const setName of sets) {
           }
         } else if (setName === "populated") problems.push(`${w} browser approval: agent detail did not open`);
         if (await clickText(page, "button", "New agent")) { await sleep(300); await shot(page, "modal-new-agent"); }
+      }
+      if (s === "code" && setName === "populated") {
+        for (const error of await checkCodeGraph(page, shot)) problems.push(`${w} code review: ${error}`);
       }
       if (s === "providers") {
         if (await clickText(page, "button", "Add provider")) { await sleep(300); await shot(page, "modal-add-provider"); }

@@ -17,6 +17,9 @@ export async function checkAgentMessaging(page) {
     if (!input()) return ['composer missing'];
     value('keep this draft');
     await paste('first.png');
+    const navigate = (label) => [...document.querySelectorAll('.nav-item')].find((b) => b.textContent.trim() === label)?.click();
+    navigate('Home'); await wait(); navigate('Agents'); await wait();
+    if (!input() || input().value !== 'keep this draft' || !document.querySelector('.composer img')) return ['navigation lost agent draft or attachment'];
     window.__agentState('running'); await wait();
     enter(); enter(); await wait();
     if (window.__test.sends.length) errors.push('busy Enter submitted');
