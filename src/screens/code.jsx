@@ -1,6 +1,7 @@
 // Code: structural index of a repo (symbols, references, graph) with per-worktree overlays.
 import { For, Show, createResource, createSignal, createMemo, createEffect, onCleanup, on } from "solid-js";
-import { Page, Button, Badge, Select, Input, Segmented, Empty, VirtualList } from "../ui/kit.jsx";
+import { Page, Button, Badge, Select, Input, Segmented, Toggle, Empty, VirtualList } from "../ui/kit.jsx";
+import Graph from "../ui/graph.jsx";
 import { Icon } from "../ui/icons.jsx";
 import { rpc, useEvent, fmt } from "../lib/rpc.js";
 import { params } from "../lib/nav.js";
@@ -8,129 +9,135 @@ import { agentHue, AgentChip } from "./agents.jsx";
 import "../styles/code.css";
 
 const SEV = { same_symbol: ["danger", "same symbol"], dependent: ["strict", "dependent code"], same_file: ["strict", "same file"] };
-const sevOf = (s) => SEV[s] ?? ["strict", String(s).replace(/_/g, " ")];
+const sevOf = (s) => SEV[s] ?? ["strict", String(s ?? "overlap").replace(/_/g, " ")];
 const basename = (p) => p.split("/").pop();
 const dirname = (p) => (p.includes("/") ? p.slice(0, p.lastIndexOf("/") + 1) : "");
 
-/** Deterministic force layout, computed once. Falls back to grouped grid when huge. */
-export function layout(nodes, edges) {
-  const n = nodes.length;
-  const pos = new Map();
-  const seed = (s) => { let h = 2166136261; for (const c of s) h = Math.imul(h ^ c.charCodeAt(0), 16777619); return ((h >>> 0) % 10000) / 10000; };
-  const R = Math.sqrt(n) * 38 + 40;
-  nodes.forEach((nd) => pos.set(nd.id, { x: (seed(nd.id) - 0.5) * 2 * R, y: (seed(nd.id + "y") - 0.5) * 2 * R, vx: 0, vy: 0 }));
-  if (n > 450) {
-    const groups = [...new Set(nodes.map((x) => x.group))];
-    const gc = Math.ceil(Math.sqrt(groups.length));
-    nodes.forEach((nd, i) => {
-      const gi = groups.indexOf(nd.group);
-      const p = pos.get(nd.id);
-      p.x = (gi % gc) * 260 + (seed(nd.id) - 0.5) * 220;
-      p.y = Math.floor(gi / gc) * 260 + (seed(nd.id + "y") - 0.5) * 220;
-    });
-    return pos;
-  }
-  const list = nodes.map((nd) => pos.get(nd.id));
-  const idx = new Map(nodes.map((nd, i) => [nd.id, i]));
-  const es = edges.map((e) => [idx.get(e.source), idx.get(e.target)]).filter(([a, b]) => a != null && b != null && a !== b);
-  const grp = nodes.map((nd) => nd.group);
-  for (let it = 0; it < 220; it++) {
-    const cool = 1 - it / 220;
-    for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) {
-      const a = list[i], b = list[j];
-      let dx = a.x - b.x, dy = a.y - b.y;
-      let d2 = dx * dx + dy * dy + 0.01;
-      if (d2 > 160000) continue;
-      const f = 2200 / d2, d = Math.sqrt(d2);
-      dx = (dx / d) * f; dy = (dy / d) * f;
-      a.vx += dx; a.vy += dy; b.vx -= dx; b.vy -= dy;
-    }
-    for (const [i, j] of es) {
-      const a = list[i], b = list[j];
-      const dx = b.x - a.x, dy = b.y - a.y, d = Math.sqrt(dx * dx + dy * dy) + 0.01;
-      const f = (d - (grp[i] === grp[j] ? 40 : 80)) * 0.04;
-      a.vx += (dx / d) * f; a.vy += (dy / d) * f; b.vx -= (dx / d) * f; b.vy -= (dy / d) * f;
-    }
-    for (const p of list) {
-      p.vx -= p.x * 0.004; p.vy -= p.y * 0.004;
-      p.x += Math.max(-30, Math.min(30, p.vx)) * cool; p.y += Math.max(-30, Math.min(30, p.vy)) * cool;
-      p.vx *= 0.6; p.vy *= 0.6;
-    }
-  }
-  return pos;
+// Calm palette that reads well on a dark canvas, in legend order.
+const PALETTE = ["#7aa2f7", "#9ece6a", "#e0af68", "#bb9af7", "#7dcfff", "#f7768e", "#73daca", "#ff9e64", "#c0caf5", "#b4f9f8", "#d7a6ff", "#a9b665"];
+const OTHER = "#6b7280";
+const groupOf = (nd) => {
+  const p = String(nd.path ?? nd.id).split(":")[0].split("/");
+  p.pop();
+  if (!p.length) return "(root)";
+  return p.slice(0, 2).join("/");
+};
+const SETTINGS_KEY = "philium.code.graph";
+const DEFAULTS = { link: 1, repel: 1, center: 1, size: 1, thickness: 1, arrows: false, depth: 1, local: false, display: false };
+const loadSettings = () => { try { return { ...DEFAULTS, ...JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}") }; } catch { return { ...DEFAULTS }; } };
+
+function Slider(props) {
+  return (
+    <label class="gslider">
+      <span class="lab">{props.label}<b>{props.fmt ? props.fmt(props.value) : props.value.toFixed(1)}</b></span>
+      <input type="range" min={props.min ?? 0.1} max={props.max ?? 2} step={props.step ?? 0.05} value={props.value} onInput={(e) => props.onValue(+e.currentTarget.value)} />
+    </label>
+  );
 }
 
-function Graph(props) {
-  const [view, setView] = createSignal({ x: 0, y: 0, k: 1 });
-  let svg, drag;
-  const pos = createMemo(() => layout(props.data?.nodes ?? [], props.data?.edges ?? []));
-  const maxRank = createMemo(() => Math.max(1e-9, ...(props.data?.nodes ?? []).map((x) => x.rank ?? 0)));
-  const fit = () => {
-    const ps = [...pos().values()];
-    if (!ps.length || !svg) return;
-    const xs = ps.map((p) => p.x), ys = ps.map((p) => p.y);
-    const [x0, x1, y0, y1] = [Math.min(...xs), Math.max(...xs), Math.min(...ys), Math.max(...ys)];
-    const w = svg.clientWidth || 600, h = svg.clientHeight || 400;
-    const k = Math.min(2, 0.9 * Math.min(w / Math.max(60, x1 - x0), h / Math.max(60, y1 - y0)));
-    setView({ k, x: w / 2 - ((x0 + x1) / 2) * k, y: h / 2 - ((y0 + y1) / 2) * k });
-  };
-  createEffect(on(pos, () => queueMicrotask(fit)));
-  const hot = createMemo(() => {
-    const s = props.selected; const set = new Set();
-    if (!s) return set;
-    for (const e of props.data?.edges ?? []) { if (e.source === s) set.add(e.target); if (e.target === s) set.add(e.source); }
-    return set;
+function GraphView(props) {
+  const [cfg, setCfg] = createSignal(loadSettings());
+  const set = (k, v) => setCfg((c) => { const n = { ...c, [k]: v }; try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(n)); } catch {} return n; });
+  const [hidden, setHidden] = createSignal(new Set());
+  const [gq, setGq] = createSignal("");
+  const [hover, setHover] = createSignal(null);
+  let api;
+
+  const all = createMemo(() => {
+    const nodes = (props.data?.nodes ?? []).map((n) => ({ ...n, group: groupOf(n), dir: n.group, weight: Math.max(n.weight ?? 0, props.level === "file" ? Math.sqrt(n.syms ?? 0) : 0) }));
+    return { nodes, edges: props.data?.edges ?? [] };
   });
-  const radius = (nd) => 4 + 7 * Math.sqrt((nd.rank ?? 0) / maxRank());
-  const fill = (nd) => (nd.changed_by?.length ? `hsl(${agentHue(nd.changed_by[0].agent)} 75% 62%)` : null);
-  const agents = createMemo(() => {
+  const groups = createMemo(() => {
     const m = new Map();
-    for (const nd of props.data?.nodes ?? []) for (const c of nd.changed_by ?? []) m.set(c.agent, (m.get(c.agent) ?? 0) + 1);
-    return [...m.entries()];
+    for (const n of all().nodes) m.set(n.group, (m.get(n.group) ?? 0) + 1);
+    const list = [...m.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+    return list.map(([g, c], i) => ({ g, c, color: i < PALETTE.length ? PALETTE[i] : OTHER }));
   });
-  const zoomAt = (f, cx, cy) => setView((v) => { const k = Math.max(0.05, Math.min(6, v.k * f)); const r = k / v.k; return { k, x: cx - (cx - v.x) * r, y: cy - (cy - v.y) * r }; });
-  const showLabel = (nd) => view().k > 1.4 || props.selected === nd.id || hot().has(nd.id) || (nd.rank ?? 0) / maxRank() > (view().k > 0.9 ? 0.5 : 0.75) || nd.changed_by?.length;
+  const colorOf = createMemo(() => { const m = new Map(groups().map((x) => [x.g, x.color])); return (n) => m.get(n.group) ?? OTHER; });
+
+  // Local mode: selected node plus N hops.
+  const view = createMemo(() => {
+    const { nodes, edges } = all();
+    const c = cfg();
+    const withRing = (ns) => ns.map((n) => (n.changed_by?.length ? { ...n, ring: `hsl(${agentHue(n.changed_by[0].agent)} 80% 66%)` } : n));
+    if (!c.local || !props.selected) return { nodes: withRing(nodes), edges };
+    const adj = new Map();
+    for (const e of edges) { (adj.get(e.source) ?? adj.set(e.source, []).get(e.source)).push(e.target); (adj.get(e.target) ?? adj.set(e.target, []).get(e.target)).push(e.source); }
+    const keep = new Set([props.selected]);
+    let front = [props.selected];
+    for (let d = 0; d < c.depth; d++) { const nx = []; for (const id of front) for (const o of adj.get(id) ?? []) if (!keep.has(o)) { keep.add(o); nx.push(o); } front = nx; }
+    return { nodes: withRing(nodes.filter((n) => keep.has(n.id))), edges: edges.filter((e) => keep.has(e.source) && keep.has(e.target)) };
+  });
+  const matches = createMemo(() => {
+    const t = gq().trim().toLowerCase();
+    if (!t) return new Set();
+    return new Set(view().nodes.filter((n) => String(n.label ?? "").toLowerCase().includes(t) || String(n.path ?? n.id).toLowerCase().includes(t)).map((n) => n.id));
+  });
+  createEffect(on(() => [cfg().local, cfg().depth, props.selected], () => cfg().local && queueMicrotask(() => setTimeout(() => api?.fit(), 450)), { defer: true }));
+  createEffect(on(() => props.level, () => setHidden(new Set()), { defer: true }));
+  const toggleGroup = (g, solo) => setHidden((h) => {
+    if (solo) { const only = groups().map((x) => x.g).filter((x) => x !== g); return h.size === only.length && !h.has(g) ? new Set() : new Set(only); }
+    const n = new Set(h); n.has(g) ? n.delete(g) : n.add(g); return n;
+  });
+  const settings = createMemo(() => { const c = cfg(); return { link: c.link, repel: c.repel, center: c.center, size: c.size, thickness: c.thickness, arrows: c.arrows }; });
+  const nNodes = () => view().nodes.filter((n) => !hidden().has(n.group)).length;
+
   return (
     <div class="code-graph">
-      <svg ref={svg}
-        onWheel={(e) => { e.preventDefault(); const r = svg.getBoundingClientRect(); zoomAt(e.deltaY < 0 ? 1.12 : 1 / 1.12, e.clientX - r.left, e.clientY - r.top); }}
-        onPointerDown={(e) => { if (e.target.closest(".gnode")) return; drag = { x: e.clientX, y: e.clientY, v: view() }; svg.setPointerCapture(e.pointerId); }}
-        onPointerMove={(e) => { if (drag) setView({ ...drag.v, x: drag.v.x + e.clientX - drag.x, y: drag.v.y + e.clientY - drag.y }); }}
-        onPointerUp={() => (drag = null)}>
-        <g transform={`translate(${view().x} ${view().y}) scale(${view().k})`}>
-          <For each={props.data?.edges ?? []}>
-            {(e) => {
-              const a = () => pos().get(e.source), b = () => pos().get(e.target);
-              return <Show when={a() && b()}><line class={`gedge ${props.selected && (e.source === props.selected || e.target === props.selected) ? "hot" : ""}`} x1={a().x} y1={a().y} x2={b().x} y2={b().y} stroke-width={(1 + Math.min(3, Math.log2(1 + (e.weight ?? 1)))) / view().k ** 0.5} /></Show>;
-            }}
-          </For>
-          <For each={props.data?.nodes ?? []}>
-            {(nd) => {
-              const p = () => pos().get(nd.id);
-              return (
-                <g onClick={() => props.onSelect(nd)}>
-                  <circle class={`gnode ${props.selected === nd.id ? "sel" : ""}`} cx={p().x} cy={p().y} r={radius(nd)} style={fill(nd) ? { fill: fill(nd) } : {}}>
-                    <title>{nd.id}{nd.changed_by?.length ? ` (changed by ${nd.changed_by.map((c) => c.agent).join(", ")})` : ""}</title>
-                  </circle>
-                  <Show when={showLabel(nd)}><text class="glabel" x={p().x + radius(nd) + 3} y={p().y + 3}>{nd.label}</text></Show>
-                </g>
-              );
-            }}
-          </For>
-        </g>
-      </svg>
+      <Graph nodes={view().nodes} edges={view().edges} hidden={hidden()} color={colorOf()} selected={props.selected} match={matches()} settings={settings()}
+        onSelect={(n) => props.onSelect(n)} onOpen={(n) => props.onOpen?.(n)} onHover={setHover} api={(a) => (api = a)} />
       <div class="gtools">
         <Segmented value={props.level} onChange={props.onLevel} options={[{ value: "file", label: "Files" }, { value: "symbol", label: "Symbols" }]} />
-        <Button size="sm" onClick={() => zoomAt(1.3, svg.clientWidth / 2, svg.clientHeight / 2)}>+</Button>
-        <Button size="sm" onClick={() => zoomAt(1 / 1.3, svg.clientWidth / 2, svg.clientHeight / 2)}>-</Button>
-        <Button size="sm" onClick={fit}>Fit</Button>
+        <Segmented value={cfg().local ? "local" : "global"} onChange={(v) => set("local", v === "local")} options={[{ value: "global", label: "Global" }, { value: "local", label: "Local" }]} />
+        <div class="gsearch">
+          <Icon name="search" size={12} />
+          <input placeholder="Find in graph" value={gq()} onInput={(e) => setGq(e.currentTarget.value)}
+            onKeyDown={(e) => { if (e.key === "Enter" && matches().size) api?.fit([...matches()]); if (e.key === "Escape") setGq(""); }} />
+          <Show when={gq()}><span class="cnt">{matches().size}</span></Show>
+        </div>
       </div>
+      <div class="gzoom">
+        <button title="Zoom in" onClick={() => api?.zoom(1.3)}>+</button>
+        <button title="Zoom out" onClick={() => api?.zoom(1 / 1.3)}>-</button>
+        <button title="Fit to view" onClick={() => api?.fit()}><svg width="12" height="12" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M3 7V3h4M13 3h4v4M17 13v4h-4M7 17H3v-4" /></svg></button>
+        <button title="Display settings" class={cfg().display ? "on" : ""} onClick={() => set("display", !cfg().display)}><Icon name="settings" size={12} /></button>
+      </div>
+      <Show when={cfg().display}>
+        <div class="gpanel">
+          <div class="gph">Display</div>
+          <Show when={cfg().local}>
+            <Slider label="Depth" min={1} max={4} step={1} value={cfg().depth} fmt={(v) => String(v)} onValue={(v) => set("depth", v)} />
+            <Show when={!props.selected}><div class="ghint">Select a node to see its neighbourhood.</div></Show>
+          </Show>
+          <Slider label="Node size" value={cfg().size} min={0.4} max={2.5} onValue={(v) => set("size", v)} />
+          <Slider label="Link thickness" value={cfg().thickness} min={0.2} max={3} onValue={(v) => set("thickness", v)} />
+          <Toggle on={cfg().arrows} label="Arrows" onChange={(v) => set("arrows", v)} />
+          <div class="gph">Forces</div>
+          <Slider label="Center force" value={cfg().center} min={0} max={3} onValue={(v) => set("center", v)} />
+          <Slider label="Repel force" value={cfg().repel} min={0.1} max={4} onValue={(v) => set("repel", v)} />
+          <Slider label="Link force" value={cfg().link} min={0.05} max={2} onValue={(v) => set("link", v)} />
+          <button class="greset" onClick={() => { const d = cfg().display, l = cfg().local; setCfg({ ...DEFAULTS, display: d, local: l }); localStorage.removeItem(SETTINGS_KEY); api?.reheat(); }}>Restore defaults</button>
+        </div>
+      </Show>
+      <Show when={hover()}>
+        <div class="ghover">
+          <b>{hover().label}</b>
+          <span class="mono">{hover().path ?? hover().id}</span>
+          <span>{hover().refs_in ?? 0} in, {hover().refs_out ?? 0} out{props.level === "file" && hover().syms != null ? `, ${hover().syms} symbols` : ""}</span>
+        </div>
+      </Show>
       <Show when={props.data?.truncated}><div class="note">Showing the most connected part of a larger graph</div></Show>
-      <div class="legend">
-        <span><i style={{ background: "#3a4050" }} />unchanged, size = how much depends on it</span>
-        <For each={agents()}>{([a, c]) => <span><i style={{ background: `hsl(${agentHue(a)} 75% 62%)` }} />{a} changed {c}</span>}</For>
-      </div>
-      <Show when={!(props.data?.nodes ?? []).length}><div class="code-empty">Nothing to draw yet. The index fills in after the first scan.</div></Show>
+      <Show when={groups().length}>
+        <div class="legend">
+          <For each={groups()}>{(x) => (
+            <button class={hidden().has(x.g) ? "off" : ""} title="Click to hide, shift click to show only this group" onClick={(e) => toggleGroup(x.g, e.shiftKey || e.altKey)}>
+              <i style={{ background: x.color }} />{x.g}<span class="c">{x.c}</span>
+            </button>
+          )}</For>
+          <span class="meta">{nNodes()} nodes, size = references</span>
+        </div>
+      </Show>
+      <Show when={!(props.data?.nodes ?? []).length}><div class="code-empty center">Nothing to draw yet. The index fills in after the first scan.</div></Show>
     </div>
   );
 }
@@ -210,7 +217,8 @@ export default function Code() {
     const t = q().trim().toLowerCase();
     const out = [];
     for (const f of tree()?.files ?? []) {
-      const symHits = t ? f.syms.filter((s) => s.name.toLowerCase().includes(t)) : f.syms;
+      const syms = f.syms ?? [];
+      const symHits = t ? syms.filter((s) => (s.name ?? "").toLowerCase().includes(t)) : syms;
       const fileHit = t && f.path.toLowerCase().includes(t);
       if (t && !fileHit && !symHits.length) continue;
       out.push({ t: "file", f });
@@ -247,7 +255,7 @@ export default function Code() {
             <For each={clashes().clashes}>{(c) => (
               <div class="code-clash">
                 <Badge tone={sevOf(c.severity)[0]}>{sevOf(c.severity)[1]}</Badge>
-                <AgentChip name={c.a} /> and <AgentChip name={c.b} /> both change code that overlaps
+                <AgentChip name={c.a ?? "?"} /> and <AgentChip name={c.b ?? "?"} /> both change code that overlaps
                 <span class="detail" title={(c.detail ?? []).join("\n")}>{(c.detail ?? []).slice(0, 2).join(", ")}</span>
               </div>
             )}</For>
@@ -263,11 +271,11 @@ export default function Code() {
                     <div class={`code-row file ${sel()?.id === r.f.path ? "on" : ""}`} onClick={() => { toggle(r.f.path); setSel({ id: r.f.path, file: r.f.path, label: basename(r.f.path) }); }}>
                       <span class="cv">{open().has(r.f.path) ? "v" : ">"}</span>
                       <span class="name" title={r.f.path}><span class="dir">{dirname(r.f.path)}</span>{basename(r.f.path)}</span>
-                      <span class="xs faint">{r.f.syms.length}</span>
+                      <span class="xs faint">{(r.f.syms ?? []).length}</span>
                     </div>
                   ) : (
                     <div class={`code-row sym ${sel()?.id === `${r.f.path}:${r.s.name}` ? "on" : ""}`} style={{ "padding-left": "28px" }} onClick={() => setSel({ id: `${r.f.path}:${r.s.name}`, symbol: r.s.name, file: r.f.path, label: r.s.name })}>
-                      <span class="kind">{r.s.kind.slice(0, 3)}</span>
+                      <span class="kind">{(r.s.kind ?? "sym").slice(0, 3)}</span>
                       <span class="name">{r.s.parent ? `${r.s.parent}.` : ""}{r.s.name}</span>
                       <span class="xs faint">{r.s.line}</span>
                     </div>
@@ -276,7 +284,7 @@ export default function Code() {
               </Show>
               <Show when={tree()?.truncated}><div class="xs faint" style={{ padding: "6px 10px" }}>Showing top-ranked files only. Search to narrow.</div></Show>
             </div>
-            <Graph data={graph()} level={level()} onLevel={setLevel} selected={sel()?.id} onSelect={pickNode} />
+            <GraphView data={graph()} level={level()} onLevel={setLevel} selected={sel()?.id} onSelect={(n) => (n ? pickNode(n) : setSel(null))} onOpen={(n) => { if (n.kind === "file") { setOpen((o) => new Set(o).add(n.id)); setLevel("symbol"); } }} />
             <Show when={sel()}>
               <aside class="code-drawer">
                 <div class="dhead">
