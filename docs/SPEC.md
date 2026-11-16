@@ -54,7 +54,7 @@ Design goals, in priority order:
 | N2 | UI renders only visible rows (virtualized). 1,000 agents in a list costs the same as 20. |
 | N3 | One HAL process per agent (about 5 to 10 MB each). Agents share nothing at runtime, so a crash or sandbox only affects one agent. |
 | N4 | macOS first. Windows and Linux follow without architectural change. |
-| N5 | No secret is ever written to disk outside the OS keychain. Logs on disk hold metadata only. |
+| N5 | Secrets live only in the vault file (`<data dir>/secrets/vault.json`, mode 0600 in a 0700 folder). Every agent process (HAL, shells, commands) runs under a Seatbelt profile that denies that folder, trusted agents included. No macOS Keychain, so no access prompts. Logs on disk hold metadata only. |
 | N6 | No agent limit. Every agent you start runs immediately. Philium handles provider rate limits (backoff on 429, per-provider request pacing) and shows CPU, memory, disk and rate-limit headroom so you can see when the machine is saturated. |
 
 ## 3. Architecture

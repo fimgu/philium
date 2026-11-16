@@ -52,7 +52,7 @@ function ProviderForm(props) {
       </div>
       <Show when={!sub()}>
         <Field label="Base URL"><Input mono value={url()} onValue={setUrl} placeholder={KINDS.find((k) => k.value === kind())?.url} /></Field>
-        <Field label="API key" hint={editing && p.has_key ? "Stored in the macOS Keychain. Leave empty to keep it." : "Stored only in the macOS Keychain. Agents never see it."}>
+        <Field label="API key" hint={editing && p.has_key ? "Saved in Philium's private vault. Leave empty to keep it." : "Saved in Philium's private vault, which agents cannot read."}>
           <Input mono type="password" value={key()} onValue={setKey} placeholder={editing && p.has_key ? "••••••••" : "sk-…"} />
         </Field>
         <Field label="Trust">
@@ -173,13 +173,13 @@ export default function Providers() {
     finally { setBusy(null); bump(); }
   };
   const remove = async (p) => {
-    if (!(await confirm(`Remove ${p.name}?`, "Its API key is deleted from the Keychain. Agents using it will stop working.", { danger: true, ok: "Remove" }))) return;
+    if (!(await confirm(`Remove ${p.name}?`, "Its API key is deleted from Philium's vault. Agents using it will stop working.", { danger: true, ok: "Remove" }))) return;
     await rpc("providers.remove", { id: p.id });
     bump();
   };
 
   return (
-    <Page title="Providers" sub="Keys stay in the Keychain. Agents only ever get a local gateway token."
+    <Page title="Providers" sub="Keys stay in Philium's private vault. Agents only ever get a local gateway token."
       actions={<Button variant="primary" onClick={() => setForm({})}><Icon name="plus" /> Add provider</Button>}>
       <Show when={list() && list().length === 0}>
         <Empty icon={<Icon name="key" size={32} />} title="No providers yet"

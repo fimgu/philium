@@ -237,10 +237,51 @@ pub fn profile(p: &Policy) -> String {
     // Network: loopback only (gateway, egress proxy, MCP).
     s.push_str("(allow network-outbound (remote ip \"localhost:*\"))\n");
     s.push_str("(allow network-bind (local ip \"localhost:*\"))\n(allow network-inbound (local ip \"localhost:*\"))\n");
+    s.push_str(&deny_secrets());
     s
 }
 
+/// Seatbelt rule hiding Philium's secret vault folder (`secrets.rs`).
+fn deny_secrets() -> String {
+    match crate::secrets::dir() {
+        Some(d) => format!("(deny file-read* file-write* (subpath \"{}\"))\n", esc(d)),
+        None => String::new(),
+    }
+}
+
+/// Profile for trusted (non-Strict) agents: everything allowed except the
+/// secret vault. `None` when no sandbox is available on this OS.
+pub fn trusted_profile() -> Option<String> {
+    if !matches!(backend(), Backend::Seatbelt) || !Path::new("/usr/bin/sandbox-exec").exists() {
+        return None;
+    }
+    Some(format!("(version 1)\n(allow default)\n{}", deny_secrets()))
+}
+
+/// Prefix `argv` with sandbox-exec: the Strict profile when there is a
+/// policy, otherwise the trusted profile (vault hidden).
+pub fn wrap_argv(policy: Option<&Policy>, mut argv: Vec<String>) -> Vec<String> {
+    let prof = match policy {
+        Some(p) => Some(profile(p)),
+        None => trusted_profile(),
+    };
+    match prof {
+        Some(prof) => {
+            let mut w = vec!["/usr/bin/sandbox-exec".to_string(), "-p".into(), prof];
+            w.append(&mut argv);
+            w
+        }
+        None => argv,
+    }
+}
+
 type WrapFn = Box<dyn Fn(&Path) -> (PathBuf, Vec<String>) + Send + Sync>;
+
+/// Wrapper for trusted HALs: vault hidden, everything else allowed.
+pub fn trusted_wrap() -> Option<WrapFn> {
+    let prof = trusted_profile()?;
+    Some(Box::new(move |hal: &Path| (PathBuf::from("/usr/bin/sandbox-exec"), vec!["-p".into(), prof.clone(), hal.to_string_lossy().into_owned()])))
+}
 
 pub fn wrap(p: &Policy) -> WrapFn {
     let base = profile(p);

@@ -386,8 +386,7 @@ async fn provision(ctx: &Arc<Ctx>, id: &str, fresh: bool, brief: Option<String>)
             cwd: Some(&cwd2),
             env: launch_env,
             allow_logins,
-            wrap: wrap_policy.map(|p| {
-                let w = crate::sandbox::wrap(&p);
+            wrap: wrap_policy.map(|p| crate::sandbox::wrap(&p)).or_else(crate::sandbox::trusted_wrap).map(|w| {
                 Box::new(move |b: &Path| w(b)) as Box<dyn Fn(&Path) -> (PathBuf, Vec<String>)>
             }),
         })

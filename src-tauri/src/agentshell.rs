@@ -90,12 +90,8 @@ async fn ensure(ctx: &Arc<Ctx>, agent: &str, shell: &str, s: &mut Slot) -> Resul
     std::fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
     let rcfile = scratch.join(".philium-bashrc");
     std::fs::write(&rcfile, rc(&rt.name)).map_err(|e| e.to_string())?;
-    let mut argv = vec!["/bin/bash".to_string(), "--noprofile".into(), "--rcfile".into(), rcfile.to_string_lossy().into(), "-i".into()];
-    if let Some(p) = &rt.policy {
-        let mut w = vec!["/usr/bin/sandbox-exec".to_string(), "-p".into(), crate::sandbox::profile(p)];
-        w.append(&mut argv);
-        argv = w;
-    }
+    let argv = vec!["/bin/bash".to_string(), "--noprofile".into(), "--rcfile".into(), rcfile.to_string_lossy().into(), "-i".into()];
+    let argv = crate::sandbox::wrap_argv(rt.policy.as_ref(), argv);
     let mut env = rt.env.clone();
     env.push(("BASH_SILENCE_DEPRECATION_WARNING".into(), "1".into()));
     let id = crate::terminals::open(

@@ -80,7 +80,7 @@ pub fn refresh_desk(ctx: &Arc<Ctx>) {
         cwd: None,
         env: setup.env,
         allow_logins: setup.allow_logins,
-        wrap: None,
+        wrap: crate::sandbox::trusted_wrap().map(|w| Box::new(move |b: &std::path::Path| w(b)) as Box<dyn Fn(&std::path::Path) -> (std::path::PathBuf, Vec<String>)>),
     })
     .map(Arc::new);
     if let Err(e) = &r {
@@ -270,6 +270,7 @@ fn main() {
                 _ => app.path().app_data_dir().expect("app data dir"),
             };
             std::fs::create_dir_all(&data_dir)?;
+            secrets::init(&data_dir);
 
             // Gateway on an ephemeral loopback port, inside this process.
             let listener = std::net::TcpListener::bind("127.0.0.1:0")?;

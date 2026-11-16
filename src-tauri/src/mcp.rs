@@ -410,12 +410,7 @@ async fn shell_run(ctx: &Arc<Ctx>, agent: &str, me: &str, a: &Value) -> Result<V
         let dir = a["cwd"].as_str().filter(|s| !s.is_empty()).map(|_| cwd);
         return crate::agentshell::run(ctx, agent, &shell, &command, dir, std::time::Duration::from_secs(timeout)).await;
     }
-    let mut argv = vec!["/bin/sh".to_string(), "-lc".to_string(), command.clone()];
-    if let Some(p) = &rt.policy {
-        let mut wrapped = vec!["/usr/bin/sandbox-exec".to_string(), "-p".to_string(), crate::sandbox::profile(p)];
-        wrapped.append(&mut argv);
-        argv = wrapped;
-    }
+    let argv = crate::sandbox::wrap_argv(rt.policy.as_ref(), vec!["/bin/sh".to_string(), "-lc".to_string(), command.clone()]);
     let title = a["title"].as_str().map(str::to_string).unwrap_or_else(|| {
         let c: String = command.chars().take(40).collect();
         format!("{me}: {c}")

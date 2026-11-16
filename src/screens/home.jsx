@@ -62,7 +62,7 @@ export default function Home() {
       <Show when={(providers() ?? []).length === 0 && providers.state === "ready"}>
         <Card class="home-hero">
           <h2>Welcome to Philium</h2>
-          <p class="dim">Add a provider to start. Subscriptions (ChatGPT, Claude) are used directly. API keys stay in your keychain and every request passes through the local gateway, which removes secrets before they leave your machine.</p>
+          <p class="dim">Add a provider to start. Subscriptions (ChatGPT, Claude) are used directly. API keys stay in Philium's private vault, out of agents' reach, and every request passes through the local gateway, which removes secrets before they leave your machine.</p>
           <Button variant="primary" onClick={() => go("providers")}><Icon name="key" size={12} /> Add a provider</Button>
         </Card>
       </Show>
