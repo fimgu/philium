@@ -101,7 +101,7 @@ export default function Home() {
               {(c) => (
                 <div class="list-item" onClick={() => go("code", c.repo_id ? { repo_id: c.repo_id } : {})}>
                   <Dot state="warn" /><AgentChip name={c.a} /><span class="small">and</span><AgentChip name={c.b} />
-                  <span class="grow small ellipsis">both change {(c.detail ?? [])[0] ?? "the same code"} ({String(c.severity).replace(/_/g, " ")})</span>
+                  <span class="grow small ellipsis">both change {(Array.isArray(c.detail) ? c.detail[0] : c.detail) ?? "the same code"}{c.severity ? ` (${String(c.severity).replace(/_/g, " ")})` : ""}</span>
                   <Button size="sm">See code</Button>
                 </div>
               )}
