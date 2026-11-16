@@ -136,6 +136,14 @@ pub fn profile(p: &Policy) -> String {
         s.push_str(&format!("(deny file-read* file-write* (subpath \"{}\"))\n", esc(&h.join(d))));
     }
     s.push_str("(deny file-read* file-write* (subpath \"/Library/Keychains\"))\n(deny file-read* file-write* (subpath \"/private/var/db/dslocal\"))\n");
+    // Toolchains (read + exec) and package caches (read/write), re-allowed after the denies.
+    let tool_ro: Vec<PathBuf> = [".cargo/bin", ".rustup", ".nvm", ".volta", ".pyenv", ".local/bin", ".bun/bin", ".gitconfig", ".config/git"]
+        .iter()
+        .map(|d| h.join(d))
+        .collect();
+    s.push_str(&subpaths("file-read*", &tool_ro));
+    let caches: Vec<PathBuf> = [".npm", ".cargo/registry", ".cargo/git", ".cache", "Library/Caches"].iter().map(|d| h.join(d)).collect();
+    s.push_str(&subpaths("file-read* file-write*", &caches));
     // The only places the agent may read and write.
     s.push_str(&subpaths("file-read* file-write*", &[p.workdir.clone(), p.scratch.clone(), p.hal_dir.clone()]));
     // Network: loopback only (gateway, egress proxy, MCP).
