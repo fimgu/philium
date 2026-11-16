@@ -125,7 +125,7 @@ export default function Chat() {
           <Show when={params().session && sessions.state === "ready" && !current()}>
             <NotFound title="Chat not found" action={<Button onClick={() => go("chat", {})}>Open latest chat</Button>}>This chat was deleted.</NotFound>
           </Show>
-          <Conversation hidden={!!(params().session && sessions.state === "ready" && !current())} events={events()} emptyText="Ask anything. This chat has no access to files, commands or the web." />
+          <Conversation hidden={!!(params().session && sessions.state === "ready" && !current())} events={events()} busy={busy()} emptyText="Ask anything. This chat has no access to files, commands or the web." />
           <Composer onSend={send} busy={busy()} onCancel={() => hal("POST", `/sessions/${selected()}/cancel`).catch((e) => toast(String(e), "danger"))}
             speed={effortSpeed(current()?.effort)} onSpeed={setSpeed}
             placeholder={`Message ${chosen() || "a model"}`} />

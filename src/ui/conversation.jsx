@@ -1,7 +1,7 @@
 // Conversation view built from HAL session events. Used by Agents and Chat.
 // Events are folded into items: user / assistant (streamed) / tool / file /
 // permission / error. Text is always rendered as text, never HTML.
-import { For, Index, Show, Switch, Match, createSignal, createMemo, createEffect, on } from "solid-js";
+import { For, Index, Show, Switch, Match, createSignal, createMemo, createEffect, on, onCleanup } from "solid-js";
 import { Badge, Button, toast } from "./kit.jsx";
 import { Icon } from "./icons.jsx";
 import { draftFor, newDraft } from "../lib/drafts.js";
@@ -12,6 +12,7 @@ export function fold(events) {
   const tools = new Map();
   let streaming = null;
   let turnText = false;
+  const endPendingTools = () => { for (const t of tools.values()) if (t.running) t.inactive = true; };
   for (const e of events) {
     switch (e.type) {
       case "message.created":
@@ -27,6 +28,7 @@ export function fold(events) {
         streaming = null;
         break;
       case "assistant.completed":
+        endPendingTools();
         if (streaming) { streaming.live = false; streaming = null; }
         else if (!turnText && e.text) items.push({ kind: "assistant", text: e.text, seq: e.seq });
         turnText = false;
@@ -51,8 +53,8 @@ export function fold(events) {
         if (p) { p.open = false; p.decision = e.decision; }
         break;
       }
-      case "turn.failed": items.push({ kind: "error", text: e.error, seq: e.seq }); streaming = null; break;
-      case "turn.cancelled": items.push({ kind: "note", text: "Stopped.", seq: e.seq }); streaming = null; break;
+      case "turn.failed": endPendingTools(); items.push({ kind: "error", text: e.error, seq: e.seq }); streaming = null; break;
+      case "turn.cancelled": endPendingTools(); items.push({ kind: "note", text: "Stopped.", seq: e.seq }); streaming = null; break;
       case "context.compacted": items.push({ kind: "note", text: "Context compacted to save tokens.", seq: e.seq }); break;
       case "loop.detected": items.push({ kind: "error", text: `Loop detected: the agent repeated ${e.tool ?? "a tool"} ${e.repeats ?? ""} times.`, seq: e.seq }); break;
       case "subagent.started": items.push({ kind: "note", text: `Subagent started: ${e.description ?? e.agent ?? ""}`, seq: e.seq }); break;
@@ -81,14 +83,40 @@ function argSummary(tool, args) {
 function Tool(props) {
   const [open, setOpen] = createSignal(false);
   const t = () => props.item;
+  const active = () => props.active && !t().inactive;
+  const [elapsed, setElapsed] = createSignal(0);
+  const [silent, setSilent] = createSignal(0);
+  const activeCall = createMemo(() => active() && t().running ? t().seq : null);
+  const output = createMemo(() => t().out);
+  createEffect(() => {
+    if (activeCall() == null) return;
+    // Observation time, not execution time: history may have arrived late.
+    const started = Date.now();
+    setElapsed(0);
+    const timer = setInterval(() => setElapsed(Math.floor((Date.now() - started) / 1000)), 1000);
+    onCleanup(() => clearInterval(timer));
+  });
+  createEffect(() => {
+    output();
+    if (activeCall() == null) return;
+    const updated = Date.now();
+    setSilent(0);
+    const timer = setInterval(() => setSilent(Math.floor((Date.now() - updated) / 1000)), 1000);
+    onCleanup(() => clearInterval(timer));
+  });
   return (
     <div class="msg tool conv-tool">
       <div class="row" style={{ cursor: "pointer" }} onClick={() => setOpen(!open())}>
-        <span class={`dot ${t().running ? "busy" : t().ok === false ? "bad" : "live"}`} />
+        <span class={`dot ${t().running ? active() ? "busy" : "" : t().ok === false ? "bad" : "live"}`} />
         <b>{short(t().tool)}</b>
         <span class="ellipsis dim grow">{argSummary(t().tool, t().args)}</span>
         <Show when={t().ms != null}><span class="faint xs">{(t().ms / 1000).toFixed(1)}s</span></Show>
       </div>
+      <Show when={t().running}>
+        <div class="xs dim" role="status">{active()
+          ? `Awaiting tool completion · observed ${elapsed()}s${silent() >= 30 ? ` · No new output for ${silent()}s. It may be working or waiting for approval. This is not a completion signal.` : ""}`
+          : "No tool completion recorded in loaded history."}</div>
+      </Show>
       <Show when={open()}>
         <pre class="conv-pre">{JSON.stringify(t().args, null, 2)}</pre>
         <Show when={t().out || t().result}><pre class="conv-pre">{(t().result || t().out || "").slice(0, 20000)}</pre></Show>
@@ -123,7 +151,7 @@ export function Conversation(props) {
               <Match when={it().kind === "assistant"}>
                 <div class={`msg ${it().live ? "live" : ""}`}>{it().text}<Show when={it().live}><span class="caret" /></Show></div>
               </Match>
-              <Match when={it().kind === "tool"}><Tool item={it()} /></Match>
+              <Match when={it().kind === "tool"}><Tool item={it()} active={props.busy && !props.readOnly} /></Match>
               <Match when={it().kind === "file"}>
                 <details class="msg tool">
                   <summary><Icon name="repo" size={12} /> edited <b>{it().path}</b></summary>
@@ -168,11 +196,11 @@ const readImage = (file) => new Promise((resolve, reject) => {
   r.readAsDataURL(file);
 });
 
-/** Speed presets mapped to HAL reasoning effort. `normal` leaves it to the model. */
+/** Effort presets. Names are not guarantees of latency, cost or quality. */
 export const SPEEDS = [
-  { value: "fast", label: "Fast", effort: "low", hint: "Low reasoning effort: quick answers" },
+  { value: "fast", label: "Fast", effort: "low", hint: "Requests low reasoning effort, not guaranteed speed" },
   { value: "normal", label: "Normal", effort: "default", hint: "The model's default effort" },
-  { value: "deep", label: "Deep", effort: "high", hint: "High reasoning effort: slower, more thorough" },
+  { value: "deep", label: "Deep", effort: "high", hint: "Requests high reasoning effort, not guaranteed quality" },
 ];
 export const speedEffort = (v) => SPEEDS.find((s) => s.value === v)?.effort ?? "default";
 export const effortSpeed = (e) => (e === "low" || e === "minimal" || e === "none" ? "fast" : e === "high" || e === "xhigh" || e === "max" ? "deep" : "normal");
@@ -234,12 +262,13 @@ export function Composer(props) {
         onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
       />
       <Show when={props.onSpeed}>
-        <div class="speed" title="How hard the model thinks before answering. Fast is quickest and cheapest.">
+        <div class="speed" role="group" aria-label="Reasoning effort" title="Reasoning effort, not guaranteed speed. Support depends on the provider and model.">
           <For each={SPEEDS}>{(s) => (
-            <button type="button" classList={{ on: (props.speed || "normal") === s.value }} onClick={() => props.onSpeed(s.value)} title={s.hint}>{s.label}</button>
+            <button type="button" disabled={props.disabled || props.effortPending} aria-pressed={(props.speed || "normal") === s.value} classList={{ on: (props.speed || "normal") === s.value }} onClick={() => props.onSpeed(s.value)} title={s.hint}>{s.label}</button>
           )}</For>
         </div>
       </Show>
+      <Show when={props.onSpeed}><div class="xs dim" style={{ width: "100%" }}>Reasoning effort: provider and model support varies. Speed, cost and quality are not guaranteed.{props.effortPending ? " Updating effort…" : ""}</div></Show>
       <Show when={props.busy} fallback={<Button variant="primary" onClick={send} disabled={props.disabled || sending()}>Send</Button>}>
         <Button onClick={props.onCancel}><Icon name="stop" size={12} /> Stop</Button>
       </Show>

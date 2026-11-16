@@ -290,7 +290,31 @@ function AgentView(props) {
 
   const a = () => info()?.id === props.id ? info() : props.agent;
   const [effort, setEffort] = createSignal("default");
-  createEffect(on(() => props.id, (id) => rpc("agents.get_effort", { id }).then(setEffort).catch(() => setEffort("default"))));
+  const [effortPending, setEffortPending] = createSignal(false);
+  let effortRequest = 0;
+  onCleanup(() => effortRequest++);
+  createEffect(on(() => props.id, (id) => {
+    const request = ++effortRequest;
+    setEffort("default");
+    setEffortPending(true);
+    rpc("agents.get_effort", { id })
+      .then((value) => { if (request === effortRequest && props.id === id) setEffort(value); })
+      .catch(() => { if (request === effortRequest && props.id === id) setEffort("default"); })
+      .finally(() => { if (request === effortRequest && props.id === id) setEffortPending(false); });
+  }));
+  const changeEffort = async (value) => {
+    if (effortPending() || !live()) return;
+    const id = props.id, request = ++effortRequest;
+    setEffortPending(true);
+    try {
+      const saved = await rpc("agents.set_effort", { id, effort: speedEffort(value) });
+      if (request === effortRequest && props.id === id) setEffort(saved);
+    } catch (e) {
+      if (request === effortRequest && props.id === id) toast(String(e), "danger");
+    } finally {
+      if (request === effortRequest && props.id === id) setEffortPending(false);
+    }
+  };
   const live = () => a()?.id === props.id ? a()?.live : props.agent?.live;
   let observedId, observedLive;
   createEffect(() => {
@@ -348,10 +372,10 @@ function AgentView(props) {
             <Show when={historyLoading()}><div class="history-loading small dim" role="status">Loading saved conversation…</div></Show>
             <Show when={historyError()}><div class="history-error shield danger" role="alert">Unable to load saved conversation: {historyError()} <Button size="sm" onClick={() => load(props.id, retryAfter)}>Retry history</Button></div></Show>
             <Show when={historyMore()}><div class="history-more small dim" role="status">More saved history is available. Showing loaded pages only. <Button size="sm" disabled={historyLoading()} onClick={() => load(props.id, historyCursor())}>Load more history</Button></div></Show>
-            <Conversation events={events()} readOnly={!live()} emptyText={historyLoading() ? "Loading saved conversation…" : historyError() ? "History could not be loaded. Retry above." : live() ? "Send the first message to start." : "No saved messages. This agent is stopped. Resume it to continue."}
+            <Conversation events={events()} busy={busy()} readOnly={!live()} emptyText={historyLoading() ? "Loading saved conversation…" : historyError() ? "History could not be loaded. Retry above." : live() ? "Send the first message to start." : "No saved messages. This agent is stopped. Resume it to continue."}
               onApprove={(id, scope) => decide(id, "approve", scope)} onDeny={(id) => decide(id, "deny")} />
             <Composer draftKey={`agent:${props.id}`} onSend={send} busy={busy()} disabled={!live()} onCancel={() => rpc("agents.cancel", { id: props.id }, { action: true }).catch((e) => toast(String(e), "danger"))}
-              speed={effortSpeed(effort())} onSpeed={(v) => rpc("agents.set_effort", { id: props.id, effort: speedEffort(v) }).then(setEffort).catch((e) => toast(String(e), "danger"))}
+              speed={effortSpeed(effort())} effortPending={effortPending()} onSpeed={changeEffort}
               placeholder={live() ? `Message ${a()?.name ?? ""}` : "Agent is stopped"} />
           </Show>
           <Show when={tab() === "terms"}><Terminals id={props.id} /></Show>
