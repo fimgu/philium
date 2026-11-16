@@ -39,6 +39,9 @@ use crate::db::{new_id, now};
 use crate::hal::{self, Hal};
 use crate::providers::{self, ConfigOpts};
 
+#[path = "agent_history.rs"]
+mod history;
+
 /// Live state for one running agent (not persisted).
 pub struct Runtime {
     pub hal: Arc<Hal>,
@@ -774,9 +777,12 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
             Ok(report)
         }
         "events" => {
-            let after = args["after"].as_i64().unwrap_or(0);
+            let after = args["after"].as_i64().unwrap_or(0).max(0);
             let limit = args["limit"].as_i64().unwrap_or(2000).clamp(1, 10000);
-            hal_get(&id()?, &format!("/events?after={after}&limit={limit}")).await
+            let raw = ctx::arg_str(&args, "id")?;
+            let c = ctx.clone();
+            tokio::task::spawn_blocking(move || history::events(&c, &raw, after, limit))
+                .await.map_err(|e| format!("saved agent history task failed: {e}"))?
         }
         "messages" => hal_get(&id()?, "/messages").await,
         "permissions" => hal_get(&id()?, "/permissions").await,
