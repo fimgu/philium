@@ -2,6 +2,7 @@
 import { For, Show, createResource, createSignal, createMemo, createEffect, onCleanup, on } from "solid-js";
 import { Page, Button, Badge, Select, Input, Segmented, Toggle, Empty, VirtualList } from "../ui/kit.jsx";
 import Graph from "../ui/graph.jsx";
+import CodeInspector from "../ui/code-inspector.jsx";
 import { Icon } from "../ui/icons.jsx";
 import { rpc, useEvent, fmt } from "../lib/rpc.js";
 import { params } from "../lib/nav.js";
@@ -44,8 +45,9 @@ function GraphView(props) {
   let api;
 
   const all = createMemo(() => {
-    const nodes = (props.data?.nodes ?? []).map((n) => ({ ...n, group: groupOf(n), dir: n.group, weight: Math.max(n.weight ?? 0, props.level === "file" ? Math.sqrt(n.syms ?? 0) : 0) }));
-    return { nodes, edges: props.data?.edges ?? [] };
+    const nodes = (props.data?.nodes ?? []).filter((n) => !props.changesOnly || props.changedPaths?.has(n.path ?? n.id)).map((n) => ({ ...n, group: groupOf(n), dir: n.group, weight: Math.max(n.weight ?? 0, props.level === "file" ? Math.sqrt(n.syms ?? 0) : 0) }));
+    const ids = new Set(nodes.map((n) => n.id));
+    return { nodes, edges: (props.data?.edges ?? []).filter((e) => ids.has(e.source) && ids.has(e.target)) };
   });
   const groups = createMemo(() => {
     const m = new Map();
@@ -59,7 +61,7 @@ function GraphView(props) {
   const view = createMemo(() => {
     const { nodes, edges } = all();
     const c = cfg();
-    const withRing = (ns) => ns.map((n) => (n.changed_by?.length ? { ...n, ring: `hsl(${agentHue(n.changed_by[0].agent)} 80% 66%)` } : n));
+    const withRing = (ns) => ns.map((n) => props.showChanges && props.changedPaths?.has(n.path ?? n.id) ? { ...n, ring: "#e0af68" } : (n.changed_by?.length ? { ...n, ring: `hsl(${agentHue(n.changed_by[0].agent)} 80% 66%)` } : n));
     if (!c.local || !props.selected) return { nodes: withRing(nodes), edges };
     const adj = new Map();
     for (const e of edges) { (adj.get(e.source) ?? adj.set(e.source, []).get(e.source)).push(e.target); (adj.get(e.target) ?? adj.set(e.target, []).get(e.target)).push(e.source); }
@@ -154,9 +156,9 @@ function RefList(props) {
     <For each={grouped(g.items)}>
       {([path, rs]) => (
         <>
-          <div class="ref-file">{path}</div>
+          <button class="ref-file" onClick={() => props.onJump?.({ path, line: 1 })}>{path}</button>
           <For each={rs}>{(r) => (
-            <div class={`ref ${g.possible ? "possible" : ""}`}>
+            <div class={`ref ${g.possible ? "possible" : ""}`} role="button" tabindex="0" onClick={() => props.onJump?.(r)} onKeyDown={(e) => e.key === "Enter" && props.onJump?.(r)}>
               <span class="loc">{r.path}:{r.line}</span>
               <span class="small faint"> {r.kind}{r.from ? ` in ${r.from}` : ""}</span>
               <Show when={g.possible}><span class="tag">name match</span></Show>
@@ -171,7 +173,7 @@ function RefList(props) {
     <>
       <div class="dsec">Definition</div>
       <Show when={(props.data?.defs ?? []).length} fallback={<div class="code-empty">No definition found in this view.</div>}>
-        <For each={props.data.defs}>{(d) => <div class="ref"><span class="loc">{d.path}:{d.line}</span><span class="small faint"> {d.kind}</span><div class="src">{d.sig || d.name}</div></div>}</For>
+        <For each={props.data.defs}>{(d) => <div class="ref" role="button" tabindex="0" onClick={() => props.onJump?.(d)} onKeyDown={(e) => e.key === "Enter" && props.onJump?.(d)}><span class="loc">{d.path}:{d.line}</span><span class="small faint"> {d.kind}</span><div class="src">{d.sig || d.name}</div></div>}</For>
       </Show>
       <div class="dsec">Used here <Badge tone="secure">{exact().length} confirmed</Badge></div>
       <Show when={exact().length} fallback={<div class="code-empty">No confirmed uses.</div>}>{Group({ items: exact() })}</Show>
@@ -195,11 +197,27 @@ export default function Code() {
   const [open, setOpen] = createSignal(new Set());
   const [sel, setSel] = createSignal(null); // {id, symbol, label}
   const [busy, setBusy] = createSignal(false);
+  const [tab, setTab] = createSignal("source");
+  const [showChanges, setShowChanges] = createSignal(false);
+  const [changesOnly, setChangesOnly] = createSignal(false);
+  const [expanded, setExpanded] = createSignal(false);
+  const [inspectorSize, setInspectorSize] = createSignal(360);
+  let resizeCleanup;
+  onCleanup(() => resizeCleanup?.());
+  const resize = (event) => {
+    event.preventDefault();
+    const vertical = window.innerWidth <= 1450;
+    const start = vertical ? event.clientY : event.clientX, initial = inspectorSize();
+    const move = (e) => setInspectorSize(Math.max(vertical ? 180 : 300, Math.min(vertical ? window.innerHeight * .65 : window.innerWidth * .7, initial + start - (vertical ? e.clientY : e.clientX))));
+    const stop = () => { window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", stop); };
+    resizeCleanup?.(); resizeCleanup = stop;
+    window.addEventListener("pointermove", move); window.addEventListener("pointerup", stop, { once: true });
+  };
 
   const target = () => {
     const r = repo();
     if (!r) return null;
-    return viewId() === "main" ? { repo_id: r } : { worktree_id: viewId() };
+    return viewId() === "main" ? { repo_id: r } : viewId() === "local" ? { repo_id: r, working_tree: true } : { worktree_id: viewId() };
   };
   const key = () => { const t = target(); return t ? JSON.stringify([t, tick()]) : null; };
   const [tick, setTick] = createSignal(0);
@@ -207,10 +225,14 @@ export default function Code() {
   const [tree] = createResource(key, () => rpc("codeindex.tree", target()).catch(() => ({ files: [] })));
   const gkey = () => { const k = key(); return k ? k + level() : null; };
   const [graph] = createResource(gkey, () => rpc("codeindex.graph", { ...target(), level: level(), worktrees: true }).catch(() => ({ nodes: [], edges: [] })));
+  const [changes] = createResource(key, () => rpc("codeindex.changes", target()).catch((e) => ({ files: [], error: String(e) })));
+  const changedPaths = createMemo(() => new Set((changes()?.files ?? []).flatMap((f) => [f.path, f.old_path].filter(Boolean))));
+  const targetLabel = () => viewId() === "main" ? "Indexed base (fixed commit)" : viewId() === "local" ? "Local checkout (working snapshot)" : `${agentName((wts() ?? []).find((w) => w.id === viewId()) ?? {})} worktree (working snapshot)`;
   const [clashes, clr] = createResource(repo, (r) => (r ? rpc("codeindex.clashes", { repo_id: r }).catch(() => ({ clashes: [] })) : { clashes: [] }));
   const [refs] = createResource(() => (sel()?.symbol ? JSON.stringify([target(), sel().symbol, tick()]) : null), () => rpc("codeindex.refs", { ...target(), symbol: sel().symbol }).catch((e) => ({ error: String(e), defs: [], refs: [] })));
   useEvent("codeindex:clashes", () => clr.refetch());
   createEffect(on(repo, () => { setViewId("main"); setSel(null); }, { defer: true }));
+  createEffect(on(viewId, () => { setSel(null); setExpanded(false); setTab("source"); }, { defer: true }));
 
   const agentName = (w) => w.agent_name || w.branch;
   const rows = createMemo(() => {
@@ -227,7 +249,7 @@ export default function Code() {
     return out;
   });
   const toggle = (p) => setOpen((o) => { const n = new Set(o); n.has(p) ? n.delete(p) : n.add(p); return n; });
-  const pickNode = (nd) => setSel(nd.kind === "file" ? { id: nd.id, file: nd.id, label: nd.label } : { id: nd.id, symbol: nd.label, file: nd.path, label: nd.label });
+  const pickNode = (nd) => { setTab("source"); const file = nd.path ?? nd.id; const indexed = (tree()?.files ?? []).find((f) => f.path === file)?.syms?.find((s) => s.name === nd.label); setSel(nd.kind === "file" ? { id: nd.id, file, label: nd.label } : { id: nd.id, symbol: nd.label, file, label: nd.label, line: nd.line ?? indexed?.line }); };
   const reindex = async () => { setBusy(true); try { await rpc("codeindex.reindex", target()); setTick((t) => t + 1); } finally { setBusy(false); } };
   const upToDate = () => !!status() && !status().error;
 
@@ -237,8 +259,8 @@ export default function Code() {
         <div class="code-bar" style={repo() ? undefined : { display: "none" }}>
           <Select value={repo()} onValue={setRepoId} options={(repos() ?? []).map((r) => ({ value: r.id, label: r.name }))} />
           <Select value={viewId()} onValue={(v) => { setViewId(v); setSel(null); }}
-            options={[{ value: "main", label: "Main (base commit)" }, ...(wts() ?? []).filter((w) => w.state === "active").map((w) => ({ value: w.id, label: `${agentName(w)} (worktree)` }))]} />
-          <Show when={viewId() !== "main"}><AgentChip name={agentName((wts() ?? []).find((w) => w.id === viewId()) ?? {})} /></Show>
+            options={[{ value: "main", label: "Indexed base commit" }, { value: "local", label: "Local checkout" }, ...(wts() ?? []).filter((w) => w.state === "active").map((w) => ({ value: w.id, label: `${agentName(w)} (worktree)` }))]} />
+          <Show when={viewId() !== "main" && viewId() !== "local"}><AgentChip name={agentName((wts() ?? []).find((w) => w.id === viewId()) ?? {})} /></Show>
           <div class="code-status">
             <Show when={status()?.error}><span class="err">{status().error}</span></Show>
             <Show when={upToDate()}>
@@ -248,6 +270,8 @@ export default function Code() {
               <span class="row" style={{ color: "var(--secure)", gap: "4px" }}><span class="dot live" />up to date{status().built_at ? `, ${fmt.ago(status().built_at)}` : ""}</span>
             </Show>
           </div>
+          <Toggle on={showChanges()} label={`Changes (${changes()?.files?.length ?? 0})`} onChange={setShowChanges} />
+          <Show when={showChanges()}><Toggle on={changesOnly()} label="Changed nodes only" onChange={setChangesOnly} /></Show>
           <Button size="sm" disabled={busy()} onClick={reindex}><Icon name="refresh" size={12} /> {busy() ? "Indexing" : "Reindex"}</Button>
         </div>
         <Show when={(clashes()?.clashes ?? []).length}>
@@ -262,19 +286,20 @@ export default function Code() {
           </div>
         </Show>
         <Show when={repo()} fallback={<Empty title="No repositories yet">Add a repository on the Repos screen. Philium indexes its symbols and references so you and your agents can see what depends on what.</Empty>}>
-          <div class={`code-main ${sel() ? "" : "no-drawer"}`}>
+          <div class={`code-main ${sel() ? "has-inspector" : "no-drawer"} ${expanded() && sel() ? "inspector-expanded" : ""}`} style={{ "--inspector-size": `${inspectorSize()}px` }}>
             <div class="code-side">
               <div class="search"><Input placeholder="Search files and symbols" value={q()} onValue={setQ} /></div>
+              <Show when={showChanges()}><section class="changed-files"><div class="dsec">Changes against base {(changes()?.base_commit ?? "").slice(0, 8)}</div><Show when={changes.loading}><div class="inspector-note">Loading changes…</div></Show><Show when={changes()?.error}><div class="inspector-note err">{changes().error}</div></Show><Show when={changes()?.note}><div class="inspector-note">{changes().note}</div></Show><Show when={changes()?.truncated}><div class="inspector-note">Changed file list truncated.</div></Show><For each={changes()?.files ?? []}>{(f) => <button class="changed-file" title={f.old_path ? `${f.old_path} → ${f.path}` : f.path} onClick={() => { setSel({ id: f.path, file: f.path, label: basename(f.path) }); setTab("diff"); }}><b>{f.status}</b><span>{f.old_path ? `${f.old_path} → ` : ""}{f.path}</span><small>+{f.added ?? 0} −{f.removed ?? 0}</small></button>}</For><Show when={!changes.loading && !changes()?.files?.length && !changes()?.note}><div class="inspector-note">No changes in this target.</div></Show></section></Show>
               <Show when={rows().length} fallback={<div class="code-empty">{tree.loading ? "Loading index" : q() ? "No matches." : "No indexed files in this view."}</div>}>
                 <VirtualList items={rows()} rowHeight={24}>
                   {(r) => r.t === "file" ? (
-                    <div class={`code-row file ${sel()?.id === r.f.path ? "on" : ""}`} onClick={() => { toggle(r.f.path); setSel({ id: r.f.path, file: r.f.path, label: basename(r.f.path) }); }}>
+                    <div class={`code-row file ${sel()?.id === r.f.path ? "on" : ""}`} onClick={() => { toggle(r.f.path); setTab("source"); setSel({ id: r.f.path, file: r.f.path, label: basename(r.f.path) }); }}>
                       <span class="cv">{open().has(r.f.path) ? "v" : ">"}</span>
                       <span class="name" title={r.f.path}><span class="dir">{dirname(r.f.path)}</span>{basename(r.f.path)}</span>
                       <span class="xs faint">{(r.f.syms ?? []).length}</span>
                     </div>
                   ) : (
-                    <div class={`code-row sym ${sel()?.id === `${r.f.path}:${r.s.name}` ? "on" : ""}`} style={{ "padding-left": "28px" }} onClick={() => setSel({ id: `${r.f.path}:${r.s.name}`, symbol: r.s.name, file: r.f.path, label: r.s.name })}>
+                    <div class={`code-row sym ${sel()?.id === `${r.f.path}:${r.s.name}` ? "on" : ""}`} style={{ "padding-left": "28px" }} onClick={() => { setTab("source"); setSel({ id: `${r.f.path}:${r.s.name}`, symbol: r.s.name, file: r.f.path, label: r.s.name, line: r.s.line }); }}>
                       <span class="kind">{(r.s.kind ?? "sym").slice(0, 3)}</span>
                       <span class="name">{r.s.parent ? `${r.s.parent}.` : ""}{r.s.name}</span>
                       <span class="xs faint">{r.s.line}</span>
@@ -284,21 +309,18 @@ export default function Code() {
               </Show>
               <Show when={tree()?.truncated}><div class="xs faint" style={{ padding: "6px 10px" }}>Showing top-ranked files only. Search to narrow.</div></Show>
             </div>
-            <GraphView data={graph()} level={level()} onLevel={setLevel} selected={sel()?.id} onSelect={(n) => (n ? pickNode(n) : setSel(null))} onOpen={(n) => { if (n.kind === "file") { setOpen((o) => new Set(o).add(n.id)); setLevel("symbol"); } }} />
+            <GraphView showChanges={showChanges()} changesOnly={showChanges() && changesOnly()} changedPaths={changedPaths()} data={graph()} level={level()} onLevel={setLevel} selected={sel()?.id} onSelect={(n) => (n ? pickNode(n) : setSel(null))} onOpen={(n) => { if (n.kind === "file") { setOpen((o) => new Set(o).add(n.id)); setLevel("symbol"); } }} />
             <Show when={sel()}>
-              <aside class="code-drawer">
-                <div class="dhead">
-                  <div class="row"><b class="mono grow ellipsis">{sel().symbol ?? sel().label}</b><Button size="sm" variant="ghost" onClick={() => setSel(null)}>Close</Button></div>
-                  <div class="xs faint mono ellipsis">{sel().file}</div>
-                </div>
-                <Show when={sel().symbol} fallback={
-                  <div class="code-empty">This is a file. Pick one of its symbols in the tree, or a symbol node in the symbol graph, to see where it is used.
-                    <div style={{ "margin-top": "10px" }}><Button size="sm" onClick={() => { setOpen((o) => new Set(o).add(sel().file)); }}>Show its symbols</Button></div></div>}>
-                  <Show when={!refs.loading} fallback={<div class="code-empty">Loading</div>}>
-                    <Show when={!refs()?.error} fallback={<div class="code-empty err">{refs().error}</div>}><RefList data={refs()} /></Show>
+              <div class="inspector-slot">
+                <div class="inspector-resize" role="separator" tabindex="0" aria-label="Resize code inspector" onPointerDown={resize} onKeyDown={(e) => { if (["ArrowLeft", "ArrowUp", "ArrowRight", "ArrowDown"].includes(e.key)) { e.preventDefault(); setInspectorSize((s) => Math.max(180, s + (["ArrowLeft", "ArrowUp"].includes(e.key) ? 30 : -30))); } }} />
+                <CodeInspector selected={sel()} target={target()} targetAgentId={(wts() ?? []).find((w) => w.id === viewId())?.agent_id} targetLabel={targetLabel()} repoId={repo()} baseCommit={status()?.base_commit} tab={tab()} onTab={setTab} expanded={expanded()} onExpand={() => setExpanded(!expanded())} onClose={() => { setSel(null); setExpanded(false); }} tick={tick()}>
+                  <Show when={sel()?.symbol} fallback={<div class="code-empty">Select a symbol to inspect its references. File contents are in Source.</div>}>
+                    <Show when={!refs.loading} fallback={<div class="code-empty">Loading references…</div>}>
+                      <Show when={!refs()?.error} fallback={<div class="code-empty err">{refs().error}</div>}><RefList data={refs()} onJump={(r) => { setSel({ id: r.path, file: r.path, label: basename(r.path), line: r.line }); setTab("source"); }} /></Show>
+                    </Show>
                   </Show>
-                </Show>
-              </aside>
+                </CodeInspector>
+              </div>
             </Show>
           </div>
         </Show>

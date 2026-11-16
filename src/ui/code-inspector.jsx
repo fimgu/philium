@@ -1,0 +1,123 @@
+import { For, Show, createEffect, createMemo, createSignal, onCleanup } from "solid-js";
+import { rpc } from "../lib/rpc.js";
+import { openCodeDraft } from "../lib/code-context.js";
+
+// Tokens remain ordinary JSX text nodes, never HTML. Covers Python and common C-like languages.
+const tokens = (text) => text.split(/("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\/\/.*$|#.*$|\b(?:def|class|import|from|as|return|if|else|elif|for|while|in|is|not|and|or|None|True|False|async|await|try|except|finally|with|yield|raise|pass|const|let|var|function|export|default|new|throw|catch|public|private|fn|pub|use|struct|impl|match)\b|\b\d+(?:\.\d+)?\b)/g).map((s) => ({ text: s, kind: /^["']/.test(s) ? "string" : /^(#|\/\/)/.test(s) ? "comment" : /^\d/.test(s) ? "number" : /^(def|class|import|from|as|return|if|else|elif|for|while|in|is|not|and|or|None|True|False|async|await|try|except|finally|with|yield|raise|pass|const|let|var|function|export|default|new|throw|catch|public|private|fn|pub|use|struct|impl|match)$/.test(s) ? "keyword" : "" }));
+
+export default function CodeInspector(props) {
+  const [data, setData] = createSignal(null);
+  const [loading, setLoading] = createSignal(false);
+  const [error, setError] = createSignal("");
+  const [selection, setSelection] = createSignal(null);
+  const [agents, setAgents] = createSignal([]);
+  const [chooser, setChooser] = createSignal(null);
+  const [agent, setAgent] = createSignal("");
+  const [draftError, setDraftError] = createSignal("");
+  let generation = 0, body;
+  const path = () => props.selected?.file;
+  createEffect(() => {
+    const target = props.target, file = path(), tab = props.tab, tick = props.tick;
+    const request = ++generation;
+    setData(null); setError(""); setSelection(null); setChooser(null); setLoading(false);
+    if (!file || tab === "references") return;
+    setLoading(true);
+    rpc(tab === "diff" ? "codeindex.file_diff" : "codeindex.source", { ...target, path: file }).then((value) => {
+      if (request === generation) setData(value);
+    }).catch((e) => { if (request === generation) setError(String(e)); }).finally(() => {
+      if (request === generation) setLoading(false);
+    });
+  });
+  onCleanup(() => generation++);
+  createEffect(() => {
+    const target = props.target, repoId = props.repoId, targetAgentId = props.targetAgentId;
+    let active = true;
+    setAgents([]);
+    rpc("agents.list").then((list) => { if (active) setAgents((list ?? []).filter((a) => target?.worktree_id ? a.worktree_id === target.worktree_id || a.id === targetAgentId : a.repo_id === repoId)); }).catch(() => {});
+    onCleanup(() => { active = false; });
+  });
+  const lines = createMemo(() => String(props.tab === "diff" ? data()?.patch ?? "" : data()?.text ?? "").split("\n"));
+  const diffLines = createMemo(() => {
+    let old = 0, current = 0;
+    return lines().map((text, index) => {
+      const h = text.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+      if (h) { old = +h[1]; current = +h[2]; return { text, index, hunk: true }; }
+      if (/^(---|\+\+\+|diff |index |\\)/.test(text) || (!old && !current)) return { text, index };
+      if (text.startsWith("-")) return { text, index, old: old++ };
+      if (text.startsWith("+")) return { text, index, line: current++ };
+      return { text, index, old: old++, line: current++ };
+    });
+  });
+  const sourceStart = createMemo(() => Math.max(0, Math.min(lines().length - 3000, (props.selected?.line ?? 1) - 500)));
+  const visibleSource = createMemo(() => lines().slice(sourceStart(), sourceStart() + 3000).map((text, i) => ({ text, index: sourceStart() + i, line: sourceStart() + i + 1 })));
+  const visibleDiff = createMemo(() => diffLines().slice(0, 3000));
+  createEffect(() => {
+    const line = props.selected?.line, ready = data();
+    if (ready && line && props.tab === "source") queueMicrotask(() => body?.querySelector(`[data-line="${Number(line)}"]`)?.scrollIntoView({ block: "center" }));
+  });
+  const selectLines = (index, extend) => {
+    const start = extend && selection()?.anchor != null ? selection().anchor : index;
+    const lo = Math.min(start, index), hi = Math.max(start, index);
+    const items = props.tab === "diff" ? diffLines().slice(lo, hi + 1) : [];
+    const newNums = items.map((l) => l.line).filter((n) => n != null);
+    const nums = newNums.length ? newNums : items.map((l) => l.old).filter((n) => n != null);
+    setSelection({ anchor: start, lo, hi, text: lines().slice(lo, hi + 1).join("\n"), start: props.tab === "diff" ? nums[0] : lo + 1, end: props.tab === "diff" ? nums.at(-1) : hi + 1 });
+  };
+  const selectHunk = (index) => {
+    let end = diffLines().findIndex((l, i) => i > index && l.hunk);
+    if (end < 0) end = Math.min(lines().length, 3000);
+    end = Math.min(end, 3000);
+    selectLines(index, false); selectLines(end - 1, true);
+  };
+  const captureText = () => {
+    const selected = window.getSelection();
+    if (!selected || selected.isCollapsed || !body?.contains(selected.anchorNode) || !body?.contains(selected.focusNode)) return;
+    const row = (n) => (n?.nodeType === 1 ? n : n?.parentElement)?.closest("[data-index]");
+    const a = row(selected.anchorNode), b = row(selected.focusNode);
+    if (!a || !b) return;
+    const lo = Math.min(+a.dataset.index, +b.dataset.index), hi = Math.max(+a.dataset.index, +b.dataset.index);
+    selectLines(lo, false); selectLines(hi, true);
+    setSelection((s) => ({ ...s, text: selected.toString() }));
+  };
+  const draft = async () => {
+    if (!agent() || !selection()?.text.trim() || !agents().some((a) => a.id === agent())) return;
+    setDraftError("");
+    try {
+      const s = selection(), d = data() ?? {};
+      await openCodeDraft(agent(), { intent: chooser(), path: path(), selection: s.text.slice(0, 12000) + (s.text.length > 12000 ? "\n[Selection truncated to 12000 characters]" : ""), start_line: s.start, end_line: s.end, base_commit: d.base_commit, revision: d.revision, worktree_id: props.target?.worktree_id ?? d.worktree_id, repo_id: props.repoId, kind: props.tab === "diff" ? "diff" : "source" });
+      setChooser(null);
+    } catch (e) { setDraftError(String(e)); }
+  };
+  return <aside class="code-inspector">
+    <header class="inspector-head">
+      <div class="row"><strong class="mono ellipsis grow" title={path()}>{path()}</strong><button onClick={props.onExpand}>{props.expanded ? "Restore graph" : "Expand"}</button><button onClick={props.onClose}>Close</button></div>
+      <div class="inspector-target">{props.targetLabel}<Show when={props.target?.worktree_id}> · {props.target.worktree_id}</Show> · base {(data()?.base_commit ?? props.baseCommit ?? "unknown").slice(0, 12)}<Show when={data()?.revision}> · revision {String(data().revision).slice(0, 12)}</Show></div>
+      <nav aria-label="Code inspector tabs"><For each={["source", "diff", "references"]}>{(tab) => <button classList={{ active: props.tab === tab }} onClick={() => props.onTab(tab)}>{tab[0].toUpperCase() + tab.slice(1)}</button>}</For></nav>
+    </header>
+    <Show when={props.tab !== "references"} fallback={<div class="inspector-body">{props.children}</div>}>
+      <Show when={selection()?.text.trim()}><div class="code-selection"><span>{props.tab === "diff" ? "Diff" : "Lines"} {selection().start ?? "header"}–{selection().end ?? "header"}{selection().text.length > 12000 ? " · snippet will be truncated" : ""}</span><button title="Explain selected code in an agent draft" onClick={() => { setChooser("explain"); setAgent(""); }}>Explain</button><button title="Request a change to selected code in an agent draft" onClick={() => { setChooser("change"); setAgent(""); }}>Request a change</button></div></Show>
+      <Show when={chooser()}><div class="code-agent-chooser"><label>Choose an agent for a draft (never sends)<select value={agent()} onChange={(e) => setAgent(e.currentTarget.value)}><option value="">Choose agent…</option><For each={agents()}>{(a) => <option value={a.id}>{a.name || a.id}</option>}</For></select></label><Show when={!agents().length}><span>No agents belong to this target. Create one on the Agents page.</span></Show><button disabled={!agent()} onClick={draft}>Open draft</button><button onClick={() => setChooser(null)}>Cancel</button><Show when={draftError()}><div class="err">{draftError()}</div></Show></div></Show>
+      <div class="inspector-body" ref={body} onMouseUp={captureText}>
+        <Show when={loading()}><div class="code-empty">Loading {props.tab}…</div></Show>
+        <Show when={error()}><div class="code-empty err" role="alert">Unable to load {props.tab}: {error()}</div></Show>
+        <Show when={data()}>
+          <Show when={data().note}><div class="inspector-note">{data().note}</div></Show>
+          <Show when={data().truncated}><div class="inspector-note">Large file: this is a truncated preview, not the full file.</div></Show>
+          <Show when={data().binary}><div class="code-empty">Binary file. Text preview is unavailable.</div></Show>
+          <Show when={props.tab === "source" && data().exists === false}><div class="code-empty">File is missing or deleted in this target. Open Diff to inspect its removal.</div></Show>
+          <Show when={!data().binary && !(props.tab === "source" && data().exists === false)}>
+            <Show when={props.tab === "source" || data().patch} fallback={<div class="code-empty">No textual diff for this file against the selected base.</div>}>
+              <Show when={lines().length > 3000}><div class="inspector-note">Rendering a bounded preview: {props.tab === "source" ? `lines ${sourceStart() + 1}–${Math.min(sourceStart() + 3000, lines().length)} of ${lines().length}. Select another symbol to jump to its region.` : `first 3000 of ${lines().length} diff lines.`}</div></Show>
+              <div class="code-text" aria-label={props.tab === "source" ? `Read-only ${data().language ?? "source"}` : "Read-only diff"}>
+                <For each={props.tab === "diff" ? visibleDiff() : visibleSource()}>{(l) => <div class={`code-line ${props.tab === "diff" ? "code-diff-line" : "code-source-line"}`} classList={{ selected: selection() && l.index >= selection().lo && l.index <= selection().hi, addition: props.tab === "diff" && l.text.startsWith("+") && !l.text.startsWith("+++"), deletion: props.tab === "diff" && l.text.startsWith("-") && !l.text.startsWith("---"), jump: props.tab === "source" && l.line === props.selected?.line }} data-index={l.index} data-line={l.line}>
+                  <button class="line-number" title="Select line, shift-click for range" onClick={(e) => selectLines(l.index, e.shiftKey)}>{props.tab === "diff" ? `${l.old ?? ""} ${l.line ?? ""}` : l.line}</button><code><For each={tokens(l.text)}>{(t) => <span class={`syntax-${t.kind}`}>{t.text}</span>}</For>{"\n"}</code><Show when={l.hunk}><button class="hunk-select" onClick={() => selectHunk(l.index)}>Select hunk</button></Show>
+                </div>}</For>
+              </div>
+            </Show>
+          </Show>
+        </Show>
+      </div>
+      <footer class="inspector-note">Read only · select text or click line numbers, shift-click for a range</footer>
+    </Show>
+  </aside>;
+}
