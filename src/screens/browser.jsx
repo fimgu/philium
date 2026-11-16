@@ -103,9 +103,9 @@ export default function Screen() {
 
   const close = async (id) => { drop(id); await rpc("browser.close", { tab: id }).catch(() => {}); };
 
-  useEvent("browser:tab", (t) => { if (alive) upsert(t); });
+  useEvent("browser:tab", (t) => { if (alive && !t.owner) upsert(t); });
   useEvent("browser:closed", ({ id }) => drop(id));
-  useEvent("browser:opened", ({ id, opener }) => { if (opener === active()) select(id); });
+  useEvent("browser:opened", ({ id, opener }) => { if (opener === active() && tabs().some((t) => t.id === id)) select(id); });
   useEvent("browser:download", (d) => {
     const msg = d.state === "started" ? `Downloading ${d.name || "file"} to Downloads`
       : d.state === "done" ? `Saved ${d.name || "file"} to Downloads` : `Download failed${d.name ? `: ${d.name}` : ""}`;

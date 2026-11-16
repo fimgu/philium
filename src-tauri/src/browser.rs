@@ -10,7 +10,7 @@
 //! rpc methods (`browser.*`):
 //! - `open {url, agent?}` -> tab; `navigate {tab,url}`; `back|forward|reload|stop {tab}`; `close {tab}`
 //! - `tabs {}` -> `[{id,url,title,agent,visible}]`
-//! - `set_bounds {tab,x,y,w,h}` (CSS px, relative to the window content); `hide {tab?}`, `show {tab?}` (no tab = all)
+//! - `set_bounds {tab,x,y,w,h}` (CSS px, relative to the window content); `hide {tab?|owner?}`, `show {tab?|owner?}` (no tab = all tabs of owner, none = shared)
 //! - `snapshot {tab}` -> page text; `external {url}` opens in the system browser
 //!
 //! Events: `browser:tab` `{id,url,title,agent,loading,error}` on any tab change, `browser:closed` `{id}`,
@@ -310,7 +310,11 @@ fn set_visible(ctx: &Ctx, id: &str, vis: bool) -> Result<(), String> {
 fn ids(args: &Value) -> Vec<String> {
     match arg_opt_str(args, "tab") {
         Some(t) => vec![t],
-        None => state().lock().unwrap().tabs.iter().map(|t| t.id.clone()).collect(),
+        // No tab: every tab of `owner` (absent = the shared Browser screen's tabs).
+        None => {
+            let owner = arg_opt_str(args, "owner");
+            state().lock().unwrap().tabs.iter().filter(|t| t.owner == owner).map(|t| t.id.clone()).collect()
+        }
     }
 }
 
