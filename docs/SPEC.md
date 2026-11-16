@@ -670,7 +670,7 @@ This also keeps a running "Philium backlog" on the board, so ideas you have mid-
 
 ### Subscriptions (researched 2026-11-16)
 
-You trust both providers, so they run in **Standard** mode (not Strict). Their traffic still goes through the gateway for logging and stats.
+You trust both providers, so they run in **Standard** mode (not Strict). Philium still logs their activity, token usage and TPS, read from the official CLIs' own output.
 
 | Subscription | Can Philium use it directly? | How Philium does it |
 |---|---|---|
