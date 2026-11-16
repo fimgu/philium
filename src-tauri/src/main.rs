@@ -247,6 +247,7 @@ fn main() {
             if let Some(app) = handle.try_state::<App>() {
                 agents::shutdown(&app.ctx);
                 terminals::shutdown(&app.ctx);
+                let _ = reaper::shutdown(&app.ctx);
                 if let Some(h) = app.ctx.desk() {
                     h.stop();
                 }
