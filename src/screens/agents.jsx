@@ -251,21 +251,29 @@ function AgentView(props) {
   const [info, { refetch }] = createResource(() => props.id, (id) => rpc("agents.get", { id }));
   const [historyLoading, setHistoryLoading] = createSignal(false);
   const [historyError, setHistoryError] = createSignal("");
+  const [historyCursor, setHistoryCursor] = createSignal(0);
+  const [historyMore, setHistoryMore] = createSignal(false);
+  let retryAfter = 0;
   let generation = 0, historyId;
   const merge = (previous, incoming) => {
     const bySeq = new Map(previous.map((event) => [event.seq, event]));
     for (const event of incoming) if (!bySeq.has(event.seq)) bySeq.set(event.seq, event);
     return [...bySeq.values()].sort((a, b) => a.seq - b.seq);
   };
-  const load = async (id) => {
+  const load = async (id, after = 0) => {
     const request = ++generation;
-    if (historyId !== id) { historyId = id; setEvents([]); }
+    if (historyId !== id) { historyId = id; setEvents([]); setHistoryCursor(0); setHistoryMore(false); }
+    retryAfter = after;
     setHistoryLoading(true); setHistoryError("");
     try {
-      const evs = await rpc("agents.events", { id, after: 0, limit: 5000 }, { local: true });
+      const evs = await rpc("agents.events", { id, after, limit: 5000 }, { local: true });
       if (request !== generation || props.id !== id) return;
       if (!Array.isArray(evs)) throw new Error("Invalid history response");
       setEvents((current) => merge(current, evs));
+      // Cursor belongs to the fetched page, never to newer SSE events merged above.
+      const next = evs.at(-1)?.seq ?? after;
+      setHistoryCursor(next);
+      setHistoryMore(evs.length === 5000 && next > after);
     } catch (e) {
       if (request === generation && props.id === id) setHistoryError(String(e));
     } finally {
@@ -273,7 +281,7 @@ function AgentView(props) {
     }
   };
   onCleanup(() => generation++);
-  createEffect(on(() => props.id, load));
+  createEffect(on(() => props.id, (id) => load(id)));
   useEvent("agents:events", (p) => {
     if (p.id !== props.id || historyId !== props.id) return;
     setEvents((current) => merge(current, p.events ?? []));
@@ -338,7 +346,8 @@ function AgentView(props) {
         <div class="agent-main">
           <Show when={tab() === "chat"}>
             <Show when={historyLoading()}><div class="history-loading small dim" role="status">Loading saved conversation…</div></Show>
-            <Show when={historyError()}><div class="history-error shield danger" role="alert">Unable to load saved conversation: {historyError()} <Button size="sm" onClick={() => load(props.id)}>Retry history</Button></div></Show>
+            <Show when={historyError()}><div class="history-error shield danger" role="alert">Unable to load saved conversation: {historyError()} <Button size="sm" onClick={() => load(props.id, retryAfter)}>Retry history</Button></div></Show>
+            <Show when={historyMore()}><div class="history-more small dim" role="status">More saved history is available. Showing loaded pages only. <Button size="sm" disabled={historyLoading()} onClick={() => load(props.id, historyCursor())}>Load more history</Button></div></Show>
             <Conversation events={events()} readOnly={!live()} emptyText={historyLoading() ? "Loading saved conversation…" : historyError() ? "History could not be loaded. Retry above." : live() ? "Send the first message to start." : "No saved messages. This agent is stopped. Resume it to continue."}
               onApprove={(id, scope) => decide(id, "approve", scope)} onDeny={(id) => decide(id, "deny")} />
             <Composer draftKey={`agent:${props.id}`} onSend={send} busy={busy()} disabled={!live()} onCancel={() => rpc("agents.cancel", { id: props.id }, { action: true }).catch((e) => toast(String(e), "danger"))}

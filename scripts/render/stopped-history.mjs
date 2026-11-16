@@ -65,6 +65,32 @@ export async function checkStoppedHistory(page, shot) {
     if (!document.querySelector('.composer img[alt="history-draft.png"]')) errors.push('switching agents lost draft attachment');
     if (input().value !== 'stopped draft kept') errors.push('switching agents lost draft');
     if (t.historyActions.join() !== 'agents.resume,agents.stop') errors.push('inspection auto-resumed runtime');
+    // A full oldest page is explicitly bounded. SSE cannot move its next-page cursor.
+    t.historyEvents.a1 = Array.from({ length: 5000 }, (_, i) => ({ seq: i + 1, type: 'fixture.neutral' }));
+    t.historyEvents.a1[0] = event(1, 'oldest paged history');
+    t.historyEvents.a1.push(event(5001, 'later unique saved message'));
+    window.__philiumGo('home', {}); await wait(); await navigate('a1');
+    if (!document.querySelector('.history-more') || text().includes('later unique')) errors.push('full page lacked explicit more notice or auto-fetched');
+    window.__emit('agents:events', { id: 'a1', events: [event(9000, 'newer SSE beyond cursor'), event(5001, 'later unique saved message')] }); await wait();
+    t.failHistory = true; click('Load more history'); await wait();
+    if (t.historyPages.at(-1)?.after !== 5000 || t.historyPages.at(-1)?.limit !== 5000) errors.push('paging used SSE cursor or wrong limit');
+    if (!document.querySelector('.history-error') || !text().includes('oldest paged')) errors.push('page failure discarded history or hid local error');
+    t.failHistory = false; click('Retry history'); await wait();
+    if (t.historyPages.at(-1)?.after !== 5000) errors.push('page retry lost fetched cursor');
+    if ([...document.querySelectorAll('.conv .msg.user')].filter((e) => e.textContent === 'later unique saved message').length !== 1) errors.push('paged SSE boundary duplicated or lost later message');
+    if (document.querySelector('.history-more')) errors.push('short final page retained more notice');
+    // A held page must not replace another agent or advance its cursor.
+    window.__philiumGo('home', {}); await wait(); await navigate('a1');
+    t.holdHistory = true; click('Load more history'); await wait();
+    const heldPage = t.historyPending.splice(0);
+    if (!heldPage.length) errors.push('stale paging request not exercised');
+    t.holdHistory = false; await navigate('a2');
+    heldPage.forEach((p) => p.resolve()); await wait();
+    if (text().includes('later unique') || document.querySelector('.history-more')) errors.push('stale page leaked into peer');
+    if (t.historyPages.at(-1)?.after !== 0) errors.push('target change did not reset page cursor');
+    await navigate('a1');
+    if (input().value !== 'stopped draft kept' || !document.querySelector('.composer img[alt="history-draft.png"]')) errors.push('paging lost draft');
+    if (t.historyActions.join() !== 'agents.resume,agents.stop') errors.push('paging auto-resumed runtime');
     return errors;
   });
   await shot(page, 'agents-stopped-history');

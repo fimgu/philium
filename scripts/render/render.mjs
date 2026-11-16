@@ -84,7 +84,8 @@ const stub = (fx, setName) => {
           if (a.method === "agents.events") {
             const id = a.args.id;
             t.historyCalls.push(id);
-            const response = structuredClone(t.historyEvents[id] ?? []);
+            (t.historyPages ??= []).push({ id, after: a.args.after, limit: a.args.limit });
+            const response = structuredClone((t.historyEvents[id] ?? []).filter((e) => e.seq > (a.args.after ?? 0)).slice(0, a.args.limit ?? 5000));
             if (t.holdHistory) await new Promise((resolve, reject) => t.historyPending.push({ id, response, resolve, reject }));
             if (t.failHistory) throw "Saved history unreadable";
             return response;
