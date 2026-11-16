@@ -88,7 +88,8 @@ const worktrees = [
   { id: "w2", repo_id: "r1", agent_id: "a2", branch: "agent/otter", path: "/Users/demo/Philium/worktrees/otter", agent_name: "otter", created_at: now - 7200000, status: { unsaved: false, dirty_files: [], ahead: 0, behind: 1, unpushed_commits: 0, unmerged_commits: 0 } },
 ];
 const terms = [
-  { id: "term1", title: "cargo test", agent_id: "a1", agent: "lion", state: "running", cmd: "cargo test", cwd: "/Users/demo/Philium/worktrees/lion", created_at: now - 600000 },
+  { id: "term0", title: "lion shell", agent_id: "a1", agent: "lion", state: "running", cmd: "bash", cwd: "/Users/demo/Philium/worktrees/lion", created_at: now - 700000 },
+  { id: "term1", title: "lion: npm run dev", agent_id: "a1", agent: "lion", state: "running", cmd: "npm run dev", cwd: "/Users/demo/Philium/worktrees/lion", created_at: now - 600000 },
   { id: "term2", title: "npm run build", agent_id: "a2", agent: "otter", state: "exited", exit_code: 0, cmd: "npm run build", created_at: now - 900000 },
   { id: "term3", title: "shell", state: "exited", exit_code: 1, cmd: "zsh", created_at: now - 1200000 },
 ];
@@ -151,8 +152,9 @@ export const POPULATED = {
   "board.playbooks": [],
   "board.mail_threads": [],
   "board.mail_inbox": [],
+  "agents.shell": "term0",
   "terminals.list": terms,
-  "terminals.buffer": { data: Buffer.from("$ cargo test\r\nrunning 12 tests\r\ntest result: ok. 12 passed\r\n").toString("base64") },
+  "terminals.buffer": { data: Buffer.from("\x1b[38;5;110mlion\x1b[38;5;244m lion $\x1b[0m cargo test -q\r\nrunning 112 tests\r\n........................................\r\ntest result: \x1b[32mok\x1b[0m. 112 passed; 0 failed\r\n\x1b[38;5;110mlion\x1b[38;5;244m lion $\x1b[0m git status -s\r\n M src/screens/agents.jsx\r\n?? src/ui/termview.jsx\r\n\x1b[38;5;110mlion\x1b[38;5;244m lion $\x1b[0m ").toString("base64") },
   "workspace.repos_list": repos,
   "workspace.worktrees": worktrees,
   "workspace.branches": [{ name: "main", current: true, commit: "a1b2c3d4e5", date: now - 3600000 }, { name: "agent/lion", commit: "b2c3d4e5f6", date: now - 600000 }, { name: "agent/otter", commit: "c3d4e5f6a7" }, { name: "origin/main", commit: "a1b2c3d4e5" }, { name: "origin/HEAD" }],

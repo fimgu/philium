@@ -4,6 +4,8 @@ import { For, Show, createSignal, createResource, createMemo, createEffect, on, 
 import { NotFound, Page, Button, Badge, Dot, Empty, Modal, Field, Input, TextArea, Select, Toggle, Segmented, confirm, toast } from "../ui/kit.jsx";
 import { Icon } from "../ui/icons.jsx";
 import { Conversation, Composer, speedEffort, effortSpeed } from "../ui/conversation.jsx";
+import { AgentTerminals } from "../ui/agent-terminals.jsx";
+import { AgentBrowser } from "../ui/agent-browser.jsx";
 import { rpc, useEvent, fmt } from "../lib/rpc.js";
 import { go, params, registerCommands } from "../lib/nav.js";
 import "../styles/agents.css";
@@ -231,6 +233,20 @@ function Details(props) {
 
 function AgentView(props) {
   const [tab, setTab] = createSignal("chat");
+  // Side panel: what the agent is doing, live. Remembered across agents.
+  const [aside, setAsideRaw] = createSignal(localStorage.getItem("agent.aside") ?? "terminal");
+  const setAside = (v) => { setAsideRaw(v); localStorage.setItem("agent.aside", v); };
+  const [asideW, setAsideW] = createSignal(Number(localStorage.getItem("agent.aside.w")) || 520);
+  const [browserPing, setBrowserPing] = createSignal(false);
+  createEffect(on(aside, (v) => { if (v === "browser") setBrowserPing(false); }));
+  const drag = (e) => {
+    e.preventDefault();
+    const x0 = e.clientX, w0 = asideW();
+    const move = (ev) => setAsideW(Math.max(320, Math.min(window.innerWidth - 560, w0 + (x0 - ev.clientX))));
+    const up = () => { window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up); localStorage.setItem("agent.aside.w", String(asideW())); };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+  };
   const [events, setEvents] = createSignal([]);
   const [info, { refetch }] = createResource(() => props.id, (id) => rpc("agents.get", { id }));
   let lastSeq = 0;
@@ -288,23 +304,41 @@ function AgentView(props) {
         <Show when={a()?.strict}><Badge tone="strict"><Icon name="shield" size={11} /> Strict</Badge></Show>
         <span class="mono xs faint ellipsis">{a()?.model_ref}</span>
         <div class="grow" />
-        <Segmented value={tab()} onChange={setTab} options={[{ value: "chat", label: "Conversation" }, { value: "terms", label: "Terminals" }, { value: "changes", label: "Changes" }, { value: "info", label: "Details" }]} />
+        <Segmented value={tab()} onChange={setTab} options={[{ value: "chat", label: "Conversation" }, { value: "terms", label: "Commands" }, { value: "changes", label: "Changes" }, { value: "info", label: "Details" }]} />
+        <Segmented value={aside()} onChange={setAside} options={[
+          { value: "terminal", label: <span class="row gap-4" title="The agent's live terminal"><Icon name="terminal" size={12} /> Terminal</span> },
+          { value: "browser", label: <span class="row gap-4" title="The agent's live browser"><Icon name="globe" size={12} /> Browser<Show when={browserPing()}><span class="ping" /></Show></span> },
+          { value: "none", label: <span title="Hide the side panel">Hide</span> },
+        ]} />
         <Show when={live()} fallback={<Button size="sm" onClick={() => rpc("agents.resume", { id: props.id }).catch((e) => toast(String(e), "danger"))}><Icon name="play" size={11} /> Resume</Button>}>
           <Button size="sm" onClick={() => rpc("agents.stop", { id: props.id })}><Icon name="stop" size={11} /> Stop</Button>
         </Show>
         <Button size="sm" variant="ghost" title="Remove agent and clean up" onClick={remove}><Icon name="trash" size={12} /></Button>
       </div>
       <Show when={a()?.error}><div class="shield danger" style={{ margin: "8px 16px 0" }}>{a().error}</div></Show>
-      <Show when={tab() === "chat"}>
-        <Conversation events={events()} emptyText={live() ? "Send the first message to start." : "This agent is stopped. Resume it to continue."}
-          onApprove={(id, scope) => decide(id, "approve", scope)} onDeny={(id) => decide(id, "deny")} />
-        <Composer onSend={send} busy={busy()} disabled={!live()} onCancel={() => rpc("agents.cancel", { id: props.id })}
-          speed={effortSpeed(effort())} onSpeed={(v) => rpc("agents.set_effort", { id: props.id, effort: speedEffort(v) }).then(setEffort).catch((e) => toast(String(e), "danger"))}
-          placeholder={live() ? `Message ${a()?.name ?? ""}` : "Agent is stopped"} />
-      </Show>
-      <Show when={tab() === "terms"}><Terminals id={props.id} /></Show>
-      <Show when={tab() === "changes"}><Changes id={props.id} /></Show>
-      <Show when={tab() === "info" && info()}><Details agent={info()} /></Show>
+      <div class="agent-body">
+        <div class="agent-main">
+          <Show when={tab() === "chat"}>
+            <Conversation events={events()} emptyText={live() ? "Send the first message to start." : "This agent is stopped. Resume it to continue."}
+              onApprove={(id, scope) => decide(id, "approve", scope)} onDeny={(id) => decide(id, "deny")} />
+            <Composer onSend={send} busy={busy()} disabled={!live()} onCancel={() => rpc("agents.cancel", { id: props.id })}
+              speed={effortSpeed(effort())} onSpeed={(v) => rpc("agents.set_effort", { id: props.id, effort: speedEffort(v) }).then(setEffort).catch((e) => toast(String(e), "danger"))}
+              placeholder={live() ? `Message ${a()?.name ?? ""}` : "Agent is stopped"} />
+          </Show>
+          <Show when={tab() === "terms"}><Terminals id={props.id} /></Show>
+          <Show when={tab() === "changes"}><Changes id={props.id} /></Show>
+          <Show when={tab() === "info" && info()}><Details agent={info()} /></Show>
+        </div>
+        <div class="agent-aside" classList={{ hidden: aside() === "none" }} style={{ width: `${asideW()}px` }}>
+            <div class="aside-grip" onPointerDown={drag} title="Drag to resize" />
+            <div class="aside-body" classList={{ hidden: aside() !== "terminal" }}>
+              <AgentTerminals id={props.id} name={a()?.name ?? ""} live={live()} />
+            </div>
+            <div class="aside-body" classList={{ hidden: aside() !== "browser" }}>
+              <AgentBrowser agent={props.id} name={a()?.name} strict={a()?.strict} provider={a()?.model_ref?.split("/")[0]} visible={aside() === "browser"} onActivity={() => setBrowserPing(true)} />
+            </div>
+          </div>
+      </div>
     </div>
   );
 }
