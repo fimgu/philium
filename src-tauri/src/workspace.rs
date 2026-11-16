@@ -79,9 +79,21 @@ fn worktree(ctx: &Arc<Ctx>, id: &str) -> Result<Value, String> {
 fn text<'a>(v: &'a Value, key: &str) -> Result<&'a str, String> {
     v[key].as_str().ok_or_else(|| format!("Missing {key}"))
 }
+/// Expand `~` / `~/...` to the home folder; trim stray whitespace and quotes.
+pub(crate) fn expand_home(path: &str) -> std::path::PathBuf {
+    let p = path.trim().trim_matches(|c| c == '"' || c == '\'');
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    match (p, home) {
+        ("~", Some(h)) => h,
+        (p, Some(h)) if p.starts_with("~/") => h.join(&p[2..]),
+        (p, _) => std::path::PathBuf::from(p),
+    }
+}
 fn add_repo(ctx: &Arc<Ctx>, path: &str) -> Result<Value, String> {
-    let path = std::fs::canonicalize(path).map_err(|e| e.to_string())?;
-    let top = git(&path, &["rev-parse", "--show-toplevel"])?;
+    let wanted = expand_home(path);
+    let path = std::fs::canonicalize(&wanted).map_err(|_| format!("No folder at {}", wanted.display()))?;
+    let top = git(&path, &["rev-parse", "--show-toplevel"])
+        .map_err(|_| format!("{} is not inside a Git repository", path.display()))?;
     let path = std::fs::canonicalize(top).map_err(|e| e.to_string())?;
     let path_str = path.to_string_lossy().to_string();
     if let Some(row) = ctx

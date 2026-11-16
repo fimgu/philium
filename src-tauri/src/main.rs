@@ -174,6 +174,21 @@ async fn app_call(app: &App, m: &str, args: Value) -> Result<Value, String> {
             let body = chat_session_body(&ws, args["title"].as_str().unwrap_or("Chat"), args["model"].as_str());
             h.call(reqwest::Method::POST, "/sessions", Some(body)).await
         }
+        // Native folder picker (macOS). Returns {path} or {path: null} if cancelled.
+        "pick_folder" => {
+            let prompt = args["prompt"].as_str().unwrap_or("Choose a folder").replace('"', "'");
+            tokio::task::spawn_blocking(move || {
+                if !cfg!(target_os = "macos") {
+                    return Err("Folder picker is only available on macOS for now; type the path instead.".to_string());
+                }
+                let script = format!("POSIX path of (choose folder with prompt \"{prompt}\")");
+                let out = std::process::Command::new("osascript").args(["-e", &script]).output().map_err(|e| e.to_string())?;
+                let p = String::from_utf8_lossy(&out.stdout).trim().trim_end_matches('/').to_string();
+                Ok(json!({ "path": if out.status.success() && !p.is_empty() { Some(p) } else { None } }))
+            })
+            .await
+            .map_err(|e| e.to_string())?
+        }
         // Disk used by Philium, by area. Bounded walk so it stays fast.
         "disk" => {
             let (root, data) = (ctx.root.clone(), ctx.data_dir.clone());
