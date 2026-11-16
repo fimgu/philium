@@ -1,15 +1,495 @@
-//! TODO: implemented by the mcp lane. See ctx.rs for the module contract.
+//! Philium's agent tools, served over MCP (Streamable HTTP, JSON responses)
+//! on a loopback port. Each agent's HAL connects with its own bearer token, so
+//! every call is attributed to exactly one agent (SPEC 8).
+//!
+//! Tools (model-visible as `mcp_philium_<name>`):
+//!   board_list, board_get, board_create, board_claim, board_update, board_submit,
+//!   mail_send, mail_read, agent_spawn, agent_status, agent_stop,
+//!   shell_run, shell_read, shell_write, shell_kill,
+//!   browser_open, browser_snapshot, graph_query, playbook_get, resource_register
+//!
+//! rpc: status {} -> {url, agents_connected}
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock};
 
-use serde_json::Value;
+use axum::extract::State;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::post;
+use axum::{Json, Router};
+use serde_json::{json, Value};
 
 use crate::ctx::Ctx;
 
-pub fn init(_ctx: &Arc<Ctx>) -> Result<(), String> {
+fn tokens() -> &'static Mutex<HashMap<String, String>> {
+    static T: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    T.get_or_init(Default::default)
+}
+
+/// New MCP bearer token for an agent (replaces any previous one).
+pub fn issue_token(agent_id: &str) -> String {
+    revoke(agent_id);
+    let t = crate::hal::random_token();
+    tokens().lock().unwrap().insert(t.clone(), agent_id.to_string());
+    t
+}
+
+pub fn revoke(agent_id: &str) {
+    tokens().lock().unwrap().retain(|_, a| a != agent_id);
+}
+
+fn who(headers: &HeaderMap) -> Option<String> {
+    let presented = headers.get("authorization")?.to_str().ok()?.strip_prefix("Bearer ")?;
+    let map = tokens().lock().unwrap();
+    map.iter()
+        .find(|(t, _)| {
+            t.len() == presented.len() && t.bytes().zip(presented.bytes()).fold(0u8, |a, (x, y)| a | (x ^ y)) == 0
+        })
+        .map(|(_, a)| a.clone())
+}
+
+pub fn init(ctx: &Arc<Ctx>) -> Result<(), String> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+    listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+    let url = format!("http://{}/mcp", listener.local_addr().map_err(|e| e.to_string())?);
+    let _ = ctx.mcp_url.set(url);
+    let app = router(ctx.clone());
+    tauri::async_runtime::spawn(async move {
+        let l = tokio::net::TcpListener::from_std(listener).expect("mcp listener");
+        if let Err(e) = axum::serve(l, app).await {
+            eprintln!("philium: mcp stopped: {e}");
+        }
+    });
     Ok(())
 }
 
+pub fn router(ctx: Arc<Ctx>) -> Router {
+    Router::new()
+        .route("/mcp", post(handle).get(|| async { StatusCode::METHOD_NOT_ALLOWED }).delete(|| async { StatusCode::OK }))
+        .with_state(ctx)
+}
+
+async fn handle(State(ctx): State<Arc<Ctx>>, headers: HeaderMap, Json(req): Json<Value>) -> Response {
+    // Host header check blocks DNS rebinding from a browser page.
+    let host = headers.get("host").and_then(|h| h.to_str().ok()).unwrap_or("");
+    if !(host.starts_with("127.0.0.1:") || host.starts_with("localhost:")) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Some(agent) = who(&headers) else {
+        return (StatusCode::UNAUTHORIZED, "bad token").into_response();
+    };
+    if let Value::Array(batch) = req {
+        let mut out = vec![];
+        for r in batch {
+            if let Some(v) = dispatch(&ctx, &agent, r).await {
+                out.push(v);
+            }
+        }
+        return Json(Value::Array(out)).into_response();
+    }
+    match dispatch(&ctx, &agent, req).await {
+        Some(v) => Json(v).into_response(),
+        None => StatusCode::ACCEPTED.into_response(),
+    }
+}
+
+/// One JSON-RPC message. Notifications (no id) return None.
+pub async fn dispatch(ctx: &Arc<Ctx>, agent: &str, req: Value) -> Option<Value> {
+    let id = req.get("id").cloned()?;
+    let method = req["method"].as_str().unwrap_or("");
+    let result = match method {
+        "initialize" => Ok(json!({
+            "protocolVersion": req["params"]["protocolVersion"].as_str().unwrap_or("2025-06-18"),
+            "capabilities": { "tools": { "listChanged": false } },
+            "serverInfo": { "name": "philium", "version": env!("CARGO_PKG_VERSION") },
+        })),
+        "ping" => Ok(json!({})),
+        "tools/list" => Ok(json!({ "tools": tool_list() })),
+        "tools/call" => {
+            let name = req["params"]["name"].as_str().unwrap_or("").to_string();
+            let args = req["params"]["arguments"].clone();
+            let args = if args.is_null() { json!({}) } else { args };
+            ctx.log_event("tool_call", Some(agent), &json!({ "tool": name }));
+            let _ = ctx.db.exec(
+                "UPDATE agents SET last_active_at=?2 WHERE id=?1",
+                rusqlite::params![agent, crate::db::now()],
+            );
+            let r = call_tool(ctx, agent, &name, args).await;
+            Ok(match r {
+                Ok(v) => {
+                    let text = match v {
+                        Value::String(s) => s,
+                        v => serde_json::to_string_pretty(&v).unwrap_or_default(),
+                    };
+                    json!({ "content": [{ "type": "text", "text": text }], "isError": false })
+                }
+                Err(e) => json!({ "content": [{ "type": "text", "text": e }], "isError": true }),
+            })
+        }
+        _ => Err(json!({ "code": -32601, "message": format!("method not found: {method}") })),
+    };
+    Some(match result {
+        Ok(r) => json!({ "jsonrpc": "2.0", "id": id, "result": r }),
+        Err(e) => json!({ "jsonrpc": "2.0", "id": id, "error": e }),
+    })
+}
+
+fn t(name: &str, desc: &str, props: Value, required: &[&str]) -> Value {
+    json!({ "name": name, "description": desc,
+            "inputSchema": { "type": "object", "properties": props, "required": required } })
+}
+
+pub fn tool_list() -> Vec<Value> {
+    let s = json!({ "type": "string" });
+    let i = json!({ "type": "integer" });
+    let b = json!({ "type": "boolean" });
+    vec![
+        t("board_list", "List tasks on the shared master board. Filter by status (open, claimed, in_review, done, cancelled), owner (agent name) or q (text).",
+          json!({ "status": s, "owner": s, "q": s }), &[]),
+        t("board_get", "Full task: description, dependencies, playbook progress, history.", json!({ "id": s }), &["id"]),
+        t("board_create", "Add a task to the master board.",
+          json!({ "title": s, "detail": s, "priority": { "type": "string", "enum": ["low", "normal", "high", "urgent"] },
+                  "depends_on": { "type": "array", "items": s }, "playbook": s }), &["title"]),
+        t("board_claim", "Claim a task with an exclusive lease, or renew your lease (heartbeat). Only open tasks whose dependencies are done can be claimed.",
+          json!({ "id": s, "lease_secs": i }), &["id"]),
+        t("board_update", "Update a task you own: note progress, change status, set the current playbook step or PR URL.",
+          json!({ "id": s, "status": s, "note": s, "step": s, "pr_url": s, "detail": s }), &["id"]),
+        t("board_submit", "Submit a claimed task for review with a summary and the PR URL. Playbook checks run.",
+          json!({ "id": s, "summary": s, "pr_url": s }), &["id", "summary"]),
+        t("mail_send", "Message another agent by name, \"all\" for every agent, or \"you\" for the human.",
+          json!({ "to": s, "body": s }), &["to", "body"]),
+        t("mail_read", "Read your inbox (marks messages read).", json!({ "unread_only": b }), &[]),
+        t("agent_spawn", "Start a helper agent. It gets its own worktree of the same repo and its own session.",
+          json!({ "name": s, "brief": s, "model": s, "role": s, "task_id": s }), &["brief"]),
+        t("agent_status", "Status of agents: everyone, or one by name.", json!({ "name": s }), &[]),
+        t("agent_stop", "Stop a helper agent you spawned.", json!({ "name": s }), &["name"]),
+        t("shell_run", "Run a shell command in a visible, persistent terminal in your workspace. Waits for it to finish (up to timeout_secs, default 120) and returns the trimmed output and exit code. With background=true it returns the terminal id immediately (use for servers and watchers).",
+          json!({ "command": s, "cwd": s, "timeout_secs": i, "background": b, "title": s }), &["command"]),
+        t("shell_read", "Recent output of one of your terminals.", json!({ "id": s, "max_bytes": i }), &["id"]),
+        t("shell_write", "Send input to one of your terminals (include \\n to press Enter).", json!({ "id": s, "data": s }), &["id", "data"]),
+        t("shell_kill", "Stop one of your terminals.", json!({ "id": s }), &["id"]),
+        t("browser_open", "Open a URL in Philium's shared browser (visible to the human). Returns a tab id.", json!({ "url": s }), &["url"]),
+        t("browser_snapshot", "Text content of a browser tab.", json!({ "tab": s }), &["tab"]),
+        t("graph_query", "Code graph of your repo: which files import which. Cheaper than reading files. Optional `path` focuses on one file's neighbours.",
+          json!({ "path": s }), &[]),
+        t("playbook_get", "The standard steps and checks for a job: commit, open_pr, test_pr, review_pr, docs, release, teardown.",
+          json!({ "job": s }), &["job"]),
+        t("resource_register", "Declare something you created outside Philium's tools (container, cluster, process, temp dir) so it is cleaned up with you.",
+          json!({ "kind": s, "handle": s, "note": s }), &["kind", "handle"]),
+    ]
+}
+
+fn arg<'a>(a: &'a Value, k: &str) -> Result<&'a str, String> {
+    a[k].as_str().filter(|s| !s.is_empty()).ok_or_else(|| format!("missing `{k}`"))
+}
+
+fn agent_row(ctx: &Ctx, agent: &str) -> Result<Value, String> {
+    crate::agents::get_row(ctx, agent).ok_or_else(|| "unknown agent".to_string())
+}
+
+/// Terminal ids an agent may touch: only its own.
+fn own_terminal(ctx: &Ctx, agent: &str, id: &str) -> Result<(), String> {
+    let rows = ctx.db.query("SELECT agent_id FROM terminals WHERE id=?1", [id])?;
+    match rows.first() {
+        Some(r) if r["agent_id"].as_str() == Some(agent) => Ok(()),
+        Some(_) => Err("that terminal belongs to someone else".into()),
+        None => Err("no such terminal".into()),
+    }
+}
+
+/// Keep tool output small: head + tail of long text.
+pub fn trim_output(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let head = max / 4;
+    let tail = max - head;
+    let cut = |i: usize| (0..=i).rev().find(|j| s.is_char_boundary(*j)).unwrap_or(0);
+    let h = &s[..cut(head)];
+    let t = &s[cut(s.len() - tail)..];
+    format!("{h}\n... [{} bytes omitted] ...\n{t}", s.len() - h.len() - t.len())
+}
+
+/// Resolve a requested cwd inside the agent's workspace.
+fn inside(base: &PathBuf, rel: Option<&str>) -> Result<PathBuf, String> {
+    let Some(r) = rel.filter(|r| !r.is_empty()) else { return Ok(base.clone()) };
+    let p = if r.starts_with('/') { PathBuf::from(r) } else { base.join(r) };
+    let canon = p.canonicalize().map_err(|e| format!("cwd {r}: {e}"))?;
+    let b = base.canonicalize().map_err(|e| e.to_string())?;
+    if !canon.starts_with(&b) {
+        return Err("cwd must be inside your workspace".into());
+    }
+    Ok(canon)
+}
+
+pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Result<Value, String> {
+    let row = agent_row(ctx, agent)?;
+    let me = row["name"].as_str().unwrap_or("agent").to_string();
+    match name {
+        "board_list" => {
+            let mut f = a.clone();
+            if let Some(o) = a["owner"].as_str() {
+                f["owner"] = json!(crate::agents::get_row(ctx, o).and_then(|r| r["id"].as_str().map(str::to_string)).unwrap_or_default());
+            }
+            crate::board::list(ctx, &f)
+        }
+        "board_get" => crate::board::get(ctx, arg(&a, "id")?),
+        "board_create" => {
+            let deps: Vec<String> = a["depends_on"]
+                .as_array()
+                .map(|v| v.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            crate::board::create(
+                ctx,
+                &me,
+                arg(&a, "title")?,
+                a["detail"].as_str().unwrap_or(""),
+                a["priority"].as_str(),
+                row["repo_id"].as_str(),
+                &deps,
+                a["playbook"].as_str(),
+            )
+        }
+        "board_claim" => {
+            let r = crate::board::claim(ctx, agent, arg(&a, "id")?, a["lease_secs"].as_i64().unwrap_or(900).clamp(60, 7200))?;
+            let _ = ctx.db.exec("UPDATE agents SET task_id=?2 WHERE id=?1", rusqlite::params![agent, arg(&a, "id")?]);
+            ctx.emit("agents:changed", json!({ "id": agent }));
+            Ok(r)
+        }
+        "board_update" => {
+            let mut patch = a.clone();
+            if let Some(o) = patch.as_object_mut() {
+                o.remove("id");
+            }
+            crate::board::update(ctx, agent, arg(&a, "id")?, &patch)
+        }
+        "board_submit" => crate::board::submit(ctx, agent, arg(&a, "id")?, arg(&a, "summary")?, a["pr_url"].as_str()),
+        "mail_send" => {
+            let to = arg(&a, "to")?;
+            if !matches!(to, "all" | "you") && crate::agents::get_row(ctx, to).is_none() {
+                return Err(format!("no agent named {to}"));
+            }
+            crate::board::send(ctx, &me, to, arg(&a, "body")?)
+        }
+        "mail_read" => crate::board::inbox(ctx, &me, a["unread_only"].as_bool().unwrap_or(true), true),
+        "agent_spawn" => {
+            let strict = row["strict"].as_i64() == Some(1);
+            let model = a["model"].as_str().map(str::to_string).or_else(|| row["model_ref"].as_str().map(str::to_string));
+            // A Strict agent's helpers stay on the same untrusted provider, Strict too.
+            if strict {
+                let mine = row["model_ref"].as_str().unwrap_or("").split('/').next().unwrap_or("").to_string();
+                if model.as_deref().and_then(|m| m.split('/').next()) != Some(mine.as_str()) {
+                    return Err("Strict agents can only spawn helpers on their own provider".into());
+                }
+            }
+            let r = crate::agents::spawn(
+                ctx,
+                crate::agents::SpawnReq {
+                    name: a["name"].as_str().map(str::to_string),
+                    role: a["role"].as_str().map(str::to_string).or(Some("helper".into())),
+                    model,
+                    repo_id: row["repo_id"].as_str().map(str::to_string),
+                    task_id: a["task_id"].as_str().map(str::to_string),
+                    brief: Some(format!("{}\n\n(Spawned by {me}. Report back with mail_send to {me}.)", arg(&a, "brief")?)),
+                    parent_id: Some(agent.to_string()),
+                    strict,
+                },
+            )?;
+            Ok(json!({ "name": r["name"], "id": r["id"], "state": r["state"] }))
+        }
+        "agent_status" => {
+            let all = crate::agents::list(ctx)?;
+            let pick = |r: &Value| {
+                json!({ "name": r["name"], "state": r["state"], "role": r["role"], "model": r["model_ref"],
+                        "task": r["task_title"], "branch": r["branch"] })
+            };
+            match a["name"].as_str() {
+                Some(n) => all
+                    .as_array()
+                    .and_then(|v| v.iter().find(|r| r["name"] == n).map(pick))
+                    .ok_or_else(|| format!("no agent named {n}")),
+                None => Ok(Value::Array(all.as_array().map(|v| v.iter().map(pick).collect()).unwrap_or_default())),
+            }
+        }
+        "agent_stop" => {
+            let target = crate::agents::get_row(ctx, arg(&a, "name")?).ok_or("no such agent")?;
+            if target["parent_id"].as_str() != Some(agent) {
+                return Err("you can only stop helpers you spawned".into());
+            }
+            crate::agents::stop(ctx, target["id"].as_str().unwrap_or_default(), "stopped");
+            Ok(json!("stopped"))
+        }
+        "shell_run" => shell_run(ctx, agent, &me, &a).await,
+        "shell_read" => {
+            let id = arg(&a, "id")?;
+            own_terminal(ctx, agent, id)?;
+            let max = a["max_bytes"].as_u64().unwrap_or(8192).min(65536) as usize;
+            Ok(json!(crate::terminals::snapshot(ctx, id, max).unwrap_or_default()))
+        }
+        "shell_write" => {
+            let id = arg(&a, "id")?;
+            own_terminal(ctx, agent, id)?;
+            crate::terminals::write(ctx, id, arg(&a, "data")?.as_bytes())?;
+            Ok(json!("ok"))
+        }
+        "shell_kill" => {
+            let id = arg(&a, "id")?;
+            own_terminal(ctx, agent, id)?;
+            crate::terminals::kill(ctx, id)?;
+            Ok(json!("killed"))
+        }
+        "browser_open" => {
+            let url = arg(&a, "url")?;
+            if !(url.starts_with("http://") || url.starts_with("https://")) {
+                return Err("only http(s) URLs".into());
+            }
+            if row["strict"].as_i64() == Some(1) && !url.starts_with("http://localhost") && !url.starts_with("http://127.0.0.1") {
+                return Err("Strict agents can only open local pages".into());
+            }
+            Ok(json!(crate::browser::agent_open(ctx, &me, url).await?))
+        }
+        "browser_snapshot" => {
+            let text = crate::browser::agent_snapshot(ctx, arg(&a, "tab")?).await?;
+            Ok(json!(trim_output(&text, 20000)))
+        }
+        "graph_query" => {
+            let path = crate::agents::runtime(agent).map(|r| r.cwd.clone()).ok_or("agent not running")?;
+            let g = crate::graph::call(ctx, "get", json!({ "repo_path": path })).await?;
+            Ok(match a["path"].as_str() {
+                Some(p) => focus(&g, p),
+                None => g,
+            })
+        }
+        "playbook_get" => {
+            let repo = crate::agents::runtime(agent).map(|r| r.cwd.clone());
+            crate::board::playbook(ctx, arg(&a, "job")?, repo.as_deref())
+        }
+        "resource_register" => {
+            let kind = arg(&a, "kind")?;
+            const KINDS: &[&str] =
+                &["process", "container", "compose_project", "kind_cluster", "port", "tmpdir", "branch", "other"];
+            if !KINDS.contains(&kind) {
+                return Err(format!("kind must be one of {}", KINDS.join(", ")));
+            }
+            let id = crate::reaper::register(ctx, Some(agent), kind, arg(&a, "handle")?, json!({ "note": a["note"], "by": "agent" }));
+            Ok(json!({ "resource_id": id }))
+        }
+        _ => Err(format!("unknown tool {name}")),
+    }
+}
+
+/// Neighbourhood of one file in the code graph.
+fn focus(g: &Value, path: &str) -> Value {
+    let edges: Vec<&Value> = g["edges"]
+        .as_array()
+        .map(|e| {
+            e.iter()
+                .filter(|e| {
+                    e["from"].as_str().is_some_and(|f| f.ends_with(path)) || e["to"].as_str().is_some_and(|t| t.ends_with(path))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    json!({ "file": path, "edges": edges })
+}
+
+async fn shell_run(ctx: &Arc<Ctx>, agent: &str, me: &str, a: &Value) -> Result<Value, String> {
+    let rt = crate::agents::runtime(agent).ok_or("agent not running")?;
+    let command = arg(a, "command")?.to_string();
+    let cwd = inside(&rt.cwd, a["cwd"].as_str())?;
+    let mut argv = vec!["/bin/sh".to_string(), "-lc".to_string(), command.clone()];
+    if let Some(p) = &rt.policy {
+        let mut wrapped = vec!["/usr/bin/sandbox-exec".to_string(), "-p".to_string(), crate::sandbox::profile(p)];
+        wrapped.append(&mut argv);
+        argv = wrapped;
+    }
+    let title = a["title"].as_str().map(str::to_string).unwrap_or_else(|| {
+        let c: String = command.chars().take(40).collect();
+        format!("{me}: {c}")
+    });
+    let id = crate::terminals::open(
+        ctx,
+        crate::terminals::Opts { title, command: Some(argv), cwd, env: rt.env.clone(), agent_id: Some(agent.to_string()) },
+    )?;
+    if a["background"].as_bool() == Some(true) {
+        return Ok(json!({ "terminal": id, "running": true }));
+    }
+    let timeout = a["timeout_secs"].as_u64().unwrap_or(120).clamp(1, 3600);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
+    loop {
+        let rows = ctx.db.query("SELECT state, exit_code FROM terminals WHERE id=?1", [&id])?;
+        let r = rows.first().cloned().unwrap_or(Value::Null);
+        let done = r["state"].as_str().is_some_and(|s| s != "running");
+        if done || std::time::Instant::now() >= deadline {
+            let out = crate::terminals::snapshot(ctx, &id, 65536).unwrap_or_default();
+            return Ok(json!({
+                "terminal": id,
+                "exit_code": r["exit_code"],
+                "finished": done,
+                "output": trim_output(&out, 12000),
+                "note": if done { Value::Null } else { json!("still running: use shell_read / shell_kill") },
+            }));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+}
+
 pub async fn call(_ctx: &Arc<Ctx>, method: &str, _args: Value) -> Result<Value, String> {
-    Err(format!("mcp.{method}: not implemented"))
+    match method {
+        "status" => Ok(json!({
+            "url": _ctx.mcp_url.get(),
+            "agents_connected": tokens().lock().unwrap().len(),
+        })),
+        _ => Err(format!("unknown mcp.{method}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn protocol_and_auth() {
+        let ctx = Ctx::test();
+        ctx.db
+            .exec("INSERT INTO agents(id,name,model_ref,created_at,last_active_at) VALUES('a1','lion','p/m',0,0)", [])
+            .unwrap();
+        let init = dispatch(&ctx, "a1", json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}))
+            .await
+            .unwrap();
+        assert_eq!(init["result"]["protocolVersion"], "2025-03-26");
+        assert!(dispatch(&ctx, "a1", json!({"jsonrpc":"2.0","method":"notifications/initialized"})).await.is_none());
+        let list = dispatch(&ctx, "a1", json!({"jsonrpc":"2.0","id":2,"method":"tools/list"})).await.unwrap();
+        let names: Vec<&str> = list["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"shell_run") && names.contains(&"board_claim") && names.contains(&"mail_send"));
+        let bad = dispatch(&ctx, "a1", json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"nope"}})).await.unwrap();
+        assert_eq!(bad["result"]["isError"], true);
+
+        let t = issue_token("a1");
+        let mut h = HeaderMap::new();
+        h.insert("authorization", format!("Bearer {t}").parse().unwrap());
+        assert_eq!(who(&h).as_deref(), Some("a1"));
+        revoke("a1");
+        assert_eq!(who(&h), None);
+    }
+
+    #[test]
+    fn trims_long_output() {
+        let s = "x".repeat(100_000);
+        let t = trim_output(&s, 1000);
+        assert!(t.len() < 1100 && t.contains("omitted"));
+        assert_eq!(trim_output("short", 1000), "short");
+    }
+
+    #[test]
+    fn cwd_stays_inside() {
+        let base = std::env::temp_dir().join(format!("mcp-cwd-{}", crate::db::new_id()));
+        std::fs::create_dir_all(base.join("sub")).unwrap();
+        assert!(inside(&base, Some("sub")).is_ok());
+        assert!(inside(&base, Some("..")).is_err());
+        assert!(inside(&base, Some("/etc")).is_err());
+        assert_eq!(inside(&base, None).unwrap(), base);
+    }
 }
