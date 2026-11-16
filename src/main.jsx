@@ -9,6 +9,7 @@ import { ImproveHost } from "./ui/improve.jsx";
 import { Icon } from "./ui/icons.jsx";
 import { rpc, failures, clearFailures } from "./lib/rpc.js";
 import { route, go, commands, improve } from "./lib/nav.js";
+import "./lib/alerts.js";
 import "./styles/tokens.css";
 import "./styles/components.css";
 
