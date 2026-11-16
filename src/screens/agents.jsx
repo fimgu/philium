@@ -1,7 +1,7 @@
 // Agents: every named agent, its live conversation, approvals, terminals and
 // changes. Untrusted-provider agents are marked Strict everywhere.
 import { For, Show, createSignal, createResource, createMemo, createEffect, on, onCleanup } from "solid-js";
-import { Page, Button, Badge, Dot, Empty, Modal, Field, Input, TextArea, Select, Toggle, Segmented, confirm, toast } from "../ui/kit.jsx";
+import { NotFound, Page, Button, Badge, Dot, Empty, Modal, Field, Input, TextArea, Select, Toggle, Segmented, confirm, toast } from "../ui/kit.jsx";
 import { Icon } from "../ui/icons.jsx";
 import { Conversation, Composer, speedEffort, effortSpeed } from "../ui/conversation.jsx";
 import { rpc, useEvent, fmt } from "../lib/rpc.js";
@@ -356,7 +356,14 @@ export default function Agents() {
             </div>
             <For each={tree()}>{({ a, d }) => <AgentRow agent={a} depth={d} selected={a.id === selected()} onClick={() => go("agents", { id: a.id })} />}</For>
           </div>
-          <Show when={selected()} keyed>{(id) => <AgentView id={id} agent={(list() ?? []).find((a) => a.id === id)} />}</Show>
+          <Show when={selected()} keyed>{(id) => (
+            <Show when={list.loading || (list() ?? []).some((a) => a.id === id)} fallback={
+              <NotFound title="Agent not found" action={<Button onClick={() => go("agents", {})}>Back to agents</Button>}>
+                This agent was removed or never existed.
+              </NotFound>}>
+              <AgentView id={id} agent={(list() ?? []).find((a) => a.id === id)} />
+            </Show>
+          )}</Show>
         </div>
       </Show>
       <Show when={spawn()}>
