@@ -38,7 +38,7 @@ pub fn init(ctx: &Arc<Ctx>) -> Result<(), String> {
     std::thread::spawn(move || loop {
         std::thread::sleep(std::time::Duration::from_secs(15));
         let Some(ctx) = weak.upgrade() else { break };
-        let _lock = WRITE.lock().unwrap();
+        let _lock = WRITE.lk();
         let _ = expire(&ctx);
     });
     Ok(())
@@ -141,7 +141,7 @@ pub fn get(ctx: &Arc<Ctx>, id: &str) -> Result<Value, String> {
     decorate(ctx, raw(ctx, id)?, true)
 }
 pub fn list(ctx: &Arc<Ctx>, filter: &Value) -> Result<Value, String> {
-    let _lock = WRITE.lock().unwrap();
+    let _lock = WRITE.lk();
     expire(ctx)?;
     let rows = ctx
         .db
@@ -204,7 +204,7 @@ pub fn create(
     depends_on: &[String],
     job: Option<&str>,
 ) -> Result<Value, String> {
-    let _lock = WRITE.lock().unwrap();
+    let _lock = WRITE.lk();
     if title.trim().is_empty() {
         return Err("Title is required".into());
     }
@@ -225,7 +225,7 @@ pub fn claim(
     task_id: &str,
     lease_secs: i64,
 ) -> Result<Value, String> {
-    let _lock = WRITE.lock().unwrap();
+    let _lock = WRITE.lk();
     expire(ctx)?;
     if !(1..=86400).contains(&lease_secs) {
         return Err("Lease must be 1 to 86400 seconds".into());
@@ -257,7 +257,7 @@ pub fn claim(
     get(ctx, task_id)
 }
 pub fn update(ctx: &Arc<Ctx>, actor: &str, task_id: &str, patch: &Value) -> Result<Value, String> {
-    let _lock = WRITE.lock().unwrap();
+    let _lock = WRITE.lk();
     expire(ctx)?;
     update_inner(ctx, actor, task_id, patch)
 }
@@ -346,7 +346,7 @@ pub fn submit(
     summary: &str,
     pr_url: Option<&str>,
 ) -> Result<Value, String> {
-    let _lock = WRITE.lock().unwrap();
+    let _lock = WRITE.lk();
     expire(ctx)?;
     submit_inner(ctx, agent_id, task_id, summary, pr_url)
 }
@@ -407,7 +407,7 @@ fn submit_inner(
     get(ctx, id)
 }
 pub fn release_agent(ctx: &Arc<Ctx>, agent_id: &str) {
-    let _lock = WRITE.lock().unwrap();
+    let _lock = WRITE.lk();
     let name = identity(ctx, agent_id)
         .map(|x| x.0)
         .unwrap_or(agent_id.into());
@@ -652,7 +652,7 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
         ),
         "release" => update(ctx, "you", s(&args, "task_id")?, &json!({"status":"open"})),
         "delete" => {
-            let _lock = WRITE.lock().unwrap();
+            let _lock = WRITE.lk();
             let id = s(&args, "task_id")?;
             let t = raw(ctx, id)?;
             if t["status"] == "claimed" || t["status"] == "in_review" {
@@ -665,7 +665,7 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
             Ok(json!(true))
         }
         "deps_set" => {
-            let _lock = WRITE.lock().unwrap();
+            let _lock = WRITE.lk();
             let id = s(&args, "task_id")?;
             set_deps(ctx, id, &strings(&args["depends_on"])?)?;
             event(ctx, id, "you", "dependencies", &args["depends_on"])?;
@@ -1013,3 +1013,6 @@ mod tests {
         assert!(get(&c, &id).is_err());
     }
 }
+
+#[allow(unused_imports)]
+use crate::ctx::{LockExt, RwExt};

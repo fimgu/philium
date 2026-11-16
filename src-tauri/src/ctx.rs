@@ -63,7 +63,7 @@ impl Ctx {
     }
 
     pub fn desk(&self) -> Option<Arc<crate::hal::Hal>> {
-        self.desk.read().unwrap().as_ref().ok().cloned()
+        self.desk.rd().as_ref().ok().cloned()
     }
 
     pub fn handle(&self) -> Option<&tauri::AppHandle> {
@@ -120,4 +120,50 @@ pub fn arg_str(args: &Value, k: &str) -> Result<String, String> {
 
 pub fn arg_opt_str(args: &Value, k: &str) -> Option<String> {
     args.get(k).and_then(Value::as_str).map(str::to_string)
+}
+
+/// Poison-tolerant locking. A panic on one thread while holding a lock must
+/// not turn every later rpc into a panic too: the data behind our locks is
+/// plain maps and buffers that stay consistent, so we recover the guard.
+pub trait LockExt<T: ?Sized> {
+    fn lk(&self) -> std::sync::MutexGuard<'_, T>;
+}
+impl<T: ?Sized> LockExt<T> for std::sync::Mutex<T> {
+    fn lk(&self) -> std::sync::MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+pub trait RwExt<T: ?Sized> {
+    fn rd(&self) -> std::sync::RwLockReadGuard<'_, T>;
+    fn wr(&self) -> std::sync::RwLockWriteGuard<'_, T>;
+}
+impl<T: ?Sized> RwExt<T> for std::sync::RwLock<T> {
+    fn rd(&self) -> std::sync::RwLockReadGuard<'_, T> {
+        self.read().unwrap_or_else(|e| e.into_inner())
+    }
+    fn wr(&self) -> std::sync::RwLockWriteGuard<'_, T> {
+        self.write().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::*;
+    #[test]
+    fn poisoned_locks_recover() {
+        let m = Arc::new(std::sync::Mutex::new(1));
+        let r = Arc::new(std::sync::RwLock::new(2));
+        let (m2, r2) = (m.clone(), r.clone());
+        let _ = std::thread::spawn(move || {
+            let _g = m2.lock().unwrap();
+            let _w = r2.write().unwrap();
+            panic!("poison");
+        })
+        .join();
+        assert!(m.is_poisoned() && r.is_poisoned());
+        assert_eq!(*m.lk(), 1);
+        assert_eq!(*r.rd(), 2);
+        *r.wr() = 3;
+        assert_eq!(*r.rd(), 3);
+    }
 }

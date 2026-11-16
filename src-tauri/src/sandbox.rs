@@ -264,12 +264,12 @@ fn tokens() -> &'static Mutex<HashMap<String, String>> {
 }
 
 fn agent_token(agent: &str) -> String {
-    tokens().lock().unwrap().entry(agent.to_string()).or_insert_with(crate::hal::random_token).clone()
+    tokens().lk().entry(agent.to_string()).or_insert_with(crate::hal::random_token).clone()
 }
 
 /// Drop the agent's proxy credential (kill switch / teardown).
 pub fn revoke(agent: &str) {
-    tokens().lock().unwrap().remove(agent);
+    tokens().lk().remove(agent);
 }
 
 /// Env for a strict agent. Proxy credential is per agent.
@@ -370,7 +370,7 @@ fn auth_agent(h: &Head) -> Option<String> {
     let raw = base64::engine::general_purpose::STANDARD.decode(b.trim()).ok()?;
     let raw = String::from_utf8(raw).ok()?;
     let (user, pass) = raw.split_once(':')?;
-    let ok = tokens().lock().unwrap().get(user).map(|t| t == pass).unwrap_or(false);
+    let ok = tokens().lk().get(user).map(|t| t == pass).unwrap_or(false);
     ok.then(|| user.to_string())
 }
 
@@ -812,3 +812,6 @@ mod toolchain_probe {
         assert_eq!(expand("~/x"), h.join("x"));
     }
 }
+
+#[allow(unused_imports)]
+use crate::ctx::{LockExt, RwExt};

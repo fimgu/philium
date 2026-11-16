@@ -107,7 +107,7 @@ impl Db {
     }
 
     pub fn with<T>(&self, f: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> Result<T, String> {
-        f(&self.0.lock().unwrap()).map_err(|e| e.to_string())
+        f(&self.0.lock().unwrap_or_else(|e| e.into_inner())).map_err(|e| e.to_string())
     }
 
     pub fn exec(&self, sql: &str, params: impl rusqlite::Params) -> Result<usize, String> {

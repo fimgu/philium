@@ -93,14 +93,14 @@ impl Store for Keychain {
 pub struct MemStore(pub Mutex<HashMap<String, Creds>>);
 impl Store for MemStore {
     fn load(&self, id: &str) -> Option<Creds> {
-        self.0.lock().unwrap().get(id).cloned()
+        self.0.lk().get(id).cloned()
     }
     fn save(&self, id: &str, c: &Creds) -> Result<(), String> {
-        self.0.lock().unwrap().insert(id.into(), c.clone());
+        self.0.lk().insert(id.into(), c.clone());
         Ok(())
     }
     fn delete(&self, id: &str) {
-        self.0.lock().unwrap().remove(id);
+        self.0.lk().remove(id);
     }
 }
 
@@ -422,7 +422,7 @@ async fn start_claude(ctx: &Arc<Ctx>) -> Result<Value, String> {
     let auto_url = claude_auth_url(&local, &challenge, &state);
     let manual_url = claude_auth_url(CLAUDE_MANUAL_REDIRECT, &challenge, &state);
     let (tx, mut rx) = tokio::sync::watch::channel(false);
-    if let Some(old) = pending().lock().unwrap().insert(id.clone(), Pending { verifier: verifier.clone(), state: state.clone(), cancel: tx }) {
+    if let Some(old) = pending().lk().insert(id.clone(), Pending { verifier: verifier.clone(), state: state.clone(), cancel: tx }) {
         let _ = old.cancel.send(true);
     }
     open_browser(&auto_url);
@@ -443,7 +443,7 @@ async fn start_claude(ctx: &Arc<Ctx>) -> Result<Value, String> {
             finish(&c, &id2, Kind::ClaudeOauth, creds).await
         }
         .await;
-        pending().lock().unwrap().remove(&id2);
+        pending().lk().remove(&id2);
         done(&c, &id2, r);
     });
     Ok(json!({ "id": id, "kind": "claude_oauth", "auto_url": auto_url, "manual_url": manual_url }))
@@ -451,7 +451,7 @@ async fn start_claude(ctx: &Arc<Ctx>) -> Result<Value, String> {
 
 async fn paste_claude(ctx: &Arc<Ctx>, id: &str, input: &str) -> Result<Value, String> {
     let (verifier, state) = {
-        let p = pending().lock().unwrap();
+        let p = pending().lk();
         let p = p.get(id).ok_or("no sign-in in progress. Press Sign in with Claude first")?;
         (p.verifier.clone(), p.state.clone())
     };
@@ -460,7 +460,7 @@ async fn paste_claude(ctx: &Arc<Ctx>, id: &str, input: &str) -> Result<Value, St
         return Err("that code belongs to a different sign-in attempt; start again".into());
     }
     let creds = claude_exchange(CLAUDE_TOKEN_URL, &verifier, &code, &state, CLAUDE_MANUAL_REDIRECT).await?;
-    if let Some(p) = pending().lock().unwrap().remove(id) {
+    if let Some(p) = pending().lk().remove(id) {
         let _ = p.cancel.send(true);
     }
     finish(ctx, id, Kind::ClaudeOauth, creds).await?;
@@ -484,7 +484,7 @@ async fn start_chatgpt(ctx: &Arc<Ctx>) -> Result<Value, String> {
     }
     let interval = v["interval"].as_u64().or_else(|| v["interval"].as_str().and_then(|s| s.trim().parse().ok())).unwrap_or(5).clamp(1, 60);
     let (tx, mut rx) = tokio::sync::watch::channel(false);
-    if let Some(old) = pending().lock().unwrap().insert(id.clone(), Pending { verifier: String::new(), state: String::new(), cancel: tx }) {
+    if let Some(old) = pending().lk().insert(id.clone(), Pending { verifier: String::new(), state: String::new(), cancel: tx }) {
         let _ = old.cancel.send(true);
     }
     open_browser(OPENAI_VERIFY_URL);
@@ -516,7 +516,7 @@ async fn start_chatgpt(ctx: &Arc<Ctx>) -> Result<Value, String> {
             finish(&c, &id2, Kind::ChatgptOauth, chatgpt_creds(t, None)?).await
         }
         .await;
-        pending().lock().unwrap().remove(&id2);
+        pending().lk().remove(&id2);
         done(&c, &id2, r);
     });
     Ok(json!({ "id": id, "kind": "chatgpt_oauth", "user_code": code, "verify_url": OPENAI_VERIFY_URL }))
@@ -577,7 +577,7 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
         "oauth_paste" => paste_claude(ctx, &arg_str(&args, "id")?, &arg_str(&args, "input")?).await,
         "oauth_cancel" => {
             let id = target_id(ctx, Kind::parse(&arg_str(&args, "kind")?)?);
-            if let Some(p) = pending().lock().unwrap().remove(&id) {
+            if let Some(p) = pending().lk().remove(&id) {
                 let _ = p.cancel.send(true);
             }
             Ok(Value::Null)
@@ -613,7 +613,7 @@ mod tests {
             post(move |Json(b): Json<Value>| {
                 let c = counter.clone();
                 async move {
-                    c.lock().unwrap().push(b);
+                    c.lk().push(b);
                     Json(json!({ "access_token": "NEW-ACCESS", "refresh_token": "NEW-REFRESH", "expires_in": 3600, "scope": "user:profile user:inference" }))
                 }
             }),
@@ -658,19 +658,19 @@ mod tests {
         let fresh_c = Creds { access: "OLD".into(), refresh: "R".into(), expires_at: now_ms() + 3_600_000, scopes: vec!["user:inference".into()], ..Default::default() };
         store.save("claude", &fresh_c).unwrap();
         assert_eq!(fresh(&store, "claude", Kind::ClaudeOauth, &url, "").await.unwrap().access, "OLD");
-        assert!(seen.lock().unwrap().is_empty());
+        assert!(seen.lk().is_empty());
         let stale = Creds { expires_at: now_ms() + 1000, email: Some("a@b.c".into()), ..fresh_c };
         store.save("claude", &stale).unwrap();
         let n = fresh(&store, "claude", Kind::ClaudeOauth, &url, "").await.unwrap();
         assert_eq!((n.access.as_str(), n.refresh.as_str(), n.email.as_deref()), ("NEW-ACCESS", "NEW-REFRESH", Some("a@b.c")));
         assert_eq!(store.load("claude").unwrap().access, "NEW-ACCESS", "persisted");
-        let body = seen.lock().unwrap()[0].clone();
+        let body = seen.lk()[0].clone();
         assert_eq!((body["grant_type"].as_str(), body["refresh_token"].as_str()), (Some("refresh_token"), Some("R")));
         // Concurrent callers refresh once.
         store.save("claude", &Creds { expires_at: 0, ..n }).unwrap();
         let (a, b) = tokio::join!(fresh(&store, "claude", Kind::ClaudeOauth, &url, ""), fresh(&store, "claude", Kind::ClaudeOauth, &url, ""));
         assert!(a.is_ok() && b.is_ok());
-        assert_eq!(seen.lock().unwrap().len(), 2, "one extra refresh, not two");
+        assert_eq!(seen.lk().len(), 2, "one extra refresh, not two");
         assert!(fresh(&store, "none", Kind::ClaudeOauth, &url, "").await.is_err());
     }
 
@@ -701,3 +701,6 @@ mod tests {
         assert!(g.get("max_output_tokens").is_none() && g["instructions"].as_str().is_some());
     }
 }
+
+#[allow(unused_imports)]
+use crate::ctx::{LockExt, RwExt};

@@ -22,6 +22,12 @@ fn schema(ctx: &Arc<Ctx>) -> Result<(), String> {
 }
 pub fn init(ctx: &Arc<Ctx>) -> Result<(), String> {
     schema(ctx)?;
+    // Runs before any module starts a process this run, so every live process
+    // row belongs to a previous run that did not shut down cleanly.
+    let stale = reap_stale_processes(ctx);
+    if !stale["removed"].as_array().map_or(true, |a| a.is_empty()) || !stale["errors"].as_array().map_or(true, |a| a.is_empty()) {
+        ctx.log_event("reaper:stale_processes", None, &stale);
+    }
     let weak = Arc::downgrade(ctx);
     std::thread::Builder::new()
         .name("philium-reaper".into())
@@ -95,7 +101,12 @@ pub fn register(
         }
     }
     // Signature cannot return an error: fail closed rather than create an untracked resource.
-    ctx.db.exec("INSERT INTO resources(id,agent_id,kind,handle,meta,created_at) VALUES(?1,?2,?3,?4,?5,?6)",params![id,agent_id,kind,handle,meta.to_string(),now()]).expect("resource registration must persist before creation");
+    if let Err(e) = ctx.db.exec("INSERT INTO resources(id,agent_id,kind,handle,meta,created_at) VALUES(?1,?2,?3,?4,?5,?6)",params![id,agent_id,kind,handle,meta.to_string(),now()]) {
+        // Never panic in a request path. The row is missing, so the orphan
+        // scan (worktrees/containers) or startup reconcile picks it up later.
+        eprintln!("philium: resource registration failed: {e}");
+        ctx.log_event("reaper:register_error", agent_id, &json!({"kind":kind,"handle":handle,"error":e}));
+    }
     ctx.log_event(
         "reaper:register",
         agent_id,
@@ -555,6 +566,21 @@ pub fn teardown_agent(ctx: &Arc<Ctx>, agent_id: &str, force: bool) -> Result<Val
         force,
     )
 }
+/// Startup hook: stop processes a crashed previous run left behind. Identity
+/// checks in `stop_process` make a reused PID safe (it is never signalled).
+pub fn reap_stale_processes(ctx: &Arc<Ctx>) -> Value {
+    let _q = REAP_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut removed = Vec::new();
+    let mut errors = Vec::new();
+    let Ok(all) = rows(ctx, None, None) else { return json!({"removed":[],"errors":["ledger unreadable"]}) };
+    for r in all.into_iter().filter(|r| r["state"] != "released" && matches!(r["kind"].as_str(), Some("process" | "terminal"))) {
+        match remove(ctx, &r, false) {
+            Ok(v) => removed.push(v),
+            Err(e) => errors.push(json!({"id":r["id"],"error":e})),
+        }
+    }
+    json!({"removed":removed,"errors":errors})
+}
 /// App lifecycle hook. Stop agent processes, never containers, clusters or worktrees.
 pub fn shutdown(ctx: &Arc<Ctx>) -> Result<Value, String> {
     let _q = REAP_QUEUE.lock().map_err(|e| e.to_string())?;
@@ -994,6 +1020,28 @@ mod tests {
         assert!(peer_live);
         assert_eq!(rows(&ctx, None, Some("live")).unwrap()[0]["id"], container);
         std::fs::remove_dir_all(ctx.root.parent().unwrap()).unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn startup_reaps_previous_run_processes_and_releases_dead_ones() {
+        use std::os::unix::process::CommandExt;
+        let ctx = Ctx::test();
+        schema(&ctx).unwrap();
+        let mut leftover = Command::new("sleep").arg("60").process_group(0).spawn().unwrap();
+        let pid = leftover.id();
+        register(&ctx, Some("a"), "process", &pid.to_string(), json!({"pid":pid,"pgid":pid,"what":"hal"}));
+        let mut dead = Command::new("true").spawn().unwrap();
+        let dpid = dead.id();
+        register(&ctx, Some("a"), "process", &dpid.to_string(), json!({"pid":dpid}));
+        dead.wait().unwrap();
+        let r = reap_stale_processes(&ctx);
+        let st = leftover.try_wait().unwrap();
+        let _ = leftover.kill();
+        let _ = leftover.wait();
+        assert!(st.is_some(), "leftover HAL killed: {r}");
+        assert!(r["errors"].as_array().unwrap().is_empty(), "{r}");
+        assert!(rows(&ctx, None, None).unwrap().iter().all(|r| r["state"] == "released"));
+        let _ = std::fs::remove_dir_all(ctx.root.parent().unwrap());
     }
     #[cfg(unix)]
     #[test]

@@ -84,14 +84,14 @@ pub fn refresh_desk(ctx: &Arc<Ctx>) {
     if let Err(e) = &r {
         eprintln!("philium: desk HAL: {e}");
     }
-    *ctx.desk.write().unwrap() = r;
+    *ctx.desk.wr() = r;
     ctx.emit("app:desk", json!({}));
 }
 
 /// Proxy one request to the desk HAL. `path` must be an absolute API path.
 #[tauri::command]
 async fn hal(app: State<'_, App>, method: String, path: String, body: Option<Value>) -> Result<Value, String> {
-    let h = app.ctx.desk.read().unwrap().clone().map_err(|e| format!("HAL failed to start: {e}"))?;
+    let h = app.ctx.desk.rd().clone().map_err(|e| format!("HAL failed to start: {e}"))?;
     hal::validate_path(&path)?;
     h.call(hal::parse_method(&method)?, &path, body).await
 }
@@ -134,7 +134,7 @@ async fn app_call(app: &App, m: &str, args: Value) -> Result<Value, String> {
     let ctx = &app.ctx;
     match m {
         "status" => {
-            let desk = ctx.desk.read().unwrap().clone();
+            let desk = ctx.desk.rd().clone();
             Ok(json!({
                 "desk": match desk { Ok(h) => json!({"ok": h.alive(), "pid": h.pid}), Err(e) => json!({"ok": false, "error": e}) },
                 "gateway": ctx.gateway_url,
@@ -368,7 +368,7 @@ mod e2e {
                 let marker = marker.clone();
                 async move {
                     let auth = h.get("authorization").map(|v| v.to_str().unwrap().to_string()).unwrap_or_default();
-                    let first = { let mut s = s2.lock().unwrap(); s.push((auth, body.clone())); s.len() == 1 };
+                    let first = { let mut s = s2.lk(); s.push((auth, body.clone())); s.len() == 1 };
                     if !body.contains("\"stream\":true") {
                         return ([("content-type", "application/json")], r#"{"data":[{"id":"up-model"}]}"#.to_string());
                     }
@@ -469,7 +469,7 @@ mod e2e {
         assert_eq!(denied["ok"], false);
         assert!(denied["result"].as_str().unwrap().starts_with("Permission denied"), "{denied}");
 
-        let seen_now = seen.lock().unwrap().clone();
+        let seen_now = seen.lk().clone();
         assert!(!seen_now.is_empty(), "upstream got nothing");
         for (auth, body) in &seen_now {
             assert_eq!(auth, "Bearer REAL-KEY-ONLY-IN-GATEWAY");
@@ -489,14 +489,14 @@ mod e2e {
         let mut blocking = p.clone();
         blocking.guard = GuardMode::Block;
         gw.set_routes(vec![Route { provider: blocking, api_key: Some("REAL-KEY-ONLY-IN-GATEWAY".into()) }]);
-        let before = seen.lock().unwrap().len();
+        let before = seen.lk().len();
         let s = h.call(reqwest::Method::POST, "/sessions", Some(chat_session_body(&ws, "e2e2", None))).await.unwrap();
         let sid = s["id"].as_str().or(s["session"]["id"].as_str()).unwrap().to_string();
         h.call(reqwest::Method::POST, &format!("/sessions/{sid}/messages"), Some(json!({"text": "key AKIAABCDEFGHIJKLMNOP"}))).await.unwrap();
         let evs = wait_turn(&h, &sid).await;
         let failed = evs.as_array().unwrap().iter().find(|e| e["type"] == "turn.failed").cloned().expect("turn failed");
         assert!(failed.to_string().contains("Philium guard blocked"), "{failed}");
-        assert_eq!(seen.lock().unwrap().len(), before, "blocked request reached upstream");
+        assert_eq!(seen.lk().len(), before, "blocked request reached upstream");
 
         h.stop();
         let _ = std::fs::remove_dir_all(&dir);
@@ -523,7 +523,7 @@ mod e2e {
                     let key = h.get("x-api-key").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
                     let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
                     let has_result = body.contains("tool_result");
-                    s2.lock().unwrap().push((key, v));
+                    s2.lk().push((key, v));
                     let ev = |t: &str, d: Value| format!("event: {t}\ndata: {d}\n\n");
                     let mut sse = ev("message_start", json!({"type":"message_start","message":{"id":"m1","model":"claude-e2e","usage":{"input_tokens":30,"output_tokens":1}}}));
                     if has_result {
@@ -561,7 +561,7 @@ mod e2e {
         tokio::task::spawn_blocking(move || refresh_desk(&c2)).await.unwrap();
         let h = match ctx.desk() {
             Some(h) => h,
-            None => panic!("desk HAL failed: {:?}", ctx.desk.read().unwrap().as_ref().err()),
+            None => panic!("desk HAL failed: {:?}", ctx.desk.rd().as_ref().err()),
         };
         let ws = dir.join("ws");
         std::fs::create_dir_all(&ws).unwrap();
@@ -573,7 +573,7 @@ mod e2e {
         assert!(!text.contains("\"turn.failed\""), "{text}");
         assert!(text.contains("all done"), "{text}");
         assert!(evs.as_array().unwrap().iter().any(|e| e["type"] == "tool.finished" && e["tool"] == "shell"), "{text}");
-        let s = seen.lock().unwrap().clone();
+        let s = seen.lk().clone();
         assert!(s.len() >= 2);
         assert!(s.iter().all(|(k, _)| k == "sk-ant-REAL"));
         assert!(s[0].1["tools"][0]["input_schema"].is_object(), "{}", s[0].1);
@@ -585,3 +585,6 @@ mod e2e {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+#[allow(unused_imports)]
+use crate::ctx::{LockExt, RwExt};

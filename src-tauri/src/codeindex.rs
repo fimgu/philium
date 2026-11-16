@@ -506,7 +506,7 @@ pub fn base_scope(repo_id: &str, commit: &str) -> String {
 
 /// Build the base snapshot for `branch` of the repo if its commit changed. Returns the commit.
 pub fn ensure_base(ctx: &Ctx, repo_id: &str, repo: &Path, branch: &str) -> Result<String, String> {
-    let _g = index_lock().lock().unwrap();
+    let _g = index_lock().lk();
     let commit = rev_parse(repo, branch)?;
     let cur = ctx.db.query("SELECT commit_id FROM ci_snap WHERE repo_id=?1", [repo_id])?;
     if cur.first().and_then(|r| r["commit_id"].as_str()) == Some(commit.as_str()) {
@@ -525,7 +525,7 @@ pub fn ensure_base(ctx: &Ctx, repo_id: &str, repo: &Path, branch: &str) -> Resul
         c.execute("DELETE FROM ci_wt WHERE repo_id=?1", [repo_id])?;
         Ok(())
     })?;
-    debounce().lock().unwrap().clear();
+    debounce().lk().clear();
     let ls = git(repo, &["-c", "core.quotepath=off", "ls-tree", "-r", "-l", &commit])?;
     let mut files: Vec<(String, String)> = vec![]; // (path, sha)
     for l in ls.lines() {
@@ -599,13 +599,13 @@ pub fn wt_scope(wt_id: &str) -> String {
 /// Reparse only the worktree files that differ from the base commit. Returns files reparsed.
 pub fn ensure_delta(ctx: &Ctx, repo_id: &str, base: &str, wt_id: &str, wt: &Path, force: bool) -> Result<usize, String> {
     if !force {
-        if let Some(t) = debounce().lock().unwrap().get(wt_id) {
+        if let Some(t) = debounce().lk().get(wt_id) {
             if t.elapsed() < DEBOUNCE {
                 return Ok(0);
             }
         }
     }
-    let _g = index_lock().lock().unwrap();
+    let _g = index_lock().lk();
     let scope = wt_scope(wt_id);
     let prev = ctx.db.query("SELECT base_commit FROM ci_wt WHERE wt_id=?1", [wt_id])?;
     if prev.first().and_then(|r| r["base_commit"].as_str()).map(|b| b != base).unwrap_or(false) {
@@ -662,7 +662,7 @@ pub fn ensure_delta(ctx: &Ctx, repo_id: &str, base: &str, wt_id: &str, wt: &Path
         c.execute("INSERT OR REPLACE INTO ci_wt(wt_id,repo_id,base_commit,indexed_at) VALUES(?1,?2,?3,?4)", params![wt_id, repo_id, base, crate::db::now()])?;
         c.execute_batch("COMMIT")
     })?;
-    debounce().lock().unwrap().insert(wt_id.to_string(), Instant::now());
+    debounce().lk().insert(wt_id.to_string(), Instant::now());
     Ok(n + stale.len())
 }
 
@@ -1400,7 +1400,7 @@ fn clash_key(c: &Clash) -> String {
 /// Emit `codeindex:clashes` and log `code_clash` for clashes not announced before.
 fn publish(ctx: &Ctx, cl: &[Clash]) {
     let keys: HashSet<String> = cl.iter().map(clash_key).collect();
-    let mut prev = announced().lock().unwrap();
+    let mut prev = announced().lk();
     if *prev == keys {
         return;
     }
@@ -1841,3 +1841,6 @@ mod bench {
         println!("TOTAL exact {tp} rg lines {tr} refs tokens {tn}");
     }
 }
+
+#[allow(unused_imports)]
+use crate::ctx::{LockExt, RwExt};

@@ -32,17 +32,17 @@ fn tokens() -> &'static Mutex<HashMap<String, String>> {
 pub fn issue_token(agent_id: &str) -> String {
     revoke(agent_id);
     let t = crate::hal::random_token();
-    tokens().lock().unwrap().insert(t.clone(), agent_id.to_string());
+    tokens().lk().insert(t.clone(), agent_id.to_string());
     t
 }
 
 pub fn revoke(agent_id: &str) {
-    tokens().lock().unwrap().retain(|_, a| a != agent_id);
+    tokens().lk().retain(|_, a| a != agent_id);
 }
 
 fn who(headers: &HeaderMap) -> Option<String> {
     let presented = headers.get("authorization")?.to_str().ok()?.strip_prefix("Bearer ")?;
-    let map = tokens().lock().unwrap();
+    let map = tokens().lk();
     map.iter()
         .find(|(t, _)| {
             t.len() == presented.len() && t.bytes().zip(presented.bytes()).fold(0u8, |a, (x, y)| a | (x ^ y)) == 0
@@ -443,7 +443,7 @@ pub async fn call(_ctx: &Arc<Ctx>, method: &str, _args: Value) -> Result<Value, 
     match method {
         "status" => Ok(json!({
             "url": _ctx.mcp_url.get(),
-            "agents_connected": tokens().lock().unwrap().len(),
+            "agents_connected": tokens().lk().len(),
         })),
         _ => Err(format!("unknown mcp.{method}")),
     }
@@ -496,3 +496,6 @@ mod tests {
         assert_eq!(inside(&base, None).unwrap(), base);
     }
 }
+
+#[allow(unused_imports)]
+use crate::ctx::{LockExt, RwExt};

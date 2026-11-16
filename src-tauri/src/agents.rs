@@ -61,7 +61,7 @@ fn runtimes() -> &'static Runtimes {
 }
 
 pub fn runtime(id: &str) -> Option<Arc<Runtime>> {
-    runtimes().lock().unwrap().get(id).cloned()
+    runtimes().lk().get(id).cloned()
 }
 
 const NAMES: &[&str] = &[
@@ -377,9 +377,19 @@ async fn provision(ctx: &Arc<Ctx>, id: &str, fresh: bool, brief: Option<String>)
     .await
     .map_err(|e| e.to_string())??;
     let hal = Arc::new(hal);
-    if fresh {
-        crate::reaper::register(ctx, Some(id), "process", &hal.pid.to_string(), json!({ "what": "hal" }));
+    // Every start gets a ledger row (resume too), and the previous HAL's row
+    // is released: that process is gone, and its PID may be reused.
+    if let Ok(prev) = ctx.db.query(
+        "SELECT id FROM resources WHERE agent_id=?1 AND kind='process' AND state!='released' AND meta LIKE '%\"what\":\"hal\"%'",
+        [id],
+    ) {
+        for r in prev {
+            if let Some(rid) = r["id"].as_str() {
+                crate::reaper::release(ctx, rid);
+            }
+        }
     }
+    crate::reaper::register(ctx, Some(id), "process", &hal.pid.to_string(), json!({ "what": "hal" }));
 
     // Session: reuse on resume (HAL keeps it in its own SQLite).
     let session = match row["hal_session_id"].as_str().filter(|_| !fresh) {
@@ -406,7 +416,7 @@ async fn provision(ctx: &Arc<Ctx>, id: &str, fresh: bool, brief: Option<String>)
 
     let pump = tokio::spawn(pump_events(ctx.clone(), id.to_string(), hal.clone(), session.clone()));
     let rt = Arc::new(Runtime { hal: hal.clone(), session: session.clone(), name: name.clone(), cwd, strict, env, policy, pump });
-    if let Some(old) = runtimes().lock().unwrap().insert(id.to_string(), rt) {
+    if let Some(old) = runtimes().lk().insert(id.to_string(), rt) {
         old.pump.abort();
         old.hal.stop();
     }
@@ -434,7 +444,8 @@ async fn pump_events(ctx: Arc<Ctx>, id: String, hal: Arc<Hal>, session: String) 
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
     loop {
-        if !hal.alive() {
+        if let Some(reason) = hal.exit_reason() {
+            on_hal_exit(&ctx, &id, &hal, &reason);
             return;
         }
         let url = format!("{}/sessions/{session}/events?stream=true&after={after}", hal.base);
@@ -481,6 +492,33 @@ async fn pump_events(ctx: Arc<Ctx>, id: String, hal: Arc<Hal>, session: String) 
     }
 }
 
+/// The agent's HAL exited on its own (crash, OOM kill, signal). Clean up what
+/// runs on its behalf and park the agent in `failed` with a readable reason so
+/// the UI can offer Resume. No-op if the runtime was already replaced/stopped.
+fn on_hal_exit(ctx: &Arc<Ctx>, id: &str, hal: &Arc<Hal>, reason: &str) {
+    let owned = {
+        let mut map = runtimes().lk();
+        match map.get(id) {
+            Some(rt) if Arc::ptr_eq(&rt.hal, hal) => map.remove(id).is_some(),
+            _ => false,
+        }
+    };
+    if !owned {
+        return;
+    }
+    let msg = format!("{reason}. Press Resume to restart it.");
+    let _ = ctx.db.kv_set(&format!("agent_error.{id}"), &msg);
+    if let Some(n) = get_row(ctx, id).and_then(|r| r["name"].as_str().map(str::to_string)) {
+        ctx.gateway.revoke_agent(&n);
+    }
+    crate::mcp::revoke(id);
+    crate::terminals::kill_agent(ctx, id);
+    hal.stop();
+    set_state(ctx, id, "failed");
+    ctx.log_event("agent_hal_exited", Some(id), &json!({ "reason": reason }));
+    ctx.emit("agents:error", json!({ "id": id, "error": msg }));
+}
+
 pub fn parse_sse(block: &str) -> Vec<Value> {
     let data: Vec<&str> = block
         .lines()
@@ -525,7 +563,11 @@ fn apply_event(ctx: &Arc<Ctx>, id: &str, ev: &Value) {
 }
 
 fn rt(id: &str) -> Result<Arc<Runtime>, String> {
-    runtime(id).ok_or_else(|| "agent is not running (resume it first)".to_string())
+    let r = runtime(id).ok_or_else(|| "agent is not running (resume it first)".to_string())?;
+    if let Some(reason) = r.hal.exit_reason() {
+        return Err(format!("{reason}. Press Resume to restart it."));
+    }
+    Ok(r)
 }
 
 pub async fn send(ctx: &Arc<Ctx>, id: &str, text: &str) -> Result<Value, String> {
@@ -543,7 +585,7 @@ pub async fn send_with_images(ctx: &Arc<Ctx>, id: &str, text: &str, images: Valu
 /// Stop the HAL and everything that runs on the agent's behalf. Keeps the
 /// worktree, scratch and record so it can resume or be reviewed.
 pub fn stop(ctx: &Arc<Ctx>, id: &str, state: &str) {
-    if let Some(rt) = runtimes().lock().unwrap().remove(id) {
+    if let Some(rt) = runtimes().lk().remove(id) {
         rt.pump.abort();
         rt.hal.stop();
     }
@@ -560,14 +602,20 @@ pub fn stop(ctx: &Arc<Ctx>, id: &str, state: &str) {
 
 /// Called on app exit: stop every agent HAL; containers/worktrees are kept.
 pub fn shutdown(ctx: &Arc<Ctx>) {
-    let ids: Vec<String> = runtimes().lock().unwrap().keys().cloned().collect();
+    let ids: Vec<String> = runtimes().lk().keys().cloned().collect();
     for id in ids {
         stop(ctx, &id, "stopped");
     }
 }
 
 pub fn init(ctx: &Arc<Ctx>) -> Result<(), String> {
-    // A previous run's agents have no HAL any more.
+    // A previous run's agents have no HAL any more (HAL exits when our stdin
+    // pipe closes, so a crashed Philium leaves no live HALs behind).
+    for r in ctx.db.query("SELECT id FROM agents WHERE state IN ('provisioning','running','waiting')", [])? {
+        if let Some(id) = r["id"].as_str() {
+            let _ = ctx.db.kv_set(&format!("agent_error.{id}"), "Philium quit while this agent was working. Press Resume to continue.");
+        }
+    }
     ctx.db.exec(
         "UPDATE agents SET state='stopped' WHERE state IN ('provisioning','running','idle','waiting')",
         [],
@@ -652,8 +700,15 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
         }
         "resume" => {
             let id = id()?;
-            if runtime(&id).is_some() {
-                return Ok(Value::Null);
+            if let Some(r) = runtime(&id) {
+                if r.hal.alive() {
+                    return Ok(Value::Null);
+                }
+                // Dead HAL the watcher has not reaped yet: drop it and restart.
+                stop(ctx, &id, "stopped");
+            }
+            if get_row(ctx, &id).is_none() {
+                return Err("unknown agent".into());
             }
             set_state(ctx, &id, "provisioning");
             let c = ctx.clone();
@@ -846,3 +901,6 @@ mod tests {
         assert!(ctx.db.query("SELECT * FROM agents", []).unwrap().is_empty());
     }
 }
+
+#[allow(unused_imports)]
+use crate::ctx::{LockExt, RwExt};

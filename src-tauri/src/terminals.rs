@@ -46,7 +46,7 @@ struct Manager {
 }
 static MANAGERS: OnceLock<Mutex<HashMap<usize, Arc<Manager>>>> = OnceLock::new();
 fn manager(ctx: &Arc<Ctx>) -> Arc<Manager> {
-    let mut all = MANAGERS.get_or_init(Default::default).lock().unwrap();
+    let mut all = MANAGERS.get_or_init(Default::default).lk();
     all.retain(|_, m| m.ctx.strong_count() > 0);
     all.entry(Arc::as_ptr(ctx) as usize).or_insert_with(|| {
         let m = Arc::new(Manager { ctx: Arc::downgrade(ctx), entries: Mutex::new(HashMap::new()) });
@@ -55,8 +55,8 @@ fn manager(ctx: &Arc<Ctx>) -> Arc<Manager> {
             std::thread::sleep(Duration::from_millis(16));
             let Some(m) = weak.upgrade() else { break };
             let Some(ctx) = m.ctx.upgrade() else { break };
-            for (id, t) in m.entries.lock().unwrap().iter() {
-                let mut out = t.output.lock().unwrap();
+            for (id, t) in m.entries.lk().iter() {
+                let mut out = t.output.lk();
                 if !out.pending.is_empty() { ctx.emit("terminals:data", json!({"id":id,"data":B64.encode(std::mem::take(&mut out.pending)),"offset":out.total})); }
                 if let Some(code) = out.exit { if !out.announced { out.announced = true; ctx.emit("terminals:exit", json!({"id":id,"code":code})); ctx.notify("terminals"); } }
             }
@@ -164,7 +164,7 @@ pub fn open(ctx: &Arc<Ctx>, o: Opts) -> Result<String, String> {
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    let mut out = t.output.lock().unwrap();
+                    let mut out = t.output.lk();
                     out.ring.extend(&buf[..n]);
                     out.total += n as u64;
                     while out.ring.len() > CAP {
@@ -180,7 +180,7 @@ pub fn open(ctx: &Arc<Ctx>, o: Opts) -> Result<String, String> {
             }
         }
         let code = loop {
-            match t.child.lock().unwrap().try_wait() {
+            match t.child.lk().try_wait() {
                 Ok(Some(status)) => break status.exit_code(),
                 Err(_) => break 1,
                 Ok(None) => {}
@@ -196,7 +196,7 @@ pub fn open(ctx: &Arc<Ctx>, o: Opts) -> Result<String, String> {
                 rusqlite::params![tid, code, db::now()],
             );
         }
-        t.output.lock().unwrap().exit = Some(code);
+        t.output.lk().exit = Some(code);
     });
     ctx.emit("terminals:changed", json!({"id":id}));
     ctx.notify("terminals");
@@ -213,24 +213,24 @@ fn get(ctx: &Arc<Ctx>, id: &str) -> Result<Arc<Terminal>, String> {
 }
 pub fn write(ctx: &Arc<Ctx>, id: &str, data: &[u8]) -> Result<(), String> {
     let t = get(ctx, id)?;
-    if t.output.lock().unwrap().exit.is_some() {
+    if t.output.lk().exit.is_some() {
         return Err("terminal exited".into());
     }
-    let mut w = t.writer.lock().unwrap();
+    let mut w = t.writer.lk();
     w.write_all(data)
         .and_then(|_| w.flush())
         .map_err(|e| e.to_string())
 }
 pub fn kill(ctx: &Arc<Ctx>, id: &str) -> Result<(), String> {
     let t = get(ctx, id)?;
-    if t.output.lock().unwrap().exit.is_some() {
+    if t.output.lk().exit.is_some() {
         return Ok(());
     }
     #[cfg(unix)]
     if let Some(pid) = t.pid {
         // The PTY child is a session leader. Signal only its owned process group,
         // before the child is reaped, so PID reuse cannot target an unrelated group.
-        let mut child = t.child.lock().unwrap();
+        let mut child = t.child.lk();
         if child.try_wait().map_err(|e| e.to_string())?.is_none() {
             let rc = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
             if rc == 0 {
@@ -240,7 +240,7 @@ pub fn kill(ctx: &Arc<Ctx>, id: &str) -> Result<(), String> {
             return Ok(());
         }
     }
-    let result = t.killer.lock().unwrap().kill().map_err(|e| e.to_string());
+    let result = t.killer.lk().kill().map_err(|e| e.to_string());
     result
 }
 pub fn kill_agent(ctx: &Arc<Ctx>, agent_id: &str) {
@@ -334,7 +334,7 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
         "buffer" => {
             let (data, offset) = match get(ctx, &id) {
                 Ok(t) => {
-                    let out = t.output.lock().unwrap();
+                    let out = t.output.lk();
                     (out.ring.iter().copied().collect::<Vec<u8>>(), out.total)
                 }
                 Err(_) => (vec![], 0),
@@ -382,7 +382,7 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
             {
                 return Err("only exited terminals can be removed".into());
             }
-            manager(ctx).entries.lock().unwrap().remove(&id);
+            manager(ctx).entries.lk().remove(&id);
             ctx.emit("terminals:changed", json!({"id":id}));
         }
         _ => return Err(format!("unknown terminals.{method}")),
@@ -394,7 +394,7 @@ mod tests {
     use super::*;
     fn wait(ctx: &Arc<Ctx>, id: &str) {
         for _ in 0..500 {
-            if get(ctx, id).unwrap().output.lock().unwrap().exit.is_some() {
+            if get(ctx, id).unwrap().output.lk().exit.is_some() {
                 return;
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -479,7 +479,7 @@ mod tests {
         .unwrap();
         wait(&ctx, &id);
         let t = get(&ctx, &id).unwrap();
-        let out = t.output.lock().unwrap();
+        let out = t.output.lk();
         assert_eq!(out.ring.len(), CAP);
         assert!(out.pending.len() <= CAP);
         assert_eq!(out.total, 300000);
@@ -541,3 +541,6 @@ mod tests {
         );
     }
 }
+
+#[allow(unused_imports)]
+use crate::ctx::{LockExt, RwExt};

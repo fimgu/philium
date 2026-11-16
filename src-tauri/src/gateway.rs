@@ -105,10 +105,10 @@ impl TokenSource {
     }
     #[cfg(test)]
     pub fn set(&self, f: Arc<TokenFn>) {
-        *self.0.write().unwrap() = f;
+        *self.0.wr() = f;
     }
     async fn get(&self, id: &str, kind: Kind) -> Result<crate::oauth::Creds, String> {
-        let f = self.0.read().unwrap().clone();
+        let f = self.0.rd().clone();
         f(id.to_string(), kind).await
     }
 }
@@ -148,7 +148,7 @@ impl Gateway {
     }
 
     pub fn set_routes(&self, routes: Vec<Route>) {
-        *self.routes.write().unwrap() =
+        *self.routes.wr() =
             routes.into_iter().map(|r| (r.provider.id.clone(), r)).collect();
     }
 
@@ -156,16 +156,16 @@ impl Gateway {
     pub fn issue_token(&self, agent: &str, providers: Option<Vec<String>>) -> String {
         self.revoke_agent(agent);
         let t = crate::hal::random_token();
-        self.agent_tokens.write().unwrap().insert(t.clone(), agent.to_string());
+        self.agent_tokens.wr().insert(t.clone(), agent.to_string());
         if let Some(p) = providers {
-            self.agent_providers.write().unwrap().insert(agent.to_string(), p);
+            self.agent_providers.wr().insert(agent.to_string(), p);
         }
         t
     }
 
     pub fn revoke_agent(&self, agent: &str) {
-        self.agent_tokens.write().unwrap().retain(|_, a| a != agent);
-        self.agent_providers.write().unwrap().remove(agent);
+        self.agent_tokens.wr().retain(|_, a| a != agent);
+        self.agent_providers.wr().remove(agent);
     }
 
     pub fn router(self: &Arc<Self>) -> Router {
@@ -175,11 +175,11 @@ impl Gateway {
     }
 
     pub fn recent(&self) -> Vec<Activity> {
-        self.log.lock().unwrap().iter().map(|r| r.summary.clone()).collect()
+        self.log.lk().iter().map(|r| r.summary.clone()).collect()
     }
 
     pub fn detail(&self, id: u64) -> Option<Value> {
-        let log = self.log.lock().unwrap();
+        let log = self.log.lk();
         let r = log.iter().find(|r| r.summary.id == id)?;
         Some(json!({
             "summary": r.summary,
@@ -190,12 +190,12 @@ impl Gateway {
     }
 
     pub fn clear(&self) {
-        self.log.lock().unwrap().clear();
+        self.log.lk().clear();
     }
 
     fn push(&self, rec: Record) {
         let s = rec.summary.clone();
-        let mut log = self.log.lock().unwrap();
+        let mut log = self.log.lk();
         if log.len() >= LOG_CAPACITY {
             log.pop_front();
         }
@@ -205,7 +205,7 @@ impl Gateway {
     }
 
     fn update(&self, id: u64, f: impl FnOnce(&mut Record)) {
-        let mut log = self.log.lock().unwrap();
+        let mut log = self.log.lk();
         let Some(rec) = log.iter_mut().find(|r| r.summary.id == id) else { return };
         f(rec);
         let s = rec.summary.clone();
@@ -237,7 +237,7 @@ impl Gateway {
         if eq(&self.token) {
             return Some(None);
         }
-        let agents = self.agent_tokens.read().unwrap();
+        let agents = self.agent_tokens.rd();
         agents.iter().find(|(t, _)| eq(t)).map(|(_, a)| Some(a.clone()))
     }
 }
@@ -363,13 +363,13 @@ async fn proxy(
         return error_response(StatusCode::UNAUTHORIZED, "philium_auth", "invalid gateway token".into());
     };
     if let Some(a) = &agent {
-        if let Some(allowed) = gw.agent_providers.read().unwrap().get(a) {
+        if let Some(allowed) = gw.agent_providers.rd().get(a) {
             if !allowed.contains(&provider) {
                 return error_response(StatusCode::FORBIDDEN, "philium_route", format!("agent {a} may not use provider {provider}"));
             }
         }
     }
-    let Some(route) = gw.routes.read().unwrap().get(&provider).cloned() else {
+    let Some(route) = gw.routes.rd().get(&provider).cloned() else {
         return error_response(StatusCode::NOT_FOUND, "philium_route", format!("unknown provider {provider}"));
     };
     if rest.split('/').any(|s| s == ".." || s == ".") {
@@ -573,7 +573,7 @@ async fn proxy(
         let body = resp.bytes_stream().map(move |item| {
             match item {
                 Ok(chunk) => {
-                    let s = tr.lock().unwrap().feed(&chunk);
+                    let s = tr.lk().feed(&chunk);
                     fin.feed(s.as_bytes());
                     Ok(Bytes::from(s))
                 }
@@ -583,7 +583,7 @@ async fn proxy(
                 }
             }
         });
-        let tail = futures_util::stream::once(async move { Ok(Bytes::from(tr2.lock().unwrap().end())) });
+        let tail = futures_util::stream::once(async move { Ok(Bytes::from(tr2.lk().end())) });
         Response::new(Body::from_stream(body.chain(tail)))
     } else if convert {
         let bytes = resp.bytes().await.unwrap_or_default();
@@ -633,7 +633,7 @@ mod tests {
             any(move |headers: HeaderMap, body: String| {
                 let s = s.clone();
                 async move {
-                    s.lock().unwrap().push((headers, body));
+                    s.lk().push((headers, body));
                     let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
                                data: {\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":3}}\n\n\
                                data: [DONE]\n\n";
@@ -696,7 +696,7 @@ mod tests {
             }
             assert_eq!(r.send().await.unwrap().status(), 401);
         }
-        assert!(seen.lock().unwrap().is_empty());
+        assert!(seen.lk().is_empty());
     }
 
     #[tokio::test]
@@ -713,7 +713,7 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let text = resp.text().await.unwrap();
         assert!(text.contains("[DONE]"), "stream passed through: {text}");
-        let (headers, sent) = seen.lock().unwrap()[0].clone();
+        let (headers, sent) = seen.lk()[0].clone();
         assert_eq!(headers["authorization"], "Bearer REAL-UPSTREAM-KEY");
         assert!(!sent.contains("AKIAABCDEFGHIJKLMNOP"));
         assert!(sent.contains("[REDACTED:aws_access_key]"));
@@ -739,7 +739,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 403);
         assert!(resp.text().await.unwrap().contains("aws_access_key"));
-        assert!(seen.lock().unwrap().is_empty());
+        assert!(seen.lk().is_empty());
         let a = gw.recent().pop().unwrap();
         assert_eq!((a.state, a.guard), ("blocked", "blocked"));
         assert!(!gw.detail(a.id).unwrap().to_string().contains("AKIA"));
@@ -758,7 +758,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
-        let (headers, _) = seen.lock().unwrap()[0].clone();
+        let (headers, _) = seen.lk()[0].clone();
         assert_eq!(headers["x-api-key"], "REAL-UPSTREAM-KEY");
         assert_eq!(headers["anthropic-version"], "2023-06-01");
         assert!(headers.get("authorization").is_none());
@@ -781,7 +781,7 @@ mod tests {
                 .json(&json!({"model":"m","stream":true,"system":"sys AKIAABCDEFGHIJKLMNOP","messages":[]}))
                 .send().await.unwrap();
             assert_eq!(resp.status(), 200);
-            let (h, sent) = seen.lock().unwrap()[0].clone();
+            let (h, sent) = seen.lk()[0].clone();
             assert_eq!(h["authorization"], "Bearer OAUTH-ACCESS");
             assert!(h.get("x-api-key").is_none(), "gateway token never forwarded");
             assert!(!format!("{h:?}{sent}").contains(&tok));
@@ -810,7 +810,7 @@ mod tests {
         let r = reqwest::Client::new().post(format!("{url}/messages")).bearer_auth("t".repeat(48)).json(&json!({})).send().await.unwrap();
         assert_eq!(r.status(), 401);
         assert!(r.text().await.unwrap().contains("Sign in again"));
-        assert!(seen.lock().unwrap().is_empty());
+        assert!(seen.lk().is_empty());
     }
 
     #[test]
@@ -824,3 +824,6 @@ mod tests {
         assert_eq!(extract_usage(whole, ""), (Some(7), Some(8)));
     }
 }
+
+#[allow(unused_imports)]
+use crate::ctx::{LockExt, RwExt};

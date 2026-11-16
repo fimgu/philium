@@ -20,7 +20,14 @@ pub struct Hal {
     // Holding stdin open keeps HAL alive; dropping it (EOF) shuts HAL down.
     proc: Mutex<Option<(Child, ChildStdin)>>,
     pub config: Value,
+    /// Last stderr lines, kept for crash reports.
+    tail: Arc<Mutex<Vec<String>>>,
+    /// Exit status once the process is known to have exited.
+    exited: Mutex<Option<std::process::ExitStatus>>,
 }
+
+/// How long a HAL may take to print its handshake before we give up.
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// How to launch one HAL.
 pub struct Launch<'a> {
@@ -135,7 +142,7 @@ impl Hal {
             std::thread::spawn(move || {
                 for line in BufReader::new(err).lines().map_while(Result::ok) {
                     eprintln!("hal: {line}");
-                    let mut t = tail.lock().unwrap();
+                    let mut t = tail.lk();
                     t.push(line);
                     if t.len() > 20 {
                         t.remove(0);
@@ -143,15 +150,26 @@ impl Hal {
                 }
             })
         });
-        let mut line = String::new();
-        let read = BufReader::new(stdout).read_line(&mut line);
+        // Read the handshake on a helper thread so a wedged HAL cannot hang us.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            let r = BufReader::new(stdout).read_line(&mut line).map(|_| line);
+            let _ = tx.send(r);
+        });
+        let (read, line) = match rx.recv_timeout(HANDSHAKE_TIMEOUT) {
+            Ok(Ok(l)) if l.is_empty() => (Err(std::io::Error::other("HAL closed stdout before the handshake")), l),
+            Ok(Ok(l)) => (Ok(()), l),
+            Ok(Err(e)) => (Err(e), String::new()),
+            Err(_) => (Err(std::io::Error::other("HAL did not start within 30s")), String::new()),
+        };
         let explain = |child: &mut Child, what: String| {
             let _ = child.kill();
             let _ = child.wait();
             if let Some(r) = reader {
                 let _ = r.join();
             }
-            match first_error_line(&tail.lock().unwrap()) {
+            match first_error_line(&tail.lk()) {
                 Some(l) => format!("HAL exited: {l}"),
                 None => what,
             }
@@ -163,30 +181,64 @@ impl Hal {
             Ok(v) => v,
             Err(e) => return Err(explain(&mut child, format!("bad HAL handshake {line:?}: {e}"))),
         };
-        let base = handshake["address"].as_str().ok_or("handshake missing address")?.to_string();
+        let Some(base) = handshake["address"].as_str().map(str::to_string) else {
+            return Err(explain(&mut child, "HAL handshake missing address".into()));
+        };
         if !base.starts_with("http://127.0.0.1:") {
             let _ = child.kill();
+            let _ = child.wait();
             return Err(format!("refusing non-loopback HAL address {base}"));
         }
-        Ok(Hal {
+        Ok(Hal::attach(child, stdin, tail, base, token, pid, l.config))
+    }
+
+    fn attach(child: Child, stdin: ChildStdin, tail: Arc<Mutex<Vec<String>>>, base: String, token: String, pid: u32, config: Value) -> Hal {
+        Hal {
             base,
             token,
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .build()
+                .unwrap_or_default(),
             pid,
             proc: Mutex::new(Some((child, stdin))),
-            config: l.config,
-        })
+            config,
+            tail,
+            exited: Mutex::new(None),
+        }
     }
 
     pub fn alive(&self) -> bool {
-        match self.proc.lock().unwrap().as_mut() {
-            Some((c, _)) => matches!(c.try_wait(), Ok(None)),
+        match self.proc.lk().as_mut() {
+            Some((c, _)) => match c.try_wait() {
+                Ok(None) => true,
+                Ok(Some(st)) => {
+                    *self.exited.lk() = Some(st);
+                    false
+                }
+                Err(_) => false,
+            },
             None => false,
         }
     }
 
+    /// Human-readable reason for an unexpected exit, or None while running.
+    pub fn exit_reason(&self) -> Option<String> {
+        if self.alive() {
+            return None;
+        }
+        let status = match *self.exited.lk() {
+            Some(st) => describe_status(st),
+            None => "stopped".to_string(),
+        };
+        Some(match first_error_line(&self.tail.lk()) {
+            Some(l) => format!("HAL {status}: {l}"),
+            None => format!("HAL {status}"),
+        })
+    }
+
     pub fn stop(&self) {
-        if let Some((mut child, stdin)) = self.proc.lock().unwrap().take() {
+        if let Some((mut child, stdin)) = self.proc.lk().take() {
             drop(stdin);
             for _ in 0..30 {
                 if let Ok(Some(_)) = child.try_wait() {
@@ -220,6 +272,27 @@ impl Drop for Hal {
 }
 
 /// Only API paths the UI needs; maintenance/admin routes stay unreachable.
+fn describe_status(st: std::process::ExitStatus) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = st.signal() {
+            let name = match sig {
+                9 => " (SIGKILL)",
+                15 => " (SIGTERM)",
+                11 => " (SIGSEGV)",
+                6 => " (SIGABRT)",
+                _ => "",
+            };
+            return format!("was killed by signal {sig}{name}");
+        }
+    }
+    match st.code() {
+        Some(c) => format!("exited with code {c}"),
+        None => "exited".into(),
+    }
+}
+
 pub fn validate_path(path: &str) -> Result<(), String> {
     let route = path.split('?').next().unwrap_or("");
     let ok_chars = path.chars().all(|c| c.is_ascii_alphanumeric() || "/-_.?=&%".contains(c));
@@ -280,6 +353,59 @@ mod tests {
         }
     }
 
+    fn fake(script: &str) -> Hal {
+        let mut c = Command::new("/bin/sh")
+            .args(["-c", script])
+            .stdin(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let tail: Arc<Mutex<Vec<String>>> = Arc::default();
+        let err = c.stderr.take().unwrap();
+        let t2 = tail.clone();
+        let rd = std::thread::spawn(move || {
+            for l in BufReader::new(err).lines().map_while(Result::ok) {
+                t2.lk().push(l);
+            }
+        });
+        let stdin = c.stdin.take().unwrap();
+        let pid = c.id();
+        let h = Hal::attach(c, stdin, tail, "http://127.0.0.1:9".into(), "t".into(), pid, Value::Null);
+        if !script.contains("sleep") {
+            let _ = rd.join();
+        }
+        h
+    }
+
+    #[test]
+    fn crash_is_detected_with_reason() {
+        let h = fake("echo 'error: model config broken' >&2; exit 3");
+        for _ in 0..100 {
+            if !h.alive() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let r = h.exit_reason().expect("exited");
+        assert!(r.contains("code 3") && r.contains("model config broken"), "{r}");
+    }
+
+    #[test]
+    fn killed_hal_reports_signal_and_stop_is_idempotent() {
+        let h = fake("sleep 30");
+        assert!(h.alive() && h.exit_reason().is_none());
+        unsafe { libc::kill(h.pid as i32, libc::SIGKILL) };
+        for _ in 0..100 {
+            if !h.alive() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(h.exit_reason().unwrap().contains("SIGKILL"));
+        h.stop();
+        h.stop();
+    }
+
     #[test]
     fn rejects_escape_and_admin_routes() {
         for p in ["", "health", "//evil.example/x", "http://evil.example/sessions",
@@ -290,3 +416,6 @@ mod tests {
         }
     }
 }
+
+#[allow(unused_imports)]
+use crate::ctx::{LockExt, RwExt};
