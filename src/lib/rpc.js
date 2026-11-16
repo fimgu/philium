@@ -15,7 +15,7 @@ const track = (key, p) => p.then(
 
 export const rpc = (method, args, options = {}) => {
   const request = invoke("rpc", { method, args: args ?? null });
-  return options.action ? request : track(method, request);
+  return options.action || options.local ? request : track(method, request);
 };
 export const hal = (method, path, body) => {
   const request = invoke("hal", { method, path, body });

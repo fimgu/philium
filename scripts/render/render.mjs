@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import puppeteer from "puppeteer-core";
 import { EMPTY, POPULATED, FAILING, SLOW, HUGE } from "./fixtures.js";
 import { checkAgentMessaging, checkChatMessaging } from "./robustness.mjs";
+import { checkStoppedHistory } from "./stopped-history.mjs";
 import { checkCodeGraph } from "./code-review.mjs";
 const SETS = { empty: EMPTY, populated: POPULATED, failing: FAILING, slow: SLOW, huge: HUGE };
 
@@ -77,6 +78,25 @@ const stub = (fx, setName) => {
         throw fixtures.__fail[window.__n % fixtures.__fail.length];
       }
       if (cmd === "rpc") {
+        if (window.__test.historyMode) {
+          const t = window.__test;
+          if (a.method === "agents.get") return structuredClone(t.historyAgents[a.args.id]);
+          if (a.method === "agents.events") {
+            const id = a.args.id;
+            t.historyCalls.push(id);
+            const response = structuredClone(t.historyEvents[id] ?? []);
+            if (t.holdHistory) await new Promise((resolve, reject) => t.historyPending.push({ id, response, resolve, reject }));
+            if (t.failHistory) throw "Saved history unreadable";
+            return response;
+          }
+          if (["agents.resume", "agents.stop"].includes(a.method)) {
+            t.historyActions.push(a.method);
+            t.historyAgents[a.args.id].live = a.method === "agents.resume";
+            t.historyAgents[a.args.id].state = a.method === "agents.resume" ? "idle" : "stopped";
+            window.__emit("agents:changed", { id: a.args.id });
+            return {};
+          }
+        }
         if (["codeindex.source", "codeindex.changes", "codeindex.file_diff"].includes(a.method)) {
           window.__test.codeCalls.push({ method: a.method, ...a.args });
           const live = !!(a.args.worktree_id || a.args.working_tree);
@@ -216,6 +236,7 @@ for (const setName of sets) {
             await shot(page, "agents-permissions-resolved");
             for (const error of await checkAgentMessaging(page)) problems.push(`${w} messaging: ${error}`);
             await shot(page, "agents-messaging-checked");
+            for (const error of await checkStoppedHistory(page, shot)) problems.push(`${w} stopped history: ${error}`);
           }
         } else if (setName === "populated") problems.push(`${w} browser approval: agent detail did not open`);
         if (await clickText(page, "button", "New agent")) { await sleep(300); await shot(page, "modal-new-agent"); }

@@ -140,7 +140,7 @@ export function Conversation(props) {
                       <span class="dim xs">Page content may be sent to this agent's provider. Session approval applies only to this tool.</span>
                     </Show>
                   </div>
-                  <Show when={it().open} fallback={<Badge tone={/^(appr|allow)/.test(it().decision ?? "") ? "secure" : "danger"}>{it().decision ?? "resolved"}</Badge>}>
+                  <Show when={it().open && !props.readOnly} fallback={<Badge tone={it().open ? "" : /^(appr|allow)/.test(it().decision ?? "") ? "secure" : "danger"}>{it().open ? "Historical request · agent stopped" : it().decision ?? "resolved"}</Badge>}>
                     <div class="row" style={{ width: "100%", "justify-content": "flex-end", "flex-wrap": "wrap" }}>
                       <Button size="sm" onClick={() => props.onDeny?.(it().id)}>Deny</Button>
                       <Button size="sm" onClick={() => props.onApprove?.(it().id, "once")}>Allow once</Button>

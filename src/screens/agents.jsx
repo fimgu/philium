@@ -249,31 +249,48 @@ function AgentView(props) {
   };
   const [events, setEvents] = createSignal([]);
   const [info, { refetch }] = createResource(() => props.id, (id) => rpc("agents.get", { id }));
-  let lastSeq = 0;
-
-  const load = async (id) => {
-    setEvents([]); lastSeq = 0;
-    try {
-      const evs = await rpc("agents.events", { id, after: 0, limit: 5000 });
-      if (props.id !== id) return;
-      setEvents(evs);
-      lastSeq = evs.at(-1)?.seq ?? 0;
-    } catch { /* not running: empty */ }
+  const [historyLoading, setHistoryLoading] = createSignal(false);
+  const [historyError, setHistoryError] = createSignal("");
+  let generation = 0, historyId;
+  const merge = (previous, incoming) => {
+    const bySeq = new Map(previous.map((event) => [event.seq, event]));
+    for (const event of incoming) if (!bySeq.has(event.seq)) bySeq.set(event.seq, event);
+    return [...bySeq.values()].sort((a, b) => a.seq - b.seq);
   };
+  const load = async (id) => {
+    const request = ++generation;
+    if (historyId !== id) { historyId = id; setEvents([]); }
+    setHistoryLoading(true); setHistoryError("");
+    try {
+      const evs = await rpc("agents.events", { id, after: 0, limit: 5000 }, { local: true });
+      if (request !== generation || props.id !== id) return;
+      if (!Array.isArray(evs)) throw new Error("Invalid history response");
+      setEvents((current) => merge(current, evs));
+    } catch (e) {
+      if (request === generation && props.id === id) setHistoryError(String(e));
+    } finally {
+      if (request === generation && props.id === id) setHistoryLoading(false);
+    }
+  };
+  onCleanup(() => generation++);
   createEffect(on(() => props.id, load));
   useEvent("agents:events", (p) => {
-    if (p.id !== props.id) return;
-    const fresh = p.events.filter((e) => (e.seq ?? 0) > lastSeq);
-    if (!fresh.length) return;
-    lastSeq = fresh.at(-1).seq ?? lastSeq;
-    setEvents((xs) => xs.concat(fresh));
+    if (p.id !== props.id || historyId !== props.id) return;
+    setEvents((current) => merge(current, p.events ?? []));
   });
   useEvent("agents:changed", (p) => { if (p.id === props.id) refetch(); });
 
-  const a = () => info() ?? props.agent;
+  const a = () => info()?.id === props.id ? info() : props.agent;
   const [effort, setEffort] = createSignal("default");
   createEffect(on(() => props.id, (id) => rpc("agents.get_effort", { id }).then(setEffort).catch(() => setEffort("default"))));
-  const live = () => a()?.live;
+  const live = () => a()?.id === props.id ? a()?.live : props.agent?.live;
+  let observedId, observedLive;
+  createEffect(() => {
+    const id = props.id, value = live();
+    if (typeof value !== "boolean") return;
+    if (observedId === id && observedLive !== value) load(id);
+    observedId = id; observedLive = value;
+  });
   const busy = () => ["running", "waiting"].includes(a()?.state);
 
   const send = async (text, images = []) => {
@@ -281,7 +298,7 @@ function AgentView(props) {
     catch (e) { toast(sendError(e), "danger"); return false; }
   };
   const decide = (request_id, decision, scope) =>
-    rpc("agents.permission", { id: props.id, request_id, decision, scope }, { action: true }).catch((e) => toast(String(e), "danger"));
+    live() ? rpc("agents.permission", { id: props.id, request_id, decision, scope }, { action: true }).catch((e) => toast(String(e), "danger")) : Promise.resolve();
 
   const remove = async () => {
     const r = await rpc("agents.remove", { id: props.id }).catch((e) => ({ error: String(e) }));
@@ -311,7 +328,7 @@ function AgentView(props) {
           { value: "browser", label: <span class="row gap-4" title="The agent's live browser"><Icon name="globe" size={12} /> Browser<Show when={browserPing()}><span class="ping" /></Show></span> },
           { value: "none", label: <span title="Hide the side panel">Hide</span> },
         ]} />
-        <Show when={live()} fallback={<Button size="sm" onClick={() => rpc("agents.resume", { id: props.id }).catch((e) => toast(String(e), "danger"))}><Icon name="play" size={11} /> Resume</Button>}>
+        <Show when={live()} fallback={<Button size="sm" onClick={() => rpc("agents.resume", { id: props.id }, { action: true }).catch((e) => toast(String(e), "danger"))}><Icon name="play" size={11} /> Resume</Button>}>
           <Button size="sm" onClick={() => rpc("agents.stop", { id: props.id }, { action: true }).catch((e) => toast(String(e), "danger"))}><Icon name="stop" size={11} /> Stop</Button>
         </Show>
         <Button size="sm" variant="ghost" title="Remove agent and clean up" onClick={remove}><Icon name="trash" size={12} /></Button>
@@ -320,7 +337,9 @@ function AgentView(props) {
       <div class="agent-body">
         <div class="agent-main">
           <Show when={tab() === "chat"}>
-            <Conversation events={events()} emptyText={live() ? "Send the first message to start." : "This agent is stopped. Resume it to continue."}
+            <Show when={historyLoading()}><div class="history-loading small dim" role="status">Loading saved conversation…</div></Show>
+            <Show when={historyError()}><div class="history-error shield danger" role="alert">Unable to load saved conversation: {historyError()} <Button size="sm" onClick={() => load(props.id)}>Retry history</Button></div></Show>
+            <Conversation events={events()} readOnly={!live()} emptyText={historyLoading() ? "Loading saved conversation…" : historyError() ? "History could not be loaded. Retry above." : live() ? "Send the first message to start." : "No saved messages. This agent is stopped. Resume it to continue."}
               onApprove={(id, scope) => decide(id, "approve", scope)} onDeny={(id) => decide(id, "deny")} />
             <Composer draftKey={`agent:${props.id}`} onSend={send} busy={busy()} disabled={!live()} onCancel={() => rpc("agents.cancel", { id: props.id }, { action: true }).catch((e) => toast(String(e), "danger"))}
               speed={effortSpeed(effort())} onSpeed={(v) => rpc("agents.set_effort", { id: props.id, effort: speedEffort(v) }).then(setEffort).catch((e) => toast(String(e), "danger"))}
