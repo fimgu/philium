@@ -8,6 +8,8 @@
 //! worktrees), serialized by one lock, incremental by file stamp (mtime+len), and debounced.
 //!
 //! Target args (all methods): `worktree_id` | `agent` (id or name) | `repo_id`.
+//! `repo_id` alone is the indexed base commit. Add `working_tree: true` for the
+//! local checkout, represented by the stable virtual worktree id `local:{repo_id}`.
 //! Query results carry `text`, compact and compact by design (`max_tokens` is only a safety limit, default 60000)
 //! with "N more, narrow with ..." hints.
 //!
@@ -24,6 +26,9 @@
 //!   `weight` (= `refs_in` + `refs_out`, summed edge weights) and, for files, `syms` (symbol count).
 //!   Edges carry `weight` (number of references between the two nodes).
 //! - `reindex {}`
+//! - `source {path}` -> bounded source at the selected base blob or current disk
+//! - `changes {}` -> net committed/staged/unstaged/untracked changes vs graph base
+//! - `file_diff {path}` -> bounded patch vs graph base (never external diff/textconv)
 //!
 //! Events: `codeindex:clashes` (list) when the clash set changes; audit event `code_clash`.
 
@@ -40,6 +45,9 @@ use tree_sitter::{Node, Parser};
 
 use crate::ctx::Ctx;
 use crate::workspace::git;
+
+#[path = "codeinspect.rs"]
+mod inspect;
 
 const MAX_FILE: u64 = 400 * 1024;
 const MAX_FILES: usize = 20000;
@@ -537,7 +545,7 @@ pub fn ensure_base(ctx: &Ctx, repo_id: &str, repo: &Path, branch: &str) -> Resul
             continue;
         }
         let size: u64 = m[3].parse().unwrap_or(u64::MAX);
-        if size > MAX_FILE || lang_of(path).is_none() || skipped(path) {
+        if size > MAX_FILE || lang_of(path).is_none() || skipped(path) || inspect::private_name(Path::new(path)) || m[0] == "120000" {
             continue;
         }
         files.push((path.to_string(), m[2].to_string()));
@@ -630,7 +638,7 @@ pub fn ensure_delta(ctx: &Ctx, repo_id: &str, base: &str, wt_id: &str, wt: &Path
     let mut batch: Vec<(String, String, Parsed)> = vec![];
     let mut gone: Vec<String> = vec![];
     for p in &files {
-        match stamp_of(&wt.join(p)) {
+        match inspect::checked(wt, p).ok().and_then(|safe| stamp_of(&safe)) {
             Some(st) => {
                 if existing.get(p) == Some(&st) {
                     continue;
@@ -1303,6 +1311,11 @@ fn target_for_repo(ctx: &Ctx, repo_id: &str, wt: Option<Wt>) -> Result<Target, S
 
 pub fn resolve(ctx: &Ctx, args: &Value) -> Result<Target, String> {
     if let Some(id) = args["worktree_id"].as_str() {
+        if let Some(repo) = id.strip_prefix("local:") {
+            let mut t = target_for_repo(ctx, repo, None)?;
+            t.wt = Some(Wt { id: id.into(), path: t.repo_path.clone(), label: "Local checkout".into() });
+            return Ok(t);
+        }
         let w = ctx.db.query("SELECT * FROM worktrees WHERE id=?1", [id])?.into_iter().next().ok_or("unknown worktree")?;
         return target_for_repo(ctx, w["repo_id"].as_str().unwrap_or(""), Some(wt_row(ctx, &w)));
     }
@@ -1313,7 +1326,11 @@ pub fn resolve(ctx: &Ctx, args: &Value) -> Result<Target, String> {
         Some(r) => r.to_string(),
         None => ctx.db.query("SELECT id FROM repos ORDER BY added_at LIMIT 1", [])?.first().and_then(|r| r["id"].as_str().map(str::to_string)).ok_or("no repos yet. Add a repo first.")?,
     };
-    target_for_repo(ctx, &repo, None)
+    let mut target = target_for_repo(ctx, &repo, None)?;
+    if args["working_tree"].as_bool() == Some(true) {
+        target.wt = Some(Wt { id: format!("local:{repo}"), path: target.repo_path.clone(), label: "Local checkout".into() });
+    }
+    Ok(target)
 }
 
 pub fn resolve_agent(ctx: &Ctx, agent: &str) -> Result<Target, String> {
@@ -1551,6 +1568,14 @@ fn build_graph(ctx: &Ctx, l: &Loaded, args: &Value) -> Value {
 pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, String> {
     let cap = cap_of(&args);
     match method {
+        "source" | "changes" | "file_diff" => {
+            let c = ctx.clone();
+            let method = method.to_string();
+            tokio::task::spawn_blocking(move || {
+                let t = resolve(&c, &args)?;
+                inspect::call(&c, &t, &method, &args)
+            }).await.map_err(|e| e.to_string())?
+        }
         "clashes" => {
             let c = ctx.clone();
             let rid = args["repo_id"].as_str().map(str::to_string);
