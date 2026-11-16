@@ -1,0 +1,11 @@
+/* Home dashboard */
+.home-hero { margin-bottom: 18px; border-color: var(--accent-dim, var(--line)); }
+.home-hero h2 { margin: 0 0 6px; }
+.home-hero p { max-width: 640px; margin: 0 0 12px; }
+.home-stats { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; margin-bottom: 20px; }
+.home-sec { margin-bottom: 20px; min-width: 0; }
+.home-sec h2 { font-size: 13px; font-weight: 600; margin: 0; color: var(--text-dim); text-transform: none; }
+.home-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); gap: 0 20px; }
+.home-board { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 10px; }
+.home-num { font-size: 20px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.home-feed { max-height: 320px; overflow: auto; }

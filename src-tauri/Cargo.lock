@@ -2980,6 +2980,7 @@ dependencies = [
  "base64 0.23.1",
  "futures-util",
  "keyring",
+ "libc",
  "portable-pty",
  "rand 0.8.8",
  "regex",

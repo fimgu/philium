@@ -143,6 +143,64 @@ async fn app_call(app: &App, m: &str, args: Value) -> Result<Value, String> {
             ctx.notify("settings");
             Ok(Value::Null)
         }
+        // Plain chat on the desk HAL. It has no sandbox, so chat sessions get
+        // no tools at all: every action is denied, whatever the model.
+        "chat_create" => {
+            let h = ctx.desk().ok_or("HAL is not running")?;
+            let ws = ctx.data_dir.join("desk").join("chat");
+            std::fs::create_dir_all(&ws).map_err(|e| e.to_string())?;
+            let rules = vec![
+                json!({ "action": "*", "resource": "*", "effect": "deny" }),
+                json!({ "action": "*", "resource": "**", "effect": "deny" }),
+                json!({ "action": "*", "resource": "/**", "effect": "deny" }),
+            ];
+            let mut body = json!({
+                "workspace": ws,
+                "title": args["title"].as_str().unwrap_or("Chat"),
+                "permission_mode": "auto_deny",
+                "permission_rules": rules,
+            });
+            if let Some(m) = args["model"].as_str().filter(|m| !m.is_empty()) {
+                body["model"] = json!(m);
+            }
+            h.call(reqwest::Method::POST, "/sessions", Some(body)).await
+        }
+        // Disk used by Philium, by area. Bounded walk so it stays fast.
+        "disk" => {
+            let (root, data) = (ctx.root.clone(), ctx.data_dir.clone());
+            tokio::task::spawn_blocking(move || {
+                fn size(p: &std::path::Path, budget: &mut u32) -> u64 {
+                    let Ok(md) = std::fs::symlink_metadata(p) else { return 0 };
+                    if !md.is_dir() {
+                        return md.len();
+                    }
+                    let Ok(rd) = std::fs::read_dir(p) else { return 0 };
+                    let mut n = 0;
+                    for e in rd.flatten() {
+                        if *budget == 0 {
+                            break;
+                        }
+                        *budget -= 1;
+                        n += size(&e.path(), budget);
+                    }
+                    n
+                }
+                let mut out = serde_json::Map::new();
+                for (k, p) in [
+                    ("worktrees", root.join("worktrees")),
+                    ("scratch", data.join("agents")),
+                    ("previews", data.join("previews")),
+                    ("data", data.join("philium.db")),
+                    ("logs", data.join("activity.jsonl")),
+                ] {
+                    let mut budget = 200_000;
+                    out.insert(k.into(), json!({ "bytes": size(&p, &mut budget), "partial": budget == 0 }));
+                }
+                Ok(Value::Object(out))
+            })
+            .await
+            .map_err(|e| e.to_string())?
+        }
         "events" => {
             let limit = args["limit"].as_i64().unwrap_or(100).clamp(1, 1000);
             Ok(json!(ctx.db.query(
