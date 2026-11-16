@@ -33,9 +33,31 @@ struct Shell {
     command: tokio::sync::Mutex<Slot>,
 }
 type Slots = Mutex<HashMap<String, Arc<Shell>>>;
+static S: OnceLock<Slots> = OnceLock::new();
 fn slot(agent: &str, shell: &str) -> Arc<Shell> {
-    static S: OnceLock<Slots> = OnceLock::new();
     S.get_or_init(Default::default).lk().entry(format!("{agent}\0{shell}")).or_default().clone()
+}
+
+/// Poll the command, not the lifetime of its persistent bash process.
+pub fn command_status(ctx: &Arc<Ctx>, agent: &str, id: &str) -> Option<Value> {
+    let prefix = format!("{agent}\0");
+    let shells: Vec<_> = S.get_or_init(Default::default).lk().iter()
+        .filter(|(key, _)| key.starts_with(&prefix)).map(|(_, s)| s.clone()).collect();
+    for shell in shells {
+        if shell.current.lk().as_deref() != Some(id) { continue; }
+        let Ok(s) = shell.command.try_lock() else {
+            return Some(json!({"state":"running", "running":true, "finished":false, "exit_code":null}));
+        };
+        if let Some(from) = s.pending {
+            if let Some((_, code)) = crate::terminals::since(ctx, id, from).and_then(|b| parse(&b)) {
+                return Some(json!({"state":"finished", "running":false, "finished":true, "exit_code":code}));
+            }
+            let alive = crate::terminals::alive(ctx, id);
+            return Some(json!({"state":if alive {"running"} else {"interrupted"}, "running":alive, "finished":false, "exit_code":null}));
+        }
+        return Some(json!({"state":"idle", "running":false, "finished":null, "exit_code":null}));
+    }
+    None
 }
 
 /// Shell names: short, lowercase words. "main" is the default shell.
@@ -146,26 +168,29 @@ pub async fn current(ctx: &Arc<Ctx>, agent: &str, shell: &str, open: bool) -> Op
     ensure(ctx, agent, shell, &mut s).await.ok()
 }
 
+// Return a pollable terminal well before the MCP transport's 300-second cap.
+// This is a response budget, not a deadline that kills the command.
+fn foreground_budget(requested: Duration) -> Duration {
+    requested.min(Duration::from_secs(30))
+}
+
 pub async fn run(ctx: &Arc<Ctx>, agent: &str, shell: &str, command: &str, cwd: Option<PathBuf>, timeout: Duration) -> Result<Value, String> {
+    let timeout = foreground_budget(timeout);
     let deadline = Instant::now() + timeout;
     let sl = slot(agent, shell);
     let mut s = tokio::time::timeout(timeout, sl.command.lock())
         .await
         .map_err(|_| "this shell is busy with another command. Use another shell (shell_open), or background=true for long-running commands.")?;
     let id = ensure(ctx, agent, shell, &mut s).await?;
-    // A previous command timed out: wait for it before typing a new one.
+    // A previous response returned early or was cancelled. Never enqueue a
+    // retry behind an unfinished command: report its terminal immediately.
     if let Some(from) = s.pending {
-        loop {
-            if crate::terminals::since(ctx, &id, from).and_then(|b| parse(&b)).is_some() {
-                s.pending = None;
-                break;
-            }
-            if Instant::now() >= deadline || !crate::terminals::alive(ctx, &id) {
-                return Err(format!(
-                    "shell \"{shell}\" is still running the previous command (terminal {id}). Run elsewhere with shell_open, or use shell_read to watch it, shell_write to answer it or \"\\u0003\" to interrupt, or shell_kill to reset the shell."
-                ));
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+        if crate::terminals::since(ctx, &id, from).and_then(|b| parse(&b)).is_some() {
+            s.pending = None;
+        } else {
+            return Err(format!(
+                "shell \"{shell}\" is still running the previous command (terminal {id}). Do not retry it. Use shell_read to watch it, shell_write to answer it or \"\\u0003\" to interrupt, or shell_kill to reset the shell."
+            ));
         }
     }
     let from = crate::terminals::total(ctx, &id).ok_or("the shell is gone")?;
@@ -175,13 +200,18 @@ pub async fn run(ctx: &Arc<Ctx>, agent: &str, shell: &str, command: &str, cwd: O
     };
     line.push('\n');
     crate::terminals::write(ctx, &id, line.as_bytes())?;
+    // Persist before the first await so dropping this request cannot forget
+    // the live command and let a retry type into its input.
+    s.pending = Some(from);
     loop {
         let buf = crate::terminals::since(ctx, &id, from).unwrap_or_default();
         if let Some((out, code)) = parse(&buf) {
+            s.pending = None;
             return Ok(json!({
                 "terminal": id,
                 "exit_code": code,
                 "finished": true,
+                "running": false,
                 "output": crate::mcp::trim_output(&text(&out), 12000),
             }));
         }
@@ -191,14 +221,16 @@ pub async fn run(ctx: &Arc<Ctx>, agent: &str, shell: &str, command: &str, cwd: O
                 s.pending = Some(from);
             } else {
                 s.id = None;
+                s.pending = None;
             }
             let partial = buf.windows(START.len()).position(|w| w == START).map_or(&buf[..], |i| &buf[i + START.len()..]);
             return Ok(json!({
                 "terminal": id,
                 "exit_code": Value::Null,
                 "finished": false,
+                "running": alive,
                 "output": crate::mcp::trim_output(&text(partial), 12000),
-                "note": if alive { "still running in your shell: use shell_read to follow it, shell_write to answer prompts or send \"\\u0003\" to interrupt" } else { "the shell exited; the next shell_run opens a new one" },
+                "note": if alive { "still running, not failed: do not run this command again. Use shell_read with the returned terminal id to follow progress and completion, or shell_write to answer prompts or send \"\\u0003\" to interrupt" } else { "the shell exited; the next shell_run opens a new one" },
             }));
         }
         tokio::time::sleep(Duration::from_millis(60)).await;
@@ -208,6 +240,12 @@ pub async fn run(ctx: &Arc<Ctx>, agent: &str, shell: &str, command: &str, cwd: O
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn foreground_wait_stays_below_transport_timeout() {
+        assert_eq!(foreground_budget(Duration::from_secs(900)), Duration::from_secs(30));
+        assert_eq!(foreground_budget(Duration::from_secs(2)), Duration::from_secs(2));
+    }
 
     #[test]
     fn parse_markers() {
@@ -295,6 +333,46 @@ mod tests {
             assert_eq!(visible.expect("terminal lookup blocked behind a running command"), Some(id.clone()));
         }
         assert!(running.await.unwrap().unwrap().to_string().contains("metadata-ok"));
+        let partial = run(&ctx, &agent, MAIN, "sleep 0.5; echo long-job-done", None, Duration::from_millis(100)).await.unwrap();
+        assert_eq!(partial["finished"], false);
+        assert_eq!(partial["running"], true);
+        assert_eq!(partial["terminal"], id);
+        assert_eq!(command_status(&ctx, &agent, &id).unwrap()["running"], true);
+        let rejected = run(&ctx, &agent, MAIN, "echo duplicate", None, Duration::from_secs(5)).await.unwrap_err();
+        assert!(rejected.contains("Do not retry"));
+        let from = sl.command.lock().await.pending.unwrap();
+        let (out, code) = wait(from).await;
+        assert_eq!(code, 0);
+        assert!(text(&out).contains("long-job-done"));
+        assert!(!text(&out).contains("duplicate"));
+        let status = command_status(&ctx, &agent, &id).unwrap();
+        assert_eq!(status["finished"], true);
+        assert_eq!(status["exit_code"], 0);
+        let next = run(&ctx, &agent, MAIN, "echo follow-up-ok", None, Duration::from_secs(5)).await.unwrap();
+        assert_eq!(next["finished"], true);
+        assert!(next["output"].as_str().unwrap().contains("follow-up-ok"));
+
+        // A disconnected caller must not lose ownership of the live command.
+        let cancelled = {
+            let ctx = ctx.clone();
+            let agent = agent.clone();
+            tokio::spawn(async move {
+                run(&ctx, &agent, MAIN, "sleep 0.5; echo cancelled-caller-done", None, Duration::from_secs(5)).await
+            })
+        };
+        for _ in 0..100 {
+            if sl.command.try_lock().is_err() { break; }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(sl.command.try_lock().is_err());
+        cancelled.abort();
+        assert!(cancelled.await.unwrap_err().is_cancelled());
+        let from = sl.command.lock().await.pending.expect("cancelled request forgot its live command");
+        assert!(run(&ctx, &agent, MAIN, "echo duplicate-after-cancel", None, Duration::from_secs(5)).await.is_err());
+        let (out, code) = wait(from).await;
+        assert_eq!(code, 0);
+        assert!(text(&out).contains("cancelled-caller-done"));
+        assert!(!text(&out).contains("duplicate-after-cancel"));
         crate::terminals::kill(&ctx, &id).unwrap();
         for _ in 0..100 {
             if !crate::terminals::alive(&ctx, &id) { break; }

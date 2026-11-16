@@ -188,6 +188,9 @@ fn instructions(name: &str, strict: bool, worktree: Option<&Path>) -> String {
          - Other agents and the human: board_* for tasks (claim before working, keep the lease alive), mail_send / mail_read for messages. mail_send to \"you\" reaches the human.\n\
          - Jobs like commit, open_pr, review_pr, release: playbook_get first and follow it. Finished work lands as a GitHub pull request.\n\
          \n\
+         - Run builds and test suites with background=true and poll shell_read. Foreground calls return after at most 30 seconds without killing the command. A running result or transport error does not mean the command stopped: inspect the existing terminal before retrying. Never enqueue duplicate tests. Keep progress visible rather than piping live output to tail.\n\
+         - Minimize model round trips: batch independent inspections, use bounded file ranges and focused tests before broad suites. Do not repeatedly sleep in foreground tools while waiting for a job.\n\
+         - Before reporting completion, inspect every started job's finished state and exit_code. Report changed files, checks actually run, failures and remaining blockers. Idle is not proof that the task succeeded.\n\
          ## Rules\n\
          - Do what was asked with the most direct tool. Do not inspect Philium itself (its source, config, env or proxy) unless the task is about Philium.\n\
          - If a tool returns an error you cannot fix from your side, tell the human the exact error in one line and stop. Do not work around Philium's limits.\n\

@@ -168,12 +168,12 @@ pub fn tool_list() -> Vec<Value> {
           json!({ "name": s, "brief": s, "model": s, "role": s, "task_id": s }), &["brief"]),
         t("agent_status", "Status of agents: everyone, or one by name.", json!({ "name": s }), &[]),
         t("agent_stop", "Stop a helper agent you spawned.", json!({ "name": s }), &["name"]),
-        t("shell_run", "Run a command in your persistent interactive shell (bash), which the human watches live. State carries over between calls (cd, exports, venvs). Waits for it to finish (up to timeout_secs, default 120) and returns the trimmed output and exit code. Pass shell to use another of your shells (see shell_open). With background=true it runs in its own new terminal and returns the id immediately: use that for dev servers, watchers and anything that never exits.",
+        t("shell_run", "Run a command in your persistent interactive shell (bash), visible live to the human. State carries over (cd, exports, venvs). Waits at most 30 seconds, or timeout_secs if shorter, then returns terminal, running, finished, output and exit_code. A running response is NOT failure: do not retry the command. Poll shell_read with the terminal id until finished, and check exit_code. Pass shell to use another shell. Use background=true for builds, test suites, dev servers and watchers to return a terminal id immediately.",
           json!({ "command": s, "cwd": s, "timeout_secs": i, "background": b, "title": s, "shell": s }), &["command"]),
         t("shell_open", "Open another persistent shell by name (for example \"dev\" or \"tests\") when your main shell is busy or you want a separate session. Use the name with shell_run's shell argument. Returns the terminal id.",
           json!({ "name": s }), &["name"]),
         t("shell_list", "Your terminals: shells and background commands, with state.", json!({}), &[]),
-        t("shell_read", "Recent output of one of your terminals.", json!({ "id": s, "max_bytes": i }), &["id"]),
+        t("shell_read", "Recent terminal output plus running, finished and exit_code. For persistent shells, these describe the command, not the shell process. finished=null means no pending command result. Poll a running command instead of launching it again. A finished command with nonzero exit_code failed.", json!({ "id": s, "max_bytes": i }), &["id"]),
         t("shell_write", "Send input to one of your terminals (include \\n to press Enter).", json!({ "id": s, "data": s }), &["id", "data"]),
         t("shell_kill", "Stop one of your terminals.", json!({ "id": s }), &["id"]),
         t("graph_query", "Code graph of your repo: which files import which. Cheaper than reading files. Optional `path` focuses on one file's neighbours.",
@@ -339,7 +339,16 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
             let id = arg(&a, "id")?;
             own_terminal(ctx, agent, id)?;
             let max = a["max_bytes"].as_u64().unwrap_or(8192).min(65536) as usize;
-            Ok(json!(crate::terminals::snapshot(ctx, id, max).unwrap_or_default()))
+            let output = crate::terminals::snapshot(ctx, id, max).unwrap_or_default();
+            let mut status = crate::agentshell::command_status(ctx, agent, id).unwrap_or_else(|| {
+                let row = ctx.db.query("SELECT state,exit_code FROM terminals WHERE id=?1", [id])
+                    .ok().and_then(|rows| rows.into_iter().next()).unwrap_or(json!({}));
+                let running = crate::terminals::alive(ctx, id);
+                json!({"state":row["state"], "running":running, "finished":!running && row["exit_code"].is_number(), "exit_code":row["exit_code"]})
+            });
+            status["terminal"] = json!(id);
+            status["output"] = json!(output);
+            Ok(status)
         }
         "shell_write" => {
             let id = arg(&a, "id")?;
@@ -470,6 +479,34 @@ mod tests {
         let t = trim_output(&s, 1000);
         assert!(t.len() < 1100 && t.contains("omitted"));
         assert_eq!(trim_output("short", 1000), "short");
+    }
+
+    #[tokio::test]
+    async fn shell_read_reports_background_completion_and_isolates_peers() {
+        let ctx = Ctx::test();
+        for (id, name) in [("poll-owner", "poll-owner"), ("poll-peer", "poll-peer")] {
+            ctx.db.exec("INSERT INTO agents(id,name,model_ref,created_at,last_active_at) VALUES(?1,?2,'p/m',0,0)", [id, name]).unwrap();
+        }
+        let id = crate::terminals::open(&ctx, crate::terminals::Opts {
+            title: "poll-test".into(),
+            command: Some(vec!["/bin/bash".into(), "-c".into(), "sleep 0.3; echo poll-complete; exit 7".into()]),
+            cwd: ctx.data_dir.clone(), env: vec![], agent_id: Some("poll-owner".into()),
+        }).unwrap();
+        let first = call_tool(&ctx, "poll-owner", "shell_read", json!({"id":id})).await.unwrap();
+        assert_eq!(first["running"], true);
+        assert_eq!(first["finished"], false);
+        assert!(call_tool(&ctx, "poll-peer", "shell_read", json!({"id":id})).await.unwrap_err().contains("someone else"));
+        let mut completed = None;
+        for _ in 0..200 {
+            let result = call_tool(&ctx, "poll-owner", "shell_read", json!({"id":id})).await.unwrap();
+            if result["finished"] == true { completed = Some(result); break; }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let result = completed.expect("background command did not expose completion");
+        assert_eq!(result["running"], false);
+        assert_eq!(result["exit_code"], 7);
+        assert!(result["output"].as_str().unwrap().contains("poll-complete"));
+        assert!(!crate::terminals::alive(&ctx, &id));
     }
 
     #[test]
