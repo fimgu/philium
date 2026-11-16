@@ -285,6 +285,11 @@ async fn provision(ctx: &Arc<Ctx>, id: &str, fresh: bool, brief: Option<String>)
             .db
             .query("SELECT path FROM worktrees WHERE agent_id=?1 AND state='active' LIMIT 1", [id])?;
         worktree = match existing.first().and_then(|r| r["path"].as_str()) {
+            Some(p) if !Path::new(p).is_dir() => {
+                return Err(format!(
+                    "The agent's worktree folder {p} is missing (deleted or moved). Remove the agent, or restore the folder and press Resume."
+                ));
+            }
             Some(p) => Some(PathBuf::from(p)),
             None => {
                 let (c, repo, n, aid) = (ctx.clone(), repo.to_string(), name.clone(), id.to_string());

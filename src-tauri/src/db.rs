@@ -96,6 +96,10 @@ pub fn new_id() -> String {
 impl Db {
     pub fn open(path: &Path) -> Result<Db, String> {
         let c = Connection::open(path).map_err(|e| e.to_string())?;
+        // Other processes (previews, sqlite3 CLI, a second instance) may hold
+        // the write lock briefly: wait instead of failing with SQLITE_BUSY.
+        c.busy_timeout(std::time::Duration::from_secs(5)).map_err(|e| e.to_string())?;
+        c.execute_batch("PRAGMA synchronous=NORMAL;").map_err(|e| e.to_string())?;
         c.execute_batch(SCHEMA).map_err(|e| e.to_string())?;
         Ok(Db(Mutex::new(c)))
     }
@@ -159,5 +163,47 @@ mod tests {
         db.exec("INSERT INTO repos(id,name,path,added_at) VALUES('r','n','/p',1)", []).unwrap();
         let rows = db.query("SELECT * FROM repos", []).unwrap();
         assert_eq!(rows[0]["name"], "n");
+        assert_eq!(db.kv_get("missing"), None);
+    }
+
+    #[test]
+    fn reopen_is_idempotent_and_concurrent_writers_wait() {
+        let dir = std::env::temp_dir().join(format!("philium-db-{}", new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        let a = std::sync::Arc::new(Db::open(&path).unwrap());
+        let b = std::sync::Arc::new(Db::open(&path).unwrap()); // schema runs twice: fine
+        let mut hs = vec![];
+        for (i, db) in [a.clone(), b.clone(), a.clone(), b.clone()].into_iter().enumerate() {
+            hs.push(std::thread::spawn(move || {
+                for j in 0..50 {
+                    db.with(|c| {
+                        c.execute_batch("BEGIN IMMEDIATE")?;
+                        c.execute("INSERT INTO kv(k,v) VALUES(?1,'x')", [format!("{i}.{j}")])?;
+                        c.execute_batch("COMMIT")
+                    })
+                    .unwrap();
+                }
+            }));
+        }
+        for h in hs {
+            h.join().unwrap();
+        }
+        let n = a.query("SELECT COUNT(*) AS n FROM kv", []).unwrap()[0]["n"].as_i64();
+        assert_eq!(n, Some(200));
+        drop((a, b));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn poisoned_connection_lock_still_serves() {
+        let db = std::sync::Arc::new(Db::memory());
+        let d2 = db.clone();
+        let _ = std::thread::spawn(move || {
+            let _ = d2.with(|_| -> rusqlite::Result<()> { panic!("boom") });
+        })
+        .join();
+        db.kv_set("a", "1").unwrap();
+        assert_eq!(db.kv_get("a").as_deref(), Some("1"));
     }
 }

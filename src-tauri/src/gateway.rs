@@ -134,8 +134,11 @@ impl Gateway {
             token,
             client: reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(20))
+                // Per-read idle timeout: a stalled upstream stream ends with an
+                // error instead of hanging the agent's turn forever.
+                .read_timeout(std::time::Duration::from_secs(300))
                 .build()
-                .expect("http client"),
+                .unwrap_or_default(),
             routes: RwLock::new(HashMap::new()),
             agent_tokens: RwLock::new(HashMap::new()),
             agent_providers: RwLock::new(HashMap::new()),
@@ -682,6 +685,97 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         panic!("activity never finished");
+    }
+
+    /// Raw TCP upstream: answers every connection with `reply`, then either
+    /// closes (reset mid-stream) or holds the socket open (`hold`).
+    async fn raw_upstream(reply: &'static str, hold: bool) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 8192];
+                    let _ = s.read(&mut buf).await;
+                    let _ = s.write_all(reply.as_bytes()).await;
+                    if hold {
+                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    }
+                });
+            }
+        });
+        format!("http://{addr}/v1")
+    }
+
+    fn post(url: &str) -> reqwest::RequestBuilder {
+        reqwest::Client::new().post(format!("{url}/chat/completions")).bearer_auth("t".repeat(48)).json(&json!({"model":"m","stream":true,"messages":[]}))
+    }
+
+    #[tokio::test]
+    async fn rate_limit_and_5xx_pass_through_with_retry_after() {
+        for (code, reply) in [
+            (429, "HTTP/1.1 429 Too Many Requests\r\nretry-after: 7\r\ncontent-type: application/json\r\ncontent-length: 27\r\n\r\n{\"error\":\"slow down pls\"}"),
+            (503, "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 4\r\n\r\nbusy"),
+        ] {
+            let base = raw_upstream(reply, false).await;
+            let (gw, url) = gateway(&base, Kind::OpenaiChat, GuardMode::Redact).await;
+            let r = post(&url).send().await.unwrap();
+            assert_eq!(r.status().as_u16(), code);
+            if code == 429 {
+                assert_eq!(r.headers()["retry-after"], "7");
+            }
+            let _ = r.text().await;
+            let a = settle(&gw).await;
+            assert_eq!((a.state, a.status), ("error", Some(code)));
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_unreachable_is_502() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}/v1", l.local_addr().unwrap());
+        drop(l);
+        let (gw, url) = gateway(&base, Kind::OpenaiChat, GuardMode::Redact).await;
+        let r = post(&url).send().await.unwrap();
+        assert_eq!(r.status(), 502);
+        assert!(r.text().await.unwrap().contains("upstream unreachable"));
+        assert_eq!(gw.recent().pop().unwrap().state, "error");
+    }
+
+    #[tokio::test]
+    async fn connection_reset_mid_stream_is_an_error_not_a_hang() {
+        // Promise 1000 bytes, send a few, close.
+        let base = raw_upstream("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 1000\r\n\r\ndata: {\"choices\":[]}\n\n", false).await;
+        let (gw, url) = gateway(&base, Kind::OpenaiChat, GuardMode::Redact).await;
+        let r = post(&url).send().await.unwrap();
+        assert_eq!(r.status(), 200);
+        assert!(r.text().await.is_err(), "client sees the broken stream");
+        let a = settle(&gw).await;
+        assert_eq!(a.state, "error");
+        assert!(a.error.unwrap_or_default().contains("upstream stream error"));
+    }
+
+    #[tokio::test]
+    async fn malformed_anthropic_sse_does_not_panic() {
+        let base = raw_upstream("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\ndata: {not json\n\ndata: {\"type\":\"content_block_delta\",\"index\":99}\n\ndata: \u{0}\u{ff}\n\nevent: x\n\n", false).await;
+        let (gw, url) = gateway(&base, Kind::Anthropic, GuardMode::Redact).await;
+        let r = post(&url).send().await.unwrap();
+        assert_eq!(r.status(), 200);
+        let _ = r.text().await;
+        assert_ne!(settle(&gw).await.state, "pending");
+    }
+
+    #[tokio::test]
+    async fn client_disconnect_mid_stream_finalizes_activity() {
+        let base = raw_upstream("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n10\r\ndata: {\"a\":1}\n\n\r\n", true).await;
+        let (gw, url) = gateway(&base, Kind::OpenaiChat, GuardMode::Redact).await;
+        let mut r = post(&url).send().await.unwrap();
+        assert!(r.chunk().await.unwrap().is_some());
+        drop(r); // client goes away while upstream is still open
+        let a = settle(&gw).await;
+        assert_ne!(a.state, "pending");
+        assert!(a.duration_ms.is_some());
     }
 
     #[tokio::test]

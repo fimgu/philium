@@ -68,8 +68,7 @@ fn push_msg(out: &mut Vec<Value>, role: &str, blocks: Vec<Value>) {
         return;
     }
     if let Some(last) = out.last_mut() {
-        if last["role"] == role {
-            let arr = last["content"].as_array_mut().unwrap();
+        if let (true, Some(arr)) = (last["role"] == role, last["content"].as_array_mut()) {
             arr.extend(blocks);
             if role == "user" {
                 // tool_result blocks must lead the user turn.

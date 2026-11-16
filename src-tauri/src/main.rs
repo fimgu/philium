@@ -99,11 +99,26 @@ async fn hal(app: State<'_, App>, method: String, path: String, body: Option<Val
 /// One entry point for every feature module: `rpc("terminals.open", {...})`.
 #[tauri::command]
 async fn rpc(app: State<'_, App>, method: String, args: Option<Value>) -> Result<Value, String> {
+    use futures_util::FutureExt;
+    // A bug in one handler must not take the IPC call (or app) down with it:
+    // turn panics into an error the UI can show.
+    let label = method.clone();
+    match std::panic::AssertUnwindSafe(rpc_inner(&app, method, args)).catch_unwind().await {
+        Ok(r) => r,
+        Err(p) => {
+            let msg = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_default();
+            app.ctx.log_event("rpc_panic", None, &json!({ "method": label, "panic": msg }));
+            Err(format!("Internal error in {label}: {msg}"))
+        }
+    }
+}
+
+async fn rpc_inner(app: &App, method: String, args: Option<Value>) -> Result<Value, String> {
     let ctx = app.ctx.clone();
     let args = args.unwrap_or(Value::Null);
     let (module, m) = method.split_once('.').ok_or("method must be module.name")?;
     match module {
-        "app" => app_call(&app, m, args).await,
+        "app" => app_call(app, m, args).await,
         "activity" => match m {
             "list" => Ok(json!(ctx.gateway.recent())),
             "detail" => Ok(json!(ctx.gateway.detail(args["id"].as_u64().ok_or("id")?))),
@@ -312,6 +327,26 @@ fn main() {
 
             refresh_desk(&ctx);
             app.manage(App { ctx: ctx.clone() });
+
+            // Desk HAL watcher: surface a crash and restart it with backoff.
+            let c4 = ctx.clone();
+            tauri::async_runtime::spawn(async move {
+                let mut backoff = 2u64;
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+                    let dead = c4.desk().and_then(|h| h.exit_reason());
+                    let Some(reason) = dead else {
+                        backoff = 2;
+                        continue;
+                    };
+                    c4.log_event("desk_hal_exited", None, &json!({ "reason": reason }));
+                    *c4.desk.wr() = Err(format!("{reason}. Restarting."));
+                    c4.emit("app:desk", json!({ "error": reason }));
+                    let c = c4.clone();
+                    let _ = tauri::async_runtime::spawn_blocking(move || refresh_desk(&c)).await;
+                    backoff = (backoff * 2).min(60);
+                }
+            });
 
             // Provider changes -> restart desk HAL if its model list changed.
             let mut changes = ctx.changes.subscribe();
