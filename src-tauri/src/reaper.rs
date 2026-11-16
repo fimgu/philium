@@ -25,13 +25,22 @@ pub fn init(ctx: &Arc<Ctx>) -> Result<(), String> {
     let weak = Arc::downgrade(ctx);
     std::thread::Builder::new()
         .name("philium-reaper".into())
-        .spawn(move || loop {
-            let Some(ctx) = weak.upgrade() else { break };
-            if let Err(e) = sweep(&ctx) {
-                ctx.log_event("reaper:error", None, &json!({"error":e}));
+        .spawn(move || {
+            let mut tick = 0u64;
+            loop {
+                let Some(ctx) = weak.upgrade() else { break };
+                if tick % 3 == 0 {
+                    if let Err(e) = reconcile(&ctx) {
+                        ctx.log_event("reaper:reconcile_error", None, &json!({"error":e}));
+                    }
+                }
+                if let Err(e) = sweep(&ctx) {
+                    ctx.log_event("reaper:error", None, &json!({"error":e}));
+                }
+                drop(ctx);
+                tick = tick.wrapping_add(1);
+                std::thread::sleep(Duration::from_secs(300));
             }
-            drop(ctx);
-            std::thread::sleep(Duration::from_secs(300));
         })
         .map_err(|e| e.to_string())?;
     Ok(())
@@ -143,7 +152,18 @@ fn policy(
     if work && matches!(state, Some("failed" | "stopped")) && age < failed_hours * HOUR {
         return Decision::Keep;
     }
-    let terminal = matches!(state, Some("done" | "failed" | "stopped" | "tearing_down"));
+    let terminal = matches!(
+        state,
+        Some(
+            "done"
+                | "failed"
+                | "stopped"
+                | "tearing_down"
+                | "review"
+                | "finishing"
+                | "waiting_review"
+        )
+    );
     let due = explicit || state.is_none() || terminal || idle >= idle_hours * HOUR;
     if !due {
         return Decision::Keep;
@@ -181,7 +201,7 @@ fn strval<'a>(v: &'a Value, key: &str) -> Result<&'a str, String> {
         .ok_or_else(|| format!("Missing resource {key}"))
 }
 fn rows(ctx: &Arc<Ctx>, agent: Option<&str>, state: Option<&str>) -> Result<Vec<Value>, String> {
-    ctx.db.query("SELECT r.*,a.name AS agent_name,a.state AS agent_state,a.last_active_at FROM resources r LEFT JOIN agents a ON a.id=r.agent_id WHERE (?1 IS NULL OR r.agent_id=?1) AND (?2 IS NULL OR r.state=?2) ORDER BY CASE r.kind WHEN 'process' THEN 0 WHEN 'terminal' THEN 0 WHEN 'port' THEN 9 ELSE 1 END,r.created_at",params![agent,state])
+    ctx.db.query("SELECT r.*,a.name AS agent_name,a.state AS agent_state,a.last_active_at FROM resources r LEFT JOIN agents a ON a.id=r.agent_id WHERE (?1 IS NULL OR r.agent_id=?1) AND (?2 IS NULL OR r.state=?2) ORDER BY CASE r.kind WHEN 'process' THEN 0 WHEN 'terminal' THEN 0 WHEN 'port' THEN 9 WHEN 'colima' THEN 10 ELSE 1 END,r.created_at",params![agent,state])
 }
 fn unsaved(ctx: &Arc<Ctx>, r: &Value) -> bool {
     if r["kind"] != "worktree" {
@@ -226,6 +246,15 @@ fn safe_child(path: &Path, root: &Path) -> Result<(), String> {
     }
     Ok(())
 }
+fn group_alive(group: i64) -> Result<bool, String> {
+    Ok(command("ps", &["-axo", "pgid=,stat="])?
+        .lines()
+        .any(|line| {
+            let mut cols = line.split_whitespace();
+            cols.next().and_then(|s| s.parse::<i64>().ok()) == Some(group)
+                && !cols.next().unwrap_or("Z").starts_with('Z')
+        }))
+}
 fn stop_process(r: &Value) -> Result<(), String> {
     let m = meta(r);
     let pid = m["pid"]
@@ -236,6 +265,11 @@ fn stop_process(r: &Value) -> Result<(), String> {
         return Err("Refusing unsafe PID".into());
     }
     let Some(current) = identity(pid) else {
+        if let Some(group) = m["pgid"].as_i64() {
+            if group_alive(group)? {
+                return Err("Process leader is gone but its group is still live. Ownership must be recovered before signalling".into());
+            }
+        }
         return Ok(());
     };
     let expected = m["process_identity"]
@@ -258,12 +292,22 @@ fn stop_process(r: &Value) -> Result<(), String> {
     };
     command("kill", &["-TERM", "--", &target])?;
     for _ in 0..50 {
-        if identity(pid).as_deref() != Some(expected) {
+        let live = if let Some(group) = m["pgid"].as_i64() {
+            group_alive(group)?
+        } else {
+            identity(pid).as_deref() == Some(expected)
+        };
+        if !live {
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    if identity(pid).as_deref() == Some(expected) {
+    let live = if let Some(group) = m["pgid"].as_i64() {
+        group_alive(group)?
+    } else {
+        identity(pid).as_deref() == Some(expected)
+    };
+    if live {
         command("kill", &["-KILL", "--", &target])?;
     }
     Ok(())
@@ -324,7 +368,10 @@ fn destroy(ctx: &Arc<Ctx>, r: &Value, force: bool) -> Result<(), String> {
             if handle.starts_with('-') {
                 return Err("Invalid container handle".into());
             }
-            let owner = strval(r, "agent_id")?;
+            let owner = r["agent_id"]
+                .as_str()
+                .or(m["owner_label"].as_str())
+                .ok_or("Container owner missing")?;
             let inspected = command(
                 "docker",
                 &[
@@ -334,15 +381,26 @@ fn destroy(ctx: &Arc<Ctx>, r: &Value, force: bool) -> Result<(), String> {
                     handle,
                 ],
             )?;
-            let name = r["agent_name"].as_str().unwrap_or(owner);
+            let name = r["agent_name"]
+                .as_str()
+                .or(m["agent_name"].as_str())
+                .unwrap_or(owner);
             if inspected != owner && inspected != name {
                 return Err("Container ownership label does not match ledger".into());
             }
             command("docker", &["rm", "-f", handle])?;
         }
         "kind_cluster" => {
+            if m["orphan"] == true
+                && m["observed_handle"] == handle
+                && handle.starts_with("philium-")
+            {
+                command("kind", &["delete", "cluster", "--name", handle])?;
+                return Ok(());
+            }
             let owner = r["agent_name"]
                 .as_str()
+                .or(m["agent_name"].as_str())
                 .or(r["agent_id"].as_str())
                 .ok_or("Missing cluster owner")?;
             if !handle.starts_with(&format!("philium-{owner}-")) {
@@ -399,6 +457,7 @@ fn process_rows(
     explicit: bool,
     force: bool,
 ) -> Result<Value, String> {
+    schema(ctx)?;
     let auto = ctx.setting("teardown.mode", "ask") == "auto";
     let idle_hours = setting_hours(ctx, "teardown.idle_hours", 4);
     let failed_hours = setting_hours(ctx, "teardown.failed_hours", 24);
@@ -407,6 +466,9 @@ fn process_rows(
     let mut kept = Vec::new();
     let mut errors = Vec::new();
     for r in resources {
+        if !explicit && !ctx.db.query("SELECT id FROM teardown_proposals WHERE resource_id=?1 AND state='dismissed' AND created_at>?2",params![strval(&r,"id")?,now()-24*HOUR])?.is_empty() {
+            kept.push(r["id"].clone()); continue;
+        }
         let m = meta(&r);
         // A manually created workspace has no agent by design, not a missing owner.
         let state = r["agent_state"].as_str().or_else(|| {
@@ -418,7 +480,9 @@ fn process_rows(
         });
         let last = r["last_active_at"]
             .as_i64()
-            .unwrap_or(r["created_at"].as_i64().unwrap_or(now()));
+            .unwrap_or(0)
+            .max(r["created_at"].as_i64().unwrap_or(now()))
+            .max(m["last_active_at"].as_i64().unwrap_or(0));
         let age = now() - last;
         let dirty = unsaved(ctx, &r);
         let colima = m["started_by_philium"] == true
@@ -458,7 +522,9 @@ fn process_rows(
             },
         }
     }
-    Ok(json!({"needs_confirmation":!proposals.is_empty() || !kept.is_empty() || !errors.is_empty(),"removed":removed,"proposals":proposals,"kept":kept,"errors":errors}))
+    Ok(
+        json!({"needs_confirmation":!proposals.is_empty() || !kept.is_empty() || !errors.is_empty(),"removed":removed,"proposals":proposals,"kept":kept,"errors":errors}),
+    )
 }
 pub fn teardown_agent(ctx: &Arc<Ctx>, agent_id: &str, force: bool) -> Result<Value, String> {
     let _q = REAP_QUEUE.lock().map_err(|e| e.to_string())?;
@@ -515,6 +581,83 @@ fn sweep(ctx: &Arc<Ctx>) -> Result<Value, String> {
         false,
         false,
     )
+}
+fn reconcile(ctx: &Arc<Ctx>) -> Result<Value, String> {
+    let _q = REAP_QUEUE.lock().map_err(|e| e.to_string())?;
+    let scan = orphans(ctx)?;
+    let mut recovered = Vec::new();
+    for orphan in scan["resources"].as_array().ok_or("Invalid orphan scan")? {
+        let kind = strval(orphan, "kind")?;
+        let handle = strval(orphan, "handle")?;
+        // Recheck after acquiring the reaper queue. Creators can register while scanning.
+        if !ctx
+            .db
+            .query(
+                "SELECT id FROM resources WHERE kind=?1 AND handle=?2 AND state!='released'",
+                params![kind, handle],
+            )?
+            .is_empty()
+        {
+            continue;
+        }
+        let mut metadata = json!({"orphan":true,"observed_handle":handle});
+        let mut agent = None;
+        if kind == "worktree" {
+            match crate::workspace::recover_worktree(ctx, Path::new(handle)) {
+                Ok(id) => {
+                    metadata["worktree_id"] = json!(id);
+                    let w = ctx
+                        .db
+                        .query("SELECT agent_id FROM worktrees WHERE id=?1", [&id])?;
+                    agent = w
+                        .first()
+                        .and_then(|r| r["agent_id"].as_str())
+                        .map(str::to_owned);
+                }
+                Err(e) => {
+                    ctx.log_event(
+                        "reaper:orphan_unresolved",
+                        None,
+                        &json!({"handle":handle,"error":e}),
+                    );
+                    continue;
+                }
+            }
+        } else if kind == "container" {
+            let label = orphan["agent"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .ok_or("Orphan has no ownership label")?;
+            metadata["owner_label"] = json!(label);
+            metadata["agent_name"] = json!(label);
+            agent = ctx
+                .db
+                .query("SELECT id FROM agents WHERE id=?1 OR name=?1", [label])?
+                .first()
+                .and_then(|r| r["id"].as_str())
+                .map(str::to_owned);
+        } else if kind == "kind_cluster" {
+            agent = ctx
+                .db
+                .query("SELECT id,name FROM agents ORDER BY length(name) DESC", [])?
+                .iter()
+                .find(|r| {
+                    r["name"]
+                        .as_str()
+                        .map(|n| handle.starts_with(&format!("philium-{n}-")))
+                        .unwrap_or(false)
+                })
+                .and_then(|r| r["id"].as_str())
+                .map(str::to_owned);
+        }
+        recovered.push(register(ctx, agent.as_deref(), kind, handle, metadata));
+    }
+    ctx.log_event(
+        "reaper:reconcile",
+        None,
+        &json!({"recovered":recovered,"errors":scan["errors"]}),
+    );
+    Ok(json!({"recovered":recovered,"errors":scan["errors"]}))
 }
 fn orphans(ctx: &Arc<Ctx>) -> Result<Value, String> {
     let ledger = rows(ctx, None, None)?;
@@ -620,7 +763,7 @@ fn dispatch(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, String> 
                 match remove(ctx,&r,true){Ok(v)=>{ctx.db.exec("UPDATE teardown_proposals SET state='approved' WHERE id=?1",[id])?;results.push(v)},Err(e)=>results.push(json!({"id":id,"error":e}))}
             }ctx.emit("reaper:proposals",json!({"changed":true}));Ok(json!(results))
         }
-        "sweep_now"=>sweep(ctx),"orphans"=>orphans(ctx),_=>Err(format!("reaper.{method}: unknown method"))
+        "sweep_now"=>{ let scan=reconcile(ctx)?; let mut result=sweep(ctx)?; result["reconciliation"]=scan; Ok(result) },"orphans"=>orphans(ctx),_=>Err(format!("reaper.{method}: unknown method"))
     }
 }
 #[cfg(test)]
@@ -789,6 +932,112 @@ mod tests {
         assert!(remove(&ctx, &r, true).is_err());
         assert!(p.join("precious").exists());
         assert_eq!(rows(&ctx, None, Some("leaked")).unwrap()[0]["id"], id);
+        std::fs::remove_dir_all(ctx.root.parent().unwrap()).unwrap();
+    }
+    #[test]
+    fn dismissed_proposals_do_not_reappear_on_next_sweep() {
+        let ctx = Ctx::test();
+        schema(&ctx).unwrap();
+        let id = register(&ctx, None, "port", "42000", json!({"orphan":true}));
+        let plan = sweep(&ctx).unwrap();
+        let pid = plan["proposals"][0]["id"].as_str().unwrap();
+        dispatch(&ctx, "dismiss", json!({"ids":[pid]})).unwrap();
+        let next = sweep(&ctx).unwrap();
+        assert!(next["proposals"].as_array().unwrap().is_empty());
+        assert_eq!(next["kept"][0], id);
+        std::fs::remove_dir_all(ctx.root.parent().unwrap()).unwrap();
+    }
+    #[test]
+    fn manual_resources_are_not_immediately_orphaned() {
+        let ctx = Ctx::test();
+        schema(&ctx).unwrap();
+        register(&ctx, None, "port", "42001", json!({}));
+        let plan = sweep(&ctx).unwrap();
+        assert_eq!(plan["kept"].as_array().unwrap().len(), 1);
+        assert!(plan["proposals"].as_array().unwrap().is_empty());
+        std::fs::remove_dir_all(ctx.root.parent().unwrap()).unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_stops_owned_group_but_preserves_peer_and_containers() {
+        use std::os::unix::process::CommandExt;
+        let ctx = Ctx::test();
+        schema(&ctx).unwrap();
+        let mut owned = Command::new("sleep")
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut peer = Command::new("sleep")
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = owned.id();
+        register(
+            &ctx,
+            Some("gone"),
+            "process",
+            &pid.to_string(),
+            json!({"pid":pid,"pgid":pid}),
+        );
+        let container = register(&ctx, None, "container", "never-contact-docker", json!({}));
+        let result = shutdown(&ctx).unwrap();
+        // Always clean up test-owned children, even if the assertion below fails.
+        let _ = owned.kill();
+        let owned_result = owned.wait().unwrap();
+        let peer_live = peer.try_wait().unwrap().is_none();
+        let _ = peer.kill();
+        let _ = peer.wait();
+        assert!(result["errors"].as_array().unwrap().is_empty(), "{result}");
+        assert!(!owned_result.success());
+        assert!(peer_live);
+        assert_eq!(rows(&ctx, None, Some("live")).unwrap()[0]["id"], container);
+        std::fs::remove_dir_all(ctx.root.parent().unwrap()).unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn process_identity_guard_and_term_escalation() {
+        use std::{
+            io::{BufRead, BufReader},
+            os::unix::process::{CommandExt, ExitStatusExt},
+        };
+        let ctx = Ctx::test();
+        schema(&ctx).unwrap();
+        let mut child = Command::new("sh")
+            .args(["-c", "trap '' TERM; echo ready; while :; do sleep 1; done"])
+            .stdout(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut ready = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready.trim(), "ready");
+        let pid = child.id();
+        let id = register(
+            &ctx,
+            None,
+            "process",
+            &pid.to_string(),
+            json!({"pid":pid,"pgid":pid}),
+        );
+        let row = rows(&ctx, None, None).unwrap().remove(0);
+        let mut stale = row.clone();
+        let mut bad = meta(&stale);
+        bad["process_identity"] = json!("not this process");
+        stale["meta"] = json!(bad.to_string());
+        assert!(stop_process(&stale).is_err());
+        assert!(child.try_wait().unwrap().is_none());
+        let started = std::time::Instant::now();
+        let result = stop_process(&row);
+        let _ = child.kill();
+        let status = child.wait().unwrap();
+        assert!(result.is_ok(), "{result:?}");
+        assert!(started.elapsed() >= Duration::from_secs(5));
+        assert_eq!(status.signal(), Some(9));
+        release(&ctx, &id);
         std::fs::remove_dir_all(ctx.root.parent().unwrap()).unwrap();
     }
 }
