@@ -31,6 +31,7 @@ export default function Home() {
   const [events, ev] = createResource(() => rpc("app.events", { limit: 30 }).catch(() => []));
   const [disk] = createResource(() => rpc("app.disk").catch(() => null));
   const [providers] = createResource(() => rpc("providers.list").catch(() => []));
+  const [clashes, cl] = createResource(() => rpc("codeindex.clashes", {}).then((r) => r?.clashes ?? []).catch(() => []));
   const [spawn, setSpawn] = createSignal(false);
 
   let t;
@@ -39,6 +40,7 @@ export default function Home() {
   useEvent("agents:changed", () => soon(() => { ag.refetch(); ev.refetch(); }));
   useEvent("board:changed", () => tk.refetch());
   useEvent("event", () => soon(() => { ev.refetch(); st.refetch(); }));
+  useEvent("codeindex:clashes", () => cl.refetch());
   useEvent("reaper:proposals", () => pr.refetch());
   useEvent("reaper:changed", () => pr.refetch());
 
@@ -53,7 +55,7 @@ export default function Home() {
   const guardHits = createMemo(() => (events() ?? []).filter((e) => /guard|blocked|denied/.test(e.kind)));
   const totals = () => stats()?.totals ?? {};
   const diskTotal = () => Object.values(disk() ?? {}).reduce((s, v) => s + (v.bytes ?? 0), 0);
-  const attention = () => waiting().length + (proposals() ?? []).length + (leaked() ?? []).length + failed().length;
+  const attention = () => waiting().length + (proposals() ?? []).length + (leaked() ?? []).length + failed().length + (clashes() ?? []).length;
 
   return (
     <Page title="Home" actions={<Button variant="primary" onClick={() => setSpawn(true)}><Icon name="plus" size={12} /> New agent</Button>}>
@@ -92,6 +94,15 @@ export default function Home() {
                   <Dot state="bad" /><AgentChip name={a.name} />
                   <span class="grow small ellipsis">failed{a.error ? `: ${a.error}` : ""}</span>
                   <Button size="sm">Open</Button>
+                </div>
+              )}
+            </For>
+            <For each={clashes()}>
+              {(c) => (
+                <div class="list-item" onClick={() => go("code", c.repo_id ? { repo_id: c.repo_id } : {})}>
+                  <Dot state="warn" /><AgentChip name={c.a} /><span class="small">and</span><AgentChip name={c.b} />
+                  <span class="grow small ellipsis">both change {(c.detail ?? [])[0] ?? "the same code"} ({String(c.severity).replace(/_/g, " ")})</span>
+                  <Button size="sm">See code</Button>
                 </div>
               )}
             </For>
