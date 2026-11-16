@@ -482,23 +482,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shell_read_reports_background_completion_and_isolates_peers() {
+    async fn shell_read_over_http_reports_completion_and_isolates_peers() {
         let ctx = Ctx::test();
         for (id, name) in [("poll-owner", "poll-owner"), ("poll-peer", "poll-peer")] {
             ctx.db.exec("INSERT INTO agents(id,name,model_ref,created_at,last_active_at) VALUES(?1,?2,'p/m',0,0)", [id, name]).unwrap();
         }
+        // Use the production router, authentication and JSON-RPC serialization
+        // over a real TCP listener, not a mocked tool result or dispatcher call.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let app = router(ctx.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(3)).build().unwrap();
+        let owner = issue_token("poll-owner");
+        let peer = issue_token("poll-peer");
+        let init = json!({"jsonrpc":"2.0", "id":1, "method":"initialize", "params":{"protocolVersion":"2025-03-26"}});
+        let response = client.post(&url).bearer_auth(&owner).json(&init).send().await.unwrap();
+        assert!(response.status().is_success());
+        assert_eq!(response.json::<Value>().await.unwrap()["result"]["serverInfo"]["name"], "philium");
         let id = crate::terminals::open(&ctx, crate::terminals::Opts {
             title: "poll-test".into(),
             command: Some(vec!["/bin/bash".into(), "-c".into(), "sleep 0.3; echo poll-complete; exit 7".into()]),
             cwd: ctx.data_dir.clone(), env: vec![], agent_id: Some("poll-owner".into()),
         }).unwrap();
-        let first = call_tool(&ctx, "poll-owner", "shell_read", json!({"id":id})).await.unwrap();
+        let request = json!({"jsonrpc":"2.0", "id":2, "method":"tools/call", "params":{"name":"shell_read", "arguments":{"id":id}}});
+        let read = |token: String| {
+            let client = client.clone();
+            let url = url.clone();
+            let request = request.clone();
+            async move {
+                let response = client.post(url).bearer_auth(token).json(&request).send().await.unwrap();
+                assert!(response.status().is_success());
+                response.json::<Value>().await.unwrap()
+            }
+        };
+        let decode = |response: Value| -> Value {
+            assert_eq!(response["result"]["isError"], false);
+            serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+        };
+        let first = decode(read(owner.clone()).await);
         assert_eq!(first["running"], true);
         assert_eq!(first["finished"], false);
-        assert!(call_tool(&ctx, "poll-peer", "shell_read", json!({"id":id})).await.unwrap_err().contains("someone else"));
+        let denied = read(peer).await;
+        assert_eq!(denied["result"]["isError"], true);
+        assert!(denied["result"]["content"][0]["text"].as_str().unwrap().contains("someone else"));
+        assert_eq!(client.post(&url).json(&request).send().await.unwrap().status(), reqwest::StatusCode::UNAUTHORIZED);
+        assert_eq!(client.post(&url).bearer_auth(&owner).header("host", "untrusted.example").json(&request).send().await.unwrap().status(), reqwest::StatusCode::FORBIDDEN);
         let mut completed = None;
         for _ in 0..200 {
-            let result = call_tool(&ctx, "poll-owner", "shell_read", json!({"id":id})).await.unwrap();
+            let result = decode(read(owner.clone()).await);
             if result["finished"] == true { completed = Some(result); break; }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
@@ -507,6 +539,14 @@ mod tests {
         assert_eq!(result["exit_code"], 7);
         assert!(result["output"].as_str().unwrap().contains("poll-complete"));
         assert!(!crate::terminals::alive(&ctx, &id));
+        // A second query retains the terminal's final result.
+        let second = decode(read(owner).await);
+        assert_eq!(second["finished"], true);
+        assert_eq!(second["exit_code"], 7);
+        revoke("poll-owner");
+        revoke("poll-peer");
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
     }
 
     #[test]

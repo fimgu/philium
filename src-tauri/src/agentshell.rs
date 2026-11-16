@@ -333,7 +333,11 @@ mod tests {
             assert_eq!(visible.expect("terminal lookup blocked behind a running command"), Some(id.clone()));
         }
         assert!(running.await.unwrap().unwrap().to_string().contains("metadata-ok"));
-        let partial = run(&ctx, &agent, MAIN, "sleep 0.5; echo long-job-done", None, Duration::from_millis(100)).await.unwrap();
+        let started = Instant::now();
+        let partial = run(&ctx, &agent, MAIN, "sleep 31; echo long-job-done", None, Duration::from_secs(900)).await.unwrap();
+        let elapsed = started.elapsed();
+        assert!(elapsed >= Duration::from_secs(29) && elapsed < Duration::from_secs(31), "foreground response took {elapsed:?}");
+        println!("requested_wait=900s actual_response={elapsed:?} running={} finished={}", partial["running"], partial["finished"]);
         assert_eq!(partial["finished"], false);
         assert_eq!(partial["running"], true);
         assert_eq!(partial["terminal"], id);
@@ -348,6 +352,7 @@ mod tests {
         let status = command_status(&ctx, &agent, &id).unwrap();
         assert_eq!(status["finished"], true);
         assert_eq!(status["exit_code"], 0);
+        println!("long command completed after partial return: exit_code={} output={}", status["exit_code"], text(&out));
         let next = run(&ctx, &agent, MAIN, "echo follow-up-ok", None, Duration::from_secs(5)).await.unwrap();
         assert_eq!(next["finished"], true);
         assert!(next["output"].as_str().unwrap().contains("follow-up-ok"));
