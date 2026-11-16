@@ -4,7 +4,7 @@ import { For, Show, createSignal, createResource, createMemo, createEffect, on, 
 import { NotFound, Page, Button, Select, toast } from "../ui/kit.jsx";
 import { Icon } from "../ui/icons.jsx";
 import { Conversation, Composer, speedEffort, effortSpeed } from "../ui/conversation.jsx";
-import { rpc, hal, fmt } from "../lib/rpc.js";
+import { rpc, hal, fmt, sendError } from "../lib/rpc.js";
 import { go, params } from "../lib/nav.js";
 import "../styles/agents.css";
 
@@ -40,8 +40,10 @@ export default function Chat() {
       if (evs?.length) {
         after = evs.at(-1).seq;
         setEvents((x) => x.concat(evs));
-        if (evs.some((e) => TERMINAL.has(e.type))) setBusy(false);
-        if (evs.some((e) => e.type === "turn.started")) setBusy(true);
+        for (const event of evs) {
+          if (event.type === "turn.started") setBusy(true);
+          else if (TERMINAL.has(event.type)) setBusy(false);
+        }
       }
     } catch { /* desk restarting */ }
     if (busy()) timer = setTimeout(() => poll(id), 400);
@@ -64,17 +66,19 @@ export default function Chat() {
     let id = selected();
     if (!id) {
       try {
-        const s = await rpc("app.chat_create", { model: chosen() || null, title: text.slice(0, 60) });
+        const s = await rpc("app.chat_create", { model: chosen() || null, title: text.slice(0, 60) }, { action: true });
         id = s.id; await refetch(); go("chat", { session: id });
-      } catch (e) { return toast(String(e), "danger"); }
+      } catch (e) { toast(String(e), "danger"); return false; }
     } else if (model() && model() !== current()?.model) {
-      await hal("PATCH", `/sessions/${id}`, { model: model() }).catch((e) => toast(String(e), "danger"));
+      try { await hal("PATCH", `/sessions/${id}`, { model: model() }); }
+      catch (e) { toast(String(e), "danger"); return false; }
     }
     setBusy(true);
     try {
       await hal("POST", `/sessions/${id}/messages`, { text, images });
-    } catch (e) { setBusy(false); return toast(String(e), "danger"); }
+    } catch (e) { setBusy(false); toast(sendError(e), "danger"); return false; }
     poll(id);
+    return true;
   };
 
   const setSpeed = async (v) => {
@@ -122,7 +126,7 @@ export default function Chat() {
             <NotFound title="Chat not found" action={<Button onClick={() => go("chat", {})}>Open latest chat</Button>}>This chat was deleted.</NotFound>
           </Show>
           <Conversation hidden={!!(params().session && sessions.state === "ready" && !current())} events={events()} emptyText="Ask anything. This chat has no access to files, commands or the web." />
-          <Composer onSend={send} busy={busy()} onCancel={() => hal("POST", `/sessions/${selected()}/cancel`)}
+          <Composer onSend={send} busy={busy()} onCancel={() => hal("POST", `/sessions/${selected()}/cancel`).catch((e) => toast(String(e), "danger"))}
             speed={effortSpeed(current()?.effort)} onSpeed={setSpeed}
             placeholder={`Message ${chosen() || "a model"}`} />
         </div>

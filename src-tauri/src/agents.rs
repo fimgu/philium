@@ -601,9 +601,10 @@ pub(crate) fn message_body(text: &str, images: Value) -> Value {
     json!({ "text": text, "images": images, "allow_browser": true })
 }
 
-pub async fn send_with_images(ctx: &Arc<Ctx>, id: &str, text: &str, images: Value) -> Result<Value, String> {
+pub async fn send_with_images(_ctx: &Arc<Ctx>, id: &str, text: &str, images: Value) -> Result<Value, String> {
     let r = rt(id)?;
-    set_state(ctx, id, "running");
+    // Only HAL events change turn state. A rejected request is not a new turn,
+    // and setting state after acceptance can race a fast completion event.
     r.hal
         .call(reqwest::Method::POST, &format!("/sessions/{}/messages", r.session), Some(message_body(text, images)))
         .await
@@ -693,9 +694,8 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
         "get" => {
             let id = id()?;
             let mut row = with_live(ctx, get_row(ctx, &id).ok_or("gone")?);
-            if runtime(&id).is_some() {
-                row["session"] = hal_get(&id, "").await.unwrap_or(Value::Null);
-            }
+            // The view must remain available while HAL or a tool is busy.
+            // Live session reads belong to their dedicated endpoints, not metadata.
             row["resources"] = json!(ctx.db.query(
                 "SELECT * FROM resources WHERE agent_id=?1 AND state!='released' ORDER BY created_at",
                 [&id]

@@ -253,7 +253,9 @@ impl Hal {
 
     /// One JSON request to this HAL's API.
     pub async fn call(&self, method: reqwest::Method, path: &str, body: Option<Value>) -> Result<Value, String> {
-        let mut req = self.client.request(method, format!("{}{}", self.base, path)).bearer_auth(&self.token);
+        let mut req = self.client.request(method, format!("{}{}", self.base, path))
+            .bearer_auth(&self.token)
+            .timeout(std::time::Duration::from_secs(15));
         if let Some(b) = body {
             req = req.json(&b);
         }

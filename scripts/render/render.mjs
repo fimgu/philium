@@ -7,6 +7,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import puppeteer from "puppeteer-core";
 import { EMPTY, POPULATED, FAILING, SLOW, HUGE } from "./fixtures.js";
+import { checkAgentMessaging, checkChatMessaging } from "./robustness.mjs";
 const SETS = { empty: EMPTY, populated: POPULATED, failing: FAILING, slow: SLOW, huge: HUGE };
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -32,6 +33,19 @@ const port = server.address().port;
 const stub = (fx, setName) => {
   const fixtures = fx;
   window.__permissionCalls = [];
+  const listeners = new Map();
+  window.__test = { sends: [], mode: "reject", holdShell: false };
+  window.__emit = (topic, payload) => {
+    for (const [id, subscribed] of listeners) {
+      if (subscribed === topic) window[`_${id}`]?.({ event: topic, id, payload });
+    }
+  };
+  window.__agentState = (state) => {
+    fixtures["agents.get"].state = state;
+    fixtures["agents.list"].find((a) => a.id === "a1").state = state;
+    window.__emit("agents:changed", { id: "a1" });
+  };
+  let permissionSeq = 2000;
   let cb = 1;
   window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener() {} };
   window.__TAURI_INTERNALS__ = {
@@ -40,6 +54,14 @@ const stub = (fx, setName) => {
     unregisterCallback() {},
     convertFileSrc: (p) => p,
     async invoke(cmd, a) {
+      if (cmd === "plugin:event|listen") {
+        listeners.set(a.handler, a.event);
+        return a.handler;
+      }
+      if (cmd === "plugin:event|unlisten") {
+        listeners.delete(a.eventId);
+        return;
+      }
       if (cmd.startsWith("plugin:")) return 1;
       if (fixtures.__delay) await new Promise((r) => setTimeout(r, fixtures.__delay));
       if (fixtures.__fail && (cmd === "rpc" || cmd === "hal")) {
@@ -47,7 +69,25 @@ const stub = (fx, setName) => {
         throw fixtures.__fail[window.__n % fixtures.__fail.length];
       }
       if (cmd === "rpc") {
-        if (a.method === "agents.permission") window.__permissionCalls.push(a.args);
+        if (["agents.cancel", "agents.stop"].includes(a.method) && window.__test.failCancel) throw 'Cancellation unavailable';
+        if (a.method === "agents.shell" && window.__test.holdShell) {
+          await new Promise((resolve) => { window.__test.releaseShell = resolve; });
+        }
+        if (a.method === "agents.send") {
+          window.__test.sends.push(a.args);
+          await new Promise((resolve) => { window.__test.releaseSend = resolve; });
+          if (window.__test.mode === "reject") throw 'HAL 409 Conflict: {"type":"busy","message":"session is busy"}';
+          return {};
+        }
+        if (a.method === "agents.permission") {
+          window.__permissionCalls.push(a.args);
+          queueMicrotask(() => {
+            const event = { type: "permission.resolved", seq: permissionSeq++, request_id: a.args.request_id, decision: a.args.decision };
+            for (const [id, topic] of listeners) {
+              if (topic === "agents:events") window[`_${id}`]?.({ event: topic, id, payload: { id: a.args.id, events: [event] } });
+            }
+          });
+        }
         const v = fixtures[a.method];
         if (v !== undefined) return JSON.parse(JSON.stringify(v));
         if (/\.(list|tabs|names|proposals|ledger|inbox|threads|playbooks|branches|worktrees|models)$|repos_list/.test(a.method)) return [];
@@ -55,8 +95,22 @@ const stub = (fx, setName) => {
         return {};
       }
       if (cmd === "hal") {
+        if (a.path.endsWith("/cancel") && window.__test.failCancel) throw 'Cancellation unavailable';
+        if (a.method === "POST" && a.path.endsWith("/messages")) {
+          window.__test.sends.push(a.body);
+          if (window.__test.mode === "reject") throw 'HAL 409 Conflict: {"type":"busy"}';
+          const key = `hal GET ${a.path.replace(/\/messages$/, "/events")}`;
+          const events = fixtures[key] ?? [];
+          const seq = (events.at(-1)?.seq ?? 0) + 1;
+          fixtures[key] = [...events, { type: "turn.started", seq }, ...(window.__test.chatWorking ? [] : [{ type: "assistant.completed", seq: seq + 1, text: "Accepted" }])];
+          return {};
+        }
         const key = `hal ${a.method} ${a.path.split("?")[0]}`;
-        if (fixtures[key] !== undefined) return JSON.parse(JSON.stringify(fixtures[key]));
+        if (fixtures[key] !== undefined) {
+          const value = JSON.parse(JSON.stringify(fixtures[key]));
+          if (a.path.includes("/events")) return value.filter((e) => e.seq > Number(new URLSearchParams(a.path.split("?")[1]).get("after") ?? 0));
+          return value;
+        }
         return a.method === "GET" ? [] : {};
       }
       return null;
@@ -105,9 +159,12 @@ for (const setName of sets) {
       });
       for (const b of bad) problems.push(`${setName} ${w}x${h} ${s}: ${b}`);
       if (s === "agents") {
+        if (setName === "populated") await page.evaluate(() => { window.__test.holdShell = true; });
         if (await clickText(page, ".list-item", "lion")) {
           await sleep(500); await shot(page, "agents-detail");
           if (setName === "populated") {
+            if (!(await page.$(".composer textarea"))) problems.push(`${w} delayed shell hid conversation`);
+            await page.evaluate(() => { window.__test.holdShell = false; window.__test.releaseShell?.(); });
             const errors = await page.evaluate(async () => {
               const errors = [];
               const cards = [...document.querySelectorAll(".perm")];
@@ -127,9 +184,14 @@ for (const setName of sets) {
                 const c = calls[i];
                 if (!c || c.id !== "a1" || c.request_id !== `browser-perm-${i}` || c.decision !== decision || c.scope !== scope) errors.push(`wrong approval payload ${i}`);
               });
+              const resolved = [...document.querySelectorAll(".perm.done")];
+              if (resolved.length !== 3 || resolved.some((c) => c.querySelector("button"))) errors.push("resolved permission controls remain actionable");
               return errors;
             });
             errors.forEach((e) => problems.push(`${w} browser approval: ${e}`));
+            await shot(page, "agents-permissions-resolved");
+            for (const error of await checkAgentMessaging(page)) problems.push(`${w} messaging: ${error}`);
+            await shot(page, "agents-messaging-checked");
           }
         } else if (setName === "populated") problems.push(`${w} browser approval: agent detail did not open`);
         if (await clickText(page, "button", "New agent")) { await sleep(300); await shot(page, "modal-new-agent"); }
@@ -138,7 +200,10 @@ for (const setName of sets) {
         if (await clickText(page, "button", "Add provider")) { await sleep(300); await shot(page, "modal-add-provider"); }
       }
       if (s === "chat" && setName === "populated") {
-        if (await clickText(page, ".list-item", "Gateway retry")) { await sleep(600); await shot(page, "chat-conversation"); }
+        if (await clickText(page, ".list-item", "Gateway retry")) {
+          await sleep(600); await shot(page, "chat-conversation");
+          for (const error of await checkChatMessaging(page)) problems.push(`${w} chat messaging: ${error}`);
+        }
       }
       if (s === "board" && setName === "populated") {
         if (await clickText(page, "[class*=card], article", "Refactor worktree")) { await sleep(400); await shot(page, "board-detail"); }

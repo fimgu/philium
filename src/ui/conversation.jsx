@@ -2,7 +2,7 @@
 // Events are folded into items: user / assistant (streamed) / tool / file /
 // permission / error. Text is always rendered as text, never HTML.
 import { For, Index, Show, Switch, Match, createSignal, createMemo, createEffect, on } from "solid-js";
-import { Badge, Button } from "./kit.jsx";
+import { Badge, Button, toast } from "./kit.jsx";
 import { Icon } from "./icons.jsx";
 
 /** Fold a list of HAL events into display items. Pure, incremental-safe. */
@@ -180,16 +180,24 @@ export function Composer(props) {
   const [text, setText] = createSignal("");
   const [images, setImages] = createSignal([]);
   const [over, setOver] = createSignal(false);
+  const [sending, setSending] = createSignal(false);
   const add = async (files) => {
     const imgs = [...files].filter((f) => f.type.startsWith("image/"));
     if (imgs.length) setImages([...images(), ...(await Promise.all(imgs.map(readImage)))].slice(0, 8));
   };
-  const send = () => {
-    const t = text().trim();
-    if ((!t && !images().length) || props.disabled) return;
-    props.onSend(t, images().map(({ data, media_type, name }) => ({ data, media_type, name })));
-    setText("");
-    setImages([]);
+  const send = async () => {
+    const draft = text(), attached = images();
+    const t = draft.trim();
+    if ((!t && !attached.length) || props.disabled || props.busy || sending()) return;
+    setSending(true);
+    try {
+      const accepted = await props.onSend(t, attached.map(({ data, media_type, name }) => ({ data, media_type, name })));
+      if (accepted !== false) {
+        if (text() === draft) setText("");
+        setImages((current) => current.filter((im) => !attached.includes(im)));
+      }
+    } catch (e) { toast(String(e), "danger"); }
+    finally { setSending(false); }
   };
   return (
     <div class="composer" style={{ "flex-wrap": "wrap", outline: over() ? "1px dashed var(--accent, #7aa2ff)" : "none" }}
@@ -224,9 +232,10 @@ export function Composer(props) {
           )}</For>
         </div>
       </Show>
-      <Show when={props.busy} fallback={<Button variant="primary" onClick={send} disabled={props.disabled}>Send</Button>}>
+      <Show when={props.busy} fallback={<Button variant="primary" onClick={send} disabled={props.disabled || sending()}>Send</Button>}>
         <Button onClick={props.onCancel}><Icon name="stop" size={12} /> Stop</Button>
       </Show>
+      <Show when={props.busy}><div class="xs dim" role="status" style={{ width: "100%" }}>Working or waiting for approval. Your draft stays here. Use Stop to interrupt.</div></Show>
     </div>
   );
 }

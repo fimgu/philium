@@ -13,8 +13,18 @@ const track = (key, p) => p.then(
   (e) => { setFailures((f) => ({ ...f, [key]: e })); throw e; },
 );
 
-export const rpc = (method, args) => track(method, invoke("rpc", { method, args: args ?? null }));
-export const hal = (method, path, body) => track(`hal ${method} ${String(path).split("?")[0]}`, invoke("hal", { method, path, body }));
+export const rpc = (method, args, options = {}) => {
+  const request = invoke("rpc", { method, args: args ?? null });
+  return options.action ? request : track(method, request);
+};
+export const hal = (method, path, body) => {
+  const request = invoke("hal", { method, path, body });
+  return method === "GET" ? track(`hal ${method} ${String(path).split("?")[0]}`, request) : request;
+};
+
+export const sendError = (error) => /session is busy|"type"\s*:\s*"busy"/i.test(String(error))
+  ? "This agent is still working or waiting for approval. Your draft was kept. Wait, approve the request, or press Stop before sending."
+  : String(error);
 
 /** Subscribe to a backend event for the lifetime of the current component. */
 export function useEvent(topic, fn) {

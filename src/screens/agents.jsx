@@ -1,12 +1,12 @@
 // Agents: every named agent, its live conversation, approvals, terminals and
 // changes. Untrusted-provider agents are marked Strict everywhere.
-import { For, Show, createSignal, createResource, createMemo, createEffect, on, onCleanup } from "solid-js";
+import { For, Show, createSignal, createResource, createMemo, createEffect, on, onCleanup, Suspense } from "solid-js";
 import { NotFound, Page, Button, Badge, Dot, Empty, Modal, Field, Input, TextArea, Select, Toggle, Segmented, confirm, toast } from "../ui/kit.jsx";
 import { Icon } from "../ui/icons.jsx";
 import { Conversation, Composer, speedEffort, effortSpeed } from "../ui/conversation.jsx";
 import { AgentTerminals } from "../ui/agent-terminals.jsx";
 import { AgentBrowser } from "../ui/agent-browser.jsx";
-import { rpc, useEvent, fmt } from "../lib/rpc.js";
+import { rpc, useEvent, fmt, sendError } from "../lib/rpc.js";
 import { go, params, registerCommands } from "../lib/nav.js";
 import "../styles/agents.css";
 import "../styles/code.css";
@@ -277,10 +277,11 @@ function AgentView(props) {
   const busy = () => ["running", "waiting"].includes(a()?.state);
 
   const send = async (text, images = []) => {
-    try { await rpc("agents.send", { id: props.id, text, images }); } catch (e) { toast(String(e), "danger"); }
+    try { await rpc("agents.send", { id: props.id, text, images }, { action: true }); return true; }
+    catch (e) { toast(sendError(e), "danger"); return false; }
   };
   const decide = (request_id, decision, scope) =>
-    rpc("agents.permission", { id: props.id, request_id, decision, scope }).catch((e) => toast(String(e), "danger"));
+    rpc("agents.permission", { id: props.id, request_id, decision, scope }, { action: true }).catch((e) => toast(String(e), "danger"));
 
   const remove = async () => {
     const r = await rpc("agents.remove", { id: props.id }).catch((e) => ({ error: String(e) }));
@@ -311,7 +312,7 @@ function AgentView(props) {
           { value: "none", label: <span title="Hide the side panel">Hide</span> },
         ]} />
         <Show when={live()} fallback={<Button size="sm" onClick={() => rpc("agents.resume", { id: props.id }).catch((e) => toast(String(e), "danger"))}><Icon name="play" size={11} /> Resume</Button>}>
-          <Button size="sm" onClick={() => rpc("agents.stop", { id: props.id })}><Icon name="stop" size={11} /> Stop</Button>
+          <Button size="sm" onClick={() => rpc("agents.stop", { id: props.id }, { action: true }).catch((e) => toast(String(e), "danger"))}><Icon name="stop" size={11} /> Stop</Button>
         </Show>
         <Button size="sm" variant="ghost" title="Remove agent and clean up" onClick={remove}><Icon name="trash" size={12} /></Button>
       </div>
@@ -321,7 +322,7 @@ function AgentView(props) {
           <Show when={tab() === "chat"}>
             <Conversation events={events()} emptyText={live() ? "Send the first message to start." : "This agent is stopped. Resume it to continue."}
               onApprove={(id, scope) => decide(id, "approve", scope)} onDeny={(id) => decide(id, "deny")} />
-            <Composer onSend={send} busy={busy()} disabled={!live()} onCancel={() => rpc("agents.cancel", { id: props.id })}
+            <Composer onSend={send} busy={busy()} disabled={!live()} onCancel={() => rpc("agents.cancel", { id: props.id }, { action: true }).catch((e) => toast(String(e), "danger"))}
               speed={effortSpeed(effort())} onSpeed={(v) => rpc("agents.set_effort", { id: props.id, effort: speedEffort(v) }).then(setEffort).catch((e) => toast(String(e), "danger"))}
               placeholder={live() ? `Message ${a()?.name ?? ""}` : "Agent is stopped"} />
           </Show>
@@ -332,10 +333,14 @@ function AgentView(props) {
         <div class="agent-aside" classList={{ hidden: aside() === "none" }} style={{ width: `${asideW()}px` }}>
             <div class="aside-grip" onPointerDown={drag} title="Drag to resize" />
             <div class="aside-body" classList={{ hidden: aside() !== "terminal" }}>
-              <AgentTerminals id={props.id} name={a()?.name ?? ""} live={live()} />
+              <Suspense fallback={<div class="small dim" role="status">Loading terminals…</div>}>
+                <AgentTerminals id={props.id} name={a()?.name ?? ""} live={live()} />
+              </Suspense>
             </div>
             <div class="aside-body" classList={{ hidden: aside() !== "browser" }}>
-              <AgentBrowser agent={props.id} name={a()?.name} strict={a()?.strict} provider={a()?.model_ref?.split("/")[0]} visible={aside() === "browser"} onActivity={() => setBrowserPing(true)} />
+              <Suspense fallback={<div class="small dim" role="status">Loading browser…</div>}>
+                <AgentBrowser agent={props.id} name={a()?.name} strict={a()?.strict} provider={a()?.model_ref?.split("/")[0]} visible={aside() === "browser"} onActivity={() => setBrowserPing(true)} />
+              </Suspense>
             </div>
           </div>
       </div>

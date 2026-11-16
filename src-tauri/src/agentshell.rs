@@ -26,8 +26,14 @@ struct Slot {
     /// Stream offset of a command that timed out and may still be running.
     pending: Option<u64>,
 }
-type Slots = Mutex<HashMap<String, Arc<tokio::sync::Mutex<Slot>>>>;
-fn slot(agent: &str, shell: &str) -> Arc<tokio::sync::Mutex<Slot>> {
+#[derive(Default)]
+struct Shell {
+    // UI metadata must never wait for a running command.
+    current: Mutex<Option<String>>,
+    command: tokio::sync::Mutex<Slot>,
+}
+type Slots = Mutex<HashMap<String, Arc<Shell>>>;
+fn slot(agent: &str, shell: &str) -> Arc<Shell> {
     static S: OnceLock<Slots> = OnceLock::new();
     S.get_or_init(Default::default).lk().entry(format!("{agent}\0{shell}")).or_default().clone()
 }
@@ -113,6 +119,7 @@ async fn ensure(ctx: &Arc<Ctx>, agent: &str, shell: &str, s: &mut Slot) -> Resul
         }
         tokio::time::sleep(Duration::from_millis(30)).await;
     }
+    *slot(agent, shell).current.lk() = Some(id.clone());
     s.id = Some(id.clone());
     s.pending = None;
     Ok(id)
@@ -121,27 +128,28 @@ async fn ensure(ctx: &Arc<Ctx>, agent: &str, shell: &str, s: &mut Slot) -> Resul
 /// Open (or return) a named shell. Errors explain why it could not start.
 pub async fn open(ctx: &Arc<Ctx>, agent: &str, shell: &str) -> Result<String, String> {
     let sl = slot(agent, shell);
-    let mut s = sl.lock().await;
+    let mut s = sl.command.lock().await;
     ensure(ctx, agent, shell, &mut s).await
 }
 
 /// The agent's main shell, opening it if the agent runs. None when stopped.
 pub async fn current(ctx: &Arc<Ctx>, agent: &str, shell: &str, open: bool) -> Option<String> {
     let sl = slot(agent, shell);
-    let mut s = sl.lock().await;
-    if let Some(id) = s.id.as_ref().filter(|id| crate::terminals::alive(ctx, id)) {
-        return Some(id.clone());
+    let current = sl.current.lk().clone();
+    if let Some(id) = current.filter(|id| crate::terminals::alive(ctx, id)) {
+        return Some(id);
     }
     if !open {
         return None;
     }
+    let mut s = sl.command.lock().await;
     ensure(ctx, agent, shell, &mut s).await.ok()
 }
 
 pub async fn run(ctx: &Arc<Ctx>, agent: &str, shell: &str, command: &str, cwd: Option<PathBuf>, timeout: Duration) -> Result<Value, String> {
     let deadline = Instant::now() + timeout;
     let sl = slot(agent, shell);
-    let mut s = tokio::time::timeout(timeout, sl.lock())
+    let mut s = tokio::time::timeout(timeout, sl.command.lock())
         .await
         .map_err(|_| "this shell is busy with another command. Use another shell (shell_open), or background=true for long-running commands.")?;
     let id = ensure(ctx, agent, shell, &mut s).await?;
@@ -265,7 +273,34 @@ mod tests {
         assert_eq!(c, 0);
         let (_, c) = cmd("exit_code_test() { return 7; }; exit_code_test").await;
         assert_eq!(c, 7);
+        // Exercise the actual command path while the UI asks for metadata.
+        let agent = format!("metadata-test-{id}");
+        let sl = slot(&agent, MAIN);
+        *sl.current.lk() = Some(id.clone());
+        sl.command.lock().await.id = Some(id.clone());
+        let running = {
+            let ctx = ctx.clone();
+            let agent = agent.clone();
+            tokio::spawn(async move {
+                run(&ctx, &agent, MAIN, "sleep 0.5; echo metadata-ok", None, Duration::from_secs(5)).await
+            })
+        };
+        for _ in 0..100 {
+            if sl.command.try_lock().is_err() { break; }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(sl.command.try_lock().is_err(), "test command must hold the command lock");
+        for open in [false, true] {
+            let visible = tokio::time::timeout(Duration::from_millis(100), current(&ctx, &agent, MAIN, open)).await;
+            assert_eq!(visible.expect("terminal lookup blocked behind a running command"), Some(id.clone()));
+        }
+        assert!(running.await.unwrap().unwrap().to_string().contains("metadata-ok"));
         crate::terminals::kill(&ctx, &id).unwrap();
+        for _ in 0..100 {
+            if !crate::terminals::alive(&ctx, &id) { break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(current(&ctx, &agent, MAIN, false).await, None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
