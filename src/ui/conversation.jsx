@@ -107,7 +107,7 @@ export function Conversation(props) {
     if (stick() && el) queueMicrotask(() => (el.scrollTop = el.scrollHeight));
   }));
   return (
-    <div class="conv" ref={el} onScroll={(e) => {
+    <div class="conv" style={props.hidden ? { display: "none" } : undefined} ref={el} onScroll={(e) => {
       const d = e.currentTarget;
       setStick(d.scrollHeight - d.scrollTop - d.clientHeight < 60);
     }}>

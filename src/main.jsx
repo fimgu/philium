@@ -4,10 +4,10 @@
 import { render } from "solid-js/web";
 import { For, Show, createSignal, createMemo, lazy, Suspense, onMount, onCleanup } from "solid-js";
 import { Dynamic } from "solid-js/web";
-import { ToastHost, ConfirmHost } from "./ui/kit.jsx";
+import { ToastHost, ConfirmHost, Guard, toast, cleanError } from "./ui/kit.jsx";
 import { ImproveHost } from "./ui/improve.jsx";
 import { Icon } from "./ui/icons.jsx";
-import { rpc } from "./lib/rpc.js";
+import { rpc, failures, clearFailures } from "./lib/rpc.js";
 import { route, go, commands, improve } from "./lib/nav.js";
 import "./styles/tokens.css";
 import "./styles/components.css";
@@ -64,7 +64,10 @@ function Palette(props) {
 function App() {
   const [palette, setPalette] = createSignal(false);
   const [status, setStatus] = createSignal(null);
-  const refresh = () => rpc("app.status").then(setStatus).catch(() => {});
+  const refresh = () => rpc("app.status").then(setStatus).catch(() => setStatus((s) => ({ ...(s ?? {}), desk: { ok: false, error: "Backend not responding" } })));
+  const [attempt, setAttempt] = createSignal(0);
+  const failing = () => Object.entries(failures()).filter(([k]) => !k.startsWith("browser.") && k !== "app.status");
+  const retry = () => { clearFailures(); refresh(); setAttempt((n) => n + 1); };
   onMount(() => {
     refresh();
     const t = setInterval(refresh, 5000);
@@ -113,8 +116,15 @@ function App() {
         </div>
       </nav>
       <main class="main">
-        <Suspense>
-          <Dynamic component={COMPONENTS[route()] ?? COMPONENTS.home} />
+        <Show when={failing().length}>
+          <div class="fail-banner" role="alert">
+            <span class="ellipsis grow">Some data could not load: {cleanError(failing()[0][1])}{failing().length > 1 ? ` (+${failing().length - 1} more)` : ""}</span>
+            <button class="btn sm" onClick={retry}>Retry</button>
+            <button class="btn ghost sm" onClick={clearFailures} aria-label="Dismiss">Dismiss</button>
+          </div>
+        </Show>
+        <Suspense fallback={<div class="loading" role="status"><span class="spinner" />Loading</div>}>
+          <For each={[`${route()}:${attempt()}`]}>{(r) => <Guard><Dynamic component={COMPONENTS[r.split(":")[0]] ?? COMPONENTS.home} /></Guard>}</For>
         </Suspense>
       </main>
       <Show when={palette()}><Palette onClose={() => setPalette(false)} /></Show>
@@ -125,4 +135,6 @@ function App() {
   );
 }
 
+window.addEventListener("unhandledrejection", (e) => { e.preventDefault(); console.error("unhandled", e.reason); toast(cleanError(e.reason), "bad"); });
+window.__philiumGo = go; // used by scripts/render for stale-id checks
 render(() => <App />, document.getElementById("root"));

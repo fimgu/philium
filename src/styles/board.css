@@ -49,3 +49,6 @@
 .board-columns{height:60vh}
 }
 
+.board-task-title{display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+.board-owner{max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.board-meta{flex-wrap:nowrap;overflow:hidden;white-space:nowrap}

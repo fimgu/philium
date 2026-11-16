@@ -151,7 +151,8 @@
 @keyframes rise { from { opacity: 0; transform: translateY(6px) scale(0.99); } }
 .toasts { position: fixed; right: 16px; bottom: 16px; display: grid; gap: 8px; z-index: 60; }
 .toast { padding: 10px 14px; border-radius: var(--radius); background: var(--surface-active); border: 1px solid var(--line-strong); box-shadow: var(--shadow); max-width: 380px; animation: rise 160ms var(--ease); }
-.toast.bad { border-color: var(--danger); }
+.toast.bad, .toast.danger { border-color: var(--danger); }
+.toast { overflow-wrap: anywhere; }
 .toast.good { border-color: var(--secure); }
 
 /* ---------- command palette ---------- */
@@ -214,3 +215,16 @@
 .composer .speed button { border: 0; background: transparent; padding: 0 10px; border-radius: 4px; color: var(--text-dim); cursor: pointer; font-size: var(--fs-s); font-family: inherit; }
 .composer .speed button:hover { color: var(--text); }
 .composer .speed button.on { background: var(--surface-active); color: var(--text); }
+
+/* robustness: long text never breaks layout */
+.ellipsis { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.empty p { overflow-wrap: anywhere; }
+.page-head h1 { white-space: nowrap; }
+.page-head .sub { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.page-head .actions { flex: none; }
+.msg { overflow-wrap: anywhere; white-space: pre-wrap; }
+.fail-banner { display: flex; align-items: center; gap: 8px; padding: 8px 24px; background: var(--danger-dim); border-bottom: 1px solid var(--danger); color: var(--text); font-size: var(--fs-s); flex: none; }
+.board-task-title, .list-item .small { overflow-wrap: anywhere; }
+.loading { flex: 1; display: flex; align-items: center; justify-content: center; gap: 10px; color: var(--text-faint); font-size: var(--fs-s); }
+.spinner { width: 14px; height: 14px; border-radius: 50%; border: 2px solid var(--line-strong); border-top-color: var(--accent); animation: spin 0.8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }

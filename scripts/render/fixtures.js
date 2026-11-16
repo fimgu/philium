@@ -50,7 +50,7 @@ for (let i = 0; i < 24; i++) rows.push({
 });
 const statRow = (name, i) => ({ id: name, name, agent: name, provider: name, provider_id: name, model: name, requests: 120 - i * 20, tokens_in: 90000 - i * 10000, tokens_out: 24000 - i * 3000, input_tokens: 90000 - i * 10000, output_tokens: 24000 - i * 3000, cost: 4.2 - i, avg_ttft_ms: 420 + i * 90, avg_tps: 60 - i * 5, error_rate: i * 0.01, guard_actions: i });
 const points = Array.from({ length: 24 }, (_, i) => ({ t: now - (24 - i) * 3600000, ts: now - (24 - i) * 3600000, requests: 10 + ((i * 7) % 13), tokens_in: 8000 + i * 600, tokens_out: 2000 + i * 100, cost: 0.2 + (i % 5) * 0.1 }));
-const tree = { files: ["src/main.rs", "src/db.rs", "src/gateway.rs", "src/agents.rs", "src/ui/kit.jsx"].map((path, i) => ({ path, lines: 100 + i * 40, symbols: 4 + i, language: path.endsWith("rs") ? "rust" : "js" })) };
+const tree = { files: ["src/main.rs", "src/db.rs", "src/gateway.rs", "src/agents.rs", "src/ui/kit.jsx"].map((path, i) => ({ path, lines: 100 + i * 40, syms: [{ name: "init", kind: "function", line: 3 }, { name: "Config", kind: "struct", line: 20 }], language: path.endsWith("rs") ? "rust" : "js" })) };
 
 const tev = (seq, type, o) => ({ seq, type, ...o });
 const chatEvents = [
@@ -138,8 +138,57 @@ export const POPULATED = {
   "codeindex.status": { files: 5, symbols: 42, indexed_at: now - 60000, state: "ready" },
   "codeindex.tree": tree,
   "codeindex.graph": { nodes: tree.files.map((f, i) => ({ id: f.path, label: f.path.split("/").pop(), path: f.path, size: 5 + i })), edges: [{ source: "src/main.rs", target: "src/db.rs" }, { source: "src/main.rs", target: "src/gateway.rs" }, { source: "src/agents.rs", target: "src/db.rs" }] },
-  "codeindex.clashes": { clashes: [{ a: "lion", b: "otter", detail: ["src/gateway.rs"] }] },
+  "codeindex.clashes": { clashes: [{ a: "lion", b: "otter", severity: "high", detail: ["src/gateway.rs"] }] },
   "hal GET /sessions": sessions,
   "hal GET /sessions/s1/events": chatEvents,
   "hal GET /sessions/s2/events": [],
+};
+
+// ---- robustness sets ----
+// FAILING: every call rejects with realistic Rust/Tauri error strings.
+export const FAILING = {
+  __fail: [
+    "database is locked",
+    "Error: gateway: connection refused (os error 61)",
+    "No such file or directory (os error 2)",
+    "HAL not running: harness offline",
+    "providers: keychain access denied: User canceled the authorization",
+  ],
+};
+// SLOW: populated data, every call delayed.
+export const SLOW = { ...POPULATED, __delay: 4000 };
+
+const long = (n, w = "very-long-segment") => Array.from({ length: n }, () => w).join("-");
+const uni = "日本語のタイトル 🚀 Ünïcödé مرحبا עברית ";
+const hugeAgents = Array.from({ length: 1000 }, (_, i) => ({
+  ...agents[i % agents.length], id: "h" + i, name: i % 7 === 0 ? long(12) + i : `agent-${i}`,
+}));
+const hugeTasks = Array.from({ length: 1000 }, (_, i) => ({
+  ...tasks[i % tasks.length], id: "ht" + i, title: i % 3 === 0 ? uni.repeat(6) + i : long(20, "title") + i,
+  owner: i % 5 ? "lion" : long(10), depends_on: Array.from({ length: i % 4 }, (_, k) => "x" + k),
+}));
+const hugeRows = Array.from({ length: 1000 }, (_, i) => ({ ...rows[i % rows.length], id: 5000 - i, model: long(12, "model") }));
+const hugeRepos = Array.from({ length: 200 }, (_, i) => ({
+  ...repos[i % 2], id: "hr" + i, name: long(10, "repo") + i, path: "/Users/demo/" + long(30, "deep/directory"),
+}));
+const hugeTerms = Array.from({ length: 60 }, (_, i) => ({ ...terms[i % 3], id: "ht" + i, title: uni + long(6) }));
+const hugeMsg = "A".repeat(3000) + " " + uni.repeat(80) + "\n" + "/Users/demo/" + long(80, "path");
+const hugeEvents = [
+  tev(1, "message.created", { role: "user", content: hugeMsg }),
+  tev(2, "tool.started", { call_id: "c1", tool: "mcp_philium_shell_run", arguments: { command: long(80, "cmd --flag") } }),
+  tev(3, "tool.finished", { call_id: "c1", ok: true, duration_ms: 99999, result: "x".repeat(5000) }),
+  tev(4, "assistant.completed", { text: hugeMsg }),
+  tev(5, "file.changed", { path: "src/" + long(60, "deep/dir") + "/file.rs", diff: "+" + "y".repeat(4000) }),
+];
+export const HUGE = {
+  ...POPULATED,
+  "agents.list": hugeAgents,
+  "board.list": hugeTasks,
+  "activity.list": hugeRows,
+  "workspace.repos_list": hugeRepos,
+  "terminals.list": hugeTerms,
+  "agents.events": hugeEvents,
+  "hal GET /sessions": Array.from({ length: 300 }, (_, i) => ({ id: "s" + i, title: i % 2 ? uni.repeat(5) : long(30, "chat"), model: "claude/claude-opus-5-5", updated_at: now - i * 1000 })),
+  "hal GET /sessions/s0/events": hugeEvents,
+  "providers.list": Array.from({ length: 30 }, (_, i) => ({ ...provs[i % 4], id: "p" + i, name: long(8, "Provider") + i })),
 };

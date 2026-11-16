@@ -26,3 +26,9 @@
 .perm.done { border-color: var(--line); background: transparent; opacity: 0.75; }
 details.msg summary { cursor: pointer; display: flex; align-items: center; gap: 6px; }
 .conv-empty { color: var(--text-faint); font-size: var(--fs-s); text-align: center; max-width: 360px; margin: 0 auto; padding: 120px 0 0; line-height: 1.5; }
+.agent-chip { max-width: 100%; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 0 1 auto; display: inline-block; line-height: 20px; vertical-align: middle; }
+.conv .msg { max-width: 100%; }
+.conv details.msg > summary { display: flex; gap: 6px; align-items: center; min-width: 0; cursor: pointer; }
+.conv details.msg > summary b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.conv-pre { max-height: 320px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+.conv-tool .row > b { flex: none; }

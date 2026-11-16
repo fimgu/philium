@@ -1,17 +1,38 @@
 // Philium UI primitives. Screens compose these; no third-party UI kit.
 // Rule: never render untrusted text as HTML. Solid's text binding is safe.
-import { For, Show, createSignal, onCleanup, onMount, splitProps, createMemo } from "solid-js";
+import { For, Show, ErrorBoundary, createSignal, onCleanup, onMount, splitProps, createMemo } from "solid-js";
 import { Portal } from "solid-js/web";
 
+/** Readable text for any thrown value: strips "Error: " and Rust/Tauri noise. */
+export function cleanError(e) {
+  let m = e instanceof Error ? e.message : typeof e === "string" ? e : e && typeof e === "object" ? (e.message ?? e.error ?? safeJson(e)) : String(e ?? "Something went wrong");
+  m = String(m).replace(/^(Uncaught )?(\w*Error|error)(\([^)]*\))?:\s*/i, "").replace(/^Os \{[^}]*message: "([^"]+)"[^}]*\}/, "$1").replace(/\s+at\s+\S+:\d+:\d+.*$/s, "").trim();
+  if (!m || m === "[object Object]") m = "Something went wrong";
+  return m.length > 300 ? m.slice(0, 300) + "…" : m;
+}
+function safeJson(o) { try { return JSON.stringify(o); } catch { return "Something went wrong"; } }
+
 export function Button(props) {
-  const [p, rest] = splitProps(props, ["variant", "size", "class", "children", "busy"]);
+  const [p, rest] = splitProps(props, ["variant", "size", "class", "children", "busy", "onClick"]);
+  const [auto, setAuto] = createSignal(false);
+  const click = (e) => {
+    if (auto()) return;
+    let r;
+    try { r = p.onClick?.(e); } catch (x) { toast(cleanError(x), "bad"); return; }
+    if (r && typeof r.then === "function") {
+      setAuto(true);
+      r.catch((x) => toast(cleanError(x), "bad")).finally(() => setAuto(false));
+    }
+  };
   return (
     <button
       {...rest}
-      disabled={rest.disabled || p.busy}
+      onClick={p.onClick ? click : undefined}
+      aria-busy={p.busy || auto() || undefined}
+      disabled={rest.disabled || p.busy || auto()}
       class={`btn ${p.variant ?? ""} ${p.size ?? ""} ${p.class ?? ""}`}
     >
-      {p.busy ? "…" : p.children}
+      {p.busy || auto() ? "…" : p.children}
     </button>
   );
 }
@@ -185,8 +206,8 @@ const [toasts, setToasts] = createSignal([]);
 let toastId = 0;
 export function toast(text, tone = "") {
   const id = ++toastId;
-  setToasts((t) => [...t, { id, text: String(text), tone }]);
-  setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), tone === "bad" ? 7000 : 3500);
+  setToasts((t) => [...t, { id, text: cleanError(text), tone }]);
+  setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), tone === "bad" || tone === "danger" ? 7000 : 3500);
 }
 export function ToastHost() {
   return (
@@ -245,4 +266,25 @@ export function Bars(props) {
       <For each={props.values}>{(v) => <div title={`${v.label}: ${props.format ? props.format(v.value) : v.value}`} style={{ height: `${(v.value / max()) * 100}%` }} />}</For>
     </div>
   );
+}
+
+/** Per-screen error boundary: one broken screen never blanks the app. */
+export function Guard(props) {
+  return (
+    <ErrorBoundary fallback={(err, reset) => (
+      <div class="page-body flush">
+        <Empty title={props.title ?? "This screen hit a problem"}
+          action={<Button onClick={reset}>Retry</Button>}>
+          {cleanError(err)}
+        </Empty>
+      </div>
+    )}>
+      {props.children}
+    </ErrorBoundary>
+  );
+}
+
+/** Friendly state for a deleted or unknown id in the route params. */
+export function NotFound(props) {
+  return <Empty title={props.title ?? "Not found"} action={props.action}>{props.children ?? "It may have been removed."}</Empty>;
 }

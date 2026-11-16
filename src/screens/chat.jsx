@@ -1,7 +1,7 @@
 // Chat: quick conversations with any model, no tools. Runs on the desk HAL
 // behind the gateway. For real work, start an agent instead.
 import { For, Show, createSignal, createResource, createMemo, createEffect, on, onCleanup } from "solid-js";
-import { Page, Button, Select, toast } from "../ui/kit.jsx";
+import { NotFound, Page, Button, Select, toast } from "../ui/kit.jsx";
 import { Icon } from "../ui/icons.jsx";
 import { Conversation, Composer, speedEffort, effortSpeed } from "../ui/conversation.jsx";
 import { rpc, hal, fmt } from "../lib/rpc.js";
@@ -118,7 +118,10 @@ export default function Chat() {
               <Icon name="shield" size={12} /> Untrusted provider. Everything you type here goes through the gateway, which removes secrets it recognizes, but assume the provider can read the rest.
             </div>
           </Show>
-          <Conversation events={events()} emptyText="Ask anything. This chat has no access to files, commands or the web." />
+          <Show when={params().session && sessions.state === "ready" && !current()}>
+            <NotFound title="Chat not found" action={<Button onClick={() => go("chat", {})}>Open latest chat</Button>}>This chat was deleted.</NotFound>
+          </Show>
+          <Conversation hidden={!!(params().session && sessions.state === "ready" && !current())} events={events()} emptyText="Ask anything. This chat has no access to files, commands or the web." />
           <Composer onSend={send} busy={busy()} onCancel={() => hal("POST", `/sessions/${selected()}/cancel`)}
             speed={effortSpeed(current()?.effort)} onSpeed={setSpeed}
             placeholder={`Message ${chosen() || "a model"}`} />

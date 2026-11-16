@@ -1,16 +1,26 @@
 // Backend bridge. All Rust calls go through `rpc("module.method", args)`.
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { onCleanup } from "solid-js";
+import { onCleanup, createSignal } from "solid-js";
 
-export const rpc = (method, args) => invoke("rpc", { method, args: args ?? null });
-export const hal = (method, path, body) => invoke("hal", { method, path, body });
+// Failed calls are tracked so the shell can say "backend unreachable" instead of
+// screens silently rendering as empty. A later success of the same call clears it.
+const [failures, setFailures] = createSignal({});
+export { failures };
+export const clearFailures = () => setFailures({});
+const track = (key, p) => p.then(
+  (v) => { if (failures()[key]) setFailures((f) => { const n = { ...f }; delete n[key]; return n; }); return v; },
+  (e) => { setFailures((f) => ({ ...f, [key]: e })); throw e; },
+);
+
+export const rpc = (method, args) => track(method, invoke("rpc", { method, args: args ?? null }));
+export const hal = (method, path, body) => track(`hal ${method} ${String(path).split("?")[0]}`, invoke("hal", { method, path, body }));
 
 /** Subscribe to a backend event for the lifetime of the current component. */
 export function useEvent(topic, fn) {
   let un;
   let dead = false;
-  listen(topic, (e) => fn(e.payload)).then((u) => (dead ? u() : (un = u)));
+  listen(topic, (e) => { try { fn(e.payload ?? {}); } catch (x) { console.error(`event ${topic}`, x); } }).then((u) => (dead ? u() : (un = u)));
   onCleanup(() => { dead = true; un?.(); });
 }
 
