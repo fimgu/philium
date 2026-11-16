@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { initNav, initProviders, initActivity, loadProviders } from "./panels.js";
 
 const $ = (s) => document.querySelector(s);
 const hal = (method, path, body) => invoke("hal", { method, path, body });
@@ -35,7 +36,7 @@ async function loadModels() {
   try {
     const m = await hal("GET", "/models");
     const items = Array.isArray(m) ? m : m.models ?? [];
-    state.models = items.map((x) => (typeof x === "string" ? x : x.id ?? x.name)).filter(Boolean);
+    state.models = items.map((x) => (typeof x === "string" ? x : x.id ?? x.name)).filter((m) => m && m !== "claude-code" && m !== "none"); // Filium placeholders
   } catch (e) {
     console.warn(e);
   }
@@ -230,8 +231,14 @@ $("#new-dialog").onclose = async () => {
   }
 };
 
+initNav(() => refreshSessions().catch(() => {}));
+initProviders(async () => { await loadModels(); setStatus("providers updated"); });
+initActivity().catch((e) => console.warn(e));
+
 (async function boot() {
   try {
+    const provs = await loadProviders().catch(() => []);
+    if (!provs.length) document.querySelector('#nav [data-view="providers"]').click();
     await hal("GET", "/health");
     setStatus("HAL ready");
     await loadModels();

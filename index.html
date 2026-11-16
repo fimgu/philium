@@ -12,10 +12,15 @@
       <h1>Filium</h1>
       <button id="new-session" title="New session">+</button>
     </header>
+    <nav id="nav">
+      <button data-view="chat" class="on">Sessions</button>
+      <button data-view="providers">Providers</button>
+      <button data-view="activity">Activity <span id="act-badge"></span></button>
+    </nav>
     <ul id="sessions"></ul>
     <footer id="status">starting HAL…</footer>
   </aside>
-  <main>
+  <main id="view-chat">
     <div id="toolbar">
       <span id="title">No session</span>
       <span id="meta"></span>
@@ -29,6 +34,55 @@
       <button type="submit" id="send" disabled>Send</button>
     </form>
   </main>
+
+  <main id="view-providers" hidden>
+    <div class="toolbar"><span class="title">Providers</span><span class="meta">Keys stay in the OS keychain. HAL only ever talks to Filium's local gateway.</span>
+      <button id="add-provider">Add provider</button></div>
+    <section class="pane" id="provider-list"></section>
+  </main>
+
+  <main id="view-activity" hidden>
+    <div class="toolbar"><span class="title">Gateway activity</span><span class="meta" id="act-totals"></span>
+      <button id="act-clear">Clear</button></div>
+    <div id="act-split">
+      <table id="act-table"><thead><tr>
+        <th>Time</th><th>Provider</th><th>Model</th><th>Status</th><th>Guard</th><th>Tokens ↑/↓</th><th>Duration</th><th>Size ↑/↓</th>
+      </tr></thead><tbody></tbody></table>
+      <section id="act-detail" class="pane"><p class="meta">Select a request to see exactly what was sent.</p></section>
+    </div>
+  </main>
+
+  <dialog id="provider-dialog">
+    <form method="dialog" id="provider-form">
+      <h2>Provider</h2>
+      <label>Name <input name="name" placeholder="My provider" required /></label>
+      <label>ID <input name="id" placeholder="my-provider" pattern="[a-z0-9][a-z0-9-]{0,39}" required /></label>
+      <label>API format
+        <select name="kind">
+          <option value="openai_chat">OpenAI-compatible (chat/completions)</option>
+          <option value="openai_responses">OpenAI Responses</option>
+          <option value="anthropic">Anthropic Messages</option>
+        </select>
+      </label>
+      <label>Base URL <input name="base_url" placeholder="https://api.example.com/v1" required /></label>
+      <label>Model <input name="model" placeholder="model-id" required /></label>
+      <label>Context window <input name="context_window" type="number" value="128000" min="1000" /></label>
+      <label>API key <input name="api_key" type="password" autocomplete="off" placeholder="stored in keychain" /></label>
+      <label>Outbound secret guard
+        <select name="guard">
+          <option value="redact">Redact secrets before sending</option>
+          <option value="block">Block requests containing secrets</option>
+          <option value="off">Off (log only)</option>
+        </select>
+      </label>
+      <label class="row"><input type="checkbox" name="make_default" /> Default model</label>
+      <p id="provider-error" class="note err"></p>
+      <menu>
+        <button value="cancel" formnovalidate>Cancel</button>
+        <button value="ok" id="provider-ok">Save</button>
+      </menu>
+    </form>
+  </dialog>
 
   <dialog id="new-dialog">
     <form method="dialog" id="new-form">
