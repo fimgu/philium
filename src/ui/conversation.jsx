@@ -1,0 +1,177 @@
+// Conversation view built from HAL session events. Used by Agents and Chat.
+// Events are folded into items: user / assistant (streamed) / tool / file /
+// permission / error. Text is always rendered as text, never HTML.
+import { Index, Show, Switch, Match, createSignal, createMemo, createEffect, on } from "solid-js";
+import { Badge, Button } from "./kit.jsx";
+import { Icon } from "./icons.jsx";
+
+/** Fold a list of HAL events into display items. Pure, incremental-safe. */
+export function fold(events) {
+  const items = [];
+  const tools = new Map();
+  let streaming = null;
+  let turnText = false;
+  for (const e of events) {
+    switch (e.type) {
+      case "message.created":
+        if (e.role === "user") { items.push({ kind: "user", text: e.content, seq: e.seq }); turnText = false; }
+        break;
+      case "model.delta":
+        if (!streaming) { streaming = { kind: "assistant", text: "", seq: e.seq, live: true }; items.push(streaming); }
+        streaming.text += e.delta;
+        turnText = true;
+        break;
+      case "model.finished":
+        if (streaming) { streaming.live = false; streaming.usage = e.usage; }
+        streaming = null;
+        break;
+      case "assistant.completed":
+        if (streaming) { streaming.live = false; streaming = null; }
+        else if (!turnText && e.text) items.push({ kind: "assistant", text: e.text, seq: e.seq });
+        turnText = false;
+        break;
+      case "tool.started": {
+        const t = { kind: "tool", tool: e.tool, args: e.arguments, out: "", seq: e.seq, running: true };
+        tools.set(e.call_id, t); items.push(t); streaming = null;
+        break;
+      }
+      case "tool.output": { const t = tools.get(e.call_id); if (t) t.out += e.data; break; }
+      case "tool.finished": {
+        const t = tools.get(e.call_id);
+        if (t) { t.running = false; t.ok = e.ok; t.ms = e.duration_ms; t.result = e.result; }
+        break;
+      }
+      case "file.changed": items.push({ kind: "file", path: e.path, diff: e.diff, seq: e.seq }); break;
+      case "permission.requested":
+        items.push({ kind: "perm", id: e.request_id, action: e.action, resource: e.resource, seq: e.seq, open: true });
+        break;
+      case "permission.resolved": {
+        const p = items.find((i) => i.kind === "perm" && i.id === e.request_id);
+        if (p) { p.open = false; p.decision = e.decision; }
+        break;
+      }
+      case "turn.failed": items.push({ kind: "error", text: e.error, seq: e.seq }); streaming = null; break;
+      case "turn.cancelled": items.push({ kind: "note", text: "Stopped.", seq: e.seq }); streaming = null; break;
+      case "context.compacted": items.push({ kind: "note", text: "Context compacted to save tokens.", seq: e.seq }); break;
+      case "loop.detected": items.push({ kind: "error", text: `Loop detected: the agent repeated ${e.tool ?? "a tool"} ${e.repeats ?? ""} times.`, seq: e.seq }); break;
+      case "subagent.started": items.push({ kind: "note", text: `Subagent started: ${e.description ?? e.agent ?? ""}`, seq: e.seq }); break;
+    }
+  }
+  return items;
+}
+
+// MCP tool names are mcp_philium_shell_run etc.; show the short form.
+const short = (t) => (t ?? "").replace(/^mcp_philium_/, "").replace(/^mcp_/, "");
+
+function argSummary(tool, args) {
+  if (!args || typeof args !== "object") return "";
+  const t = short(tool);
+  if (t === "shell_run") return args.command ?? "";
+  if (args.path) return args.path;
+  if (args.file_path) return args.file_path;
+  if (args.pattern) return args.pattern;
+  if (args.title) return args.title;
+  if (args.to) return `to ${args.to}`;
+  if (args.id) return args.id;
+  const s = JSON.stringify(args);
+  return s.length > 120 ? s.slice(0, 120) + "…" : s;
+}
+
+function Tool(props) {
+  const [open, setOpen] = createSignal(false);
+  const t = () => props.item;
+  return (
+    <div class="msg tool conv-tool">
+      <div class="row" style={{ cursor: "pointer" }} onClick={() => setOpen(!open())}>
+        <span class={`dot ${t().running ? "busy" : t().ok === false ? "bad" : "live"}`} />
+        <b>{short(t().tool)}</b>
+        <span class="ellipsis dim grow">{argSummary(t().tool, t().args)}</span>
+        <Show when={t().ms != null}><span class="faint xs">{(t().ms / 1000).toFixed(1)}s</span></Show>
+      </div>
+      <Show when={open()}>
+        <pre class="conv-pre">{JSON.stringify(t().args, null, 2)}</pre>
+        <Show when={t().out || t().result}><pre class="conv-pre">{(t().result || t().out || "").slice(0, 20000)}</pre></Show>
+      </Show>
+    </div>
+  );
+}
+
+/**
+ * props: events (array, reactive), onApprove(id, scope), onDeny(id), busy
+ */
+export function Conversation(props) {
+  let el;
+  const items = createMemo(() => fold(props.events ?? []));
+  const [stick, setStick] = createSignal(true);
+  createEffect(on(() => [items().length, items().at(-1)?.text?.length], () => {
+    if (stick() && el) queueMicrotask(() => (el.scrollTop = el.scrollHeight));
+  }));
+  return (
+    <div class="conv" ref={el} onScroll={(e) => {
+      const d = e.currentTarget;
+      setStick(d.scrollHeight - d.scrollTop - d.clientHeight < 60);
+    }}>
+      <div class="timeline">
+        <Show when={items().length === 0}>
+          <div class="faint small" style={{ "text-align": "center", padding: "40px 0" }}>{props.emptyText ?? "No messages yet."}</div>
+        </Show>
+        <Index each={items()}>
+          {(it) => (
+            <Switch>
+              <Match when={it().kind === "user"}><div class="msg user">{it().text}</div></Match>
+              <Match when={it().kind === "assistant"}>
+                <div class={`msg ${it().live ? "live" : ""}`}>{it().text}<Show when={it().live}><span class="caret" /></Show></div>
+              </Match>
+              <Match when={it().kind === "tool"}><Tool item={it()} /></Match>
+              <Match when={it().kind === "file"}>
+                <details class="msg tool">
+                  <summary><Icon name="repo" size={12} /> edited <b>{it().path}</b></summary>
+                  <pre class="conv-pre diff">{(it().diff ?? "").slice(0, 20000)}</pre>
+                </details>
+              </Match>
+              <Match when={it().kind === "perm"}>
+                <div class={`perm ${it().open ? "" : "done"}`} style={{ margin: 0 }}>
+                  <Icon name="shield" size={14} />
+                  <span class="grow">Wants to <b>{it().action}</b> <code class="mono">{it().resource}</code></span>
+                  <Show when={it().open} fallback={<Badge tone={/^(appr|allow)/.test(it().decision ?? "") ? "secure" : "danger"}>{it().decision ?? "resolved"}</Badge>}>
+                    <Button size="sm" onClick={() => props.onDeny?.(it().id)}>Deny</Button>
+                    <Button size="sm" onClick={() => props.onApprove?.(it().id, "once")}>Allow once</Button>
+                    <Button size="sm" variant="primary" onClick={() => props.onApprove?.(it().id, "session")}>Always</Button>
+                  </Show>
+                </div>
+              </Match>
+              <Match when={it().kind === "error"}><div class="msg error">{it().text}</div></Match>
+              <Match when={it().kind === "note"}><div class="faint xs" style={{ "align-self": "center" }}>{it().text}</div></Match>
+            </Switch>
+          )}
+        </Index>
+      </div>
+    </div>
+  );
+}
+
+/** Composer: Enter sends, Shift+Enter newline. */
+export function Composer(props) {
+  const [text, setText] = createSignal("");
+  const send = () => {
+    const t = text().trim();
+    if (!t || props.disabled) return;
+    props.onSend(t);
+    setText("");
+  };
+  return (
+    <div class="composer">
+      <textarea
+        class="textarea grow"
+        placeholder={props.placeholder ?? "Message"}
+        value={text()}
+        disabled={props.disabled}
+        onInput={(e) => setText(e.currentTarget.value)}
+        onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
+      />
+      <Show when={props.busy} fallback={<Button variant="primary" onClick={send} disabled={props.disabled}>Send</Button>}>
+        <Button onClick={props.onCancel}><Icon name="stop" size={12} /> Stop</Button>
+      </Show>
+    </div>
+  );
+}

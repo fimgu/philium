@@ -1,0 +1,27 @@
+/* Agents + conversation styles */
+.agent-chip {
+  display: inline-flex; align-items: center; height: 20px; padding: 0 8px; border-radius: 10px;
+  font-size: var(--fs-xs); font-weight: 600; letter-spacing: 0.01em;
+  color: hsl(var(--h) 80% 76%); background: hsl(var(--h) 45% 22% / 0.6);
+}
+.agent-list { display: flex; flex-direction: column; overflow: auto; }
+.agent-row { align-items: center; }
+.agent-view { display: flex; flex-direction: column; min-height: 0; height: 100%; overflow: hidden; }
+.agent-head { display: flex; align-items: center; gap: 8px; padding: 10px 16px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+.agent-view > .page-body { overflow: auto; flex: 1; }
+.agent-details .section-title { font-size: var(--fs-s); color: var(--text-dim); font-weight: 500; margin: 20px 0 8px; }
+.agent-details .grid-2 { gap: 14px 24px; }
+
+.conv { flex: 1; overflow: auto; min-height: 0; }
+.conv .timeline { padding: 16px 20px; }
+.conv-tool { padding: 6px 10px; }
+.conv-tool .row { gap: 8px; }
+.conv-pre {
+  margin: 6px 0 0; padding: 8px 10px; background: var(--bg); border: 1px solid var(--line); border-radius: 6px;
+  font-family: var(--mono); font-size: var(--fs-xs); white-space: pre-wrap; word-break: break-word;
+  max-height: 420px; overflow: auto; user-select: text; color: var(--text-dim);
+}
+.msg.live { border-color: var(--accent-dim); }
+.caret { display: inline-block; width: 7px; height: 14px; margin-left: 2px; vertical-align: -2px; background: var(--accent); animation: pulse 1s infinite; }
+.perm.done { border-color: var(--line); background: transparent; opacity: 0.75; }
+details.msg summary { cursor: pointer; display: flex; align-items: center; gap: 6px; }
