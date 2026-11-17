@@ -641,6 +641,38 @@ mod tests {
     }
 
     #[test]
+    fn numeric_thinking_budgets_preserve_output_headroom() {
+        for (effort, max_tokens, expected) in [
+            ("16k", 64_000, Some(16_384)),
+            (" 16K ", 64_000, Some(16_384)),
+            ("16384", 64_000, Some(16_384)),
+            ("high", 64_000, Some(16_384)),
+            ("0k", 64_000, Some(1_024)),
+            ("16k", 4_096, Some(3_072)),
+            ("16k", 2_048, Some(1_024)),
+            ("16k", 1_024, None),
+        ] {
+            let translated = request(&json!({
+                "model": "claude-sonnet-5-5",
+                "reasoning_effort": effort,
+                "max_tokens": max_tokens,
+                "messages": [{"role": "user", "content": "hi"}]
+            }), true);
+            assert_eq!(translated["thinking"]["budget_tokens"].as_u64(), expected, "{effort}, max={max_tokens}");
+            assert_eq!(translated["max_tokens"], max_tokens);
+        }
+    }
+
+    #[test]
+    fn unrelated_enum_rejections_do_not_change_effort_capabilities() {
+        let unrelated = r#"{"error":{"message":"Invalid value: 'xhigh'. Supported values are: 'low', 'medium', and 'high'."}}"#;
+        assert_eq!(parse_effort_rejection(400, unrelated), None);
+        let effort = r#"{"error":{"param":"reasoning_effort","message":"Supported values are: 'low', 'high'."}}"#;
+        assert_eq!(parse_effort_rejection(422, effort), Some(vec!["low".into(), "high".into()]));
+        assert_eq!(parse_effort_rejection(500, effort), None);
+    }
+
+    #[test]
     fn dynamic_effort_injection_and_rejection_parsing() {
         // Dynamic token budgets & named levels
         let ant_16k = request(&json!({
@@ -648,8 +680,10 @@ mod tests {
             "reasoning_effort": "16k",
             "messages": [{"role": "user", "content": "hi"}]
         }), true);
-        assert_eq!(ant_16k["thinking"]["budget_tokens"], 16_000);
-        assert_eq!(ant_16k["max_tokens"], 20_096);
+        // `k` uses binary token units, matching the named high budget (16 * 1024).
+        assert_eq!(ant_16k["thinking"]["budget_tokens"], 16_384);
+        // Thinking reserves space within the model's normal output budget.
+        assert_eq!(ant_16k["max_tokens"], 64_000);
 
         let ant_num = request(&json!({
             "model": "claude-sonnet-5-5",
@@ -672,7 +706,7 @@ mod tests {
         assert!(resp.get("reasoning").is_none());
 
         // Upstream 400 error parsing: enumerated supported values
-        let enum_err = r#"{"error":{"message":"Invalid value: 'xhigh'. Supported values are: 'low', 'medium', and 'high'."}}"#;
+        let enum_err = r#"{"error":{"param":"reasoning_effort","message":"Invalid value: 'xhigh'. Supported values are: 'low', 'medium', and 'high'."}}"#;
         assert_eq!(
             parse_effort_rejection(400, enum_err),
             Some(vec!["low".into(), "medium".into(), "high".into()])
