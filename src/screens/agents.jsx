@@ -1,6 +1,7 @@
 // Agents: every named agent, its live conversation, approvals, terminals and
 // changes. Supports Human -> Orchestrator -> Worker/Reviewer hierarchies,
 // shared-prefix KV cache telemetry, AST clash/health warnings, and Fleet Command Grid.
+import { kindResources } from "../lib/kind-resources.js";
 import { For, Show, createSignal, createResource, createMemo, createEffect, on, onCleanup, Suspense } from "solid-js";
 import { NotFound, Page, Button, Badge, Dot, Empty, Modal, Field, Input, TextArea, Select, Toggle, Segmented, ModelPicker, confirm, toast } from "../ui/kit.jsx";
 import { Icon } from "../ui/icons.jsx";
@@ -277,8 +278,13 @@ function Details(props) {
   const kv = () => a()?.kv || {};
   const [kindInfo, { refetch: refetchKind }] = createResource(
     () => a()?.id,
-    (id) => rpc("agents.kind_list", { id }).catch(() => ({ installed: false, clusters: [] }))
+    async (id) => {
+      try { return { id, clusters: kindResources(await rpc("agents.kind_list", { id })) }; }
+      catch (error) { return { id, clusters: [], error: String(error) }; }
+    }
   );
+  // Resources may retain the previous value while a new agent loads.
+  const kindState = () => kindInfo()?.id === a()?.id ? kindInfo() : undefined;
   const [kindBusy, setKindBusy] = createSignal(false);
 
   const createKind = async () => {
@@ -295,11 +301,11 @@ function Details(props) {
     }
   };
 
-  const deleteKind = async (name) => {
+  const deleteKind = async (cluster) => {
     setKindBusy(true);
     try {
-      await rpc("agents.kind_delete", { id: a().id, name }, { action: true });
-      toast(`Deleted kind cluster ${name}`);
+      await rpc("agents.kind_delete", { id: a().id, cluster }, { action: true });
+      toast(`Deleted kind cluster ${cluster}`);
       refetchKind();
       props.onRefetch?.();
     } catch (e) {
@@ -337,22 +343,22 @@ function Details(props) {
             <Icon name="plus" size={11} /> Create kind Cluster
           </Button>
         </div>
-        <Show when={(kindInfo()?.clusters ?? []).length} fallback={
-          <div class="xs faint">
-            {kindInfo()?.installed === false
-              ? "kind CLI not detected on PATH (install with `brew install kind`), or let the agent run `kind_cluster` via MCP."
-              : "No active kind clusters for this agent."}
+        <Show when={(kindState()?.clusters ?? []).length} fallback={
+          <div class="xs faint" role={kindState()?.error ? "alert" : undefined}>
+            {kindState()?.error
+              ? `Could not load kind clusters: ${kindState().error}`
+              : kindInfo.loading || !kindState() ? "Loading kind clusters…" : "No active kind clusters for this agent."}
           </div>
         }>
           <div class="list">
-            <For each={kindInfo()?.clusters ?? []}>
+            <For each={kindState()?.clusters ?? []}>
               {(cl) => (
                 <div class="list-item">
                   <Dot state="live" />
-                  <span class="mono small grow">{cl.name}</span>
-                  <span class="mono xs faint">HTTP :{cl.http_port} · HTTPS :{cl.https_port}</span>
-                  <span class="mono xs faint ellipsis" style={{ "max-width": "240px" }} title={cl.kubeconfig}>{cl.kubeconfig}</span>
-                  <Button size="sm" variant="ghost" disabled={kindBusy()} onClick={() => deleteKind(cl.name)}>
+                  <span class="mono small grow">{cl.handle}</span>
+                  <span class="mono xs faint">HTTP :{cl.meta.http_port ?? "?"} · HTTPS :{cl.meta.https_port ?? "?"}</span>
+                  <span class="mono xs faint ellipsis" style={{ "max-width": "240px" }} title={cl.meta.kubeconfig}>{cl.meta.kubeconfig}</span>
+                  <Button size="sm" variant="ghost" disabled={kindBusy()} onClick={() => deleteKind(cl.handle)}>
                     <Icon name="trash" size={12} /> Delete
                   </Button>
                 </div>
