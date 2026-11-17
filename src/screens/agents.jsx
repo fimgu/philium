@@ -1,6 +1,7 @@
 // Agents: every named agent, its live conversation, approvals, terminals and
 // changes. Supports Human -> Orchestrator -> Worker/Reviewer hierarchies,
 // shared-prefix KV cache telemetry, AST clash/health warnings, and Fleet Command Grid.
+import { workspaceAgents, selectedAgentId, spawnRepoDefault } from "../lib/agent-workspace.js";
 import { kindResources } from "../lib/kind-resources.js";
 import { For, Show, createSignal, createResource, createMemo, createEffect, on, onCleanup, Suspense } from "solid-js";
 import { NotFound, Page, Button, Badge, Dot, Empty, Modal, Field, Input, TextArea, Select, Toggle, Segmented, ModelPicker, confirm, toast } from "../ui/kit.jsx";
@@ -101,7 +102,7 @@ export function SpawnModal(props) {
   const [name, setName] = createSignal(props.preset?.name ?? "");
   const [role, setRole] = createSignal(props.preset?.role ?? "worker");
   const [model, setModel] = createSignal("");
-  const [repo, setRepo] = createSignal(props.preset?.repo_id ?? activeRepoId() ?? "");
+  const [repo, setRepo] = createSignal(spawnRepoDefault(props.preset, activeRepoId()));
   const [task, setTask] = createSignal(props.preset?.task_id ?? "");
   const [brief, setBrief] = createSignal(props.preset?.brief ?? "");
   const [strict, setStrict] = createSignal(false);
@@ -903,7 +904,6 @@ export default function Agents() {
   const [spawn, setSpawn] = createSignal(null);
   const [filter, setFilter] = createSignal("all");
   const [search, setSearch] = createSignal("");
-  const [broadcastText, setBroadcastText] = createSignal("");
   const [viewMode, setViewModeRaw] = createSignal(localStorage.getItem("agents.viewMode") || "split");
   const setViewMode = (m) => { setViewModeRaw(m); localStorage.setItem("agents.viewMode", m); };
 
@@ -915,17 +915,10 @@ export default function Agents() {
     { id: "agent.split", label: "Agents: Focus view (single agent + shell/browser)", run: () => setViewMode("split") },
   ]);
 
+  const scoped = createMemo(() => workspaceAgents(list() ?? [], activeRepoId(), store.repos() ?? []));
   const filtered = createMemo(() => {
     const q = search().trim().toLowerCase();
-    const repoId = activeRepoId();
-    const activeRepo = repoId ? (store.repos() ?? []).find((r) => r.id === repoId) : null;
-    return (list() ?? []).filter((a) => {
-      if (repoId) {
-        const matchesId = a.repo_id === repoId;
-        const matchesName = activeRepo && a.repo_name === activeRepo.name;
-        const matchesCwd = activeRepo?.path && a.cwd?.startsWith(activeRepo.path);
-        if (!matchesId && !matchesName && !matchesCwd) return false;
-      }
+    return scoped().filter((a) => {
       if (filter() === "live" && !a.live) return false;
       if (filter() === "waiting" && a.state !== "waiting") return false;
       if (filter() === "warnings" && !(a.warnings ?? []).length) return false;
@@ -974,10 +967,10 @@ export default function Agents() {
     return [...groups.values()];
   });
 
-  const selected = () => params().id ?? tree()[0]?.a.id;
+  const selected = () => selectedAgentId(tree().map(({ a }) => a), params().id);
 
   const telemetry = createMemo(() => {
-    const l = list() ?? [];
+    const l = scoped();
     let totalIn = 0, totalCached = 0, warnings = 0, clashes = 0;
     const allAlerts = [];
     for (const a of l) {
@@ -1016,6 +1009,7 @@ export default function Agents() {
         decision: "approve",
         scope: "session",
         cluster_id: clusterId,
+        repo_id: activeRepoId() || null,
       });
       toast(`Approved ${res?.resolved ?? 0} waiting permission request(s)`, "secure");
       refetch();
@@ -1024,23 +1018,10 @@ export default function Agents() {
     }
   };
 
-  const sendBroadcast = async (e) => {
-    e?.preventDefault();
-    const txt = broadcastText().trim();
-    if (!txt) return;
-    try {
-      const res = await rpc("agents.broadcast", { text: txt, only_orchestrator: true });
-      setBroadcastText("");
-      toast(`Broadcast sent to ${res?.sent ?? 0} orchestrator(s)`, "secure");
-    } catch (err) {
-      toast(String(err), "danger");
-    }
-  };
-
   return (
     <Page title="Agents" flush
       sub={
-        <Show when={(list() ?? []).length}>
+        <Show when={scoped().length}>
           <span class="fleet-sub-telemetry">
             <span>{telemetry().live}/{telemetry().total} running</span>
             <Show when={telemetry().waiting > 0}>
@@ -1053,7 +1034,7 @@ export default function Agents() {
         </Show>
       }
       actions={<div class="row" style={{ gap: "8px", "flex-wrap": "wrap" }}>
-        <Show when={(list() ?? []).length}>
+        <Show when={scoped().length}>
           <input
             type="search"
             class="input fleet-search"
@@ -1075,8 +1056,9 @@ export default function Agents() {
         <Button variant="primary" onClick={() => setSpawn({})}><Icon name="plus" size={12} /> New agent</Button>
       </div>}>
 
+      <div class="agents-workspace" style={{ display: "flex", "flex-direction": "column", "min-height": "0" }}>
       <Show when={telemetry().allAlerts.length > 0}>
-        <div class="fleet-triage-strip">
+        <div class="fleet-triage-strip" style={{ flex: "none" }}>
           <Show when={telemetry().waiting > 0}>
             <Button size="sm" variant="primary" onClick={() => approveAllWaiting(null)}>
               ✓ Approve All Waiting ({telemetry().waiting})
@@ -1096,36 +1078,26 @@ export default function Agents() {
               )}
             </For>
           </div>
-          <div class="grow" />
-          <form class="fleet-broadcast-form" onSubmit={sendBroadcast}>
-            <input
-              type="text"
-              class="input fleet-broadcast-input"
-              value={broadcastText()}
-              onInput={(e) => setBroadcastText(e.currentTarget.value)}
-              placeholder="Broadcast directive to all cluster orchestrators…"
-            />
-            <Button size="sm" type="submit" disabled={!broadcastText().trim()}>Broadcast</Button>
-          </form>
         </div>
       </Show>
 
-      <Show when={(list() ?? []).length} fallback={
-        <Empty icon={<Icon name="agents" size={28} />} title="No agents yet"
-          action={<Button variant="primary" onClick={() => setSpawn({})}>Start your first Orchestrator</Button>}>
-          Dispatch a high-level goal in the Mission Bar above to launch an Orchestrator. It will map the repo, spawn parallel Workers in isolated git worktrees, and coordinate PR delivery with minimal human interference.
+      <div class="agents-workspace-content" style={{ display: "flex", flex: "1", "min-height": "0", overflow: "hidden" }}>
+      <Show when={scoped().length} fallback={
+        <Empty icon={<Icon name="agents" size={28} />} title="No agents in this workspace"
+          action={<Button variant="primary" onClick={() => setSpawn({})}>Start your first agent</Button>}>
+          Create an agent for the selected workspace, or switch workspaces to see its agents.
         </Empty>}>
         <Show when={viewMode() !== "split"} fallback={
-          <div class="split">
+          <div class="split" style={{ flex: "1", "min-width": "0" }}>
             <div class="agent-list">
               <For each={tree()}>{({ a, d }) => <AgentRow agent={a} depth={d} selected={a.id === selected()} onClick={() => go("agents", { id: a.id })} />}</For>
             </div>
             <Show when={selected()}>{(id) => (
-              <Show when={list.loading || (list() ?? []).some((a) => a.id === id())} fallback={
+              <Show when={filtered().some((a) => a.id === id())} fallback={
                 <NotFound title="Agent not found" action={<Button onClick={() => go("agents", {})}>Back to agents</Button>}>
                   This agent was removed or never existed.
                 </NotFound>}>
-                <AgentView id={id()} agent={(list() ?? []).find((a) => a.id === id())} />
+                <AgentView id={id()} agent={filtered().find((a) => a.id === id())} />
               </Show>
             )}</Show>
           </div>
@@ -1201,6 +1173,8 @@ export default function Agents() {
           </div>
         </Show>
       </Show>
+      </div>
+      </div>
       <Show when={spawn()}>
         <SpawnModal preset={spawn()} onClose={(a) => { setSpawn(null); if (a) { refetch(); go("agents", { id: a.id }); } }} />
       </Show>
