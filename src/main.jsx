@@ -103,12 +103,11 @@ function App() {
           <select
             aria-label="Active workspace repository"
             title="Scope Agents, Board, and Terminals to a repository/folder"
-            value={activeRepoId()}
             onChange={(e) => setActiveRepoId(e.currentTarget.value)}
           >
-            <option value="">All Workspaces</option>
+            <option value="" selected={!activeRepoId()}>All Workspaces</option>
             <For each={store.repos() ?? []}>
-              {(r) => <option value={r.id}>{r.name}</option>}
+              {(r) => <option value={r.id} selected={activeRepoId() === r.id}>{r.name}</option>}
             </For>
           </select>
         </div>
