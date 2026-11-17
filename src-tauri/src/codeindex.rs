@@ -717,12 +717,18 @@ pub fn load_view(ctx: &Ctx, repo_id: &str, base: &str, wt_id: Option<&str>) -> R
 
 /// Build base + delta and load the effective view. Blocking.
 pub fn index_target(ctx: &Ctx, repo_id: &str, repo: &Path, branch: &str, wt: Option<(&str, &Path)>, force: bool) -> Result<(View, String), String> {
+    let base = refresh_target(ctx, repo_id, repo, branch, wt, force)?;
+    let v = load_view(ctx, repo_id, &base, wt.map(|w| w.0))?;
+    Ok((v, base))
+}
+
+/// Refresh persisted base/delta data without materializing symbols or references.
+fn refresh_target(ctx: &Ctx, repo_id: &str, repo: &Path, branch: &str, wt: Option<(&str, &Path)>, force: bool) -> Result<String, String> {
     let base = ensure_base(ctx, repo_id, repo, branch)?;
     if let Some((id, p)) = wt {
         ensure_delta(ctx, repo_id, &base, id, p, force)?;
     }
-    let v = load_view(ctx, repo_id, &base, wt.map(|w| w.0))?;
-    Ok((v, base))
+    Ok(base)
 }
 
 // ---------------------------------------------------------------- changes
@@ -1524,11 +1530,16 @@ pub struct Loaded {
     pub base: String,
 }
 
-async fn load(ctx: &Arc<Ctx>, t: Target) -> Result<Loaded, String> {
+async fn load(ctx: &Arc<Ctx>, t: Target, include_view: bool) -> Result<Loaded, String> {
     let c = ctx.clone();
     let tt = t.clone();
     let (view, base) = tokio::task::spawn_blocking(move || {
-        index_target(&c, &tt.repo_id, &tt.repo_path, &tt.branch, tt.wt.as_ref().map(|w| (w.id.as_str(), w.path.as_path())), true)
+        let wt = tt.wt.as_ref().map(|w| (w.id.as_str(), w.path.as_path()));
+        if include_view {
+            index_target(&c, &tt.repo_id, &tt.repo_path, &tt.branch, wt, true)
+        } else {
+            refresh_target(&c, &tt.repo_id, &tt.repo_path, &tt.branch, wt, true).map(|base| (View::default(), base))
+        }
     })
     .await
     .map_err(|e| e.to_string())??;
@@ -1818,7 +1829,8 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
         }
         "status" | "map" | "find" | "refs" | "impact" | "tree" | "graph" => {
             let t = resolve(ctx, &args)?;
-            let l = load(ctx, t).await?;
+            // Status reports persisted counts, not an effective symbol/reference view.
+            let l = load(ctx, t, method != "status").await?;
             match method {
                 "status" => {
                     let c = |t: &str| ctx.db.query(&format!("SELECT count(*) AS n FROM {t} WHERE scope=?1"), [base_scope(&l.t.repo_id, &l.base)]).ok().and_then(|r| r.first().and_then(|x| x["n"].as_i64())).unwrap_or(0);
@@ -2217,7 +2229,7 @@ pub fn mcp_tools() -> Vec<Value> {
 
 pub async fn mcp_call(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Result<Value, String> {
     let t = resolve_agent(ctx, agent)?;
-    let l = load(ctx, t).await?;
+    let l = load(ctx, t, true).await?;
     let cap = a["max_tokens"].as_u64().map(|n| n as usize).unwrap_or(4000).clamp(100, 60000);
     let root = l.t.wt.as_ref().map(|w| w.path.as_path()).unwrap_or(l.t.repo_path.as_path());
     let text = match name {
@@ -2279,6 +2291,95 @@ mod tests {
         let ctx = Ctx::test();
         ctx.db.with(|c| c.execute_batch(SCHEMA)).unwrap();
         ctx
+    }
+
+    // These fixtures own only a disposable repository and an in-memory database.
+    struct StatusFixture {
+        ctx: Arc<Ctx>,
+        root: PathBuf,
+    }
+
+    impl StatusFixture {
+        fn new() -> Self {
+            let ctx = fresh_ctx();
+            let root = repo();
+            ctx.db.exec("INSERT INTO repos(id,name,path,default_branch,added_at) VALUES('status','Fixture',?1,'main',0)", [root.to_str().unwrap()]).unwrap();
+            Self { ctx, root }
+        }
+    }
+
+    impl Drop for StatusFixture {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.root).unwrap();
+            std::fs::remove_dir_all(self.ctx.data_dir.parent().unwrap()).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn status_preserves_counts_and_refreshes_delta_without_loading_view() {
+        let f = StatusFixture::new();
+        let (view, base) = index_target(&f.ctx, "status", &f.root, "main", None, true).unwrap();
+        let scope = base_scope("status", &base);
+        let count = |table: &str| f.ctx.db.query(&format!("SELECT count(*) AS n FROM {table} WHERE scope=?1"), [&scope]).unwrap()[0]["n"].clone();
+        let built = f.ctx.db.query("SELECT built_at FROM ci_snap WHERE repo_id='status'", []).unwrap()[0]["built_at"].clone();
+        let expected = json!({ "repo_id": "status", "base_commit": base, "files": count("ci_files"), "syms": count("ci_syms"), "refs": count("ci_refs"), "built_at": built, "worktree": null });
+        assert_eq!(call(&f.ctx, "status", json!({"repo_id":"status"})).await.unwrap(), expected);
+        // A poisoned reference would fail load_view's typed row decoding. Status must
+        // still count it without decoding any reference payload (no schema change).
+        f.ctx.db.exec("INSERT INTO ci_refs VALUES(?1,'src/b.rs','helper','call','not-an-integer','helper()', 'caller',2)", [&scope]).unwrap();
+        assert!(load_view(&f.ctx, "status", &base, None).is_err());
+        let mut expected = expected;
+        expected["refs"] = json!(expected["refs"].as_i64().unwrap() + 1);
+        assert_eq!(call(&f.ctx, "status", json!({"repo_id":"status"})).await.unwrap(), expected);
+        f.ctx.db.exec("DELETE FROM ci_refs WHERE line='not-an-integer'", []).unwrap();
+        expected["refs"] = json!(expected["refs"].as_i64().unwrap() - 1);
+
+        std::fs::write(f.root.join("src/a.rs"), "pub fn replacement() {}\n").unwrap();
+        std::fs::remove_file(f.root.join("src/b.rs")).unwrap();
+        std::fs::write(f.root.join("src/new.rs"), "pub fn fresh() {}\n").unwrap();
+        let args = json!({"repo_id":"status", "working_tree":true});
+        let status = call(&f.ctx, "status", args.clone()).await.unwrap();
+        assert_eq!(status["worktree"]["delta_files"], 3);
+        assert_eq!(status["worktree"]["id"], "local:status");
+        assert!(status["worktree"]["indexed_at"].as_i64().is_some());
+        for key in ["repo_id", "base_commit", "files", "syms", "refs", "built_at"] {
+            assert_eq!(status[key], expected[key], "status still counts base rows: {key}");
+        }
+        let delta = load_view(&f.ctx, "status", &base, Some("local:status")).unwrap();
+        assert_eq!(delta.syms.iter().map(|s| s.name.as_str()).collect::<HashSet<_>>(), HashSet::from(["replacement", "fresh"]));
+        assert!(delta.refs.is_empty());
+        sh(&f.root, &["restore", "src/a.rs", "src/b.rs"]);
+        std::fs::remove_file(f.root.join("src/new.rs")).unwrap();
+        let reverted = call(&f.ctx, "status", args).await.unwrap();
+        assert_eq!(reverted["worktree"]["delta_files"], 0);
+        let restored = load_view(&f.ctx, "status", &base, Some("local:status")).unwrap();
+        assert_eq!(restored.syms.len(), view.syms.len());
+        assert_eq!(restored.refs.len(), view.refs.len());
+        assert!(call(&f.ctx, "status", json!({"repo_id":"missing"})).await.is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "explicit large-reference performance evidence fixture"]
+    async fn status_large_reference_evidence() {
+        let f = StatusFixture::new();
+        let base = refresh_target(&f.ctx, "status", &f.root, "main", None, true).unwrap();
+        let scope = base_scope("status", &base);
+        f.ctx.db.with(|c| {
+            c.execute("DELETE FROM ci_refs", [])?;
+            c.execute("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<1950000) INSERT INTO ci_refs SELECT ?1,'src/b.rs','helper','call',x,'helper(2)','caller',2 FROM n", [&scope])?;
+            Ok(())
+        }).unwrap();
+        let target = resolve(&f.ctx, &json!({"repo_id":"status"})).unwrap();
+        let before = Instant::now();
+        let loaded = load(&f.ctx, target, true).await.unwrap();
+        let before_time = before.elapsed();
+        assert_eq!(loaded.view.refs.len(), 1_950_000);
+        drop(loaded);
+        let after = Instant::now();
+        let status = call(&f.ctx, "status", json!({"repo_id":"status"})).await.unwrap();
+        let after_time = after.elapsed();
+        assert_eq!(status["refs"], 1_950_000);
+        eprintln!("status fixture: refs=1950000 before_full_load_ms={} after_status_rpc_ms={} materialized_refs_before=1950000 materialized_refs_after=0", before_time.as_millis(), after_time.as_millis());
     }
 
     #[test]
