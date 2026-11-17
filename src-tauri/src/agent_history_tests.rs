@@ -347,3 +347,43 @@ async fn bundled_hal_persists_events_then_public_rpc_reads_without_resurrection(
     #[cfg(unix)]
     assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
 }
+
+#[test]
+fn sent_attachments_are_scoped_to_own_user_messages_and_read_only() {
+    let f = Fixture::new();
+    f.agent("owner", "owner", Some("session"));
+    let db = f.db("owner");
+    db.execute_batch(
+        "CREATE TABLE messages(id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, content TEXT, created_at TEXT, compacted INTEGER DEFAULT 0);
+         CREATE TABLE blobs(session_id TEXT, sha256 TEXT, media_type TEXT, data BLOB, PRIMARY KEY(session_id, sha256));
+         INSERT INTO sessions VALUES('peer');",
+    )
+    .unwrap();
+    let sent = "1".repeat(64);
+    let unreferenced = "2".repeat(64);
+    let assistant_only = "3".repeat(64);
+    let svg = "4".repeat(64);
+    let peer = "5".repeat(64);
+    let png = b"\x89PNG\r\n\x1a\nfixture".to_vec();
+    for (session, sha, media) in [("session", &sent, "image/png"), ("session", &unreferenced, "image/png"), ("session", &assistant_only, "image/png"), ("session", &svg, "image/svg+xml"), ("peer", &peer, "image/png")] {
+        db.execute("INSERT INTO blobs VALUES(?1,?2,?3,?4)", params![session, sha, media, png]).unwrap();
+    }
+    let msg = |sha: &str| json!({"role":"user","content":"x","images":[{"sha256":sha,"media_type":"image/png","name":"a.png"}]}).to_string();
+    db.execute("INSERT INTO messages(session_id,role,content,created_at) VALUES('session','user',?1,'t')", [msg(&sent)]).unwrap();
+    db.execute("INSERT INTO messages(session_id,role,content,created_at) VALUES('session','user',?1,'t')", [msg(&svg)]).unwrap();
+    db.execute("INSERT INTO messages(session_id,role,content,created_at) VALUES('session','assistant',?1,'t')", [msg(&assistant_only)]).unwrap();
+    db.execute("INSERT INTO messages(session_id,role,content,created_at) VALUES('peer','user',?1,'t')", [msg(&peer)]).unwrap();
+    drop(db);
+    let before = std::fs::read(f.path("owner")).unwrap();
+    let (media, bytes) = attachment(&f.ctx, "owner", &sent).unwrap();
+    assert_eq!((media.as_str(), bytes), ("image/png", png));
+    for sha in [&unreferenced, &assistant_only, &peer] {
+        assert!(attachment(&f.ctx, "owner", sha).unwrap_err().contains("not found"), "{sha}");
+    }
+    assert!(attachment(&f.ctx, "owner", &svg).unwrap_err().contains("cannot be previewed"));
+    assert!(attachment(&f.ctx, "owner", "../hal.db").is_err());
+    assert!(attachment(&f.ctx, "owner", &"A".repeat(64)).unwrap_err().contains("invalid"));
+    assert!(attachment(&f.ctx, "missing", &sent).is_err());
+    assert_eq!(std::fs::read(f.path("owner")).unwrap(), before);
+    assert!(!f.path("owner").with_extension("db-wal").exists());
+}

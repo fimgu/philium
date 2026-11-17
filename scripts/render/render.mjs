@@ -38,6 +38,8 @@ const stub = (fx, setName) => {
   window.__permissionCalls = [];
   const listeners = new Map();
   window.__test = { sends: [], mode: "reject", holdShell: false, codeCalls: [] };
+  // 1x1 PNG referenced by the populated agent transcript.
+  window.__test.blobs = new Map([["abababababababababababababababababababababababababababababababab", Uint8Array.from(atob("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="), (c) => c.charCodeAt(0))]]);
   if (setName === "populated") {
     fixtures["workspace.worktrees"].forEach((w) => { w.state = "active"; });
     fixtures["codeindex.tree"].files.unshift({ path: "src/review.py", syms: [{ name: "review", kind: "function", line: 3 }] });
@@ -73,6 +75,20 @@ const stub = (fx, setName) => {
         return;
       }
       if (cmd.startsWith("plugin:")) return 1;
+      if (cmd === "drafts_put_blob") {
+        const bytes = new Uint8Array(a);
+        const digest = [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))].map((b) => b.toString(16).padStart(2, "0")).join("");
+        const sig = bytes.slice(0, 4).join();
+        const media = sig === "137,80,78,71" ? "image/png" : sig.startsWith("255,216,255") ? "image/jpeg" : null;
+        if (!media) throw "Unsupported image. Use PNG, JPEG, GIF or WebP.";
+        (window.__test.blobs ??= new Map()).set(digest, bytes);
+        return { sha256: digest, media_type: media, size: bytes.length };
+      }
+      if (cmd === "drafts_blob") { const b = window.__test.blobs?.get(a.sha256); if (!b) throw "Draft image is missing"; return b; }
+      if (cmd === "drafts_load") return structuredClone(window.__test.drafts?.[a.key] ?? { text: "", images: [] });
+      if (cmd === "drafts_save") { (window.__test.drafts ??= {})[a.key] = structuredClone(a.draft); return null; }
+      if (cmd === "agent_attachment") { (window.__test.attachmentCalls ??= []).push(a); const b = window.__test.blobs?.get(a.sha256); if (!b) throw "attachment not found in this conversation"; return b; }
+      if (cmd === "capture_screenshot") return window.__test.screenshot ?? new Uint8Array();
       if (fixtures.__delay) await new Promise((r) => setTimeout(r, fixtures.__delay));
       if (fixtures.__fail && (cmd === "rpc" || cmd === "hal")) {
         window.__n = (window.__n ?? 0) + 1;

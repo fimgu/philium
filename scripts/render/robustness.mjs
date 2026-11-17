@@ -7,6 +7,16 @@ export async function checkAgentMessaging(page) {
     const input = () => document.querySelector('.composer textarea');
     const value = (text) => { input().value = text; input().dispatchEvent(new Event('input', { bubbles: true })); };
     const enter = () => input().dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+    for (let i = 0; i < 20 && !document.querySelector('.msg.user .sent-image img'); i++) await new Promise((r) => setTimeout(r, 50));
+    const sent = document.querySelector('.msg.user .sent-image img');
+    if (!sent || !sent.src.startsWith('blob:')) errors.push('sent image thumbnail missing from transcript');
+    else {
+      if (!(window.__test.attachmentCalls ?? []).every((c) => /^[0-9a-f]{64}$/.test(c.sha256) && c.id)) errors.push('attachment fetched without agent scope');
+      sent.closest('button').click(); await new Promise((r) => setTimeout(r, 50));
+      if (!document.querySelector('.lightbox img')) errors.push('lightbox did not open');
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); await new Promise((r) => setTimeout(r, 50));
+      if (document.querySelector('.lightbox')) errors.push('lightbox did not close on Escape');
+    }
     const paste = async (name) => {
       const data = Uint8Array.from(atob('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aE3cAAAAASUVORK5CYII='), (c) => c.charCodeAt(0));
       const clipboardData = new DataTransfer();
@@ -19,16 +29,16 @@ export async function checkAgentMessaging(page) {
     await paste('first.png');
     const navigate = (label) => [...document.querySelectorAll('.nav-item')].find((b) => b.textContent.trim() === label)?.click();
     navigate('Home'); await wait(); navigate('Agents'); await wait();
-    if (!input() || input().value !== 'keep this draft' || !document.querySelector('.composer img')) return ['navigation lost agent draft or attachment'];
+    if (!input() || input().value !== 'keep this draft' || !document.querySelector('.composer-images img')) return ['navigation lost agent draft or attachment'];
     window.__agentState('running'); await wait();
     enter(); enter(); await wait();
     if (window.__test.sends.length) errors.push('busy Enter submitted');
-    if (input().value !== 'keep this draft' || !document.querySelector('.composer img')) errors.push('busy draft lost');
+    if (input().value !== 'keep this draft' || !document.querySelector('.composer-images img')) errors.push('busy draft lost');
     window.__agentState('waiting'); await wait();
     enter(); await wait();
     if (window.__test.sends.length) errors.push('waiting Enter submitted');
     window.__test.failCancel = true;
-    [...document.querySelectorAll('.composer button')].find((b) => b.textContent.trim() === 'Stop')?.click();
+    [...document.querySelectorAll('.composer button')].find((b) => b.getAttribute('aria-label') === 'Stop')?.click();
     await wait();
     if (!document.body.innerText.includes('Cancellation unavailable')) errors.push('cancel failure not visible');
     if (document.body.innerText.includes('Some data could not load')) errors.push('cancel failure became data loading failure');
@@ -38,7 +48,7 @@ export async function checkAgentMessaging(page) {
     if (window.__test.sends.length !== 1) errors.push('duplicate pending submission');
     if (input().value !== 'keep this draft') errors.push('pending draft cleared early');
     window.__test.releaseSend?.(); await wait();
-    if (input().value !== 'keep this draft' || !document.querySelector('.composer img')) errors.push('rejected draft lost');
+    if (input().value !== 'keep this draft' || !document.querySelector('.composer-images img')) errors.push('rejected draft lost');
     if (document.body.innerText.includes('Some data could not load')) errors.push('action rejection became data loading failure');
     if (!document.body.innerText.includes('Your draft was kept')) errors.push('busy error lacks actionable feedback');
     window.__test.mode = 'accept';
@@ -47,12 +57,12 @@ export async function checkAgentMessaging(page) {
     await paste('second.png');
     window.__test.releaseSend?.(); await wait();
     if (input().value !== 'new draft while sending') errors.push('accepted send cleared newer edits');
-    const images = [...document.querySelectorAll('.composer img')].map((im) => im.alt);
+    const images = [...document.querySelectorAll('.composer-images img')].map((im) => im.alt);
     if (images.join() !== 'second.png') errors.push(`wrong attachments after acceptance: ${images}`);
     const retry = window.__test.sends[1];
     if (retry?.text !== 'keep this draft' || retry?.images?.[0]?.name !== 'first.png') errors.push('retry payload lost original draft');
     enter(); await wait(); window.__test.releaseSend?.(); await wait();
-    if (input().value || document.querySelector('.composer img')) errors.push('accepted unchanged draft not cleared');
+    if (input().value || document.querySelector('.composer-images img')) errors.push('accepted unchanged draft not cleared');
     if (window.__test.sends.length !== 3) errors.push('unexpected accepted send count');
     return errors;
   });
@@ -63,7 +73,7 @@ export async function checkChatMessaging(page) {
     const errors = [];
     const input = document.querySelector('.composer textarea');
     if (!input) return ['chat composer missing'];
-    if ([...document.querySelectorAll('.composer button')].some((b) => b.textContent.trim() === 'Stop')) errors.push('completed chat history still busy');
+    if ([...document.querySelectorAll('.composer button')].some((b) => b.getAttribute('aria-label') === 'Stop')) errors.push('completed chat history still busy');
     input.value = 'keep rejected chat'; input.dispatchEvent(new Event('input', { bubbles: true }));
     input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
     await new Promise((r) => setTimeout(r, 150));
@@ -82,7 +92,7 @@ export async function checkChatMessaging(page) {
     window.__test.chatWorking = true;
     await send('keep working');
     window.__test.failCancel = true;
-    const stop = [...document.querySelectorAll('.composer button')].find((b) => b.textContent.trim() === 'Stop');
+    const stop = [...document.querySelectorAll('.composer button')].find((b) => b.getAttribute('aria-label') === 'Stop');
     if (!stop) errors.push('working chat has no Stop');
     const activeTool = [...document.querySelectorAll('.conv-tool')].find((el) => el.innerText.includes('fixture_tool'));
     if (!activeTool?.querySelector('.dot.busy') || !activeTool.innerText.includes('Awaiting tool completion')) errors.push('chat busy state did not reach shared tool progress view');

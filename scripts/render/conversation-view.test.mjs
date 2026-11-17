@@ -9,11 +9,11 @@ function memoryStorage(value) {
   return { getItem: key => entries.get(key) ?? null, setItem: (key, value) => entries.set(key, value), entries };
 }
 
-test('default is conversation and valid stored preferences restore', () => {
+test('default is terminal and valid stored preferences restore', () => {
   for (const value of [undefined, 'conversation', 'terminal']) {
     const storage = memoryStorage(value);
     const [view] = createConversationView(() => storage);
-    assert.equal(view(), value ?? 'conversation');
+    assert.equal(view(), value ?? 'terminal');
   }
 });
 
@@ -21,7 +21,7 @@ test('invalid stored values fall back without executing or overwriting them', ()
   for (const invalid of ['', 'Terminal', 'shell', 'null', '{"mode":"terminal"}', '<script>bad</script>']) {
     const storage = memoryStorage(invalid);
     const [view] = createConversationView(() => storage);
-    assert.equal(view(), 'conversation');
+    assert.equal(view(), 'terminal');
     assert.equal(storage.entries.get(CONVERSATION_VIEW_KEY), invalid);
   }
 });
@@ -49,9 +49,9 @@ test('invalid setter inputs leave valid preference and storage unchanged', () =>
 test('missing, blocked getter and blocked reader storage do not prevent session choice', () => {
   for (const access of [() => undefined, () => { throw Error('blocked'); }, () => ({ getItem() { throw Error('read blocked'); } })]) {
     const [view, setView] = createConversationView(access);
-    assert.equal(view(), 'conversation');
-    assert.doesNotThrow(() => setView('terminal'));
     assert.equal(view(), 'terminal');
+    assert.doesNotThrow(() => setView('conversation'));
+    assert.equal(view(), 'conversation');
   }
 });
 

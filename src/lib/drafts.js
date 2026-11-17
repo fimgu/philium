@@ -1,10 +1,16 @@
 import { createSignal } from "solid-js";
+import { blobToBase64 } from "./images.js";
 
-// One serialized queue covers restores and writes. No browser storage or agent RPC.
-export function createDraftStore(invoke) {
+// Drafts live in private native storage: a small text index plus content-addressed
+// image blobs. Typing rewrites only the index. Image bytes are written once, on attach.
+// Draft images in memory: { sha256, media_type, name, size, blob, preview(object URL) }.
+const SAVE_ERROR = "Draft could not be saved. Keep this window open and retry.";
+export function createDraftStore(invoke, urls = globalThis.URL) {
   const drafts = new Map();
   let queue = Promise.resolve();
   const enqueue = (task) => { const result = queue.then(task); queue = result.catch(() => {}); return result; };
+  const objectUrl = (blob) => urls?.createObjectURL ? urls.createObjectURL(blob) : "";
+  const revoke = (image) => { if (image?.preview && urls?.revokeObjectURL) urls.revokeObjectURL(image.preview); };
   function get(key) {
     if (drafts.has(key)) return drafts.get(key);
     const record = newDraft();
@@ -12,7 +18,7 @@ export function createDraftStore(invoke) {
     drafts.set(key, record);
     const rawText = record.setText, rawImages = record.setImages;
     let restored = false, operations = [], revision = 0, scheduled = false;
-    const snapshot = () => ({ text: record.text(), images: record.images().map(({ data, media_type, name }) => ({ data, media_type, name })) });
+    const snapshot = () => ({ text: record.text(), images: record.images().map(({ sha256, media_type, name, size }) => ({ sha256, media_type, name, size })) });
     const save = () => {
       if (!restored || scheduled) return;
       scheduled = true;
@@ -23,11 +29,17 @@ export function createDraftStore(invoke) {
         version = revision;
         return invoke("drafts_save", { key, draft: snapshot() });
       }).then(() => {
-        if (version === revision) { record.setPending(false); record.setError(""); }
+        if (version === revision) { record.setPending(false); if (record.error() === SAVE_ERROR) record.setError(""); }
       }).catch(() => {
-        record.setError("Draft could not be saved. Keep this window open and retry.");
+        record.setError(SAVE_ERROR);
         if (version === revision) record.setPending(false);
       });
+    };
+    const setImagesTracked = (value) => {
+      const before = record.images();
+      rawImages(value);
+      const after = new Set(record.images());
+      before.filter((image) => !after.has(image)).forEach(revoke);
     };
     const change = (setter, value) => {
       revision++;
@@ -36,18 +48,30 @@ export function createDraftStore(invoke) {
       save();
     };
     record.setText = (value) => change(rawText, value);
-    record.setImages = (value) => change(rawImages, value);
+    record.setImages = (value) => change(setImagesTracked, value);
     record.retry = () => restored ? save() : restore();
     function restore() {
       record.setLoading(true);
-      enqueue(() => invoke("drafts_load", { key })).then((value) => {
-        rawText(value?.text || "");
-        rawImages((value?.images || []).map((im) => ({ ...im, preview: `data:${im.media_type};base64,${im.data}` })));
+      enqueue(async () => {
+        const value = await invoke("drafts_load", { key });
+        const images = [];
+        let missing = 0;
+        for (const ref of value?.images || []) {
+          try {
+            const bytes = await invoke("drafts_blob", { sha256: ref.sha256 });
+            const blob = new Blob([bytes], { type: ref.media_type });
+            images.push({ ...ref, blob, preview: objectUrl(blob) });
+          } catch { missing++; }
+        }
+        return { text: value?.text || "", images, missing };
+      }).then(({ text, images, missing }) => {
+        rawText(text);
+        rawImages(images);
         operations.forEach((operation) => operation());
-        const changed = operations.length > 0;
+        const changed = operations.length > 0 || missing > 0;
         operations = [];
         restored = true;
-        record.setError("");
+        record.setError(missing ? `${missing} saved image${missing > 1 ? "s" : ""} could not be restored and ${missing > 1 ? "were" : "was"} removed.` : "");
         record.setReady(true);
         record.setLoading(false);
         if (changed) save();
@@ -56,12 +80,20 @@ export function createDraftStore(invoke) {
     restore();
     return record;
   }
-  return { draftFor: get };
+  /** Store image bytes privately and return an in-memory draft image. */
+  async function attach(blob, name) {
+    const bytes = new Uint8Array(await blob.arrayBuffer());
+    const stored = await invoke("drafts_put_blob", bytes);
+    if (!stored?.sha256) throw new Error("Image could not be stored");
+    const typed = blob.type === stored.media_type ? blob : new Blob([bytes], { type: stored.media_type });
+    return { sha256: stored.sha256, media_type: stored.media_type, name: name || "image", size: stored.size ?? bytes.length, blob: typed, preview: objectUrl(typed) };
+  }
+  return { draftFor: get, attach };
 }
-export function validateDraftImages(files) {
-  const supported = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
-  if (files.some((file) => !supported.has(file.type))) throw new Error("Unsupported image type. Use PNG, JPEG, GIF or WebP.");
-  if (files.some((file) => file.size > 5 * 1024 * 1024)) throw new Error("Images must be 5 MiB or smaller.");
+
+/** HAL image parts for sending. Base64 exists only for the duration of the request. */
+export async function sendableImages(images) {
+  return Promise.all(images.map(async ({ blob, media_type, name }) => ({ data: await blobToBase64(blob), media_type, name })));
 }
 
 export function newDraft() {
@@ -79,6 +111,7 @@ const store = createDraftStore(async (command, args) => {
   return invoke(command, args);
 });
 export const draftFor = store.draftFor;
+export const attachImage = store.attach;
 export function clearSentDraft(target, text, images) {
   if (target.text() === text) target.setText("");
   target.setImages((current) => current.filter((image) => !images.includes(image)));

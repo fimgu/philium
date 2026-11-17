@@ -9,7 +9,7 @@ export async function checkEffortProgress(page, shot) {
     const previousDraft = input.value;
     input.value = 'effort preserves this draft'; input.dispatchEvent(new Event('input', { bubbles: true }));
     if (!document.querySelector('[aria-label="Reasoning effort"]')) errors.push('effort accessible group missing');
-    if (!document.body.innerText.includes('provider and model support varies')) errors.push('provider support caveat missing');
+    if (!/Support varies by provider and model/.test(document.getElementById('effort-caveat')?.textContent ?? '') || document.querySelector('[aria-label="Reasoning effort"]')?.getAttribute('aria-describedby') !== 'effort-caveat') errors.push('provider support caveat missing');
     t.holdEffort = true;
     fast().click(); await wait();
     if (!controls().every((b) => b.disabled)) errors.push('effort controls not disabled during save');

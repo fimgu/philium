@@ -1,12 +1,54 @@
 //! Replay HAL's persisted event journal without starting or contacting a runtime.
 use super::*;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use std::time::Duration;
 
 const MAX_EVENT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PAGE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_ATTACHMENT_BYTES: usize = 8 * 1024 * 1024;
 
 pub(super) fn events(ctx: &Ctx, raw: &str, after: i64, limit: i64) -> Result<Value, String> {
+    let Some((path, session)) = locate(ctx, raw)? else { return Ok(json!([])) };
+    with_db(&path, |db| read_events(db, &session, after, limit)).map_err(|e| {
+        format!("Saved conversation unavailable: {e}. Retry, or restore the agent's saved HAL data.")
+    })
+}
+
+/// Raw bytes of an image the user sent in this agent's own session. The hash
+/// must be referenced by a user message of that session, so this cannot be
+/// used to read arbitrary blobs or other sessions.
+pub(super) fn attachment(ctx: &Ctx, raw: &str, sha256: &str) -> Result<(String, Vec<u8>), String> {
+    if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+        return Err("invalid attachment reference".into());
+    }
+    let (path, session) = locate(ctx, raw)?.ok_or("agent has no saved session")?;
+    with_db(&path, |db| {
+        let found: Option<(String, i64)> = db
+            .query_row(
+                "SELECT b.media_type, length(b.data) FROM blobs b WHERE b.session_id=?1 AND b.sha256=?2 AND EXISTS (
+                    SELECT 1 FROM messages m, json_each(m.content, '$.images') i
+                    WHERE m.session_id=b.session_id AND m.role='user' AND json_extract(i.value, '$.sha256')=b.sha256)",
+                [&session, sha256],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let (media, size) = found.ok_or("attachment not found in this conversation")?;
+        if size <= 0 || size as usize > MAX_ATTACHMENT_BYTES {
+            return Err("attachment exceeds safety limit".into());
+        }
+        if !matches!(media.as_str(), "image/png" | "image/jpeg" | "image/gif" | "image/webp") {
+            return Err("attachment type cannot be previewed".into());
+        }
+        let bytes: Vec<u8> = db
+            .query_row("SELECT data FROM blobs WHERE session_id=?1 AND sha256=?2", [&session, sha256], |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        Ok((media, bytes))
+    })
+}
+
+/// Agent's HAL database path and recorded session, refusing symlinked storage.
+fn locate(ctx: &Ctx, raw: &str) -> Result<Option<(PathBuf, String)>, String> {
     // Do not use get_row: it intentionally hides SQL errors for metadata callers.
     let rows = ctx.db.query(
         "SELECT id,name,hal_session_id FROM agents WHERE id=?1 OR name=?1",
@@ -18,13 +60,12 @@ pub(super) fn events(ctx: &Ctx, raw: &str, after: i64, limit: i64) -> Result<Val
         .filter(|n| valid_name(n))
         .ok_or("saved history has invalid agent name")?;
     let Some(session) = row["hal_session_id"].as_str().filter(|s| !s.is_empty()) else {
-        return Ok(json!([]));
+        return Ok(None);
     };
     let path = ctx.agent_dir(name).join("hal/hal/hal.db");
     // History must stay in this agent's storage, not follow a replaced symlink
     // into another agent or arbitrary user database.
-    let root = ctx.agent_dir(name);
-    let mut current = root.clone();
+    let mut current = ctx.agent_dir(name);
     for part in ["", "hal", "hal", "hal.db"] {
         if !part.is_empty() {
             current.push(part);
@@ -40,14 +81,11 @@ pub(super) fn events(ctx: &Ctx, raw: &str, after: i64, limit: i64) -> Result<Val
             Err(e) => return Err(format!("Saved conversation unavailable: {e}")),
         }
     }
-    read(&path, session, after, limit).map_err(|e| {
-        format!(
-            "Saved conversation unavailable: {e}. Retry, or restore the agent's saved HAL data."
-        )
-    })
+    Ok(Some((path, session.to_string())))
 }
 
-fn read(path: &Path, session: &str, after: i64, limit: i64) -> Result<Value, String> {
+/// Open HAL's database strictly read-only with bounded execution time.
+fn with_db<T>(path: &Path, f: impl FnOnce(&Connection) -> Result<T, String>) -> Result<T, String> {
     let sidecar = |suffix: &str| {
         let mut p = path.as_os_str().to_os_string();
         p.push(suffix);
@@ -115,53 +153,55 @@ fn read(path: &Path, session: &str, after: i64, limit: i64) -> Result<Value, Str
             interrupt.interrupt();
         }
     });
-    let result = (|| {
-        let exists: bool = db
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sessions WHERE id=?1)",
-                [session],
-                |r| r.get(0),
-            )
-            .map_err(|e| e.to_string())?;
-        if !exists {
-            return Err("the recorded session is missing from saved history".into());
-        }
-        let mut stmt = db.prepare("SELECT seq,length(CAST(payload AS BLOB)),payload FROM events WHERE session_id=?1 AND seq>?2 ORDER BY seq LIMIT ?3").map_err(|e| e.to_string())?;
-        let mut rows = stmt
-            .query(rusqlite::params![
-                session,
-                after.max(0),
-                limit.clamp(1, 10000)
-            ])
-            .map_err(|e| e.to_string())?;
-        let mut bytes = 0usize;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-            let seq: i64 = row.get(0).map_err(|e| e.to_string())?;
-            let size: i64 = row.get(1).map_err(|e| e.to_string())?;
-            if size < 0
-                || size as usize > MAX_EVENT_BYTES
-                || bytes.saturating_add(size as usize) > MAX_PAGE_BYTES
-            {
-                return Err(
-                    "saved history page exceeds safety limit; retry with a smaller limit".into(),
-                );
-            }
-            bytes += size as usize;
-            let payload: String = row.get(2).map_err(|e| e.to_string())?;
-            let event = decode(&payload, session, seq).ok_or_else(|| {
-                format!("saved event at sequence {seq} is malformed or has an invalid identity")
-            })?;
-            out.push(event);
-        }
-        Ok(Value::Array(out))
-    })();
+    let result = f(&db);
     let _ = done.send(());
     let _ = timer.join();
     if immutable && wal.exists() {
         return Err("saved history changed while loading; retry to read the current WAL".into());
     }
     result
+}
+
+fn read_events(db: &Connection, session: &str, after: i64, limit: i64) -> Result<Value, String> {
+    let exists: bool = db
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE id=?1)",
+            [session],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if !exists {
+        return Err("the recorded session is missing from saved history".into());
+    }
+    let mut stmt = db.prepare("SELECT seq,length(CAST(payload AS BLOB)),payload FROM events WHERE session_id=?1 AND seq>?2 ORDER BY seq LIMIT ?3").map_err(|e| e.to_string())?;
+    let mut rows = stmt
+        .query(rusqlite::params![
+            session,
+            after.max(0),
+            limit.clamp(1, 10000)
+        ])
+        .map_err(|e| e.to_string())?;
+    let mut bytes = 0usize;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+        let seq: i64 = row.get(0).map_err(|e| e.to_string())?;
+        let size: i64 = row.get(1).map_err(|e| e.to_string())?;
+        if size < 0
+            || size as usize > MAX_EVENT_BYTES
+            || bytes.saturating_add(size as usize) > MAX_PAGE_BYTES
+        {
+            return Err(
+                "saved history page exceeds safety limit; retry with a smaller limit".into(),
+            );
+        }
+        bytes += size as usize;
+        let payload: String = row.get(2).map_err(|e| e.to_string())?;
+        let event = decode(&payload, session, seq).ok_or_else(|| {
+            format!("saved event at sequence {seq} is malformed or has an invalid identity")
+        })?;
+        out.push(event);
+    }
+    Ok(Value::Array(out))
 }
 
 fn decode(payload: &str, parent: &str, seq: i64) -> Option<Value> {

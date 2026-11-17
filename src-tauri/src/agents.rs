@@ -42,6 +42,11 @@ use crate::providers::{self, ConfigOpts};
 #[path = "agent_history.rs"]
 mod history;
 
+/// UI-only: image bytes the user sent in this agent's own conversation.
+pub fn sent_attachment(ctx: &Ctx, id: &str, sha256: &str) -> Result<(String, Vec<u8>), String> {
+    history::attachment(ctx, id, sha256)
+}
+
 /// Live state for one running agent (not persisted).
 pub struct Runtime {
     pub hal: Arc<Hal>,

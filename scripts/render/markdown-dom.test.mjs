@@ -99,6 +99,9 @@ test('Conversation Markdown DOM, streaming, unsafe content and clipboard matrix'
     assert.equal(await page.$eval('.assistant-markdown', el => el.textContent), 'Entities: & <img src=x> and &amp;');
     await page.type('textarea', 'Keep this draft through view changes');
     await page.evaluate(() => { window.originalComposer = document.querySelector('textarea'); window.originalConversation = document.querySelector('.conv'); });
+    assert.ok(await page.$('.conv-terminal'), 'terminal transcript is the default view');
+    await page.click('.conversation-view-toggle button:first-child');
+    assert.ok(await page.$('.conv-conversation'));
     await page.click('.conversation-view-toggle button:nth-child(2)');
     assert.ok(await page.$('.conv-terminal'));
     assert.equal(await page.$eval('.conversation-view-toggle button:nth-child(2)', el => el.getAttribute('aria-pressed')), 'true');

@@ -82,9 +82,6 @@ details.msg summary { cursor: pointer; display: flex; align-items: center; gap: 
 .agent-aside.hidden { display: none; }
 .ping { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); margin-left: 2px; animation: pulse 1.2s infinite; }
 /* Narrow chat column: the message box keeps the full width, controls wrap below. */
-.agent-main .composer { padding: 10px 16px; }
-.agent-main .composer .textarea { flex: 1 1 100%; }
-.agent-main .composer .textarea + * { margin-left: auto; }
 .agent-view ~ * , .split:has(.agent-view) { grid-template-columns: 232px 1fr; }
 .agent-body { overflow: hidden; }
 .agent-aside { max-width: calc(100% - 360px); min-width: 300px; }

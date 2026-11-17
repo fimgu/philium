@@ -2,13 +2,16 @@
 // Events are folded into items: user / assistant (streamed) / tool / file /
 // permission / error. Assistant Markdown is rendered without raw HTML.
 import { For, Index, Show, Switch, Match, createSignal, createMemo, createEffect, on, onCleanup } from "solid-js";
+import { Portal } from "solid-js/web";
 import { Badge, Button, toast } from "./kit.jsx";
 import { Icon } from "./icons.jsx";
 import { AssistantReply } from "./markdown.jsx";
 import { ConversationActivity } from "./conversation-activity.jsx";
 import { ViewToggle } from "./conversation-view.jsx";
 import { conversationView } from "../lib/conversation-view.js";
-import { draftFor, newDraft, clearSentDraft, validateDraftImages } from "../lib/drafts.js";
+import "../styles/composer.css";
+import { draftFor, newDraft, clearSentDraft, attachImage, sendableImages } from "../lib/drafts.js";
+import { validateImages, normalizeImage, createImageCache, MAX_IMAGES } from "../lib/images.js";
 
 /** Fold a list of HAL events into display items. Pure, incremental-safe. */
 export function fold(events) {
@@ -20,7 +23,7 @@ export function fold(events) {
   for (const e of events) {
     switch (e.type) {
       case "message.created":
-        if (e.role === "user") { items.push({ kind: "user", text: e.content, seq: e.seq }); turnText = false; }
+        if (e.role === "user") { items.push({ kind: "user", text: e.content, seq: e.seq, attachments: Array.isArray(e.attachments) ? e.attachments.filter((a) => /^[0-9a-f]{64}$/.test(a?.sha256 ?? "")) : [], imageCount: typeof e.images === "number" ? e.images : 0 }); turnText = false; }
         break;
       case "model.delta":
         if (!streaming) { streaming = { kind: "assistant", text: "", seq: e.seq, live: true }; items.push(streaming); }
@@ -158,6 +161,7 @@ export function Conversation(props) {
       setStick(d.scrollHeight - d.scrollTop - d.clientHeight < 60);
     }}>
       <ViewToggle />
+      <Lightbox />
       <div class="timeline">
         <Show when={items().length === 0}>
           <div class="conv-empty">{props.emptyText ?? "No messages yet."}</div>
@@ -165,7 +169,7 @@ export function Conversation(props) {
         <Index each={items()}>
           {(it) => (
             <Switch>
-              <Match when={it().kind === "user"}><div class="msg user">{it().text}</div></Match>
+              <Match when={it().kind === "user"}><div class="msg user"><SentImages item={it()} load={props.loadAttachment} />{it().text}</div></Match>
               <Match when={it().kind === "assistant"}>
                 <div class={`msg assistant ${it().live && props.busy && !props.readOnly ? "live" : ""}`}><AssistantReply text={it().text} live={it().live && props.busy && !props.readOnly} /></div>
               </Match>
@@ -206,14 +210,71 @@ export function Conversation(props) {
   );
 }
 
-/** Composer: Enter sends, Shift+Enter newline. Images can be pasted or dropped;
- * onSend(text, images) gets HAL image parts: [{ data: base64, media_type, name }]. */
-const readImage = (file) => new Promise((resolve, reject) => {
-  const r = new FileReader();
-  r.onload = () => resolve({ data: String(r.result).split(",")[1], media_type: file.type, name: file.name || "image", preview: r.result });
-  r.onerror = reject;
-  r.readAsDataURL(file);
-});
+const formatSize = (n) => n >= 1024 * 1024 ? `${(n / 1024 / 1024).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`;
+
+/** Full-size image overlay. Esc or click closes. */
+const [lightbox, setLightbox] = createSignal(null);
+export function Lightbox() {
+  const close = () => setLightbox(null);
+  const key = (e) => { if (e.key === "Escape" && lightbox()) close(); };
+  window.addEventListener("keydown", key);
+  onCleanup(() => window.removeEventListener("keydown", key));
+  return (
+    <Show when={lightbox()}><Portal>
+      <div class="lightbox" role="dialog" aria-modal="true" aria-label={lightbox().name} onClick={close}>
+        <img src={lightbox().src} alt={lightbox().name} />
+        <div class="lightbox-caption">{lightbox().name} · Esc to close</div>
+      </div>
+    </Portal></Show>
+  );
+}
+
+/** Images the user sent, loaded lazily from the agent's own saved session. */
+function SentImages(props) {
+  const list = () => props.item.attachments ?? [];
+  const missing = () => Math.max(0, (props.item.imageCount ?? 0) - list().length);
+  return (
+    <Show when={list().length || missing()}>
+      <div class="sent-images">
+        <For each={list()}>{(a) => <SentImage attachment={a} load={props.load} />}</For>
+        <Show when={missing()}><span class="image-chip">{missing()} image{missing() > 1 ? "s" : ""}</span></Show>
+      </div>
+    </Show>
+  );
+}
+function SentImage(props) {
+  const [src, setSrc] = createSignal("");
+  const [failed, setFailed] = createSignal(false);
+  createEffect(on(() => [props.attachment.sha256, props.load], () => {
+    setSrc(""); setFailed(false);
+    if (!props.load) return;
+    props.load(props.attachment).then(setSrc, () => setFailed(true));
+  }));
+  const name = () => props.attachment.name || "image";
+  return (
+    <Show when={src()} fallback={<span class="image-chip" title={failed() ? "Image could not be loaded from saved history" : name()}><Icon name="image" size={12} /> {name()}{failed() ? " · unavailable" : ""}</span>}>
+      <button type="button" class="sent-image" title={`${name()} · click to enlarge`} onClick={() => setLightbox({ src: src(), name: name() })}>
+        <img src={src()} alt={name()} loading="lazy" />
+      </button>
+    </Show>
+  );
+}
+/** One bounded cache per agent id. Object URLs are revoked on eviction. */
+const agentCaches = new Map();
+export function agentAttachmentLoader(id) {
+  if (!id) return undefined;
+  if (!agentCaches.has(id)) {
+    if (agentCaches.size >= 4) { const [oldest, entry] = agentCaches.entries().next().value; entry.cache.clear(); agentCaches.delete(oldest); }
+    const cache = createImageCache(async (key) => {
+      const [sha256, media_type] = key.split("|");
+      const { invoke } = await import("@tauri-apps/api/core");
+      const bytes = await invoke("agent_attachment", { id, sha256 });
+      return new Blob([bytes], { type: media_type || "image/png" });
+    });
+    agentCaches.set(id, { cache, load: (a) => cache.get(`${a.sha256}|${a.media_type || ""}`) });
+  }
+  return agentCaches.get(id).load;
+}
 
 /** Effort presets. Names are not guarantees of latency, cost or quality. */
 export const SPEEDS = [
@@ -224,6 +285,10 @@ export const SPEEDS = [
 export const speedEffort = (v) => SPEEDS.find((s) => s.value === v)?.effort ?? "default";
 export const effortSpeed = (e) => (e === "low" || e === "minimal" || e === "none" ? "fast" : e === "high" || e === "xhigh" || e === "max" ? "deep" : "normal");
 
+/** Composer card: attachments, text, then one toolbar row.
+ * Images arrive by paste, drop (anywhere over the agent pane via props.dropTarget),
+ * Attach menu file picker, or native screenshot. onSend(text, images) receives HAL
+ * image parts [{ data: base64, media_type, name }] built only at send time. */
 export function Composer(props) {
   const localDraft = newDraft();
   const record = () => props.draftKey ? draftFor(props.draftKey) : localDraft;
@@ -231,73 +296,132 @@ export function Composer(props) {
   const images = () => record().images(), setImages = (value) => record().setImages(value);
   const sending = () => record().sending();
   const [over, setOver] = createSignal(false);
+  const [notice, setNotice] = createSignal("");
+  const [adding, setAdding] = createSignal(0);
+  const [menu, setMenu] = createSignal(false);
+  let input, picker;
+  const canAttach = () => record().ready() && !props.disabled;
   const add = async (files) => {
     const target = record();
     if (!target.ready()) return;
-    const imgs = [...files].filter((f) => f.type.startsWith("image/"));
+    const list = [...files].filter((f) => f && f.size !== 0);
+    if (!list.length) return;
+    setNotice("");
+    setAdding((n) => n + list.length);
     try {
-      validateDraftImages(imgs);
-      if (imgs.length) {
-        const loaded = await Promise.all(imgs.map(readImage));
-        target.setImages((current) => [...current, ...loaded].slice(0, 8));
-      }
-    } catch (e) { toast(String(e), "danger"); }
+      const imgs = await Promise.all(list.map((f) => normalizeImage(f)));
+      validateImages(imgs, target.images().length);
+      const stored = [];
+      for (const f of imgs) stored.push(props.draftKey ? await attachImage(f, f.name || "image.png") : { sha256: "", media_type: f.type, name: f.name || "image.png", size: f.size, blob: f, preview: URL.createObjectURL(f) });
+      if (target.images().length + stored.length > MAX_IMAGES) throw new Error(`Up to ${MAX_IMAGES} images per message.`);
+      target.setImages((current) => [...current, ...stored]);
+    } catch (e) { setNotice(String(e?.message ?? e).replace(/^Error: /, "")); }
+    finally { setAdding((n) => Math.max(0, n - list.length)); input?.focus(); }
   };
+  const capture = async () => {
+    setMenu(false);
+    if (!canAttach()) return;
+    setNotice("");
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      const bytes = await invoke("capture_screenshot");
+      const size = bytes?.byteLength ?? bytes?.length ?? 0;
+      if (!size) return; // Cancelled.
+      const stamp = new Date().toTimeString().slice(0, 8).replaceAll(":", ".");
+      await add([new File([bytes], `Screenshot ${stamp}.png`, { type: "image/png" })]);
+    } catch (e) { setNotice(String(e?.message ?? e)); }
+  };
+  createEffect(() => {
+    const el = props.dropTarget?.();
+    if (!el) return;
+    const has = (e) => [...(e.dataTransfer?.types ?? [])].includes("Files");
+    const enter = (e) => { if (has(e) && canAttach()) { e.preventDefault(); setOver(true); } };
+    const leave = (e) => { if (!el.contains(e.relatedTarget)) setOver(false); };
+    const drop = (e) => { if (!has(e)) return; e.preventDefault(); setOver(false); if (canAttach()) add(e.dataTransfer.files); };
+    el.addEventListener("dragover", enter); el.addEventListener("dragleave", leave); el.addEventListener("drop", drop);
+    onCleanup(() => { el.removeEventListener("dragover", enter); el.removeEventListener("dragleave", leave); el.removeEventListener("drop", drop); });
+  });
+  createEffect(on(() => props.draftKey, () => { setNotice(""); setMenu(false); }));
   const send = async () => {
     const target = record();
     const draft = target.text(), attached = target.images();
     const t = draft.trim();
-    if (!target.ready() || (!t && !attached.length) || props.disabled || props.busy || sending()) return;
+    if (!target.ready() || (!t && !attached.length) || props.disabled || props.busy || sending() || adding()) return;
     target.setSending(true);
     try {
-      const accepted = await props.onSend(t, attached.map(({ data, media_type, name }) => ({ data, media_type, name })));
-      if (accepted !== false) {
-        clearSentDraft(target, draft, attached);
-      }
+      const accepted = await props.onSend(t, await sendableImages(attached));
+      if (accepted !== false) clearSentDraft(target, draft, attached);
     } catch (e) { toast(String(e), "danger"); }
     finally { target.setSending(false); }
   };
+  const remove = (image) => { setImages(images().filter((x) => x !== image)); input?.focus(); };
+  const empty = () => !text().trim() && !images().length;
   return (
-    <div class="composer" style={{ "flex-wrap": "wrap", outline: over() ? "1px dashed var(--accent, #7aa2ff)" : "none" }}
-      onDragOver={(e) => { e.preventDefault(); setOver(true); }} onDragLeave={() => setOver(false)}
-      onDrop={(e) => { e.preventDefault(); setOver(false); add(e.dataTransfer.files); }}>
-      <Show when={images().length}>
-        <div class="row" style={{ width: "100%", gap: "8px" }}>
+    <div class="composer composer-card" classList={{ dragging: over() }}
+      onDragOver={(e) => { if (!props.dropTarget && [...(e.dataTransfer?.types ?? [])].includes("Files")) { e.preventDefault(); setOver(true); } }}
+      onDragLeave={(e) => { if (!props.dropTarget && !e.currentTarget.contains(e.relatedTarget)) setOver(false); }}
+      onDrop={(e) => { if (props.dropTarget) return; e.preventDefault(); setOver(false); if (canAttach()) add(e.dataTransfer.files); }}>
+      <Show when={over()}><div class="composer-drop" aria-hidden="true"><Icon name="image" size={16} /> Drop images to attach</div></Show>
+      <Show when={images().length || adding()}>
+        <div class="composer-images" role="list" aria-label="Attached images">
           <For each={images()}>
-            {(im, i) => (
-              <div style={{ position: "relative" }}>
-                <img src={im.preview} alt={im.name} style={{ height: "56px", "border-radius": "6px" }} />
-                <button class="btn ghost sm" title="Remove image" style={{ position: "absolute", top: "-6px", right: "-6px" }}
-                  onClick={() => setImages(images().filter((_, j) => j !== i()))}>x</button>
+            {(im) => (
+              <div class="composer-image" role="listitem">
+                <button type="button" class="composer-thumb" title={`${im.name} · ${formatSize(im.size || 0)} · click to preview`} onClick={() => setLightbox({ src: im.preview, name: im.name })}>
+                  <img src={im.preview} alt={im.name} />
+                </button>
+                <button type="button" class="composer-image-remove" aria-label={`Remove ${im.name}`} title="Remove image" onClick={() => remove(im)}>×</button>
               </div>
             )}
           </For>
+          <Show when={adding()}><div class="composer-image pending" role="status" aria-label="Adding image"><span class="spinner" /></div></Show>
         </div>
       </Show>
       <textarea
-        class="textarea grow"
+        ref={input}
+        class="textarea composer-input"
+        rows="1"
         placeholder={props.placeholder ?? "Message"}
         value={text()}
         disabled={props.disabled || !record().ready()}
         onInput={(e) => setText(e.currentTarget.value)}
-        onPaste={(e) => { const f = [...e.clipboardData.files]; if (f.some((x) => x.type.startsWith("image/"))) { e.preventDefault(); add(f); } }}
-        onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
+        onPaste={(e) => { const f = [...(e.clipboardData?.files ?? [])]; if (f.length) { e.preventDefault(); add(f); } }}
+        onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); } }}
       />
-      <Show when={props.onSpeed}>
-        <div class="speed" role="group" aria-label="Reasoning effort" title="Reasoning effort, not guaranteed speed. Support depends on the provider and model.">
-          <For each={SPEEDS}>{(s) => (
-            <button type="button" disabled={props.disabled || props.effortPending} aria-pressed={(props.speed || "normal") === s.value} classList={{ on: (props.speed || "normal") === s.value }} onClick={() => props.onSpeed(s.value)} title={s.hint}>{s.label}</button>
-          )}</For>
+      <div class="composer-bar">
+        <div class="composer-attach">
+          <button type="button" class="composer-icon" aria-label="Attach" aria-haspopup="menu" aria-expanded={menu()} title="Attach images or a screenshot" disabled={!canAttach()} onClick={() => setMenu(!menu())}><Icon name="plus" size={14} /></button>
+          <Show when={menu()}>
+            <div class="composer-menu" role="menu" onKeyDown={(e) => e.key === "Escape" && setMenu(false)}>
+              <button type="button" role="menuitem" onClick={() => { setMenu(false); picker.click(); }}><Icon name="image" size={13} /> Choose images…</button>
+              <button type="button" role="menuitem" onClick={capture}><Icon name="camera" size={13} /> Take screenshot…</button>
+              <div class="composer-menu-hint">Paste or drop images anywhere · PNG, JPEG, GIF, WebP · up to {MAX_IMAGES}</div>
+            </div>
+          </Show>
+          <input ref={picker} type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden onChange={(e) => { add(e.currentTarget.files); e.currentTarget.value = ""; }} />
         </div>
-      </Show>
-      <Show when={props.onSpeed}><div class="xs dim" style={{ width: "100%" }}>Reasoning effort: provider and model support varies. Speed, cost and quality are not guaranteed.{props.effortPending ? " Updating effort…" : ""}</div></Show>
-      <Show when={props.busy} fallback={<Button variant="primary" onClick={send} disabled={props.disabled || !record().ready() || sending()}>Send</Button>}>
-        <Button onClick={props.onCancel}><Icon name="stop" size={12} /> Stop</Button>
-      </Show>
-      <Show when={record().loading()}><div class="xs dim" role="status">Restoring draft…</div></Show>
-      <Show when={record().pending()}><div class="xs dim" role="status">Saving draft… Keep this window open.</div></Show>
-      <Show when={record().error()}><div class="xs" role="alert">{record().error()} <button class="btn ghost sm" disabled={record().loading() || record().pending()} onClick={() => record().retry?.()}>Retry</button></div></Show>
-      <Show when={props.busy}><div class="xs dim" role="status" style={{ width: "100%" }}>Working or waiting for approval. Your draft stays here. Use Stop to interrupt.</div></Show>
+        <Show when={props.onSpeed}>
+          <div class="speed" role="group" aria-label="Reasoning effort" aria-describedby="effort-caveat" title="Reasoning effort. Requests more or less thinking. Support varies by provider and model, and speed, cost and quality are not guaranteed.">
+            <span id="effort-caveat" class="sr-only">Support varies by provider and model, and speed, cost and quality are not guaranteed.</span>
+            <For each={SPEEDS}>{(s) => (
+              <button type="button" disabled={props.disabled || props.effortPending} aria-pressed={(props.speed || "normal") === s.value} classList={{ on: (props.speed || "normal") === s.value }} onClick={() => props.onSpeed(s.value)} title={s.hint}>{s.label}</button>
+            )}</For>
+          </div>
+        </Show>
+        <div class="composer-status xs dim grow" role="status">
+          <Show when={notice()} fallback={
+            record().loading() ? "Restoring draft…" :
+            props.effortPending ? "Updating effort…" :
+            props.busy ? "Working. Your draft is kept. Stop interrupts." : ""}>
+            <span class="composer-notice" role="alert">{notice()} <button type="button" class="link" onClick={() => setNotice("")}>Dismiss</button></span>
+          </Show>
+          <Show when={record().error()}><span class="composer-notice" role="alert">{record().error()} <button type="button" class="link" disabled={record().loading() || record().pending()} onClick={() => record().retry?.()}>Retry</button></span></Show>
+        </div>
+        <Show when={props.busy} fallback={
+          <button type="button" class="composer-send" aria-label="Send" title="Send (Enter) · Shift+Enter for a new line" onClick={send} disabled={props.disabled || !record().ready() || sending() || adding() > 0 || empty()}><Icon name="send" size={14} /></button>}>
+          <button type="button" class="composer-send stop" aria-label="Stop" title="Stop the current turn" onClick={props.onCancel}><Icon name="stop" size={12} /></button>
+        </Show>
+      </div>
     </div>
   );
 }

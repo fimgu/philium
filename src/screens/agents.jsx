@@ -3,7 +3,7 @@
 import { For, Show, createSignal, createResource, createMemo, createEffect, on, onCleanup, Suspense } from "solid-js";
 import { NotFound, Page, Button, Badge, Dot, Empty, Modal, Field, Input, TextArea, Select, Toggle, Segmented, confirm, toast } from "../ui/kit.jsx";
 import { Icon } from "../ui/icons.jsx";
-import { Conversation, Composer, speedEffort, effortSpeed } from "../ui/conversation.jsx";
+import { Conversation, Composer, speedEffort, effortSpeed, agentAttachmentLoader } from "../ui/conversation.jsx";
 import { AgentTerminals } from "../ui/agent-terminals.jsx";
 import { AgentBrowser } from "../ui/agent-browser.jsx";
 import { rpc, useEvent, fmt, sendError } from "../lib/rpc.js";
@@ -324,6 +324,7 @@ function AgentView(props) {
     observedId = id; observedLive = value;
   });
   const busy = () => ["running", "waiting"].includes(a()?.state);
+  let agentMain;
 
   const send = async (text, images = []) => {
     try { await rpc("agents.send", { id: props.id, text, images }, { action: true }); return true; }
@@ -367,14 +368,14 @@ function AgentView(props) {
       </div>
       <Show when={a()?.error}><div class="shield danger" style={{ margin: "8px 16px 0" }}>{a().error}</div></Show>
       <div class="agent-body">
-        <div class="agent-main">
+        <div class="agent-main" ref={agentMain}>
           <Show when={tab() === "chat"}>
             <Show when={historyLoading()}><div class="history-loading small dim" role="status">Loading saved conversation…</div></Show>
             <Show when={historyError()}><div class="history-error shield danger" role="alert">Unable to load saved conversation: {historyError()} <Button size="sm" onClick={() => load(props.id, retryAfter)}>Retry history</Button></div></Show>
             <Show when={historyMore()}><div class="history-more small dim" role="status">More saved history is available. Showing loaded pages only. <Button size="sm" disabled={historyLoading()} onClick={() => load(props.id, historyCursor())}>Load more history</Button></div></Show>
-            <Conversation events={events()} busy={busy()} readOnly={!live()} emptyText={historyLoading() ? "Loading saved conversation…" : historyError() ? "History could not be loaded. Retry above." : live() ? "Send the first message to start." : "No saved messages. This agent is stopped. Resume it to continue."}
+            <Conversation events={events()} busy={busy()} readOnly={!live()} loadAttachment={agentAttachmentLoader(props.id)} emptyText={historyLoading() ? "Loading saved conversation…" : historyError() ? "History could not be loaded. Retry above." : live() ? "Send the first message to start." : "No saved messages. This agent is stopped. Resume it to continue."}
               onApprove={(id, scope) => decide(id, "approve", scope)} onDeny={(id) => decide(id, "deny")} />
-            <Composer draftKey={`agent:${props.id}`} onSend={send} busy={busy()} disabled={!live()} onCancel={() => rpc("agents.cancel", { id: props.id }, { action: true }).catch((e) => toast(String(e), "danger"))}
+            <Composer draftKey={`agent:${props.id}`} dropTarget={() => agentMain} onSend={send} busy={busy()} disabled={!live()} onCancel={() => rpc("agents.cancel", { id: props.id }, { action: true }).catch((e) => toast(String(e), "danger"))}
               speed={effortSpeed(effort())} effortPending={effortPending()} onSpeed={changeEffort}
               placeholder={live() ? `Message ${a()?.name ?? ""}` : "Agent is stopped"} />
           </Show>

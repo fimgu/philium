@@ -5,7 +5,7 @@ export const isConversationView = (value) => value === "conversation" || value =
 
 /** Storage is optional: private browsing, SSR and quota failures retain an in-memory preference. */
 export function createConversationView(storage = () => globalThis.window?.localStorage) {
-  let initial = "conversation";
+  let initial = "terminal";
   try {
     const saved = storage()?.getItem(CONVERSATION_VIEW_KEY);
     if (isConversationView(saved)) initial = saved;

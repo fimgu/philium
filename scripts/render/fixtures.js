@@ -54,7 +54,7 @@ const tree = { files: ["src/main.rs", "src/db.rs", "src/gateway.rs", "src/agents
 
 const tev = (seq, type, o) => ({ seq, type, ...o });
 const chatEvents = [
-  tev(2, "message.created", { role: "user", content: "Summarise the failing test and show the screenshot I attached.", images: [{ mime: "image/png", name: "shot.png" }] }),
+  tev(2, "message.created", { role: "user", content: "Summarise the failing test and show the screenshot I attached.", images: 1, attachments: [{ sha256: "abababababababababababababababababababababababababababababababab", media_type: "image/png", name: "shot.png", size: 68 }] }),
   tev(3, "tool.started", { call_id: "c1", tool: "mcp_philium_shell_run", arguments: { command: "cargo test --lib gateway" } }),
   tev(4, "tool.output", { call_id: "c1", data: "running 12 tests\ntest gateway::retry ... FAILED\n" }),
   tev(5, "tool.finished", { call_id: "c1", ok: false, duration_ms: 4200, result: "1 failed" }),

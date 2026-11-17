@@ -78,7 +78,7 @@ test('effort presets retain backend mappings without speed or cost promises', ()
   assert.equal(presets.speedEffort('normal'), 'default');
   assert.equal(presets.speedEffort('deep'), 'high');
   assert.equal(presets.effortSpeed('unsupported'), 'normal');
-  assert.match(conversation, /provider and model support varies/);
+  assert.match(conversation, /Support varies by provider and model, and speed, cost and quality are not guaranteed/);
   assert.doesNotMatch(conversation, /quickest and cheapest|Low reasoning effort: quick answers/);
 });
 
