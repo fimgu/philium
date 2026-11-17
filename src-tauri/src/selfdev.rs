@@ -150,6 +150,15 @@ fn term_exit(ctx: &Ctx, id: &str) -> Option<i64> {
 fn status(ctx: &Arc<Ctx>, id: &str) -> Result<Value, String> {
     let mut r = row(ctx, id)?;
     let agent = r["agent_id"].as_str().unwrap_or_default().to_string();
+    if let Some(t) = r["preview_terminal"].as_str() {
+        let terminal = ctx.db.query("SELECT state, exit_code FROM terminals WHERE id=?1", [t])?;
+        let terminal = terminal.first();
+        r["preview"] = json!(preview_state(
+            terminal.and_then(|t| t["state"].as_str()),
+            terminal.and_then(|t| t["exit_code"].as_i64()),
+        ));
+        r["preview_exit_code"] = json!(terminal.and_then(|t| t["exit_code"].as_i64()));
+    }
     if let Some(t) = r["test_terminal"].as_str() {
         r["tests"] = match term_exit(ctx, t) {
             None => json!("running"),
@@ -250,10 +259,55 @@ fn test(ctx: &Arc<Ctx>, id: &str) -> Result<Value, String> {
     Ok(json!({ "terminal": t }))
 }
 
+// A live CLI process is not proof that the preview window is ready.
+fn preview_state(state: Option<&str>, code: Option<i64>) -> &'static str {
+    match (state, code) {
+        (Some("running"), _) => "active",
+        (Some("exited"), Some(0)) => "stopped",
+        (Some("exited"), Some(_)) => "failed",
+        _ => "unavailable",
+    }
+}
+
+// Worktrees omit ignored binaries. Reuse the source checkout's staged sidecar,
+// never build HAL implicitly or overwrite a worktree's existing binary.
+fn stage_preview_sidecar(wt: &Path, src: &Path, target: &str) -> Result<(), String> {
+    if target.is_empty() || !target.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return Err("Could not determine the Rust host target for the preview sidecar.".into());
+    }
+    let ext = if target.contains("windows") { ".exe" } else { "" };
+    let relative = format!("src-tauri/binaries/hal-desktop-server-{target}{ext}");
+    let dest = wt.join(&relative);
+    if dest.is_file() { return Ok(()); }
+    let source = src.join(&relative);
+    let mut input = std::fs::File::open(&source).map_err(|e| format!(
+        "Preview sidecar missing: {} ({e}). Stage it in the source checkout with npm run sidecar, then retry.", source.display()
+    ))?;
+    std::fs::create_dir_all(dest.parent().ok_or("Invalid sidecar path")?).map_err(|e| e.to_string())?;
+    let mut output = std::fs::OpenOptions::new().write(true).create_new(true).open(&dest).map_err(|e| e.to_string())?;
+    let result = std::io::copy(&mut input, &mut output)
+        .and_then(|_| output.set_permissions(input.metadata()?.permissions()));
+    if let Err(e) = result {
+        drop(output);
+        let _ = std::fs::remove_file(&dest);
+        return Err(format!("Could not stage preview sidecar: {e}"));
+    }
+    Ok(())
+}
+
 /// Run the changed app side by side: own data dir, own root, keychain off.
 fn preview(ctx: &Arc<Ctx>, id: &str) -> Result<Value, String> {
-    let r = row(ctx, id)?;
+    let r = status(ctx, id)?;
+    if r["preview"] == "active" {
+        return Err("A preview process is already active. Stop it in its terminal before opening another.".into());
+    }
     let (wt, _) = worktree(ctx, r["agent_id"].as_str().unwrap_or_default())?;
+    let src = source_dir(ctx).ok_or("Philium source not found.")?;
+    let host = std::process::Command::new("rustc").arg("-vV").output().map_err(|e| e.to_string())?;
+    if !host.status.success() { return Err("rustc -vV failed while checking the preview sidecar.".into()); }
+    let version = String::from_utf8_lossy(&host.stdout);
+    let target = version.lines().find_map(|l| l.strip_prefix("host: ")).ok_or("rustc returned no host target")?;
+    stage_preview_sidecar(&wt, &src, target)?;
     let base = ctx.data_dir.join("previews").join(id);
     std::fs::create_dir_all(base.join("data")).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(base.join("root")).map_err(|e| e.to_string())?;
@@ -393,6 +447,65 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
             h.restart();
         }
         _ => Err(format!("unknown selfdev.{method}")),
+    }
+}
+
+#[cfg(test)]
+mod preview_focused_tests {
+    use super::*;
+
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!("philium-preview-test-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) { std::fs::remove_dir_all(&self.0).unwrap(); }
+    }
+
+    #[test]
+    fn terminal_status_never_calls_an_exited_preview_active() {
+        assert_eq!(preview_state(Some("running"), None), "active");
+        assert_eq!(preview_state(Some("exited"), Some(101)), "failed");
+        assert_eq!(preview_state(Some("exited"), Some(0)), "stopped");
+        assert_eq!(preview_state(Some("exited"), None), "unavailable");
+        assert_eq!(preview_state(None, None), "unavailable");
+    }
+
+    #[test]
+    fn sidecar_is_staged_without_overwriting_existing_worktree_binary() {
+        let f = Fixture::new();
+        let src = f.0.join("source");
+        let wt = f.0.join("worktree");
+        let relative = "src-tauri/binaries/hal-desktop-server-aarch64-apple-darwin";
+        std::fs::create_dir_all(src.join("src-tauri/binaries")).unwrap();
+        std::fs::write(src.join(relative), b"staged sidecar").unwrap();
+        #[cfg(unix)] {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(src.join(relative), std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        stage_preview_sidecar(&wt, &src, "aarch64-apple-darwin").unwrap();
+        assert_eq!(std::fs::read(wt.join(relative)).unwrap(), b"staged sidecar");
+        #[cfg(unix)] {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(wt.join(relative)).unwrap().permissions().mode() & 0o777, 0o755);
+        }
+        std::fs::write(src.join(relative), b"different source").unwrap();
+        stage_preview_sidecar(&wt, &src, "aarch64-apple-darwin").unwrap();
+        assert_eq!(std::fs::read(wt.join(relative)).unwrap(), b"staged sidecar");
+    }
+
+    #[test]
+    fn missing_sidecar_fails_before_creating_worktree_or_building() {
+        let f = Fixture::new();
+        let wt = f.0.join("worktree");
+        let error = stage_preview_sidecar(&wt, &f.0.join("source"), "aarch64-apple-darwin").unwrap_err();
+        assert!(error.contains("npm run sidecar"), "{error}");
+        assert!(!wt.exists());
+        assert!(stage_preview_sidecar(&wt, &f.0, "../escape").is_err());
     }
 }
 

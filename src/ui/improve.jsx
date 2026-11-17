@@ -8,11 +8,15 @@ import { improveOpen, closeImprove, go } from "../lib/nav.js";
 
 const STATES = {
   building: ["busy", "Agent is building"],
-  preview: ["live", "Preview running"],
+  preview: ["", "Preview status unavailable"],
   accepted: ["live", "Accepted"],
   rejected: ["", "Rejected"],
   rolled_back: ["warn", "Rolled back"],
 };
+
+export function previewLabel(status) {
+  return ({ active: "Preview process active", stopped: "Preview stopped", failed: "Preview failed", unavailable: "Preview status unavailable" })[status] ?? "Preview status unavailable";
+}
 
 // Recent errors are captured from the console so the agent knows what broke.
 const recentErrors = [];
@@ -47,16 +51,20 @@ function Item(props) {
     }
   });
   const s = () => st() ?? {};
+  // Covers an exit arriving before the preview RPC has stored its terminal ID.
+  const poll = setInterval(() => { if (s().preview === "active") refetch(); }, 2000);
+  onCleanup(() => clearInterval(poll));
   const testTone = () => ({ passed: "secure", failed: "danger", running: "" })[s().tests] ?? "";
   return (
     <div class="card" style={{ display: "grid", gap: "8px" }}>
       <div class="row">
-        <Dot state={STATES[s().state]?.[0]} />
+        <Dot state={s().state === "preview" ? (s().preview === "active" ? "busy" : s().preview === "failed" ? "warn" : "") : STATES[s().state]?.[0]} />
         <b class="grow ellipsis">{(s().request ?? "").split("\n")[0]}</b>
         <span class="xs faint">{fmt.ago(s().created_at)}</span>
       </div>
       <div class="row small dim" style={{ "flex-wrap": "wrap", gap: "6px" }}>
-        <span>{STATES[s().state]?.[1] ?? s().state}</span>
+        <span>{s().state === "preview" ? previewLabel(s().preview) : STATES[s().state]?.[1] ?? s().state}</span>
+        <Show when={s().state === "preview" && s().preview_exit_code != null}><span>exit {s().preview_exit_code}</span></Show>
         <Show when={s().agent_name}><span>by <a href="#" onClick={(e) => { e.preventDefault(); closeImprove(); go("agents", { id: s().agent_id }); }}>{s().agent_name}</a> ({s().agent_state})</span></Show>
         <Show when={s().files?.length}><Badge>{s().files.length} files</Badge></Show>
         <Show when={s().tests}><Badge tone={testTone()}>tests {s().tests}</Badge></Show>
@@ -67,7 +75,7 @@ function Item(props) {
       <div class="row" style={{ "flex-wrap": "wrap" }}>
         <Show when={["building", "preview"].includes(s().state)}>
           <Button size="sm" busy={busy() === "test"} onClick={() => run("test", () => rpc("selfdev.test", { id: props.id }))}>Run tests</Button>
-          <Button size="sm" busy={busy() === "preview"} onClick={() => run("preview", () => rpc("selfdev.preview", { id: props.id }))}>Open preview</Button>
+          <Button size="sm" busy={busy() === "preview"} disabled={s().preview === "active"} onClick={() => run("preview", () => rpc("selfdev.preview", { id: props.id }))}>Open preview</Button>
           <Button size="sm" variant="primary" busy={busy() === "accept"} disabled={s().tests !== "passed" || s().tested_commit !== s().head} title="Tests must pass on the latest commit" onClick={accept}>Accept</Button>
           <Button size="sm" variant="ghost" busy={busy() === "reject"} onClick={reject}>Reject</Button>
         </Show>
@@ -78,9 +86,9 @@ function Item(props) {
           })}>Roll back</Button>
         </Show>
         <Show when={s().state === "rolled_back" && s().build === "passed"}><Button size="sm" onClick={() => rpc("selfdev.restart")}>Restart Philium</Button></Show>
-        <Show when={s().test_terminal || s().build_terminal || s().preview_terminal}>
-          <Button size="sm" variant="ghost" onClick={() => { closeImprove(); go("terminals", { id: s().build_terminal ?? s().test_terminal ?? s().preview_terminal }); }}><Icon name="terminal" size={12} /> Output</Button>
-        </Show>
+        <For each={[["test_terminal", "Test output"], ["preview_terminal", "Preview output"], ["build_terminal", "Build output"]]}>{([key, label]) =>
+          <Show when={s()[key]}><Button size="sm" variant="ghost" onClick={() => { closeImprove(); go("terminals", { id: s()[key] }); }}><Icon name="terminal" size={12} /> {label}</Button></Show>
+        }</For>
       </div>
     </div>
   );
