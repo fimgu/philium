@@ -35,7 +35,7 @@ pub fn record(ctx: &Arc<Ctx>, a: &Activity) {
         if tx.execute("INSERT OR IGNORE INTO stats_seen(session,activity_id) VALUES(?1,?2)",rusqlite::params![session,a.id as i64])?==0{return Ok(())}
         let prices=tx.query_row("SELECT price_in,price_out FROM models WHERE provider_id=?1 AND model_id=?2",rusqlite::params![a.provider,model],|r|Ok((r.get::<_,Option<f64>>(0)?,r.get::<_,Option<f64>>(1)?))).ok();
         let cost=prices.and_then(|(i,o)|Some((a.input_tokens.unwrap_or(0) as f64*i?+a.output_tokens.unwrap_or(0) as f64*o?)/1_000_000.0));
-        tx.execute("INSERT INTO requests(ts,agent_id,provider_id,model,status,tokens_in,tokens_out,ttft_ms,duration_ms,tps,cost,guard_action) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",rusqlite::params![a.started_ms as i64,a.agent,a.provider,model,a.status,a.input_tokens.unwrap_or(0).min(i64::MAX as u64) as i64,a.output_tokens.unwrap_or(0).min(i64::MAX as u64) as i64,a.ttft_ms.map(|n|n.min(i64::MAX as u64) as i64),a.duration_ms.map(|n|n.min(i64::MAX as u64) as i64),tps,cost,a.guard])?;
+        tx.execute("INSERT INTO requests(ts,agent_id,provider_id,model,status,tokens_in,tokens_out,tokens_cached,ttft_ms,duration_ms,tps,cost,guard_action) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",rusqlite::params![a.started_ms as i64,a.agent,a.provider,model,a.status,a.input_tokens.unwrap_or(0).min(i64::MAX as u64) as i64,a.output_tokens.unwrap_or(0).min(i64::MAX as u64) as i64,a.cached_tokens.unwrap_or(0).min(i64::MAX as u64) as i64,a.ttft_ms.map(|n|n.min(i64::MAX as u64) as i64),a.duration_ms.map(|n|n.min(i64::MAX as u64) as i64),tps,cost,a.guard])?;
         tx.execute("INSERT INTO stats_outcomes(request_id,state) VALUES(?1,?2)",rusqlite::params![tx.last_insert_rowid(),a.state])?;
         tx.commit()
     });
@@ -152,15 +152,15 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
             for g in &mut gs {
                 let i = number(g, "tokens_in");
                 let o = number(g, "tokens_out");
+                let c = number(g, "tokens_cached");
                 g["output_input_ratio"] = if i > 0.0 { json!(o / i) } else { Value::Null };
-                // Gateway Activity currently omits cache telemetry. Null is not zero.
-                g["cached_share"] = Value::Null;
+                g["cached_share"] = if c > 0.0 && i > 0.0 { json!(c / i) } else { Value::Null };
                 g["cost_per_1k_output"] = if o > 0.0 && number(g, "unpriced_requests") == 0.0 {
                     json!(number(g, "cost") * 1000.0 / o)
                 } else {
                     Value::Null
                 };
-                g["cache_available"] = json!(false);
+                g["cache_available"] = json!(c > 0.0 && i > 0.0);
             }
             Ok(json!(gs))
         }
@@ -188,6 +188,7 @@ mod tests {
             resp_bytes: 0,
             input_tokens: Some(1000),
             output_tokens: Some(100),
+            cached_tokens: None,
             ttft_ms: Some(100),
             agent: None,
             error: None,
@@ -220,6 +221,16 @@ mod tests {
             call(&c, "efficiency", json!({})).await.unwrap()[0]["output_input_ratio"],
             0.1
         );
+        assert_eq!(
+            call(&c, "efficiency", json!({})).await.unwrap()[0]["cache_available"],
+            false
+        );
+        a.id = 99;
+        a.cached_tokens = Some(400);
+        record(&c, &a);
+        let eff = call(&c, "efficiency", json!({})).await.unwrap();
+        assert_eq!(eff[0]["cache_available"], true);
+        assert_eq!(eff[0]["cached_share"], 0.2);
     }
     #[tokio::test]
     async fn errors_ranges_and_empty() {

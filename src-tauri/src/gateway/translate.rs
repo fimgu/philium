@@ -197,8 +197,59 @@ pub fn finish_reason(stop: &str) -> &'static str {
 
 fn usage_json(u: &Value) -> Value {
     let g = |k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0);
-    let p = g("input_tokens") + g("cache_read_input_tokens") + g("cache_creation_input_tokens");
-    json!({"prompt_tokens":p,"completion_tokens":g("output_tokens"),"total_tokens":p + g("output_tokens")})
+    let cached = g("cache_read_input_tokens");
+    let p = g("input_tokens") + cached + g("cache_creation_input_tokens");
+    let mut out = json!({"prompt_tokens":p,"completion_tokens":g("output_tokens"),"total_tokens":p + g("output_tokens")});
+    if cached > 0 {
+        out["prompt_tokens_details"] = json!({"cached_tokens": cached});
+    }
+    out
+}
+
+fn mark_block_ephemeral(content: &mut Value) {
+    let ep = json!({"type": "ephemeral"});
+    match content {
+        Value::String(s) if !s.is_empty() => {
+            *content = json!([{"type": "text", "text": s.clone(), "cache_control": ep}]);
+        }
+        Value::Array(blocks) => {
+            if let Some(last) = blocks.iter_mut().rev().find(|b| b.is_object()) {
+                last["cache_control"] = ep;
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Inject up to 4 Anthropic ephemeral cache breakpoints (last tool, last system
+/// block, and last 2 messages) for `/messages` or Claude `/chat/completions`.
+pub fn inject_cache_breakpoints(v: &mut Value, anthropic: bool) {
+    if !anthropic {
+        let is_claude = v["model"].as_str().is_some_and(|m| m.to_ascii_lowercase().contains("claude"));
+        if !is_claude {
+            return;
+        }
+        if let Some(msgs) = v["messages"].as_array_mut() {
+            if let Some(sys) = msgs.iter_mut().rev().find(|m| matches!(m["role"].as_str(), Some("system" | "developer"))) {
+                mark_block_ephemeral(&mut sys["content"]);
+            }
+            for m in msgs.iter_mut().rev().filter(|m| !matches!(m["role"].as_str(), Some("system" | "developer"))).take(2) {
+                mark_block_ephemeral(&mut m["content"]);
+            }
+        }
+        return;
+    }
+    if let Some(last_tool) = v["tools"].as_array_mut().and_then(|t| t.last_mut()).filter(|t| t.is_object()) {
+        last_tool["cache_control"] = json!({"type": "ephemeral"});
+    }
+    if let Some(sys) = v.get_mut("system") {
+        mark_block_ephemeral(sys);
+    }
+    if let Some(msgs) = v["messages"].as_array_mut() {
+        for m in msgs.iter_mut().rev().take(2) {
+            mark_block_ephemeral(&mut m["content"]);
+        }
+    }
 }
 
 /// Translate a whole (non-streaming) Anthropic message to chat.completion.
@@ -299,6 +350,9 @@ impl StreamTranslator {
             }
             "message_delta" => {
                 self.out_tokens = v.pointer("/usage/output_tokens").and_then(Value::as_u64).unwrap_or(self.out_tokens);
+                if let Some(cr) = v.pointer("/usage/cache_read_input_tokens").and_then(Value::as_u64) {
+                    self.usage_in["cache_read_input_tokens"] = json!(cr);
+                }
                 let f = finish_reason(v.pointer("/delta/stop_reason").and_then(Value::as_str).unwrap_or("end_turn"));
                 self.finish = Some(f);
                 self.chunk(json!({}), Some(f))
@@ -416,8 +470,43 @@ mod tests {
             assert!(c.iter().any(|x| x.pointer("/choices/0/finish_reason") == Some(&json!("tool_calls"))));
             let u = c.last().unwrap();
             assert_eq!(u["choices"], json!([]));
-            assert_eq!(u["usage"], json!({"prompt_tokens":50,"completion_tokens":9,"total_tokens":59}));
+            assert_eq!(u["usage"], json!({"prompt_tokens":50,"completion_tokens":9,"total_tokens":59,"prompt_tokens_details":{"cached_tokens":10}}));
         }
+    }
+
+    #[test]
+    fn injects_claude_cache_breakpoints() {
+        let mut ant = request(&json!({
+            "model": "claude-sonnet-5-5",
+            "messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "u1"},
+                {"role": "assistant", "content": "a1"},
+                {"role": "user", "content": "u2"}
+            ],
+            "tools": [{"type": "function", "function": {"name": "t1", "parameters": {"type": "object"}}}]
+        }), true);
+        inject_cache_breakpoints(&mut ant, true);
+        assert_eq!(ant["tools"][0]["cache_control"], json!({"type": "ephemeral"}));
+        assert_eq!(ant["system"][0]["cache_control"], json!({"type": "ephemeral"}));
+        assert!(ant["messages"][0]["content"][0].get("cache_control").is_none());
+        assert_eq!(ant["messages"][1]["content"][0]["cache_control"], json!({"type": "ephemeral"}));
+        assert_eq!(ant["messages"][2]["content"][0]["cache_control"], json!({"type": "ephemeral"}));
+
+        let mut oai = json!({
+            "model": "claude-fable-5-2",
+            "messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "u1"},
+                {"role": "assistant", "content": "a1"},
+                {"role": "user", "content": "u2"}
+            ]
+        });
+        inject_cache_breakpoints(&mut oai, false);
+        assert_eq!(oai["messages"][0]["content"][0]["cache_control"], json!({"type": "ephemeral"}));
+        assert_eq!(oai["messages"][1]["content"], "u1");
+        assert_eq!(oai["messages"][2]["content"][0]["cache_control"], json!({"type": "ephemeral"}));
+        assert_eq!(oai["messages"][3]["content"][0]["cache_control"], json!({"type": "ephemeral"}));
     }
 
     #[test]

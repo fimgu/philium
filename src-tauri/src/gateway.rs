@@ -61,6 +61,7 @@ pub struct Activity {
     pub resp_bytes: usize,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    pub cached_tokens: Option<u64>,
     /// Time to first response byte.
     pub ttft_ms: Option<u64>,
     /// Agent whose token made the request; None = desk chat.
@@ -86,6 +87,8 @@ pub struct Gateway {
     /// Agents restricted to a provider set (Strict agents on untrusted ones).
     agent_providers: RwLock<HashMap<String, Vec<String>>>,
     log: Mutex<VecDeque<Record>>,
+    /// Per-provider 1-slot semaphores for untrusted or concurrency-limited keys.
+    slots: Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
     next_id: AtomicU64,
     pub events: broadcast::Sender<Activity>,
     log_file: Option<PathBuf>,
@@ -143,6 +146,7 @@ impl Gateway {
             agent_tokens: RwLock::new(HashMap::new()),
             agent_providers: RwLock::new(HashMap::new()),
             log: Mutex::new(VecDeque::new()),
+            slots: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             events: broadcast::channel(256).0,
             log_file,
@@ -151,8 +155,23 @@ impl Gateway {
     }
 
     pub fn set_routes(&self, routes: Vec<Route>) {
+        let mut slots = self.slots.lk();
+        slots.retain(|id, _| routes.iter().any(|r| &r.provider.id == id));
         *self.routes.wr() =
             routes.into_iter().map(|r| (r.provider.id.clone(), r)).collect();
+    }
+
+    fn slot(&self, id: &str, serialize: bool) -> Option<Arc<tokio::sync::Semaphore>> {
+        let mut slots = self.slots.lk();
+        if let Some(s) = slots.get(id) {
+            return Some(s.clone());
+        }
+        if serialize {
+            let s = Arc::new(tokio::sync::Semaphore::new(1));
+            slots.insert(id.to_string(), s.clone());
+            return Some(s);
+        }
+        None
     }
 
     /// Issue a gateway token for an agent. Optional provider allowlist.
@@ -261,6 +280,7 @@ struct Finalizer {
     tail: VecDeque<u8>,
     total: usize,
     error: Option<String>,
+    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl Finalizer {
@@ -283,7 +303,7 @@ impl Drop for Finalizer {
         let head = String::from_utf8_lossy(&self.head).into_owned();
         let tail_bytes: Vec<u8> = self.tail.iter().copied().collect();
         let tail = String::from_utf8_lossy(&tail_bytes).into_owned();
-        let (input, output) = extract_usage(&head, &tail);
+        let (input, output, cached) = extract_usage(&head, &tail);
         let total = self.total;
         let elapsed = self.started.elapsed().as_millis() as u64;
         let error = self.error.take();
@@ -295,6 +315,7 @@ impl Drop for Finalizer {
             s.resp_bytes = total;
             s.input_tokens = input.or(s.input_tokens);
             s.output_tokens = output.or(s.output_tokens);
+            s.cached_tokens = cached.or(s.cached_tokens);
             let ok = s.status.is_some_and(|c| c < 400);
             s.state = if error.is_none() && ok { "done" } else { "error" };
             if error.is_some() {
@@ -309,9 +330,10 @@ impl Drop for Finalizer {
 /// Token usage from any of the wire formats, streamed (SSE) or whole.
 /// OpenAI: prompt/completion_tokens. Responses + Anthropic: input/output_tokens
 /// (Anthropic reports input in message_start and output in message_delta).
-fn extract_usage(head: &str, tail: &str) -> (Option<u64>, Option<u64>) {
+fn extract_usage(head: &str, tail: &str) -> (Option<u64>, Option<u64>, Option<u64>) {
     let mut input = None;
     let mut output = None;
+    let mut cached = None;
     let mut visit = |v: &Value| {
         fn walk(v: &Value, f: &mut dyn FnMut(&Value)) {
             match v {
@@ -327,7 +349,19 @@ fn extract_usage(head: &str, tail: &str) -> (Option<u64>, Option<u64>) {
         }
         walk(v, &mut |u| {
             let get = |k: &str| u.get(k).and_then(Value::as_u64);
-            if let Some(i) = get("prompt_tokens").or(get("input_tokens")) {
+            let cr = get("cache_read_input_tokens")
+                .or_else(|| u.pointer("/prompt_tokens_details/cached_tokens").and_then(Value::as_u64))
+                .or_else(|| u.pointer("/input_tokens_details/cached_tokens").and_then(Value::as_u64))
+                .or_else(|| get("cached_tokens"));
+            if let Some(c) = cr {
+                cached = Some(cached.unwrap_or(0).max(c));
+            }
+            if let Some(i) = get("prompt_tokens").or_else(|| {
+                get("input_tokens").map(|raw| {
+                    raw + get("cache_read_input_tokens").unwrap_or(0)
+                        + get("cache_creation_input_tokens").unwrap_or(0)
+                })
+            }) {
                 input = Some(input.unwrap_or(0).max(i));
             }
             if let Some(o) = get("completion_tokens").or(get("output_tokens")) {
@@ -348,7 +382,18 @@ fn extract_usage(head: &str, tail: &str) -> (Option<u64>, Option<u64>) {
             }
         }
     }
-    (input, output)
+    (input, output, cached)
+}
+
+fn is_concurrency_429(body: &str) -> bool {
+    let low = body.to_ascii_lowercase();
+    body.contains("同时处理")
+        || low.contains("concurrent")
+        || low.contains("in flight")
+        || low.contains("in-flight")
+        || low.contains("already processing")
+        || low.contains("simultaneous")
+        || low.contains("1 request")
 }
 
 const FORWARD_HEADERS: [&str; 6] =
@@ -428,6 +473,7 @@ async fn proxy(
         resp_bytes: 0,
         input_tokens: None,
         output_tokens: None,
+        cached_tokens: None,
         ttft_ms: None,
         agent,
         error: None,
@@ -463,7 +509,9 @@ async fn proxy(
     if translating {
         match serde_json::from_slice::<Value>(&outgoing) {
             Ok(v) => {
-                outgoing = Bytes::from(translate::request(&v, true).to_string());
+                let mut tr = translate::request(&v, true);
+                translate::inject_cache_breakpoints(&mut tr, true);
+                outgoing = Bytes::from(tr.to_string());
                 rest = "messages".into();
             }
             Err(e) => {
@@ -474,6 +522,13 @@ async fn proxy(
                     r.summary.error = Some(msg.clone());
                 });
                 return error_response(StatusCode::BAD_REQUEST, "philium_request", msg);
+            }
+        }
+    } else if method == Method::POST && rest == "chat/completions" && p.kind == Kind::OpenaiChat {
+        if let Ok(mut v) = serde_json::from_slice::<Value>(&outgoing) {
+            if v["model"].as_str().is_some_and(|m| m.to_ascii_lowercase().contains("claude")) {
+                translate::inject_cache_breakpoints(&mut v, false);
+                outgoing = Bytes::from(serde_json::to_vec(&v).unwrap_or_default());
             }
         }
     }
@@ -499,61 +554,120 @@ async fn proxy(
         if let Ok(mut v) = serde_json::from_slice::<Value>(&outgoing) {
             if p.kind == Kind::ClaudeOauth {
                 crate::oauth::shape_claude_body(&mut v);
+                translate::inject_cache_breakpoints(&mut v, true);
             } else {
                 crate::oauth::shape_chatgpt_body(&mut v);
             }
             outgoing = Bytes::from(serde_json::to_vec(&v).unwrap_or_default());
         }
     }
-    let mut req = gw.client.request(method, &url).body(outgoing);
-    for h in FORWARD_HEADERS {
-        if sub && matches!(h, "anthropic-beta" | "user-agent") {
-            continue;
+    let mut permit = if method == Method::POST {
+        match gw.slot(&p.id, !p.trusted) {
+            Some(sem) => sem.acquire_owned().await.ok(),
+            None => None,
         }
-        if let Some(v) = headers.get(h) {
-            req = req.header(h, v);
-        }
-    }
-    if let Some(c) = &oauth {
-        req = req.bearer_auth(&c.access);
-        if p.kind == Kind::ClaudeOauth {
-            let beta = headers.get("anthropic-beta").and_then(|v| v.to_str().ok());
-            req = req
-                .header("anthropic-beta", crate::oauth::claude_beta(beta))
-                .header("user-agent", crate::oauth::CLAUDE_CLI_USER_AGENT);
-            if headers.get("anthropic-version").is_none() {
-                req = req.header("anthropic-version", "2023-06-01");
-            }
-        } else {
-            req = req.header("originator", crate::oauth::CHATGPT_ORIGINATOR);
-            if let Some(a) = &c.account_id {
-                req = req.header("chatgpt-account-id", a);
-            }
-        }
-    } else if let Some(key) = route.api_key.as_deref().filter(|k| !k.is_empty()) {
-        req = match p.kind {
-            Kind::Anthropic => req.header("x-api-key", key),
-            _ => req.bearer_auth(key),
-        };
-    }
-    if anthropic && headers.get("anthropic-version").is_none() && p.kind == Kind::Anthropic {
-        req = req.header("anthropic-version", "2023-06-01");
-    }
-    if translating {
-        req = req.header("content-type", "application/json");
-    }
-    let resp = match req.send().await {
-        Ok(r) => r,
-        Err(e) => {
-            let msg = format!("upstream unreachable: {e}");
-            gw.update(id, |r| {
-                r.summary.state = "error";
-                r.summary.error = Some(msg.clone());
-                r.summary.duration_ms = Some(started.elapsed().as_millis() as u64);
-            });
-            return error_response(StatusCode::BAD_GATEWAY, "philium_upstream", msg);
-        }
+    } else {
+        None
     };
+    let build_req = || {
+        let mut req = gw.client.request(method.clone(), &url).body(outgoing.clone());
+        for h in FORWARD_HEADERS {
+            if sub && matches!(h, "anthropic-beta" | "user-agent") {
+                continue;
+            }
+            if let Some(v) = headers.get(h) {
+                req = req.header(h, v);
+            }
+        }
+        if let Some(c) = &oauth {
+            req = req.bearer_auth(&c.access);
+            if p.kind == Kind::ClaudeOauth {
+                let beta = headers.get("anthropic-beta").and_then(|v| v.to_str().ok());
+                req = req
+                    .header("anthropic-beta", crate::oauth::claude_beta(beta))
+                    .header("user-agent", crate::oauth::CLAUDE_CLI_USER_AGENT);
+                if headers.get("anthropic-version").is_none() {
+                    req = req.header("anthropic-version", "2023-06-01");
+                }
+            } else {
+                req = req.header("originator", crate::oauth::CHATGPT_ORIGINATOR);
+                if let Some(a) = &c.account_id {
+                    req = req.header("chatgpt-account-id", a);
+                }
+            }
+        } else if let Some(key) = route.api_key.as_deref().filter(|k| !k.is_empty()) {
+            req = match p.kind {
+                Kind::Anthropic => req.header("x-api-key", key),
+                _ => req.bearer_auth(key),
+            };
+        }
+        if anthropic && headers.get("anthropic-version").is_none() && p.kind == Kind::Anthropic {
+            req = req.header("anthropic-version", "2023-06-01");
+        }
+        if translating {
+            req = req.header("content-type", "application/json");
+        }
+        req
+    };
+    let mut buffered_err: Option<(reqwest::StatusCode, Option<HeaderValue>, Option<HeaderValue>, Bytes)> = None;
+    let mut upstream_resp = None;
+    for attempt in 0..4 {
+        let resp = match build_req().send().await {
+            Ok(r) => r,
+            Err(e) => {
+                let msg = format!("upstream unreachable: {e}");
+                gw.update(id, |r| {
+                    r.summary.state = "error";
+                    r.summary.error = Some(msg.clone());
+                    r.summary.duration_ms = Some(started.elapsed().as_millis() as u64);
+                });
+                return error_response(StatusCode::BAD_GATEWAY, "philium_upstream", msg);
+            }
+        };
+        if resp.status() == StatusCode::TOO_MANY_REQUESTS && resp.headers().get("retry-after").is_none() {
+            let status = resp.status();
+            let ct = resp.headers().get("content-type").cloned();
+            let ra = resp.headers().get("retry-after").cloned();
+            let bytes = resp.bytes().await.unwrap_or_default();
+            if attempt < 3 && is_concurrency_429(&String::from_utf8_lossy(&bytes)) {
+                if permit.is_none() {
+                    if let Some(sem) = gw.slot(&p.id, true) {
+                        permit = sem.acquire_owned().await.ok();
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(150 * (attempt as u64 + 1))).await;
+                continue;
+            }
+            buffered_err = Some((status, ct, ra, bytes));
+            break;
+        }
+        upstream_resp = Some(resp);
+        break;
+    }
+    if let Some((status, content_type, retry_after, bytes)) = buffered_err {
+        gw.update(id, |r| r.summary.status = Some(status.as_u16()));
+        let mut fin = Finalizer {
+            gw: gw.clone(),
+            id,
+            started,
+            first: None,
+            head: Vec::new(),
+            tail: VecDeque::new(),
+            total: 0,
+            error: None,
+            _permit: permit,
+        };
+        fin.feed(&bytes);
+        let mut out = Response::new(Body::from(bytes));
+        *out.status_mut() = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::TOO_MANY_REQUESTS);
+        let h = out.headers_mut();
+        h.insert("content-type", content_type.unwrap_or(HeaderValue::from_static("application/json")));
+        if let Some(v) = retry_after {
+            h.insert("retry-after", v);
+        }
+        return out;
+    }
+    let resp = upstream_resp.expect("response or buffered error");
     let status = resp.status();
     gw.update(id, |r| r.summary.status = Some(status.as_u16()));
     let content_type = resp.headers().get("content-type").cloned();
@@ -568,6 +682,7 @@ async fn proxy(
         tail: VecDeque::new(),
         total: 0,
         error: None,
+        _permit: permit,
     };
     let convert = translating && status.is_success();
     let mut out = if convert && stream {
@@ -909,13 +1024,56 @@ mod tests {
 
     #[test]
     fn usage_from_each_wire_format() {
-        let anthropic = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":40,\"output_tokens\":1}}}\n\n\
+        let anthropic = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":40,\"cache_read_input_tokens\":10,\"output_tokens\":1}}}\n\n\
                          data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":9}}\n";
-        assert_eq!(extract_usage(anthropic, ""), (Some(40), Some(9)));
-        let responses = "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":6}}}\n";
-        assert_eq!(extract_usage("", responses), (Some(5), Some(6)));
+        assert_eq!(extract_usage(anthropic, ""), (Some(50), Some(9), Some(10)));
+        let responses = "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":6,\"input_tokens_details\":{\"cached_tokens\":2}}}}\n";
+        assert_eq!(extract_usage("", responses), (Some(5), Some(6), Some(2)));
         let whole = "{\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":8}}";
-        assert_eq!(extract_usage(whole, ""), (Some(7), Some(8)));
+        assert_eq!(extract_usage(whole, ""), (Some(7), Some(8), None));
+    }
+
+    #[tokio::test]
+    async fn serializes_concurrent_requests_and_retries_busy_slot_429() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (a2, m2, c2) = (active.clone(), max_active.clone(), calls.clone());
+        let app = Router::new().route(
+            "/v1/{*rest}",
+            any(move || {
+                let (a2, m2, c2) = (a2.clone(), m2.clone(), c2.clone());
+                async move {
+                    let n = c2.fetch_add(1, Ordering::SeqCst);
+                    if n == 0 {
+                        let body = "{\"error\":{\"message\":\"请求被拒绝（429）：本卡最多同时处理 1 个请求\"}}";
+                        return (StatusCode::TOO_MANY_REQUESTS, [("content-type", "application/json")], body.to_string());
+                    }
+                    let cur = a2.fetch_add(1, Ordering::SeqCst) + 1;
+                    m2.fetch_max(cur, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                    a2.fetch_sub(1, Ordering::SeqCst);
+                    (
+                        StatusCode::OK,
+                        [("content-type", "text/event-stream")],
+                        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":6}}}\n\ndata: [DONE]\n\n".to_string(),
+                    )
+                }
+            }),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1", l.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        let (gw, url) = gateway(&base, Kind::OpenaiChat, GuardMode::Off).await;
+        let (r1, r2) = tokio::join!(post(&url).send(), post(&url).send());
+        let (r1, r2) = (r1.unwrap(), r2.unwrap());
+        assert_eq!((r1.status(), r2.status()), (StatusCode::OK, StatusCode::OK));
+        let _ = (r1.text().await, r2.text().await);
+        assert_eq!(max_active.load(Ordering::SeqCst), 1, "untrusted provider streams never overlap");
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "busy-slot 429 retried transparently");
+        let a = settle(&gw).await;
+        assert_eq!((a.input_tokens, a.output_tokens, a.cached_tokens), (Some(10), Some(2), Some(6)));
     }
 }
 
