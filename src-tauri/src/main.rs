@@ -23,6 +23,7 @@ mod codeindex;
 mod graph;
 mod guard;
 mod hal;
+mod library;
 mod mcp;
 mod oauth;
 mod providers;
@@ -145,6 +146,7 @@ async fn rpc_inner(app: &App, method: String, args: Option<Value>) -> Result<Val
         "sandbox" => sandbox::call(&ctx, m, args).await,
         "stats" => stats::call(&ctx, m, args).await,
         "reaper" => reaper::call(&ctx, m, args).await,
+        "library" => library::call(&ctx, m, args).await,
         "selfdev" => selfdev::call(&ctx, m, args).await,
         "mcp" => mcp::call(&ctx, m, args).await,
         _ => Err(format!("unknown module {module}")),
@@ -310,7 +312,8 @@ fn main() {
             });
 
             // Module init. Failures are logged, never fatal: the UI shows them.
-            let inits: [(&str, fn(&Arc<Ctx>) -> Result<(), String>); 13] = [
+            let inits: [(&str, fn(&Arc<Ctx>) -> Result<(), String>); 14] = [
+                ("library", library::init),
                 ("providers", providers::init),
                 ("sandbox", sandbox::init),
                 ("mcp", mcp::init),
@@ -638,6 +641,25 @@ mod e2e {
         assert!(agents::history::attachment_at(&db_path, "other-session", &sha).is_err(), "peer session could read image");
         println!("real HAL image: forwarded upstream, stored as {sha}, scoped read ok, peer denied");
         h.stop();
+
+        // Standing rules and imported memories: the same prompt.extra agents
+        // get, through a real HAL, must reach the model's system prompt.
+        crate::library::init(&ctx).unwrap();
+        crate::library::memory_save(&ctx, "Filip-pref-marker-7731 keep replies short", "preference", None, "test").unwrap();
+        let adir = dir.join("agent-hal");
+        let mut setup = providers::hal_setup(&ctx, &adir.join("hal"), &providers::ConfigOpts::default());
+        setup.config["prompt"] = json!({ "extra": format!("{}{}", crate::library::rules(&ctx), crate::library::standing_memories(&ctx)) });
+        let ah = Hal::start(Launch { dir: &adir, config: setup.config, cwd: None, env: setup.env, allow_logins: false, wrap: None }).expect("agent-style HAL starts");
+        let s = ah.call(reqwest::Method::POST, "/sessions", Some(chat_session_body(&ws, "rules", None))).await.unwrap();
+        let sid = s["id"].as_str().or(s["session"]["id"].as_str()).unwrap().to_string();
+        let before = seen.lk().len();
+        ah.call(reqwest::Method::POST, &format!("/sessions/{sid}/messages"), Some(json!({"text":"hi"}))).await.unwrap();
+        wait_turn(&ah, &sid).await;
+        let bodies: Vec<String> = seen.lk()[before..].iter().map(|(_, b)| b.clone()).collect();
+        assert!(bodies.iter().any(|b| b.contains("standing rules") && b.contains("skill_get review-pr") && b.contains("Filip-pref-marker-7731")),
+            "rules/memories missing from model request");
+        println!("real HAL rules: standing rules + saved memory reached the model");
+        ah.stop();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

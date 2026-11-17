@@ -180,6 +180,12 @@ pub fn tool_list() -> Vec<Value> {
           json!({ "path": s }), &[]),
         t("playbook_get", "The standard steps and checks for a job: commit, open_pr, test_pr, review_pr, docs, release, teardown.",
           json!({ "job": s }), &["job"]),
+        t("skill_list", "Your skills (reusable procedures like review-pr, make-plan, babysit): name and when to use each.", json!({}), &[]),
+        t("skill_get", "Load one skill's full instructions and supporting files. Follow them.", json!({ "name": s }), &["name"]),
+        t("memory_search", "Search what Filip has told agents before (preferences, corrections, project facts). Check before asking him again.",
+          json!({ "q": s, "limit": i }), &["q"]),
+        t("memory_save", "Remember a durable preference, correction or fact for future agents. Category: fact, preference, correction, entity. project=true scopes it to this repo.",
+          json!({ "content": s, "category": s, "project": b }), &["content", "category"]),
         t("resource_register", "Declare something you created outside Philium's tools (container, cluster, process, temp dir) so it is cleaned up with you.",
           json!({ "kind": s, "handle": s, "note": s }), &["kind", "handle"]),
     ].into_iter().chain(crate::browser::mcp_tools()).chain(crate::codeindex::mcp_tools()).collect()
@@ -380,6 +386,21 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
             let repo = crate::agents::runtime(agent).map(|r| r.cwd.clone());
             crate::board::playbook(ctx, arg(&a, "job")?, repo.as_deref())
         }
+        "skill_list" => crate::library::skill_list(ctx),
+        "skill_get" => crate::library::skill_get(ctx, arg(&a, "name")?),
+        "memory_search" | "memory_save" => {
+            // Personal memory never goes to agents on untrusted (Strict) providers.
+            if row["strict"].as_i64() == Some(1) {
+                return Err("memory is not available to Strict agents".into());
+            }
+            let project = crate::agents::repo_path_of(ctx, &row);
+            if name == "memory_search" {
+                crate::library::memory_search(ctx, arg(&a, "q")?, project.as_deref(), a["limit"].as_i64().unwrap_or(10))
+            } else {
+                let scope = if a["project"].as_bool() == Some(true) { project.as_deref() } else { None };
+                crate::library::memory_save(ctx, arg(&a, "content")?, arg(&a, "category")?, scope, &me)
+            }
+        }
         "resource_register" => {
             let kind = arg(&a, "kind")?;
             const KINDS: &[&str] =
@@ -471,6 +492,26 @@ mod tests {
         assert_eq!(who(&h).as_deref(), Some("a1"));
         revoke("a1");
         assert_eq!(who(&h), None);
+    }
+
+    #[tokio::test]
+    async fn skills_and_memory_tools_respect_strict() {
+        let ctx = Ctx::test();
+        crate::library::init(&ctx).unwrap();
+        ctx.db.exec("INSERT INTO agents(id,name,model_ref,strict,created_at,last_active_at) VALUES('t1','owl','p/m',0,0,0),('s1','fox','p/m',1,0,0)", []).unwrap();
+        ctx.db.exec("INSERT INTO skills(name,description,body,source,updated_at) VALUES('review-pr','Review','do it','jcode',0)", []).unwrap();
+        let call = |agent: &'static str, name: &'static str, args: Value| {
+            let ctx = ctx.clone();
+            async move { dispatch(&ctx, agent, json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":name,"arguments":args}})).await.unwrap() }
+        };
+        let text = |r: &Value| r["result"]["content"][0]["text"].as_str().unwrap_or("").to_string();
+        assert!(text(&call("s1", "skill_get", json!({"name":"review-pr"})).await).contains("do it"));
+        let saved = call("t1", "memory_save", json!({"content":"Filip likes terse replies","category":"preference"})).await;
+        assert_ne!(saved["result"]["isError"], true, "{saved}");
+        assert!(text(&call("t1", "memory_search", json!({"q":"terse"})).await).contains("terse replies"));
+        let denied = call("s1", "memory_search", json!({"q":"terse"})).await;
+        assert_eq!(denied["result"]["isError"], true);
+        assert!(!text(&denied).contains("terse replies"));
     }
 
     #[test]

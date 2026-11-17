@@ -112,6 +112,12 @@ pub fn free_names(ctx: &Ctx, n: usize) -> Vec<String> {
     out
 }
 
+/// The main checkout path of the repo an agent works on, used to scope memory.
+pub fn repo_path_of(ctx: &Ctx, row: &Value) -> Option<String> {
+    let id = row["repo_id"].as_str()?;
+    ctx.db.query("SELECT path FROM repos WHERE id=?1", [id]).ok()?.first()?["path"].as_str().map(str::to_string)
+}
+
 pub fn get_row(ctx: &Ctx, id_or_name: &str) -> Option<Value> {
     ctx.db
         .query("SELECT * FROM agents WHERE id=?1 OR name=?1", [id_or_name])
@@ -345,7 +351,14 @@ async fn provision(ctx: &Arc<Ctx>, id: &str, fresh: bool, brief: Option<String>)
     config["server"]["workspace"] = json!(cwd);
     config["permissions"] = permission_rules(strict);
     config["limits"] = json!({ "workspace": { "allow_outside": false } });
-    config["prompt"] = json!({ "extra": instructions(&name, strict, worktree.as_deref()) });
+    let mut extra = instructions(&name, strict, worktree.as_deref());
+    extra.push('\n');
+    extra.push_str(&crate::library::rules(ctx));
+    // Personal memories only reach agents on trusted providers.
+    if !strict {
+        extra.push_str(&crate::library::standing_memories(ctx));
+    }
+    config["prompt"] = json!({ "extra": extra });
     if let Some(url) = ctx.mcp_url.get() {
         config["mcp"] = json!({ "servers": { "philium": {
             "transport": "streamable_http",
