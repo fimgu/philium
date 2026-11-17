@@ -413,8 +413,9 @@ function AgentView(props) {
   };
   const [events, setEvents] = createSignal([]);
   const [info, { refetch }] = createResource(() => props.id, (id) => rpc("agents.get", { id }));
-  const [models] = createResource(() => rpc("providers.models", {}).catch(() => []));
-  const [providers] = createResource(() => rpc("providers.list").catch(() => []));
+  const [models, { refetch: refetchModels }] = createResource(() => rpc("providers.models", {}).catch(() => []));
+  const [providers, { refetch: refetchProviders }] = createResource(() => rpc("providers.list").catch(() => []));
+  useEvent("providers:changed", () => { refetchModels(); refetchProviders(); });
   const [historyLoading, setHistoryLoading] = createSignal(false);
   const [historyError, setHistoryError] = createSignal("");
   const [historyCursor, setHistoryCursor] = createSignal(0);
@@ -481,11 +482,13 @@ function AgentView(props) {
     }
   };
   const live = () => a()?.id === props.id ? a()?.live : props.agent?.live;
+  const activeModel = createMemo(() => (models() ?? []).find((m) => m.ref === a()?.model_ref));
 
   const changeModel = async (newRef) => {
     if (!newRef || newRef === a()?.model_ref) return true;
     try {
       await rpc("agents.set_model", { id: props.id, model: newRef });
+      rpc("agents.get_effort", { id: props.id }).then((v) => setEffort(v || "default")).catch(() => {});
       toast(`Switched ${a()?.name ?? "agent"} model to ${newRef} (0 tokens used)`, "secure");
       refetch();
       return true;
@@ -619,7 +622,7 @@ function AgentView(props) {
             <Conversation events={events()} busy={busy()} readOnly={!live()} loadAttachment={agentAttachmentLoader(props.id)} emptyText={historyLoading() ? "Loading saved conversation…" : historyError() ? "History could not be loaded. Retry above." : live() ? "Send the first message to start." : "No saved messages. This agent is stopped. Resume it to continue."}
               onApprove={(id, scope) => decide(id, "approve", scope)} onDeny={(id) => decide(id, "deny")} />
             <Composer draftKey={`agent:${props.id}`} dropTarget={() => agentMain} onSend={send} busy={busy()} disabled={!live()} onCancel={() => rpc("agents.cancel", { id: props.id }, { action: true }).catch((e) => toast(String(e), "danger"))}
-              effort={effort()} speed={effortSpeed(effort())} effortPending={effortPending()} onEffort={changeEffort} onSpeed={changeEffort} onSlashModel={handleSlashModel}
+              effort={effort()} speed={effortSpeed(effort())} effortOptions={activeModel()?.effort_details ?? []} effortPending={effortPending()} onEffort={changeEffort} onSpeed={changeEffort} onSlashModel={handleSlashModel}
               placeholder={live() ? `Message ${a()?.name ?? ""} (or /effort, /model)` : "Agent is stopped"} />
           </Show>
           <Show when={tab() === "terms"}><Terminals id={props.id} /></Show>

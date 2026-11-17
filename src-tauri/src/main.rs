@@ -101,6 +101,15 @@ pub fn refresh_desk(ctx: &Arc<Ctx>) {
 async fn hal(app: State<'_, App>, method: String, path: String, body: Option<Value>) -> Result<Value, String> {
     let h = app.ctx.desk.rd().clone().map_err(|e| format!("HAL failed to start: {e}"))?;
     hal::validate_path(&path)?;
+    if method.eq_ignore_ascii_case("PATCH") && path.starts_with("/sessions/") {
+        if let Some(eff) = body.as_ref().and_then(|b| b.get("effort")).and_then(Value::as_str).map(str::to_string) {
+            app.ctx.gateway.set_effort(None, Some(&eff));
+            if let Ok(v) = h.call(hal::parse_method(&method)?, &path, body).await {
+                return Ok(v);
+            }
+            return Ok(json!({ "effort": eff }));
+        }
+    }
     h.call(hal::parse_method(&method)?, &path, body).await
 }
 
@@ -295,6 +304,10 @@ fn main() {
             let db = db::Db::open(&data_dir.join("philium.db")).map_err(|e| format!("database: {e}"))?;
             let ctx = Ctx::new(db, data_dir, philium_root(), gateway.clone(), gateway_url);
             ctx.set_handle(app.handle().clone());
+            let c_learn = ctx.clone();
+            gateway.set_learned_efforts_cb(Arc::new(move |pid, mid, levels| {
+                providers::record_learned_efforts(&c_learn, pid, mid, levels);
+            }));
 
             // Live activity -> UI and stats.
             let mut rx = gateway.events.subscribe();

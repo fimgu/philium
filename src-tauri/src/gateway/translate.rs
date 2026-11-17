@@ -12,12 +12,103 @@ fn default_max_tokens(model: &str) -> u64 {
 }
 
 fn thinking_budget(effort: &str) -> u64 {
-    match effort {
+    let raw = effort.trim().to_ascii_lowercase();
+    if let Some(num_k) = raw.strip_suffix('k').and_then(|s| s.trim().parse::<u64>().ok()) {
+        return num_k.saturating_mul(1024).max(1024);
+    }
+    if let Ok(tokens) = raw.parse::<u64>() {
+        return tokens.max(1024);
+    }
+    match raw.as_str() {
         "minimal" | "low" => 2_048,
         "medium" => 8_192,
         "high" => 16_384,
-        _ => 32_000, // xhigh, max
+        _ => 32_000,
     }
+}
+
+/// Apply an active session effort to a request body before translation/forwarding.
+pub fn inject_effort(body: &mut Value, effort: Option<&str>, is_responses_api: bool) {
+    let Some(obj) = body.as_object_mut() else { return };
+    let Some(eff) = effort.map(str::trim).filter(|e| !e.is_empty()) else { return };
+    if eff.eq_ignore_ascii_case("default") || eff.eq_ignore_ascii_case("auto") {
+        obj.remove("reasoning_effort");
+        obj.remove("reasoning");
+        obj.remove("thinking");
+        return;
+    }
+    if is_responses_api {
+        obj.remove("reasoning_effort");
+        if eff.eq_ignore_ascii_case("none") || eff.eq_ignore_ascii_case("off") {
+            obj.remove("reasoning");
+        } else {
+            obj.insert("reasoning".into(), json!({ "effort": eff }));
+        }
+    } else {
+        obj.insert("reasoning_effort".into(), json!(eff));
+    }
+}
+
+/// Strip reasoning/thinking fields from an outgoing JSON body if the upstream model rejected them.
+/// Returns `true` if any reasoning field was present and removed.
+pub fn strip_effort(body: &mut Value) -> bool {
+    let Some(obj) = body.as_object_mut() else { return false };
+    let a = obj.remove("reasoning_effort").is_some();
+    let b = obj.remove("reasoning").is_some();
+    let c = obj.remove("thinking").is_some();
+    a || b || c
+}
+
+/// Inspect an upstream HTTP 400 error body to see if it rejected `reasoning_effort`,
+/// `reasoning`, or `thinking`. Returns `Some(allowed_levels)` if it was an effort error:
+/// - non-empty Vec when the error message enumerates supported values (e.g. `'low', 'medium', 'high'`)
+/// - empty Vec when the model does not support reasoning effort at all.
+pub fn parse_effort_rejection(status: u16, body: &str) -> Option<Vec<String>> {
+    if status != 400 && status != 422 {
+        return None;
+    }
+    let low = body.to_ascii_lowercase();
+    let mentions_effort = low.contains("reasoning_effort")
+        || low.contains("reasoning.effort")
+        || low.contains("thinking")
+        || low.contains("budget_tokens")
+        || (low.contains("reasoning") && (low.contains("effort") || low.contains("unsupported") || low.contains("not support")));
+    if !mentions_effort {
+        return None;
+    }
+    // Extract single-quoted enum candidates if the error lists supported values
+    // e.g. "Supported values are: 'low', 'medium', and 'high'."
+    if low.contains("supported values") || low.contains("valid values") || low.contains("permitted") || low.contains("must be one of") {
+        let mut levels = Vec::new();
+        let tail = body
+            .find("upported values")
+            .or_else(|| body.find("alid values"))
+            .or_else(|| body.find("ermitted"))
+            .or_else(|| body.find("one of"))
+            .map(|i| &body[i..])
+            .unwrap_or(body);
+        let mut rest = tail;
+        while let Some(start) = rest.find('\'') {
+            let after = &rest[start + 1..];
+            if let Some(end) = after.find('\'') {
+                let candidate = after[..end].trim().to_ascii_lowercase();
+                if !candidate.is_empty()
+                    && candidate.len() <= 24
+                    && candidate.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                    && !levels.contains(&candidate)
+                {
+                    levels.push(candidate);
+                }
+                rest = &after[end + 1..];
+            } else {
+                break;
+            }
+        }
+        if !levels.is_empty() {
+            return Some(levels);
+        }
+    }
+    Some(vec![])
 }
 
 fn text_of(content: &Value) -> String {
@@ -547,5 +638,48 @@ mod tests {
         assert_eq!(r["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"], "{\"a\":1}");
         assert_eq!(r["choices"][0]["finish_reason"], "tool_calls");
         assert_eq!(r["usage"]["total_tokens"], 7);
+    }
+
+    #[test]
+    fn dynamic_effort_injection_and_rejection_parsing() {
+        // Dynamic token budgets & named levels
+        let ant_16k = request(&json!({
+            "model": "claude-sonnet-5-5",
+            "reasoning_effort": "16k",
+            "messages": [{"role": "user", "content": "hi"}]
+        }), true);
+        assert_eq!(ant_16k["thinking"]["budget_tokens"], 16_000);
+        assert_eq!(ant_16k["max_tokens"], 20_096);
+
+        let ant_num = request(&json!({
+            "model": "claude-sonnet-5-5",
+            "reasoning_effort": "4096",
+            "messages": [{"role": "user", "content": "hi"}]
+        }), true);
+        assert_eq!(ant_num["thinking"]["budget_tokens"], 4096);
+
+        // Gateway effort injection + strip
+        let mut chat = json!({"model": "gpt-6-luna", "messages": []});
+        inject_effort(&mut chat, Some("xhigh"), false);
+        assert_eq!(chat["reasoning_effort"], "xhigh");
+        assert!(strip_effort(&mut chat));
+        assert!(chat.get("reasoning_effort").is_none());
+
+        let mut resp = json!({"model": "gpt-6-luna", "input": "hi"});
+        inject_effort(&mut resp, Some("high"), true);
+        assert_eq!(resp["reasoning"]["effort"], "high");
+        assert!(strip_effort(&mut resp));
+        assert!(resp.get("reasoning").is_none());
+
+        // Upstream 400 error parsing: enumerated supported values
+        let enum_err = r#"{"error":{"message":"Invalid value: 'xhigh'. Supported values are: 'low', 'medium', and 'high'."}}"#;
+        assert_eq!(
+            parse_effort_rejection(400, enum_err),
+            Some(vec!["low".into(), "medium".into(), "high".into()])
+        );
+
+        // Upstream 400 error parsing: parameter completely unsupported by model
+        let unsup_err = r#"{"error":{"message":"Unrecognized request argument supplied: reasoning_effort"}}"#;
+        assert_eq!(parse_effort_rejection(400, unsup_err), Some(vec![]));
     }
 }

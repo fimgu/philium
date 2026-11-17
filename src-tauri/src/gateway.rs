@@ -77,6 +77,8 @@ struct Record {
     response_tail: String,
 }
 
+type LearnedEffortsFn = dyn Fn(&str, &str, Vec<String>) + Send + Sync;
+
 pub struct Gateway {
     pub token: String,
     client: reqwest::Client,
@@ -86,6 +88,10 @@ pub struct Gateway {
     agent_tokens: RwLock<HashMap<String, String>>,
     /// Agents restricted to a provider set (Strict agents on untrusted ones).
     agent_providers: RwLock<HashMap<String, Vec<String>>>,
+    /// Dynamic reasoning effort per agent (and desk chat under key `""`), applied at the gateway
+    /// so custom provider effort values and token budgets work regardless of HAL's internal enum.
+    efforts: RwLock<HashMap<String, String>>,
+    learned_efforts_cb: RwLock<Option<Arc<LearnedEffortsFn>>>,
     log: Mutex<VecDeque<Record>>,
     /// Per-provider 1-slot semaphores for untrusted or concurrency-limited keys.
     slots: Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
@@ -145,6 +151,8 @@ impl Gateway {
             routes: RwLock::new(HashMap::new()),
             agent_tokens: RwLock::new(HashMap::new()),
             agent_providers: RwLock::new(HashMap::new()),
+            efforts: RwLock::new(HashMap::new()),
+            learned_efforts_cb: RwLock::new(None),
             log: Mutex::new(VecDeque::new()),
             slots: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
@@ -152,6 +160,29 @@ impl Gateway {
             log_file,
             tokens: TokenSource::new(),
         })
+    }
+
+    pub fn set_learned_efforts_cb(&self, cb: Arc<LearnedEffortsFn>) {
+        *self.learned_efforts_cb.wr() = Some(cb);
+    }
+
+    /// Set the active reasoning effort for an agent (`Some(name)`) or desk chat (`None`).
+    pub fn set_effort(&self, agent: Option<&str>, effort: Option<&str>) {
+        let key = agent.unwrap_or("").to_string();
+        let mut map = self.efforts.wr();
+        match effort.map(str::trim).filter(|e| !e.is_empty() && !e.eq_ignore_ascii_case("default") && !e.eq_ignore_ascii_case("auto")) {
+            Some(e) => {
+                map.insert(key, e.to_string());
+            }
+            None => {
+                map.remove(&key);
+            }
+        }
+    }
+
+    pub fn get_effort(&self, agent: Option<&str>) -> Option<String> {
+        let key = agent.unwrap_or("");
+        self.efforts.rd().get(key).cloned()
     }
 
     pub fn set_routes(&self, routes: Vec<Route>) {
@@ -536,6 +567,8 @@ async fn proxy(
         (false, GuardMode::Off) => "flagged",
     };
     let blocked = guard_state == "blocked";
+    let model_name = model.clone();
+    let agent_name = agent.clone();
     let summary = Activity {
         id,
         started_ms: now_ms(),
@@ -583,6 +616,14 @@ async fn proxy(
 
     let mut rest = rest;
     let mut outgoing = outgoing;
+    if method == Method::POST && matches!(rest.as_str(), "chat/completions" | "responses") {
+        if let Some(eff) = gw.get_effort(agent_name.as_deref()) {
+            if let Ok(mut v) = serde_json::from_slice::<Value>(&outgoing) {
+                translate::inject_effort(&mut v, Some(&eff), rest == "responses");
+                outgoing = Bytes::from(serde_json::to_vec(&v).unwrap_or_default());
+            }
+        }
+    }
     // HAL speaks chat.completions to Anthropic-family providers; convert.
     let anthropic = matches!(p.kind, Kind::Anthropic | Kind::ClaudeOauth);
     let translating = anthropic && method == Method::POST && rest == "chat/completions";
@@ -649,8 +690,8 @@ async fn proxy(
     } else {
         None
     };
-    let build_req = || {
-        let mut req = gw.client.request(method.clone(), &url).body(outgoing.clone());
+    let build_req = |body_bytes: &Bytes| {
+        let mut req = gw.client.request(method.clone(), &url).body(body_bytes.clone());
         for h in FORWARD_HEADERS {
             if sub && matches!(h, "anthropic-beta" | "user-agent") {
                 continue;
@@ -692,7 +733,7 @@ async fn proxy(
     let mut buffered_err: Option<(reqwest::StatusCode, Option<HeaderValue>, Option<HeaderValue>, Bytes)> = None;
     let mut upstream_resp = None;
     for attempt in 0..4 {
-        let resp = match build_req().send().await {
+        let resp = match build_req(&outgoing).send().await {
             Ok(r) => r,
             Err(e) => {
                 let msg = format!("upstream unreachable: {e}");
@@ -704,6 +745,26 @@ async fn proxy(
                 return error_response(StatusCode::BAD_GATEWAY, "philium_upstream", msg);
             }
         };
+        if matches!(resp.status().as_u16(), 400 | 422) && attempt < 3 {
+            let status = resp.status();
+            let ct = resp.headers().get("content-type").cloned();
+            let ra = resp.headers().get("retry-after").cloned();
+            let bytes = resp.bytes().await.unwrap_or_default();
+            if let Some(learned) = translate::parse_effort_rejection(status.as_u16(), &String::from_utf8_lossy(&bytes)) {
+                if let (Some(cb), Some(m)) = (gw.learned_efforts_cb.rd().clone(), model_name.as_deref()) {
+                    cb(&p.id, m, learned);
+                }
+                if let Ok(mut v) = serde_json::from_slice::<Value>(&outgoing) {
+                    if translate::strip_effort(&mut v) {
+                        gw.set_effort(agent_name.as_deref(), None);
+                        outgoing = Bytes::from(serde_json::to_vec(&v).unwrap_or_default());
+                        continue;
+                    }
+                }
+            }
+            buffered_err = Some((status, ct, ra, bytes));
+            break;
+        }
         if resp.status() == StatusCode::TOO_MANY_REQUESTS && resp.headers().get("retry-after").is_none() {
             let status = resp.status();
             let ct = resp.headers().get("content-type").cloned();

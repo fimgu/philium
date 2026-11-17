@@ -364,6 +364,14 @@ fn context_window(ctx: &Ctx, pid: &str, mid: &str) -> Option<i64> {
 
 // ---------- discovery ----------
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EffortOption {
+    pub value: String,
+    pub label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Discovered {
     pub id: String,
@@ -371,6 +379,202 @@ pub struct Discovered {
     pub context_window: Option<i64>,
     pub price_in: Option<f64>,
     pub price_out: Option<f64>,
+    /// Explicitly advertised reasoning effort options from upstream `/models`
+    /// (`supported_reasoning_levels`, `reasoning_efforts`, `supported_parameters`, etc.).
+    /// `None` means upstream `/models` did not include effort metadata for this model.
+    /// `Some(vec![])` means upstream explicitly reported that this model accepts no effort parameter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub efforts: Option<Vec<EffortOption>>,
+}
+
+fn format_effort_label(v: &str) -> String {
+    let mut chars = v.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(f) => f.to_uppercase().collect::<String>() + chars.as_str(),
+    }
+}
+
+/// Extract reasoning effort options dynamically from a raw `/models` entry without hardcoding level names.
+fn parse_discovered_efforts(m: &Value) -> Option<Vec<EffortOption>> {
+    // 1. Explicit array of levels from provider (`/models` `supported_reasoning_levels`, `reasoning_efforts`, `thinking.efforts`, etc.)
+    if let Some(arr) = m
+        .get("supported_reasoning_levels")
+        .or_else(|| m.get("reasoning_efforts"))
+        .or_else(|| m.pointer("/capabilities/reasoning_efforts"))
+        .or_else(|| m.pointer("/capabilities/supported_reasoning_levels"))
+        .or_else(|| m.pointer("/thinking/supported_efforts"))
+        .and_then(Value::as_array)
+    {
+        let mut out: Vec<EffortOption> = Vec::new();
+        for item in arr {
+            let val = item
+                .as_str()
+                .or_else(|| item.get("effort").and_then(Value::as_str))
+                .or_else(|| item.get("id").and_then(Value::as_str))
+                .or_else(|| item.get("value").and_then(Value::as_str))
+                .or_else(|| item.get("name").and_then(Value::as_str));
+            if let Some(raw) = val {
+                let value = raw.trim().to_string();
+                if value.is_empty() || out.iter().any(|x| x.value == value) {
+                    continue;
+                }
+                let label = item
+                    .get("label")
+                    .or_else(|| item.get("display_name"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format_effort_label(&value));
+                let hint = item
+                    .get("description")
+                    .or_else(|| item.get("hint"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                out.push(EffortOption { value, label, hint });
+            }
+        }
+        return Some(out);
+    }
+
+    // 2. Provider `/models` `supported_parameters` (e.g. OpenRouter, LiteLLM, vLLM)
+    if let Some(params) = m.get("supported_parameters").and_then(Value::as_array) {
+        let supports_reasoning = params.iter().filter_map(Value::as_str).any(|p| {
+            p.contains("reasoning") || p.contains("thinking") || p == "effort"
+        });
+        if !supports_reasoning {
+            return Some(vec![]);
+        }
+    }
+
+    // 3. Explicit boolean capability flag in `/models`
+    if let Some(thinking) = m
+        .pointer("/capabilities/thinking")
+        .or_else(|| m.pointer("/capabilities/reasoning"))
+        .or_else(|| m.get("thinking_support"))
+        .or_else(|| m.get("reasoning"))
+        .and_then(Value::as_bool)
+    {
+        if !thinking {
+            return Some(vec![]);
+        }
+    }
+    None
+}
+
+/// Record what an upstream provider accepted or rejected at runtime for `(provider_id, model_id)`.
+/// Called by the gateway when an upstream API rejects an effort parameter or reports valid enum values.
+pub fn record_learned_efforts(ctx: &Ctx, provider_id: &str, model_id: &str, levels: Vec<String>) {
+    let mut map = discovered_efforts_map(ctx, provider_id);
+    let opts: Vec<EffortOption> = levels
+        .into_iter()
+        .filter(|v| !v.is_empty() && v != "default")
+        .map(|value| EffortOption {
+            label: format_effort_label(&value),
+            hint: None,
+            value,
+        })
+        .collect();
+    map.insert(model_id.to_string(), opts);
+    if let Ok(s) = serde_json::to_string(&map) {
+        let _ = ctx.db.kv_set(&format!("models_efforts.{provider_id}"), &s);
+        ctx.notify("providers");
+        ctx.emit("providers:changed", json!({ "id": provider_id }));
+    }
+}
+
+/// Dynamic effort options for `(kind, model_id)`.
+/// Uses the provider's discovered `/models` metadata or gateway-learned capabilities first;
+/// if the provider's `/models` endpoint did not include capability metadata yet, falls back
+/// only to protocol-level (`Kind`) transport defaults until the gateway observes otherwise.
+pub fn model_effort_details(kind: Kind, _model_id: &str, discovered: Option<&[EffortOption]>) -> Vec<EffortOption> {
+    if let Some(exp) = discovered {
+        if exp.is_empty() {
+            return vec![];
+        }
+        let mut out = vec![EffortOption {
+            value: "default".into(),
+            label: "Auto".into(),
+            hint: Some("Use the provider's default reasoning behavior".into()),
+        }];
+        for item in exp {
+            if item.value != "default" && !out.iter().any(|x| x.value == item.value) {
+                out.push(item.clone());
+            }
+        }
+        return out;
+    }
+
+    // When the upstream `/models` endpoint only returns bare model IDs without capability
+    // metadata, provide the protocol's standard effort levels (which will be refined automatically
+    // if the upstream endpoint ever rejects one).
+    let levels: &[(&str, &str)] = match kind {
+        Kind::Anthropic | Kind::ClaudeOauth => &[
+            ("default", "Auto"),
+            ("none", "None"),
+            ("low", "Low"),
+            ("medium", "Medium"),
+            ("high", "High"),
+            ("max", "Max"),
+        ],
+        Kind::ChatgptOauth | Kind::OpenaiResponses | Kind::OpenaiChat => &[
+            ("default", "Auto"),
+            ("low", "Low"),
+            ("medium", "Medium"),
+            ("high", "High"),
+        ],
+    };
+    levels
+        .iter()
+        .map(|(v, l)| EffortOption {
+            value: (*v).into(),
+            label: (*l).into(),
+            hint: None,
+        })
+        .collect()
+}
+
+pub fn model_efforts(kind: Kind, model_id: &str, discovered: Option<&[EffortOption]>) -> Vec<String> {
+    model_effort_details(kind, model_id, discovered)
+        .into_iter()
+        .map(|o| o.value)
+        .collect()
+}
+
+/// Validate a requested effort against what the provider advertised or learned for `model_ref`.
+/// Never blocks custom provider values unless the provider explicitly advertised a closed list
+/// that excludes `requested`.
+pub fn validate_effort_for_ref(ctx: &Ctx, model_ref: Option<&str>, requested: &str) -> Result<String, String> {
+    let req = requested.trim().to_ascii_lowercase();
+    if req.is_empty() || req == "default" || req == "auto" {
+        return Ok("default".into());
+    }
+    if let Ok((p, mid)) = resolve(ctx, model_ref) {
+        let disc = discovered_efforts_map(ctx, &p.id);
+        if let Some(explicit) = disc.get(&mid) {
+            if explicit.is_empty() {
+                return Err(format!("Provider `{}` reports that `{}` does not accept reasoning effort", p.id, mid));
+            }
+            if !explicit.iter().any(|o| o.value.eq_ignore_ascii_case(&req)) {
+                let allowed: Vec<&str> = std::iter::once("default")
+                    .chain(explicit.iter().map(|o| o.value.as_str()))
+                    .collect();
+                return Err(format!(
+                    "Provider `{}` supports effort [{}] for `{}` (got `{requested}`)",
+                    p.id,
+                    allowed.join(", "),
+                    mid
+                ));
+            }
+        }
+    }
+    Ok(req)
+}
+
+fn discovered_efforts_map(ctx: &Ctx, provider_id: &str) -> std::collections::HashMap<String, Vec<EffortOption>> {
+    ctx.db
+        .kv_get(&format!("models_efforts.{provider_id}"))
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
 }
 
 /// Parse an OpenAI/Anthropic/OpenRouter-style `/models` body.
@@ -397,6 +601,7 @@ pub fn parse_models_ordered(body: &Value) -> Vec<Discovered> {
                 // OpenRouter reports $/token as strings; store $/1M tokens.
                 price_in: num(m.pointer("/pricing/prompt")).map(|x| x * 1e6),
                 price_out: num(m.pointer("/pricing/completion")).map(|x| x * 1e6),
+                efforts: parse_discovered_efforts(m),
                 id,
             })
         })
@@ -494,6 +699,17 @@ pub async fn refresh_models(ctx: &Arc<Ctx>, id: &str) -> Result<Vec<Value>, Stri
     })?;
     let order: Vec<&str> = found.iter().map(|m| m.id.as_str()).collect();
     ctx.db.kv_set(&format!("models_order.{id}"), &serde_json::to_string(&order).unwrap_or_default())?;
+    let mut efforts_map = discovered_efforts_map(ctx, id);
+    for m in &found {
+        if let Some(e) = &m.efforts {
+            efforts_map.insert(m.id.clone(), e.clone());
+        }
+    }
+    if efforts_map.is_empty() {
+        let _ = ctx.db.exec("DELETE FROM kv WHERE k=?1", [format!("models_efforts.{id}")]);
+    } else {
+        ctx.db.kv_set(&format!("models_efforts.{id}"), &serde_json::to_string(&efforts_map).unwrap_or_default())?;
+    }
     ctx.db.exec("DELETE FROM kv WHERE k=?1", [format!("models_error.{id}")])?;
     ctx.notify("providers");
     ctx.emit("providers:changed", json!({ "id": id }));
@@ -504,7 +720,21 @@ pub fn models(ctx: &Ctx, provider: Option<&str>) -> Result<Vec<Value>, String> {
     let sql = "SELECT m.*, p.name AS provider_name, p.trust, p.kind, p.provider_id || '/' || m.model_id AS ref
                FROM models m JOIN (SELECT id AS provider_id, name, trust, kind, enabled FROM providers) p USING(provider_id)
                WHERE p.enabled=1 AND (?1 IS NULL OR m.provider_id=?1) ORDER BY p.provider_id, m.model_id";
-    ctx.db.query(sql, [provider])
+    let mut rows = ctx.db.query(sql, [provider])?;
+    let mut disc_cache: std::collections::HashMap<String, std::collections::HashMap<String, Vec<EffortOption>>> =
+        std::collections::HashMap::new();
+    for r in &mut rows {
+        let pid = r["provider_id"].as_str().unwrap_or("").to_string();
+        let mid = r["model_id"].as_str().unwrap_or("").to_string();
+        let kind = r["kind"].as_str().and_then(|k| Kind::parse(k).ok()).unwrap_or(Kind::OpenaiChat);
+        let disc = disc_cache
+            .entry(pid.clone())
+            .or_insert_with(|| discovered_efforts_map(ctx, &pid));
+        let exp = disc.get(&mid).map(Vec::as_slice);
+        r["efforts"] = json!(model_efforts(kind, &mid, exp));
+        r["effort_details"] = json!(model_effort_details(kind, &mid, exp));
+    }
+    Ok(rows)
 }
 
 // ---------- module ----------
@@ -804,10 +1034,42 @@ mod tests {
 
     #[test]
     fn alias_dedupe() {
-        let d = |id: &str| Discovered { id: id.into(), display: None, context_window: None, price_in: None, price_out: None };
+        let d = |id: &str| Discovered { id: id.into(), display: None, context_window: None, price_in: None, price_out: None, efforts: None };
         let mut v = vec![d("opus"), d("claude-opus-5-5"), d("gpt-6"), d("gpt-6")];
         dedupe_aliases(&mut v);
         assert_eq!(v.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["claude-opus-5-5", "gpt-6"]);
+    }
+
+    #[test]
+    fn dynamic_model_efforts_match_provider_capabilities() {
+        // Explicit /models supported_reasoning_levels preserves provider-defined levels and descriptions
+        let codex = json!({"data":[
+            {"id":"model-a","supported_reasoning_levels":[
+                {"effort":"minimal","description":"Fastest"},
+                {"effort":"deep","description":"Deep reasoning"},
+                {"effort":"xhigh","description":"Maximum depth"}
+            ]},
+            {"id":"model-b","supported_reasoning_levels":[]},
+            {"id":"model-c","supported_parameters":["temperature","max_tokens"]}
+        ]});
+        let parsed = parse_models_ordered(&codex);
+        assert_eq!(
+            model_efforts(Kind::ChatgptOauth, "model-a", parsed[0].efforts.as_deref()),
+            ["default", "minimal", "deep", "xhigh"]
+        );
+        let details = model_effort_details(Kind::ChatgptOauth, "model-a", parsed[0].efforts.as_deref());
+        assert_eq!(details[2].hint.as_deref(), Some("Deep reasoning"));
+        assert!(model_efforts(Kind::ChatgptOauth, "model-b", parsed[1].efforts.as_deref()).is_empty());
+        assert!(model_efforts(Kind::OpenaiChat, "model-c", parsed[2].efforts.as_deref()).is_empty());
+
+        // Runtime learning updates stored model capabilities dynamically
+        let ctx = Ctx::test();
+        upsert(&ctx, &p("cn", "https://a/v1")).unwrap();
+        record_learned_efforts(&ctx, "cn", "m", vec!["low".into(), "high".into()]);
+        assert_eq!(validate_effort_for_ref(&ctx, Some("cn/m"), "high").unwrap(), "high");
+        assert!(validate_effort_for_ref(&ctx, Some("cn/m"), "xhigh").is_err());
+        record_learned_efforts(&ctx, "cn", "m", vec![]);
+        assert!(validate_effort_for_ref(&ctx, Some("cn/m"), "low").is_err());
     }
 
     #[test]

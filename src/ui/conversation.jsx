@@ -355,18 +355,7 @@ export const SPEEDS = [
   { value: "normal", label: "Normal", effort: "default", hint: "The model's default effort" },
   { value: "deep", label: "Deep", effort: "high", hint: "Requests high reasoning effort, not guaranteed quality" },
 ];
-export const EFFORTS = [
-  { value: "none", label: "None", budget: "0t", hint: "Requests no extended thinking (0 thinking tokens)" },
-  { value: "low", label: "Low", budget: "2k", hint: "Requests low reasoning effort (~2,048 thinking token budget on Claude)" },
-  { value: "default", label: "Auto", budget: "def", hint: "The model's default effort" },
-  { value: "medium", label: "Med", budget: "8k", hint: "Requests medium reasoning effort (~8,192 thinking token budget on Claude)" },
-  { value: "high", label: "High", budget: "16k", hint: "Requests high reasoning effort (~16,384 thinking token budget on Claude)" },
-  { value: "xhigh", label: "Max", budget: "32k", hint: "Requests maximum reasoning effort (~32,000 thinking token budget on Claude)" },
-];
-export const speedEffort = (v) => {
-  if (EFFORTS.some((e) => e.value === v) || v === "minimal" || v === "max") return v === "max" ? "xhigh" : v === "minimal" ? "low" : v;
-  return SPEEDS.find((s) => s.value === v)?.effort ?? "default";
-};
+export const speedEffort = (v) => SPEEDS.find((s) => s.value === v)?.effort ?? (v || "default");
 export const effortSpeed = (e) => (e === "low" || e === "minimal" || e === "none" ? "fast" : e === "high" || e === "xhigh" || e === "max" ? "deep" : "normal");
 
 /** Composer card: attachments, text, then one toolbar row.
@@ -387,10 +376,16 @@ export function Composer(props) {
   const [menu, setMenu] = createSignal(false);
   let input, picker;
   const canAttach = () => record().ready() && !props.disabled;
-  const currentEffort = () => {
-    const raw = props.effort || speedEffort(props.speed || "normal");
-    return raw === "max" ? "xhigh" : raw === "minimal" ? "low" : raw;
-  };
+  const effortOptions = createMemo(() => {
+    const raw = props.effortOptions;
+    if (!Array.isArray(raw)) return [];
+    const cur = props.effort || "default";
+    if (raw.length > 0 && cur && !raw.some((o) => o.value === cur)) {
+      return [...raw, { value: cur, label: cur, hint: `Custom effort: ${cur}` }];
+    }
+    return raw;
+  });
+  const currentEffort = () => props.effort || speedEffort(props.speed || "normal");
   const selectEffort = (val) => {
     if (props.onEffort) props.onEffort(val);
     else if (props.onSpeed) props.onSpeed(val);
@@ -399,7 +394,11 @@ export function Composer(props) {
     const t = text().trimStart();
     if (!t.startsWith("/")) return null;
     if (t.startsWith("/effort")) {
-      return { kind: "effort", label: "Zero-token local command: /effort none | low | default | medium | high | max" };
+      const opts = effortOptions();
+      const summary = opts.length
+        ? opts.map((o) => o.value).join(" | ")
+        : "not supported by the active model";
+      return { kind: "effort", label: `Zero-token local command: /effort ${summary}` };
     }
     if (t.startsWith("/model")) {
       return { kind: "model", label: "Zero-token in-session model switch: /model <provider/model or substring>" };
@@ -463,20 +462,24 @@ export function Composer(props) {
     // Intercept /effort and /model locally with 0 LLM tokens spent
     if (!attached.length && /^\/effort(\s+.*)?$/i.test(t)) {
       const arg = t.replace(/^\/effort\s*/i, "").trim().toLowerCase();
-      const alias = { auto: "default", normal: "default", fast: "low", deep: "high", med: "medium", max: "xhigh", off: "none" };
-      const resolved = alias[arg] || arg;
+      const opts = effortOptions();
+      if (!opts.length) {
+        toast("The active provider/model does not accept reasoning effort parameters", "info");
+        clearSentDraft(target, draft, attached);
+        return;
+      }
+      const resolved = arg === "auto" || arg === "normal" ? "default" : arg;
       if (!resolved) {
-        toast(`Current effort: ${currentEffort()} (use /effort none|low|default|medium|high|max)`, "info");
+        const list = opts.map((o) => o.value).join(" | ");
+        toast(`Current effort: ${currentEffort()} (supported: ${list})`, "info");
         clearSentDraft(target, draft, attached);
         return;
       }
-      if (["default", "none", "minimal", "low", "medium", "high", "xhigh", "max"].includes(resolved)) {
-        selectEffort(resolved === "max" ? "xhigh" : resolved);
-        toast(`Reasoning effort set to ${resolved} (0 tokens used)`, "secure");
-        clearSentDraft(target, draft, attached);
-        return;
-      }
-      toast(`Unknown effort "${arg}". Choose: none, low, default, medium, high, max`, "danger");
+      const match = opts.find((o) => o.value.toLowerCase() === resolved || o.label.toLowerCase() === resolved);
+      const nextVal = match ? match.value : resolved;
+      selectEffort(nextVal);
+      toast(`Reasoning effort set to ${nextVal} (0 tokens used)`, "secure");
+      clearSentDraft(target, draft, attached);
       return;
     }
     if (!attached.length && /^\/model(\s+.*)?$/i.test(t) && props.onSlashModel) {
@@ -504,12 +507,12 @@ export function Composer(props) {
         {(h) => (
           <div class="composer-slash-bar xs">
             <span class="mono">{h().label}</span>
-            <Show when={h().kind === "effort"}>
+            <Show when={h().kind === "effort" && effortOptions().length > 0}>
               <div class="row gap-4">
-                <For each={EFFORTS}>
+                <For each={effortOptions()}>
                   {(ef) => (
-                    <button type="button" class="btn sm ghost" onClick={() => { selectEffort(ef.value); setText(""); }}>
-                      {ef.label} ({ef.budget})
+                    <button type="button" class="btn sm ghost" title={ef.hint || ef.value} onClick={() => { selectEffort(ef.value); setText(""); }}>
+                      {ef.label}
                     </button>
                   )}
                 </For>
@@ -556,17 +559,17 @@ export function Composer(props) {
           </Show>
           <input ref={picker} type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden onChange={(e) => { add(e.currentTarget.files); e.currentTarget.value = ""; }} />
         </div>
-        <Show when={props.onEffort || props.onSpeed}>
+        <Show when={(props.onEffort || props.onSpeed) && effortOptions().length > 0}>
           <div class="speed" role="group" aria-label="Reasoning effort" aria-describedby="effort-caveat" title="Reasoning effort (or type /effort in composer). Support varies by provider and model, and speed, cost and quality are not guaranteed.">
             <span id="effort-caveat" class="sr-only">Requests a reasoning effort level. Support varies by provider and model, and speed, cost and quality are not guaranteed.</span>
-            <For each={EFFORTS}>{(s) => (
+            <For each={effortOptions()}>{(s) => (
               <button
                 type="button"
                 disabled={props.disabled || props.effortPending}
                 aria-pressed={currentEffort() === s.value}
                 classList={{ on: currentEffort() === s.value }}
                 onClick={() => selectEffort(s.value)}
-                title={`${s.hint} (/effort ${s.value})`}
+                title={s.hint ? `${s.hint} (/effort ${s.value})` : `/effort ${s.value}`}
               >
                 {s.label}
               </button>

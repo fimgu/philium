@@ -4,7 +4,7 @@ import { For, Show, createSignal, createResource, createMemo, createEffect, on, 
 import { NotFound, Page, Button, ModelPicker, toast } from "../ui/kit.jsx";
 import { Icon } from "../ui/icons.jsx";
 import { Conversation, Composer, KvTelemetryBar, speedEffort, effortSpeed } from "../ui/conversation.jsx";
-import { rpc, hal, fmt, sendError } from "../lib/rpc.js";
+import { rpc, hal, useEvent, fmt, sendError } from "../lib/rpc.js";
 import { go, params } from "../lib/nav.js";
 import "../styles/agents.css";
 
@@ -13,8 +13,9 @@ const TERMINAL = new Set(["assistant.completed", "turn.failed", "turn.cancelled"
 export default function Chat() {
   const [sessions, { refetch }] = createResource(() =>
     hal("GET", "/sessions").then((l) => (l ?? []).filter((s) => !s.parent_id)).catch(() => []));
-  const [models] = createResource(() => rpc("providers.models", {}).catch(() => []));
-  const [providers] = createResource(() => rpc("providers.list").catch(() => []));
+  const [models, { refetch: refetchModels }] = createResource(() => rpc("providers.models", {}).catch(() => []));
+  const [providers, { refetch: refetchProviders }] = createResource(() => rpc("providers.list").catch(() => []));
+  useEvent("providers:changed", () => { refetchModels(); refetchProviders(); });
   const [def] = createResource(() => rpc("providers.default").catch(() => null));
   const [model, setModel] = createSignal("");
   const [events, setEvents] = createSignal([]);
@@ -24,6 +25,7 @@ export default function Chat() {
 
   const provById = createMemo(() => Object.fromEntries((providers() ?? []).map((p) => [p.id, p])));
   const chosen = () => model() || current()?.model || def() || "";
+  const activeModel = createMemo(() => (models() ?? []).find((m) => m.ref === chosen()));
   const untrusted = () => provById()[(chosen() || "").split("/")[0]]?.trusted === false;
 
   const sessionKv = createMemo(() => {
@@ -180,7 +182,7 @@ export default function Chat() {
           </Show>
           <Conversation hidden={!!(params().session && sessions.state === "ready" && !current())} events={events()} busy={busy()} emptyText="Ask anything. This chat has no access to files, commands or the web." />
           <Composer onSend={send} busy={busy()} onCancel={() => hal("POST", `/sessions/${selected()}/cancel`).catch((e) => toast(String(e), "danger"))}
-            effort={current()?.effort || "default"} speed={effortSpeed(current()?.effort)} onEffort={setSpeed} onSpeed={setSpeed} onSlashModel={handleSlashModel}
+            effort={current()?.effort || "default"} speed={effortSpeed(current()?.effort)} effortOptions={activeModel()?.effort_details ?? []} onEffort={setSpeed} onSpeed={setSpeed} onSlashModel={handleSlashModel}
             placeholder={`Message ${chosen() || "a model"} (or /effort, /model)`} />
         </div>
       </div>

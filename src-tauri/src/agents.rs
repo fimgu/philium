@@ -513,9 +513,17 @@ async fn provision(ctx: &Arc<Ctx>, id: &str, fresh: bool, brief: Option<String>)
             s["id"].as_str().ok_or("HAL returned no session id")?.to_string()
         }
     };
-    // Re-apply the saved speed (effort) after every start.
+    // Re-apply the saved reasoning effort after every start.
     if let Some(e) = ctx.db.kv_get(&format!("agent.effort.{id}")).filter(|e| e != "default") {
-        let _ = hal.call(reqwest::Method::PATCH, &format!("/sessions/{session}"), Some(json!({ "effort": e }))).await;
+        if let Ok(valid) = providers::validate_effort_for_ref(ctx, Some(&model_ref), &e) {
+            ctx.gateway.set_effort(Some(&name), Some(&valid));
+            let _ = hal.call(reqwest::Method::PATCH, &format!("/sessions/{session}"), Some(json!({ "effort": valid }))).await;
+        } else {
+            ctx.gateway.set_effort(Some(&name), None);
+            let _ = ctx.db.kv_set(&format!("agent.effort.{id}"), "default");
+        }
+    } else {
+        ctx.gateway.set_effort(Some(&name), None);
     }
     ctx.db.exec(
         "UPDATE agents SET hal_session_id=?2, token_hash=?3 WHERE id=?1",
@@ -1006,12 +1014,12 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
         }
         "set_effort" => {
             let id = id()?;
-            let effort = ctx::arg_str(&args, "effort")?;
-            if !["default", "none", "minimal", "low", "medium", "high", "xhigh", "max"].contains(&effort.as_str()) {
-                return Err(format!("unknown effort `{effort}`"));
-            }
+            let raw_effort = ctx::arg_str(&args, "effort")?;
+            let row = get_row(ctx, &id).ok_or("gone")?;
+            let effort = providers::validate_effort_for_ref(ctx, row["model_ref"].as_str(), &raw_effort)?;
+            ctx.gateway.set_effort(row["name"].as_str(), Some(&effort));
             if let Some(rt) = runtime(&id) {
-                rt.hal.call(reqwest::Method::PATCH, &format!("/sessions/{}", rt.session), Some(json!({ "effort": effort }))).await?;
+                let _ = rt.hal.call(reqwest::Method::PATCH, &format!("/sessions/{}", rt.session), Some(json!({ "effort": effort }))).await;
             }
             ctx.db.kv_set(&format!("agent.effort.{id}"), &effort)?;
             ctx.emit("agents:changed", json!({ "id": id, "effort": effort }));
@@ -1155,13 +1163,19 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
                 return Err("switching to an untrusted provider needs a new Strict agent".into());
             }
             let r = format!("{}/{}", p.id, m);
+            let cur_eff = ctx.db.kv_get(&format!("agent.effort.{id}")).unwrap_or_else(|| "default".into());
+            let next_eff = providers::validate_effort_for_ref(ctx, Some(&r), &cur_eff).unwrap_or_else(|_| "default".into());
+            if next_eff != cur_eff {
+                let _ = ctx.db.kv_set(&format!("agent.effort.{id}"), &next_eff);
+            }
+            ctx.gateway.set_effort(row["name"].as_str(), Some(&next_eff));
             if let Some(rt) = runtime(&id) {
                 rt.hal
                     .call(reqwest::Method::PATCH, &format!("/sessions/{}", rt.session), Some(json!({ "model": r })))
                     .await?;
             }
             ctx.db.exec("UPDATE agents SET model_ref=?2 WHERE id=?1", rusqlite::params![id, r])?;
-            ctx.emit("agents:changed", json!({ "id": id }));
+            ctx.emit("agents:changed", json!({ "id": id, "effort": next_eff }));
             Ok(json!(r))
         }
         "diff" => {
