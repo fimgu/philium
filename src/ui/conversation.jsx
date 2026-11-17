@@ -119,10 +119,10 @@ function Tool(props) {
   return (
     <div class="msg tool conv-tool">
       <button type="button" class="row conv-tool-toggle" aria-expanded={!!expanded()} onClick={() => setOpen(!expanded())}>
-        <span class={`dot ${t().running ? active() ? "busy" : "" : t().ok === false || (state()?.startsWith("Exit ") && state() !== "Exit 0") ? "bad" : state() === "Still running" ? "busy" : "live"}`} />
+        <span class={`dot ${t().running ? active() ? "busy" : "" : t().ok === false || (state()?.startsWith("Exit ") && state() !== "Exit 0") ? "bad" : state() === "Still running" ? "" : "live"}`} />
         <b>{short(t().tool) === "shell_run" ? "Shell" : short(t().tool) === "shell_read" ? "Shell output" : short(t().tool)}</b>
         <span class="ellipsis dim grow">{t().args?.description ?? t().args?.intent ?? (short(t().tool) === "shell_run" ? t().args?.shell ?? "Command" : argSummary(t().tool, t().args))}</span>
-        <span class="xs dim">{t().running ? active() ? "Running" : "Unconfirmed" : t().ok === false ? "Failed" : shellStatus(t().result) ?? "Returned"}</span>
+        <span class="xs dim">{t().running ? active() ? "Running" : "Unconfirmed" : t().ok === false ? "Failed" : (shellStatus(t().result) === "Still running" ? "Running at return" : shellStatus(t().result)) ?? "Returned"}</span>
         <Show when={t().ms != null}><span class="faint xs">{(t().ms / 1000).toFixed(1)}s</span></Show>
         <span class="dim" aria-hidden="true">{expanded() ? "▾" : "▸"}</span>
       </button>

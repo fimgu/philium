@@ -148,7 +148,7 @@ test('Conversation Markdown DOM, streaming, unsafe content and clipboard matrix'
     ]));
     await page.waitForSelector('.tool-command');
     assert.equal(await page.$eval('.tool-command', el => el.textContent), '$ printf hello');
-    assert.match(await page.$eval('.conv-tool-toggle', el => el.textContent), /Still running/);
+    assert.match(await page.$eval('.conv-tool-toggle', el => el.textContent), /Running at return/);
     assert.match(await page.$eval('.tool-output-preview', el => el.textContent), /hello/);
     await page.click('.conv-tool-toggle');
     assert.equal(await page.$eval('.tool-raw', el => el.open), false);
