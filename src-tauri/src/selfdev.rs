@@ -246,6 +246,7 @@ fn test(ctx: &Arc<Ctx>, id: &str) -> Result<Value, String> {
         return Err("The agent has uncommitted changes. Ask it to commit first.".into());
     }
     let head = git(&wt, &["rev-parse", "HEAD"])?;
+    prepare_worktree(ctx, &wt)?;
     let t = sh(
         ctx,
         "Improve: tests",
@@ -271,28 +272,104 @@ fn preview_state(state: Option<&str>, code: Option<i64>) -> &'static str {
 
 // Worktrees omit ignored binaries. Reuse the source checkout's staged sidecar,
 // never build HAL implicitly or overwrite a worktree's existing binary.
+fn sidecar_directory(wt: &Path) -> Result<(Option<std::fs::File>, PathBuf), String> {
+    let wt = wt.canonicalize().map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    let mut handle = std::fs::File::open(&wt).map_err(|e| e.to_string())?;
+    let mut directory = wt;
+    for component in ["src-tauri", "binaries"] {
+        directory.push(component);
+        #[cfg(unix)] {
+            use std::os::fd::{AsRawFd, FromRawFd};
+            let name = std::ffi::CString::new(component).unwrap();
+            let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+            let mut fd = unsafe { libc::openat(handle.as_raw_fd(), name.as_ptr(), flags) };
+            if fd < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound {
+                if unsafe { libc::mkdirat(handle.as_raw_fd(), name.as_ptr(), 0o755) } != 0 {
+                    return Err(std::io::Error::last_os_error().to_string());
+                }
+                fd = unsafe { libc::openat(handle.as_raw_fd(), name.as_ptr(), flags) };
+            }
+            if fd < 0 { return Err(format!("Unsafe sidecar directory {}: {}", directory.display(), std::io::Error::last_os_error())); }
+            handle = unsafe { std::fs::File::from_raw_fd(fd) };
+        }
+        #[cfg(not(unix))] {
+            match std::fs::symlink_metadata(&directory) {
+                Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {},
+                Ok(_) => return Err(format!("Unsafe sidecar directory: {}", directory.display())),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir(&directory).map_err(|e| e.to_string())?,
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+    }
+    #[cfg(unix)]
+    return Ok((Some(handle), directory));
+    #[cfg(not(unix))]
+    Ok((None, directory))
+}
+
 fn stage_preview_sidecar(wt: &Path, src: &Path, target: &str) -> Result<(), String> {
     if target.is_empty() || !target.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
         return Err("Could not determine the Rust host target for the preview sidecar.".into());
     }
+    let (directory_handle, directory) = sidecar_directory(wt)?;
+    #[cfg(unix)]
+    let directory_handle = directory_handle.ok_or("Missing sidecar directory handle")?;
     let ext = if target.contains("windows") { ".exe" } else { "" };
     let relative = format!("src-tauri/binaries/hal-desktop-server-{target}{ext}");
-    let dest = wt.join(&relative);
-    if dest.is_file() { return Ok(()); }
+    let dest = directory.join(format!("hal-desktop-server-{target}{ext}"));
+    #[cfg(unix)]
+    let name = std::ffi::CString::new(format!("hal-desktop-server-{target}{ext}")).unwrap();
+    #[cfg(unix)] {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        let fd = unsafe { libc::openat(directory_handle.as_raw_fd(), name.as_ptr(), libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK) };
+        if fd >= 0 {
+            let existing = unsafe { std::fs::File::from_raw_fd(fd) };
+            if existing.metadata().map_err(|e| e.to_string())?.is_file() { return Ok(()); }
+            return Err(format!("Unsafe sidecar destination: {}", dest.display()));
+        }
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::NotFound {
+            return Err(format!("Unsafe sidecar destination: {}", dest.display()));
+        }
+    }
+    #[cfg(not(unix))]
+    match std::fs::symlink_metadata(&dest) {
+        Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => return Ok(()),
+        Ok(_) => return Err(format!("Unsafe sidecar destination: {}", dest.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+        Err(e) => return Err(e.to_string()),
+    }
     let source = src.join(&relative);
     let mut input = std::fs::File::open(&source).map_err(|e| format!(
         "Preview sidecar missing: {} ({e}). Stage it in the source checkout with npm run sidecar, then retry.", source.display()
     ))?;
-    std::fs::create_dir_all(dest.parent().ok_or("Invalid sidecar path")?).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    let mut output = {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        let fd = unsafe { libc::openat(directory_handle.as_raw_fd(), name.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC, 0o600) };
+        if fd < 0 { return Err(std::io::Error::last_os_error().to_string()); }
+        unsafe { std::fs::File::from_raw_fd(fd) }
+    };
+    #[cfg(not(unix))]
     let mut output = std::fs::OpenOptions::new().write(true).create_new(true).open(&dest).map_err(|e| e.to_string())?;
     let result = std::io::copy(&mut input, &mut output)
         .and_then(|_| output.set_permissions(input.metadata()?.permissions()));
     if let Err(e) = result {
         drop(output);
+        #[cfg(unix)] {
+            use std::os::fd::AsRawFd;
+            unsafe { libc::unlinkat(directory_handle.as_raw_fd(), name.as_ptr(), 0); }
+        }
+        #[cfg(not(unix))]
         let _ = std::fs::remove_file(&dest);
         return Err(format!("Could not stage preview sidecar: {e}"));
     }
     Ok(())
+}
+
+fn prepare_worktree(ctx: &Ctx, wt: &Path) -> Result<(), String> {
+    let src = source_dir(ctx).ok_or("Philium source not found.")?;
+    stage_preview_sidecar(wt, &src, env!("PHILIUM_TARGET_TRIPLE"))
 }
 
 /// Run the changed app side by side: own data dir, own root, keychain off.
@@ -302,12 +379,7 @@ fn preview(ctx: &Arc<Ctx>, id: &str) -> Result<Value, String> {
         return Err("A preview process is already active. Stop it in its terminal before opening another.".into());
     }
     let (wt, _) = worktree(ctx, r["agent_id"].as_str().unwrap_or_default())?;
-    let src = source_dir(ctx).ok_or("Philium source not found.")?;
-    let host = std::process::Command::new("rustc").arg("-vV").output().map_err(|e| e.to_string())?;
-    if !host.status.success() { return Err("rustc -vV failed while checking the preview sidecar.".into()); }
-    let version = String::from_utf8_lossy(&host.stdout);
-    let target = version.lines().find_map(|l| l.strip_prefix("host: ")).ok_or("rustc returned no host target")?;
-    stage_preview_sidecar(&wt, &src, target)?;
+    prepare_worktree(ctx, &wt)?;
     let base = ctx.data_dir.join("previews").join(id);
     std::fs::create_dir_all(base.join("data")).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(base.join("root")).map_err(|e| e.to_string())?;
@@ -457,13 +529,15 @@ mod preview_focused_tests {
     struct Fixture(PathBuf);
     impl Fixture {
         fn new() -> Self {
-            let dir = std::env::temp_dir().join(format!("philium-preview-test-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!("philium-preview-test-{}-{unique}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
             std::fs::create_dir_all(&dir).unwrap();
             Self(dir)
         }
     }
     impl Drop for Fixture {
-        fn drop(&mut self) { std::fs::remove_dir_all(&self.0).unwrap(); }
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
     }
 
     #[test]
@@ -480,6 +554,7 @@ mod preview_focused_tests {
         let f = Fixture::new();
         let src = f.0.join("source");
         let wt = f.0.join("worktree");
+        std::fs::create_dir(&wt).unwrap();
         let relative = "src-tauri/binaries/hal-desktop-server-aarch64-apple-darwin";
         std::fs::create_dir_all(src.join("src-tauri/binaries")).unwrap();
         std::fs::write(src.join(relative), b"staged sidecar").unwrap();
@@ -499,19 +574,97 @@ mod preview_focused_tests {
     }
 
     #[test]
-    fn missing_sidecar_fails_before_creating_worktree_or_building() {
+    fn missing_sidecar_fails_before_launching_or_building() {
         let f = Fixture::new();
         let wt = f.0.join("worktree");
+        std::fs::create_dir(&wt).unwrap();
         let error = stage_preview_sidecar(&wt, &f.0.join("source"), "aarch64-apple-darwin").unwrap_err();
         assert!(error.contains("npm run sidecar"), "{error}");
-        assert!(!wt.exists());
+        assert!(!wt.join("src-tauri/binaries/hal-desktop-server-aarch64-apple-darwin").exists());
         assert!(stage_preview_sidecar(&wt, &f.0, "../escape").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_rejects_directory_and_leaf_symlink_escapes() {
+        use std::os::unix::fs::symlink;
+        let f = Fixture::new();
+        let outside = f.0.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        for component in ["src-tauri", "binaries", "leaf"] {
+            let wt = f.0.join(component);
+            std::fs::create_dir(&wt).unwrap();
+            let link = if component == "src-tauri" {
+                wt.join("src-tauri")
+            } else {
+                std::fs::create_dir(wt.join("src-tauri")).unwrap();
+                if component == "binaries" { wt.join("src-tauri/binaries") } else {
+                    std::fs::create_dir(wt.join("src-tauri/binaries")).unwrap();
+                    wt.join("src-tauri/binaries/hal-desktop-server-aarch64-apple-darwin")
+                }
+            };
+            symlink(&outside, &link).unwrap();
+            let error = stage_preview_sidecar(&wt, &f.0, "aarch64-apple-darwin").unwrap_err();
+            assert!(error.contains("Unsafe sidecar"), "{error}");
+            assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Run the compiled test binary directly (not under cargo test) so the
+    /// actual nested cargo test can use an explicitly chosen build target.
+    /// Supply disposable source/worktree checkouts with PHILIUM_SELFDEV_TEST_*.
+    #[tokio::test]
+    #[ignore = "requires disposable clean worktree, staged source sidecar and real cargo/npm/vite"]
+    async fn public_test_stages_sidecar_before_real_cargo() {
+        let src = PathBuf::from(std::env::var_os("PHILIUM_SELFDEV_TEST_SOURCE").expect("disposable source"));
+        let wt = PathBuf::from(std::env::var_os("PHILIUM_SELFDEV_TEST_WORKTREE").expect("disposable worktree"));
+        let head = git(&wt, &["rev-parse", "HEAD"]).unwrap();
+        assert!(git(&wt, &["status", "--porcelain"]).unwrap().is_empty());
+        let ext = if cfg!(windows) { ".exe" } else { "" };
+        let relative = format!("src-tauri/binaries/hal-desktop-server-{}{ext}", env!("PHILIUM_TARGET_TRIPLE"));
+        assert!(!wt.join(&relative).exists(), "must start without the ignored sidecar");
+        assert!(src.join(&relative).is_file());
+        let ctx = Ctx::test();
+        init(&ctx).unwrap();
+        crate::terminals::init(&ctx).unwrap();
+        ctx.db.kv_set("setting.selfdev.source", &src.to_string_lossy()).unwrap();
+        ctx.db.exec("INSERT INTO repos(id,name,path,added_at) VALUES('repo','fixture',?1,0)", [src.to_string_lossy().as_ref()]).unwrap();
+        ctx.db.exec("INSERT INTO agents(id,name,model_ref,created_at,last_active_at) VALUES('agent','fixture','test',0,0)", []).unwrap();
+        ctx.db.exec("INSERT INTO worktrees(id,repo_id,agent_id,path,branch,base_commit,created_at) VALUES('wt','repo','agent',?1,'HEAD',?2,0)", rusqlite::params![wt.to_string_lossy(), head]).unwrap();
+        ctx.db.exec("INSERT INTO selfdev(id,request,agent_id,state,created_at,updated_at) VALUES('improvement','fixture','agent','building',0,0)", []).unwrap();
+        struct Cleanup(Arc<Ctx>, Option<String>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                if let Some(id) = &self.1 { let _ = crate::terminals::kill(&self.0, id); }
+                if let Some(root) = self.0.data_dir.parent() { let _ = std::fs::remove_dir_all(root); }
+            }
+        }
+        let mut cleanup = Cleanup(ctx.clone(), None);
+        let reply = call(&ctx, "test", json!({"id":"improvement"})).await.unwrap();
+        let terminal = reply["terminal"].as_str().unwrap().to_string();
+        cleanup.1 = Some(terminal.clone());
+        assert_eq!(std::fs::read(wt.join(&relative)).unwrap(), std::fs::read(src.join(&relative)).unwrap());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(240);
+        let exit = loop {
+            if let Some(exit) = term_exit(&ctx, &terminal) { break exit; }
+            assert!(std::time::Instant::now() < deadline, "real selfdev.test timed out");
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        };
+        let output = crate::terminals::snapshot(&ctx, &terminal, 256 * 1024).unwrap_or_default();
+        println!("public selfdev.test worktree HEAD={head} exit={exit}\n{output}");
+        assert_eq!(exit, 0, "actual selfdev.test failed, see captured terminal output");
+        assert!(output.contains("test result: ok"), "must observe real Rust test completion");
+        let status = call(&ctx, "get", json!({"id":"improvement"})).await.unwrap();
+        assert_eq!(status["tests"], "passed");
+        assert_eq!(status["tested_commit"], head);
+        crate::terminals::call(&ctx, "remove", json!({"id":terminal})).await.unwrap();
+        cleanup.1 = None;
+    }
 
     #[test]
     fn security_files_are_flagged() {
