@@ -28,7 +28,7 @@
 //!   names {}                                  -> suggested free names
 //! events: `agents:changed` {id}, `agents:events` {id, events:[...]} (batched ~10 Hz)
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -66,6 +66,29 @@ type Runtimes = Mutex<HashMap<String, Arc<Runtime>>>;
 fn runtimes() -> &'static Runtimes {
     static R: OnceLock<Runtimes> = OnceLock::new();
     R.get_or_init(Default::default)
+}
+
+// Admission must happen before spawning: an unfinished provision has no Runtime yet.
+fn provisioning() -> &'static Mutex<HashSet<String>> {
+    static P: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    P.get_or_init(Default::default)
+}
+
+struct ProvisionAdmission(String);
+
+impl ProvisionAdmission {
+    fn acquire(id: &str) -> Result<Self, String> {
+        if !provisioning().lk().insert(id.to_string()) {
+            return Err("agent is already provisioning".into());
+        }
+        Ok(Self(id.to_string()))
+    }
+}
+
+impl Drop for ProvisionAdmission {
+    fn drop(&mut self) {
+        provisioning().lk().remove(&self.0);
+    }
 }
 
 pub fn runtime(id: &str) -> Option<Arc<Runtime>> {
@@ -331,7 +354,9 @@ pub fn spawn(ctx: &Arc<Ctx>, req: SpawnReq) -> Result<Value, String> {
     let c = ctx.clone();
     let id2 = id.clone();
     let brief = req.brief.clone();
+    let admission = ProvisionAdmission::acquire(&id)?;
     tokio::spawn(async move {
+        let _admission = admission;
         if let Err(e) = provision(&c, &id2, true, brief).await {
             let _ = c.db.kv_set(&format!("agent_error.{id2}"), &e);
             c.log_event("agent_failed", Some(&id2), &json!({ "error": e }));
@@ -967,6 +992,7 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
         }
         "resume" => {
             let id = id()?;
+            let admission = ProvisionAdmission::acquire(&id)?;
             if let Some(r) = runtime(&id) {
                 if r.hal.alive() {
                     return Ok(Value::Null);
@@ -980,6 +1006,7 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
             set_state(ctx, &id, "provisioning");
             let c = ctx.clone();
             tokio::spawn(async move {
+                let _admission = admission;
                 if let Err(e) = provision(&c, &id, false, None).await {
                     let _ = c.db.kv_set(&format!("agent_error.{id}"), &e);
                     set_state(&c, &id, "failed");
@@ -1446,6 +1473,79 @@ mod tests {
         assert_eq!(body["allow_browser"], true);
         assert_eq!(body["text"], "open a page");
         assert_eq!(body["images"], images);
+    }
+
+    #[tokio::test]
+    async fn provisioning_admission_rejects_duplicates_and_releases_on_failure() {
+        let ctx = Ctx::test();
+        let id = new_id();
+        ctx.db.exec("INSERT INTO agents(id,name,model_ref,state,created_at,last_active_at) VALUES(?1,'admission-fixture','missing/model','stopped',0,0)", [&id]).unwrap();
+        let admission = ProvisionAdmission::acquire(&id).unwrap();
+        let error = call(&ctx, "resume", json!({"id":id})).await.unwrap_err();
+        assert!(error.contains("already provisioning"));
+        assert_eq!(get_row(&ctx, &id).unwrap()["state"], "stopped");
+        // A peer has independent admission, and dropping a failed task's guard allows retry.
+        let peer = ProvisionAdmission::acquire(&new_id()).unwrap();
+        drop(peer);
+        drop(admission);
+        call(&ctx, "resume", json!({"id":id})).await.unwrap();
+        for _ in 0..100 {
+            if get_row(&ctx, &id).unwrap()["state"] == "failed" { break; }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(get_row(&ctx, &id).unwrap()["state"], "failed");
+        assert!(ProvisionAdmission::acquire(&id).is_ok());
+        std::fs::remove_dir_all(ctx.data_dir.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the actual hal-desktop-server sidecar beside the test binary"]
+    async fn real_sidecar_duplicate_resume_stop_and_reconnect() {
+        assert!(hal::server_path().is_file(), "actual HAL sidecar required");
+        let ctx = Ctx::test();
+        let id = new_id();
+        struct Fixture(Arc<Ctx>, String);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                stop(&self.0, &self.1, "stopped");
+                let _ = std::fs::remove_dir_all(self.0.data_dir.parent().unwrap());
+            }
+        }
+        let fixture = Fixture(ctx.clone(), id.clone());
+        let fixture_dir = ctx.data_dir.parent().unwrap().to_path_buf();
+        ctx.db.exec("INSERT INTO providers(id,name,kind,base_url,trust,guard_mode,enabled,default_model,created_at) VALUES('fixture','Fixture','openai_chat','http://127.0.0.1:9/v1','trusted','redact',1,'fixture-model',0)", []).unwrap();
+        ctx.db.exec("INSERT INTO agents(id,name,model_ref,state,created_at,last_active_at) VALUES(?1,'sidecar-fixture','fixture/fixture-model','stopped',0,0)", [&id]).unwrap();
+        async fn wait_live(ctx: &Arc<Ctx>, id: &str) -> Arc<Runtime> {
+            for _ in 0..400 {
+                if let Some(rt) = runtime(id) { return rt; }
+                if get_row(ctx, id).unwrap()["state"] == "failed" {
+                    panic!("sidecar provision failed: {:?}", ctx.db.kv_get(&format!("agent_error.{id}")));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            panic!("sidecar runtime did not become live");
+        }
+        call(&ctx, "resume", json!({"id":id})).await.unwrap();
+        assert!(call(&ctx, "resume", json!({"id":id})).await.unwrap_err().contains("already provisioning"));
+        let first = wait_live(&ctx, &id).await;
+        assert_eq!(first.hal.call(reqwest::Method::GET, "/health", None).await.unwrap()["status"], "ok");
+        let session = first.session.clone();
+        let pid = first.hal.pid;
+        call(&ctx, "resume", json!({"id":id})).await.unwrap();
+        assert_eq!(runtime(&id).unwrap().hal.pid, pid);
+        call(&ctx, "stop", json!({"id":id})).await.unwrap();
+        assert!(!first.hal.alive());
+        assert!(runtime(&id).is_none());
+        call(&ctx, "resume", json!({"id":id})).await.unwrap();
+        let second = wait_live(&ctx, &id).await;
+        assert_ne!(second.hal.pid, pid);
+        assert_eq!(second.session, session);
+        assert_eq!(second.hal.call(reqwest::Method::GET, "/health", None).await.unwrap()["status"], "ok");
+        stop(&ctx, &id, "stopped");
+        assert!(!second.hal.alive());
+        drop(fixture);
+        assert!(!fixture_dir.exists(), "sidecar fixture must be removed");
+        println!("real sidecar duplicate rejected, live resume idempotent, stopped PID {pid}, reconnected PID {}, preserved session {session}, both children stopped and fixture removed", second.hal.pid);
     }
 
     #[tokio::test]
