@@ -29,6 +29,7 @@ mod providers;
 mod reaper;
 mod sandbox;
 mod secrets;
+mod drafts;
 mod selfdev;
 mod stats;
 mod terminals;
@@ -366,7 +367,7 @@ fn main() {
             });
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![hal, rpc])
+        .invoke_handler(tauri::generate_handler![hal, rpc, drafts::drafts_load, drafts::drafts_save])
         .build(tauri::generate_context!())
         .expect("error while building Philium");
     tauri_app.run(|handle, event| {

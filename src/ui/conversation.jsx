@@ -8,7 +8,7 @@ import { AssistantReply } from "./markdown.jsx";
 import { ConversationActivity } from "./conversation-activity.jsx";
 import { ViewToggle } from "./conversation-view.jsx";
 import { conversationView } from "../lib/conversation-view.js";
-import { draftFor, newDraft } from "../lib/drafts.js";
+import { draftFor, newDraft, clearSentDraft } from "../lib/drafts.js";
 
 /** Fold a list of HAL events into display items. Pure, incremental-safe. */
 export function fold(events) {
@@ -233,23 +233,26 @@ export function Composer(props) {
   const [over, setOver] = createSignal(false);
   const add = async (files) => {
     const target = record();
+    if (!target.ready()) return;
     const imgs = [...files].filter((f) => f.type.startsWith("image/"));
-    if (imgs.length) {
-      const loaded = await Promise.all(imgs.map(readImage));
-      target.setImages((current) => [...current, ...loaded].slice(0, 8));
-    }
+    try {
+      if (imgs.some((f) => f.size > 5 * 1024 * 1024)) throw new Error("Images must be 5 MiB or smaller.");
+      if (imgs.length) {
+        const loaded = await Promise.all(imgs.map(readImage));
+        target.setImages((current) => [...current, ...loaded].slice(0, 8));
+      }
+    } catch (e) { toast(String(e), "danger"); }
   };
   const send = async () => {
     const target = record();
     const draft = target.text(), attached = target.images();
     const t = draft.trim();
-    if ((!t && !attached.length) || props.disabled || props.busy || sending()) return;
+    if (!target.ready() || (!t && !attached.length) || props.disabled || props.busy || sending()) return;
     target.setSending(true);
     try {
       const accepted = await props.onSend(t, attached.map(({ data, media_type, name }) => ({ data, media_type, name })));
       if (accepted !== false) {
-        if (target.text() === draft) target.setText("");
-        target.setImages((current) => current.filter((im) => !attached.includes(im)));
+        clearSentDraft(target, draft, attached);
       }
     } catch (e) { toast(String(e), "danger"); }
     finally { target.setSending(false); }
@@ -275,7 +278,7 @@ export function Composer(props) {
         class="textarea grow"
         placeholder={props.placeholder ?? "Message"}
         value={text()}
-        disabled={props.disabled}
+        disabled={props.disabled || !record().ready()}
         onInput={(e) => setText(e.currentTarget.value)}
         onPaste={(e) => { const f = [...e.clipboardData.files]; if (f.some((x) => x.type.startsWith("image/"))) { e.preventDefault(); add(f); } }}
         onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
@@ -288,9 +291,12 @@ export function Composer(props) {
         </div>
       </Show>
       <Show when={props.onSpeed}><div class="xs dim" style={{ width: "100%" }}>Reasoning effort: provider and model support varies. Speed, cost and quality are not guaranteed.{props.effortPending ? " Updating effort…" : ""}</div></Show>
-      <Show when={props.busy} fallback={<Button variant="primary" onClick={send} disabled={props.disabled || sending()}>Send</Button>}>
+      <Show when={props.busy} fallback={<Button variant="primary" onClick={send} disabled={props.disabled || !record().ready() || sending()}>Send</Button>}>
         <Button onClick={props.onCancel}><Icon name="stop" size={12} /> Stop</Button>
       </Show>
+      <Show when={record().loading()}><div class="xs dim" role="status">Restoring draft…</div></Show>
+      <Show when={record().pending()}><div class="xs dim" role="status">Saving draft… Keep this window open.</div></Show>
+      <Show when={record().error()}><div class="xs" role="alert">{record().error()} <button class="btn ghost sm" disabled={record().loading() || record().pending()} onClick={() => record().retry?.()}>Retry</button></div></Show>
       <Show when={props.busy}><div class="xs dim" role="status" style={{ width: "100%" }}>Working or waiting for approval. Your draft stays here. Use Stop to interrupt.</div></Show>
     </div>
   );
