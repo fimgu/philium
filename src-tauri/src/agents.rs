@@ -892,6 +892,35 @@ async fn hal_get(id: &str, path: &str) -> Result<Value, String> {
     r.hal.call(reqwest::Method::GET, &format!("/sessions/{}{path}", r.session), None).await
 }
 
+// Avoid competing for the same fixed ports/kubeconfig while a node image is pulled.
+static KIND_OPERATION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn local_kind_limit(ctx: &Ctx) -> u32 {
+    ctx.setting("kind.local_limit", "1").parse::<u32>().unwrap_or(1).min(8)
+}
+
+fn check_kind_inventory(stdout: &str, limit: u32) -> Result<(), String> {
+    let count = stdout.lines().filter(|s| !s.trim().is_empty()).count();
+    if count >= limit as usize { return Err(format!("This kind runtime already has {count} cluster(s) (local limit {limit}). No cluster was started.")); }
+    Ok(())
+}
+
+fn reserve_local_kind(ctx: &Ctx, aid: &str, name: &str, meta: Value) -> Result<String, String> {
+    let rid = new_id();
+    let limit = local_kind_limit(ctx);
+    let inserted = ctx.db.exec(
+        "INSERT INTO resources(id,agent_id,kind,handle,meta,created_at)
+         SELECT ?1,?2,'kind_cluster',?3,?4,?5
+         WHERE (SELECT count(*) FROM resources WHERE kind='kind_cluster' AND state!='released') < ?6
+           AND NOT EXISTS (SELECT 1 FROM resources WHERE kind='kind_cluster' AND state!='released' AND (agent_id=?2 OR handle=?3))",
+        rusqlite::params![rid, aid, name, meta.to_string(), now(), limit],
+    )?;
+    if inserted != 1 { return Err(format!("Local kind capacity unavailable (limit {limit}, one per agent). Reuse an existing cluster or remove it first.")); }
+    ctx.log_event("reaper:register", Some(aid), &json!({"id": rid, "kind":"kind_cluster", "handle":name}));
+    ctx.emit("reaper:changed", json!({"id":rid}));
+    Ok(rid)
+}
+
 pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, String> {
     let id = || -> Result<String, String> {
         let raw = ctx::arg_str(&args, "id")?;
@@ -1029,9 +1058,7 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
         "shell" => Ok(json!(crate::agentshell::current(ctx, &id()?, crate::agentshell::MAIN, args["open"].as_bool() == Some(true)).await)),
         "get_effort" => Ok(json!(ctx.db.kv_get(&format!("agent.effort.{}", id()?)).unwrap_or_else(|| "default".into()))),
         "kind_list" => {
-            let agent_filter = ctx::arg_opt_str(&args, "id")
-                .and_then(|raw| get_row(ctx, &raw))
-                .and_then(|r| r["id"].as_str().map(str::to_string));
+            let agent_filter = if args.get("id").is_some() { Some(id()?) } else { None };
             let rows = ctx.db.query(
                 "SELECT r.*, a.name AS agent_name, a.port_base AS port_base
                  FROM resources r LEFT JOIN agents a ON a.id=r.agent_id
@@ -1056,11 +1083,15 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
             let suffix = if suffix.is_empty() { "test".to_string() } else { suffix };
             let cluster_name = format!("philium-{aname}-{suffix}");
             let kubeconfig = ctx.agent_dir(&aname).join("kubeconfig");
-            let _ = std::fs::create_dir_all(ctx.agent_dir(&aname));
-            let rid = crate::reaper::register(
+            let _op = KIND_OPERATION.try_lock().map_err(|_| "Another kind operation is in progress. Try again when it finishes.")?;
+            let inventory = tokio::task::spawn_blocking(|| std::process::Command::new("kind").args(["get", "clusters"]).output())
+                .await.map_err(|e| e.to_string())?.map_err(|e| format!("Cannot inspect local kind capacity: {e}"))?;
+            if !inventory.status.success() { return Err(format!("Cannot inspect local kind capacity: {}", String::from_utf8_lossy(&inventory.stderr).trim())); }
+            check_kind_inventory(&String::from_utf8_lossy(&inventory.stdout), local_kind_limit(ctx))?;
+            std::fs::create_dir_all(ctx.agent_dir(&aname)).map_err(|e| e.to_string())?;
+            let rid = reserve_local_kind(
                 ctx,
-                Some(&aid),
-                "kind_cluster",
+                &aid,
                 &cluster_name,
                 json!({
                     "agent_name": aname,
@@ -1068,14 +1099,17 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
                     "http_port": port_base + 10,
                     "https_port": port_base + 11,
                 }),
-            );
+            )?;
             let cfg_path = ctx.agent_dir(&aname).join(format!("kind-{suffix}.yaml"));
             let kind_cfg = format!(
                 "kind: Cluster\napiVersion: kind.x-k8s.io/v1alpha4\nnodes:\n- role: control-plane\n  extraPortMappings:\n  - containerPort: 30080\n    hostPort: {}\n    protocol: TCP\n  - containerPort: 30443\n    hostPort: {}\n    protocol: TCP\n",
                 port_base + 10,
                 port_base + 11
             );
-            let _ = std::fs::write(&cfg_path, kind_cfg);
+            if let Err(e) = std::fs::write(&cfg_path, kind_cfg) {
+                crate::reaper::release(ctx, &rid);
+                return Err(format!("Could not prepare local kind config: {e}"));
+            }
             let cname = cluster_name.clone();
             let kc = kubeconfig.clone();
             let cp = cfg_path.clone();
@@ -1119,26 +1153,34 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
             }
         }
         "kind_delete" => {
+            let aid = id()?;
+            let owner = get_row(ctx, &aid).ok_or("gone")?;
+            let aname = owner["name"].as_str().ok_or("missing owner")?;
             let cluster = ctx::arg_str(&args, "cluster")?;
-            if !cluster.starts_with("philium-") {
-                return Err("refusing to delete non-philium kind cluster".into());
+            if !cluster.starts_with(&format!("philium-{aname}-")) {
+                return Err("Cluster does not belong to this agent".into());
             }
+            let _op = KIND_OPERATION.try_lock().map_err(|_| "Another kind operation is in progress. Try again when it finishes.")?;
             let rows = ctx.db.query(
                 "SELECT id, agent_id FROM resources WHERE kind='kind_cluster' AND handle=?1 AND state!='released'",
                 [&cluster],
             )?;
+            if rows.len() != 1 || rows[0]["agent_id"].as_str() != Some(aid.as_str()) {
+                return Err("No uniquely owned active cluster for this agent".into());
+            }
+            let kc = ctx.agent_dir(aname).join("kubeconfig");
             let cname = cluster.clone();
             let out = tokio::task::spawn_blocking(move || {
                 std::process::Command::new("kind")
+                    .env("KUBECONFIG", kc)
                     .args(["delete", "cluster", "--name", &cname])
                     .output()
             })
             .await
             .map_err(|e| e.to_string())?;
-            if let Ok(o) = out {
-                if !o.status.success() {
-                    return Err(format!("kind delete failed: {}", String::from_utf8_lossy(&o.stderr).trim()));
-                }
+            let o = out.map_err(|e| format!("Could not run kind: {e}"))?;
+            if !o.status.success() {
+                return Err(format!("kind delete failed: {}", String::from_utf8_lossy(&o.stderr).trim()));
             }
             for r in rows {
                 if let Some(rid) = r["id"].as_str() {
@@ -1279,6 +1321,45 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kind_admission_counts_external_clusters_and_reserves_managed_ports() {
+        assert!(check_kind_inventory("outside\nother\n", 2).is_err());
+        assert!(check_kind_inventory("", 0).is_err());
+        assert!(check_kind_inventory("outside\n", 2).is_ok());
+        let ctx = Ctx::test();
+        let rid = reserve_local_kind(&ctx, "a", "philium-a-one", json!({})).unwrap();
+        assert!(reserve_local_kind(&ctx, "b", "philium-b-one", json!({})).is_err());
+        ctx.db.kv_set("setting.kind.local_limit", "2").unwrap();
+        assert!(reserve_local_kind(&ctx, "a", "philium-a-two", json!({})).is_err());
+        crate::reaper::release(&ctx, &rid);
+        assert!(reserve_local_kind(&ctx, "a", "philium-a-two", json!({})).is_ok());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an accessible kind runtime; uses inventory only and a zero budget"]
+    async fn real_kind_runtime_refuses_at_zero_without_creating_resources() {
+        let ctx = Ctx::test();
+        ctx.db.kv_set("setting.kind.local_limit", "0").unwrap();
+        ctx.db.exec("INSERT INTO agents(id,name,model_ref,created_at,last_active_at) VALUES('a','fixture','p/m',0,0)", []).unwrap();
+        let message = call(&ctx, "kind_create", json!({"id":"a"})).await.unwrap_err();
+        assert!(message.contains("local limit 0"), "{message}");
+        println!("{message}");
+        assert_eq!(call(&ctx, "kind_list", json!({"id":"a"})).await.unwrap(), json!([]));
+        assert!(!ctx.agent_dir("fixture").exists());
+        std::fs::remove_dir_all(ctx.data_dir.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn kind_rpcs_do_not_leak_resources_or_remove_another_owners_cluster() {
+        let ctx = Ctx::test();
+        ctx.db.exec("INSERT INTO agents(id,name,model_ref,created_at,last_active_at) VALUES('a','owl','p/m',0,0),('b','owl-two','p/m',0,0)", []).unwrap();
+        reserve_local_kind(&ctx, "b", "philium-owl-two-test", json!({})).unwrap();
+        assert!(call(&ctx, "kind_list", json!({"id":"missing"})).await.is_err());
+        assert_eq!(call(&ctx, "kind_list", json!({"id":"a"})).await.unwrap(), json!([]));
+        assert!(call(&ctx, "kind_delete", json!({"id":"a","cluster":"philium-owl-two-test"})).await.unwrap_err().contains("owned"));
+        assert_eq!(call(&ctx, "kind_list", json!({"id":"b"})).await.unwrap()[0]["handle"], "philium-owl-two-test");
+    }
 
     #[test]
     fn names_are_slugs_and_unique() {

@@ -188,7 +188,7 @@ pub fn tool_list() -> Vec<Value> {
           json!({ "content": s, "category": s, "project": b }), &["content", "category"]),
         t("session_search", "Search past Philium agent transcripts and imported Jcode (~/.jcode/sessions) sessions for prior decisions, debugging context, or unfinished work on this or other repos. Omit `q` or pass keywords; set `repo_only: true` to restrict to the current repository.",
           json!({ "q": s, "repo_only": b, "limit": i }), &[]),
-        t("resource_register", "Declare something you created outside Philium's tools (container, cluster, process, temp dir) so it is cleaned up with you.",
+        t("resource_register", "Declare something you created outside Philium's tools (container, process, temp dir) so it is cleaned up with you. Use kind_cluster for managed clusters.",
           json!({ "kind": s, "handle": s, "note": s }), &["kind", "handle"]),
         t("kind_cluster", "Manage an isolated Kubernetes-in-Docker (kind) test cluster scoped to your agent (`philium-<agent>-<suffix>`), pre-registered in Philium's Reaper and wired to your isolated KUBECONFIG and port block. action: create | list | delete.",
           json!({ "action": s, "suffix": s, "cluster": s }), &["action"]),
@@ -432,7 +432,7 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
         "resource_register" => {
             let kind = arg(&a, "kind")?;
             const KINDS: &[&str] =
-                &["process", "container", "compose_project", "kind_cluster", "port", "tmpdir", "branch", "other"];
+                &["process", "container", "compose_project", "port", "tmpdir", "branch", "other"];
             if !KINDS.contains(&kind) {
                 return Err(format!("kind must be one of {}", KINDS.join(", ")));
             }
@@ -441,8 +441,9 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
         }
         "kind_cluster" => match arg(&a, "action")? {
             "list" => crate::agents::call(ctx, "kind_list", json!({ "id": agent })).await,
+            "create" | "delete" if row["strict"].as_i64() == Some(1) => Err("Strict agents cannot manage host kind clusters".into()),
             "create" => crate::agents::call(ctx, "kind_create", json!({ "id": agent, "suffix": a["suffix"] })).await,
-            "delete" => crate::agents::call(ctx, "kind_delete", json!({ "cluster": arg(&a, "cluster")? })).await,
+            "delete" => crate::agents::call(ctx, "kind_delete", json!({ "id": agent, "cluster": arg(&a, "cluster")? })).await,
             other => Err(format!("unknown kind_cluster action `{other}` (use create, list, or delete)")),
         },
         _ => Err(format!("unknown tool {name}")),
