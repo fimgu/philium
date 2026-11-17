@@ -1,9 +1,10 @@
 // Conversation view built from HAL session events. Used by Agents and Chat.
 // Events are folded into items: user / assistant (streamed) / tool / file /
-// permission / error. Text is always rendered as text, never HTML.
+// permission / error. Assistant Markdown is rendered without raw HTML.
 import { For, Index, Show, Switch, Match, createSignal, createMemo, createEffect, on, onCleanup } from "solid-js";
 import { Badge, Button, toast } from "./kit.jsx";
 import { Icon } from "./icons.jsx";
+import { AssistantReply } from "./markdown.jsx";
 import { draftFor, newDraft } from "../lib/drafts.js";
 
 /** Fold a list of HAL events into display items. Pure, incremental-safe. */
@@ -149,7 +150,7 @@ export function Conversation(props) {
             <Switch>
               <Match when={it().kind === "user"}><div class="msg user">{it().text}</div></Match>
               <Match when={it().kind === "assistant"}>
-                <div class={`msg ${it().live ? "live" : ""}`}>{it().text}<Show when={it().live}><span class="caret" /></Show></div>
+                <div class={`msg assistant ${it().live ? "live" : ""}`}><AssistantReply text={it().text} live={it().live} /></div>
               </Match>
               <Match when={it().kind === "tool"}><Tool item={it()} active={props.busy && !props.readOnly} /></Match>
               <Match when={it().kind === "file"}>

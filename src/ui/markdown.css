@@ -1,0 +1,26 @@
+.msg.assistant { white-space: normal; min-width: 0; }
+.assistant-markdown { line-height: 1.55; }
+.assistant-markdown > :first-child { margin-top: 0; }
+.assistant-markdown > :last-child { margin-bottom: 0; }
+.assistant-markdown p { white-space: pre-wrap; margin: .65em 0; }
+.assistant-markdown :is(h1,h2,h3,h4,h5,h6) { line-height: 1.25; margin: 1em 0 .5em; }
+.assistant-markdown h1 { font-size: 1.5em; }
+.assistant-markdown h2 { font-size: 1.3em; }
+.assistant-markdown h3 { font-size: 1.15em; }
+.assistant-markdown :is(ul,ol) { padding-left: 1.6em; margin: .6em 0; }
+.assistant-markdown li > p { margin: .25em 0; }
+.assistant-markdown blockquote { margin: .7em 0; padding-left: 1em; border-left: 3px solid var(--line); color: var(--text-dim); }
+.assistant-markdown a { color: var(--accent); text-decoration: underline; }
+.assistant-markdown code { font-family: var(--mono); font-size: .9em; background: var(--bg-raised); border-radius: 3px; padding: .1em .3em; }
+.assistant-markdown pre { overflow-x: auto; white-space: pre; margin: 0; padding: 12px; }
+.assistant-markdown pre code { padding: 0; background: none; }
+.markdown-code { background: var(--bg-raised); border: 1px solid var(--line); border-radius: var(--radius); margin: .7em 0; overflow: hidden; }
+.markdown-code > .markdown-copy { display: block; margin: 5px 5px 0 auto; }
+.markdown-copy { color: var(--text-dim); background: var(--surface); border: 1px solid var(--line); border-radius: 4px; padding: 4px 8px; font: inherit; font-size: .8em; cursor: pointer; }
+.markdown-copy:hover { color: var(--text); border-color: var(--accent); }
+.markdown-copy:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.markdown-actions { display: flex; justify-content: flex-end; margin-top: 8px; }
+.markdown-table { overflow-x: auto; }
+.assistant-markdown table { border-collapse: collapse; margin: .6em 0; }
+.assistant-markdown :is(th,td) { border: 1px solid var(--line); padding: .35em .65em; text-align: left; }
+.markdown-image { color: var(--text-dim); }
