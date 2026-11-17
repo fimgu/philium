@@ -9,6 +9,7 @@ import { AgentTerminals } from "../ui/agent-terminals.jsx";
 import { AgentBrowser } from "../ui/agent-browser.jsx";
 import { rpc, useEvent, fmt, sendError } from "../lib/rpc.js";
 import { go, params, registerCommands } from "../lib/nav.js";
+import { useStore, activeRepoId, agentEventsCache } from "../lib/store.js";
 import "../styles/agents.css";
 import "../styles/code.css";
 
@@ -89,16 +90,17 @@ export function WarningPills(props) {
 
 /** Spawn dialog: name, role, model (live list), repo, task, brief, Strict. */
 export function SpawnModal(props) {
+  const store = useStore();
   const [names] = createResource(() => rpc("agents.names"));
-  const [models] = createResource(() => rpc("providers.models", {}).catch(() => []));
-  const [providers] = createResource(() => rpc("providers.list").catch(() => []));
-  const [repos] = createResource(() => rpc("workspace.repos_list").catch(() => []));
+  const models = store.models;
+  const providers = store.providers;
+  const repos = store.repos;
   const [tasks] = createResource(() => rpc("board.list", { status: "open" }).catch(() => []));
-  const [def] = createResource(() => rpc("providers.default").catch(() => null));
+  const def = store.defaultModel;
   const [name, setName] = createSignal(props.preset?.name ?? "");
   const [role, setRole] = createSignal(props.preset?.role ?? "orchestrator");
   const [model, setModel] = createSignal("");
-  const [repo, setRepo] = createSignal(props.preset?.repo_id ?? "");
+  const [repo, setRepo] = createSignal(props.preset?.repo_id ?? activeRepoId() ?? "");
   const [task, setTask] = createSignal(props.preset?.task_id ?? "");
   const [brief, setBrief] = createSignal(props.preset?.brief ?? "");
   const [strict, setStrict] = createSignal(false);
@@ -411,11 +413,11 @@ function AgentView(props) {
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", up);
   };
+  const store = useStore();
   const [events, setEvents] = createSignal([]);
   const [info, { refetch }] = createResource(() => props.id, (id) => rpc("agents.get", { id }));
-  const [models, { refetch: refetchModels }] = createResource(() => rpc("providers.models", {}).catch(() => []));
-  const [providers, { refetch: refetchProviders }] = createResource(() => rpc("providers.list").catch(() => []));
-  useEvent("providers:changed", () => { refetchModels(); refetchProviders(); });
+  const models = store.models;
+  const providers = store.providers;
   const [historyLoading, setHistoryLoading] = createSignal(false);
   const [historyError, setHistoryError] = createSignal("");
   const [historyCursor, setHistoryCursor] = createSignal(0);
@@ -429,17 +431,36 @@ function AgentView(props) {
   };
   const load = async (id, after = 0) => {
     const request = ++generation;
-    if (historyId !== id) { historyId = id; setEvents([]); setHistoryCursor(0); setHistoryMore(false); }
-    retryAfter = after;
-    setHistoryLoading(true); setHistoryError("");
+    let effectiveAfter = after;
+    if (historyId !== id) {
+      historyId = id;
+      const cached = agentEventsCache.get(id);
+      if (cached?.length && after === 0) {
+        setEvents(cached);
+        effectiveAfter = cached.at(-1)?.seq ?? 0;
+        setHistoryCursor(effectiveAfter);
+        setHistoryMore(false);
+      } else {
+        setEvents([]);
+        setHistoryCursor(0);
+        setHistoryMore(false);
+      }
+    }
+    retryAfter = effectiveAfter;
+    if (!agentEventsCache.has(id)) setHistoryLoading(true);
+    setHistoryError("");
     try {
-      const evs = await rpc("agents.events", { id, after, limit: 5000 }, { local: true });
+      const evs = await rpc("agents.events", { id, after: effectiveAfter, limit: 5000 }, { local: true });
       if (request !== generation || props.id !== id) return;
       if (!Array.isArray(evs)) throw new Error("Invalid history response");
-      setEvents((current) => merge(current, evs));
-      const next = evs.at(-1)?.seq ?? after;
+      setEvents((current) => {
+        const next = merge(current, evs);
+        agentEventsCache.set(id, next);
+        return next;
+      });
+      const next = evs.at(-1)?.seq ?? effectiveAfter;
       setHistoryCursor(next);
-      setHistoryMore(evs.length === 5000 && next > after);
+      setHistoryMore(evs.length === 5000 && next > effectiveAfter);
     } catch (e) {
       if (request === generation && props.id === id) setHistoryError(String(e));
     } finally {
@@ -450,7 +471,11 @@ function AgentView(props) {
   createEffect(on(() => props.id, (id) => load(id)));
   useEvent("agents:events", (p) => {
     if (p.id !== props.id || historyId !== props.id) return;
-    setEvents((current) => merge(current, p.events ?? []));
+    setEvents((current) => {
+      const next = merge(current, p.events ?? []);
+      agentEventsCache.set(props.id, next);
+      return next;
+    });
   });
   useEvent("agents:changed", (p) => { if (p.id === props.id) refetch(); });
 
@@ -869,16 +894,15 @@ function MissionDispatchBar(props) {
 }
 
 export default function Agents() {
-  const [list, { refetch }] = createResource(() => rpc("agents.list").catch(() => []));
+  const store = useStore();
+  const list = store.agents;
+  const refetch = store.refetchAgents;
   const [spawn, setSpawn] = createSignal(null);
   const [filter, setFilter] = createSignal("all");
   const [search, setSearch] = createSignal("");
   const [broadcastText, setBroadcastText] = createSignal("");
   const [viewMode, setViewModeRaw] = createSignal(localStorage.getItem("agents.viewMode") || "clusters");
   const setViewMode = (m) => { setViewModeRaw(m); localStorage.setItem("agents.viewMode", m); };
-  let t;
-  useEvent("agents:changed", () => { clearTimeout(t); t = setTimeout(refetch, 150); });
-  onCleanup(() => clearTimeout(t));
 
   registerCommands([
     { id: "agent.new", label: "New agent / orchestrator", run: () => setSpawn({}) },
@@ -890,7 +914,15 @@ export default function Agents() {
 
   const filtered = createMemo(() => {
     const q = search().trim().toLowerCase();
+    const repoId = activeRepoId();
+    const activeRepo = repoId ? (store.repos() ?? []).find((r) => r.id === repoId) : null;
     return (list() ?? []).filter((a) => {
+      if (repoId) {
+        const matchesId = a.repo_id === repoId;
+        const matchesName = activeRepo && a.repo_name === activeRepo.name;
+        const matchesCwd = activeRepo?.path && a.cwd?.startsWith(activeRepo.path);
+        if (!matchesId && !matchesName && !matchesCwd) return false;
+      }
       if (filter() === "live" && !a.live) return false;
       if (filter() === "waiting" && a.state !== "waiting") return false;
       if (filter() === "warnings" && !(a.warnings ?? []).length) return false;
@@ -1091,12 +1123,12 @@ export default function Agents() {
             <div class="agent-list">
               <For each={tree()}>{({ a, d }) => <AgentRow agent={a} depth={d} selected={a.id === selected()} onClick={() => go("agents", { id: a.id })} />}</For>
             </div>
-            <Show when={selected()} keyed>{(id) => (
-              <Show when={list.loading || (list() ?? []).some((a) => a.id === id)} fallback={
+            <Show when={selected()}>{(id) => (
+              <Show when={list.loading || (list() ?? []).some((a) => a.id === id())} fallback={
                 <NotFound title="Agent not found" action={<Button onClick={() => go("agents", {})}>Back to agents</Button>}>
                   This agent was removed or never existed.
                 </NotFound>}>
-                <AgentView id={id} agent={(list() ?? []).find((a) => a.id === id)} />
+                <AgentView id={id()} agent={(list() ?? []).find((a) => a.id === id())} />
               </Show>
             )}</Show>
           </div>

@@ -2,13 +2,15 @@
 // Screens register in SCREENS below; each lives in src/screens/<id>.jsx and
 // default-exports a component. Adding a screen = one line here.
 import { render } from "solid-js/web";
-import { For, Show, createSignal, createMemo, lazy, Suspense, onMount, onCleanup } from "solid-js";
+import { For, Show, createSignal, createMemo, createEffect, lazy, Suspense, onMount, onCleanup } from "solid-js";
 import { Dynamic } from "solid-js/web";
 import { ToastHost, ConfirmHost, Guard, toast, cleanError } from "./ui/kit.jsx";
 import { ImproveHost } from "./ui/improve.jsx";
 import { Icon } from "./ui/icons.jsx";
 import { rpc, failures, clearFailures } from "./lib/rpc.js";
 import { route, go, commands, improve } from "./lib/nav.js";
+import { useStore, activeRepoId, setActiveRepoId } from "./lib/store.js";
+import { soundEnabled, setSoundEnabled, playSound } from "./lib/sound.js";
 import "./lib/alerts.js";
 import "./styles/tokens.css";
 import "./styles/components.css";
@@ -63,12 +65,18 @@ function Palette(props) {
 }
 
 function App() {
+  const store = useStore();
   const [palette, setPalette] = createSignal(false);
   const [status, setStatus] = createSignal(null);
   const refresh = () => rpc("app.status").then(setStatus).catch(() => setStatus((s) => ({ ...(s ?? {}), desk: { ok: false, error: "Backend not responding" } })));
   const [attempt, setAttempt] = createSignal(0);
+  const [visited, setVisited] = createSignal([route()]);
+  createEffect(() => {
+    const r = route();
+    setVisited((prev) => (prev.includes(r) ? prev : [...prev, r]));
+  });
   const failing = () => Object.entries(failures()).filter(([k]) => !k.startsWith("browser.") && k !== "app.status");
-  const retry = () => { clearFailures(); refresh(); setAttempt((n) => n + 1); };
+  const retry = () => { clearFailures(); refresh(); setVisited([route()]); setAttempt((n) => n + 1); };
   onMount(() => {
     refresh();
     const t = setInterval(refresh, 5000);
@@ -91,6 +99,19 @@ function App() {
           </svg>
           Philium
         </div>
+        <div class="workspace-switch">
+          <select
+            aria-label="Active workspace repository"
+            title="Scope Agents, Board, and Terminals to a repository/folder"
+            value={activeRepoId()}
+            onChange={(e) => setActiveRepoId(e.currentTarget.value)}
+          >
+            <option value="">All Workspaces</option>
+            <For each={store.repos() ?? []}>
+              {(r) => <option value={r.id}>{r.name}</option>}
+            </For>
+          </select>
+        </div>
         <For each={GROUPS}>
           {([g, label]) => (
             <>
@@ -106,6 +127,9 @@ function App() {
           )}
         </For>
         <div class="sidebar-foot">
+          <button class="nav-item" onClick={() => { const next = !soundEnabled(); setSoundEnabled(next); if (next) playSound("done"); }} title="Toggle audio chimes for agent approvals, completions, and errors">
+            <Icon name={soundEnabled() ? "activity" : "stop"} /> {soundEnabled() ? "Sounds on" : "Sounds muted"}
+          </button>
           <button class="nav-item" onClick={() => improve()}><Icon name="spark" /> Improve Philium</button>
           <button class="nav-item" onClick={() => setPalette(true)}><Icon name="search" /> Commands <span class="count kbd">⌘K</span></button>
           <Show when={status()}>
@@ -124,9 +148,15 @@ function App() {
             <button class="btn ghost sm" onClick={clearFailures} aria-label="Dismiss">Dismiss</button>
           </div>
         </Show>
-        <Suspense fallback={<div class="loading" role="status"><span class="spinner" />Loading</div>}>
-          <For each={[`${route()}:${attempt()}`]}>{(r) => <Guard><Dynamic component={COMPONENTS[r.split(":")[0]] ?? COMPONENTS.home} /></Guard>}</For>
-        </Suspense>
+        <For each={visited()}>
+          {(id) => (
+            <div class={`screen-pane ${route() === id ? "" : "hidden"}`}>
+              <Suspense fallback={<div class="loading" role="status"><span class="spinner" />Loading</div>}>
+                <For each={[attempt()]}>{() => <Guard><Dynamic component={COMPONENTS[id] ?? COMPONENTS.home} /></Guard>}</For>
+              </Suspense>
+            </div>
+          )}
+        </For>
       </main>
       <Show when={palette()}><Palette onClose={() => setPalette(false)} /></Show>
       <ToastHost />

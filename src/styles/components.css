@@ -238,3 +238,7 @@
 .pill.ok { color: var(--secure); background: var(--secure-dim, rgba(79,209,165,.1)); border-color: transparent; }
 .pill.warn { color: var(--strict); background: var(--strict-dim); border-color: transparent; }
 .pill.bad { color: var(--danger); background: var(--danger-dim); border-color: transparent; }
+.screen-pane { display: flex; flex-direction: column; flex: 1; min-height: 0; min-width: 0; }
+.screen-pane.hidden { display: none; }
+.workspace-switch { padding: 0 10px 8px; }
+.workspace-switch select { width: 100%; height: 28px; font-size: var(--fs-xs); background: var(--surface); color: var(--text); border: 1px solid var(--line); border-radius: var(--radius-s); padding: 0 8px; cursor: pointer; }

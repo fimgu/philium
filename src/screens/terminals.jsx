@@ -12,6 +12,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import { Page, Button, Segmented, Empty } from "../ui/kit.jsx";
 import { rpc, useEvent } from "../lib/rpc.js";
+import { useStore, activeRepoId } from "../lib/store.js";
 import "../styles/terminals.css";
 const decode = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
 const encode = (s) =>
@@ -150,8 +151,16 @@ export default function Terminals() {
   useEvent("terminals:data", (p) => {
     if (!items().some((t) => t.id === p.id)) reload();
   });
+  const store = useStore();
+  const scopedItems = createMemo(() => {
+    const rid = activeRepoId();
+    if (!rid) return items();
+    const repo = (store.repos() ?? []).find((r) => r.id === rid);
+    if (!repo?.path) return items();
+    return items().filter((t) => t.cwd?.startsWith(repo.path));
+  });
   const visible = createMemo(() => {
-    const list = items(),
+    const list = scopedItems(),
       i = Math.max(
         0,
         list.findIndex((t) => t.id === selected()),
@@ -160,7 +169,9 @@ export default function Terminals() {
   });
   const open = async () => {
     try {
-      const id = await rpc("terminals.open", {});
+      const rid = activeRepoId();
+      const repo = rid ? (store.repos() ?? []).find((r) => r.id === rid) : null;
+      const id = await rpc("terminals.open", repo?.path ? { cwd: repo.path } : {});
       await reload();
       setSelected(id);
     } catch (e) {
@@ -208,7 +219,7 @@ export default function Terminals() {
           <p role="alert">{error()}</p>
         </Show>
         <Show
-          when={items().length}
+          when={scopedItems().length}
           fallback={
             <Empty
               title="Your persistent workspace"
@@ -220,7 +231,7 @@ export default function Terminals() {
           }
         >
           <nav class="terminal-tabs" aria-label="Terminal tabs">
-            <For each={items()}>
+            <For each={scopedItems()}>
               {(t) => (
                 <button
                   class={selected() === t.id ? "on" : ""}
