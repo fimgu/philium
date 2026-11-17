@@ -186,6 +186,8 @@ pub fn tool_list() -> Vec<Value> {
           json!({ "q": s, "limit": i }), &["q"]),
         t("memory_save", "Remember a durable preference, correction or fact for future agents. Category: fact, preference, correction, entity. project=true scopes it to this repo.",
           json!({ "content": s, "category": s, "project": b }), &["content", "category"]),
+        t("session_search", "Search past Philium agent transcripts and imported Jcode (~/.jcode/sessions) sessions for prior decisions, debugging context, or unfinished work on this or other repos. Omit `q` or pass keywords; set `repo_only: true` to restrict to the current repository.",
+          json!({ "q": s, "repo_only": b, "limit": i }), &[]),
         t("resource_register", "Declare something you created outside Philium's tools (container, cluster, process, temp dir) so it is cleaned up with you.",
           json!({ "kind": s, "handle": s, "note": s }), &["kind", "handle"]),
     ].into_iter().chain(crate::browser::mcp_tools()).chain(crate::codeindex::mcp_tools()).collect()
@@ -383,7 +385,9 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
             })
         }
         // --- codeindex tools ---
-        "code_map" | "code_outline" | "code_symbol" | "code_find" | "code_refs" | "code_impact" => crate::codeindex::mcp_call(ctx, agent, name, a).await,
+        "code_map" | "code_outline" | "code_symbol" | "code_find" | "code_refs" | "code_impact" | "repo_context" => {
+            crate::codeindex::mcp_call(ctx, agent, name, a).await
+        }
         // --- end codeindex tools ---
         "playbook_get" => {
             let repo = crate::agents::runtime(agent).map(|r| r.cwd.clone());
@@ -391,14 +395,22 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
         }
         "skill_list" => crate::library::skill_list(ctx),
         "skill_get" => crate::library::skill_get(ctx, arg(&a, "name")?),
-        "memory_search" | "memory_save" => {
-            // Personal memory never goes to agents on untrusted (Strict) providers.
+        "memory_search" | "memory_save" | "session_search" => {
+            // Personal memory and past sessions never go to agents on untrusted (Strict) providers.
             if row["strict"].as_i64() == Some(1) {
-                return Err("memory is not available to Strict agents".into());
+                return Err("memory and past sessions are not available to Strict agents".into());
             }
             let project = crate::agents::repo_path_of(ctx, &row);
             if name == "memory_search" {
                 crate::library::memory_search(ctx, arg(&a, "q")?, project.as_deref(), a["limit"].as_i64().unwrap_or(10))
+            } else if name == "session_search" {
+                crate::library::session_search(
+                    ctx,
+                    a["q"].as_str().unwrap_or(""),
+                    project.as_deref(),
+                    a["repo_only"].as_bool().unwrap_or(false),
+                    a["limit"].as_u64().unwrap_or(8) as usize,
+                )
             } else {
                 let scope = if a["project"].as_bool() == Some(true) { project.as_deref() } else { None };
                 crate::library::memory_save(ctx, arg(&a, "content")?, arg(&a, "category")?, scope, &me)
@@ -667,6 +679,39 @@ mod tests {
 
         let gq: Value = serde_json::from_str(&call("graph_query", json!({"path":"src/b.rs"})).await).unwrap();
         assert!(!gq["edges"].as_array().unwrap().is_empty(), "graph_query(path) must preserve source/target edges: {gq}");
+
+        // Pre-existing external git worktree (not in Philium's `worktrees` table) is auto-discovered
+        // in both Turn-1 `prompt_map` and `repo_context`, with structural AST branch diffing.
+        let ext_wt = ctx.data_dir.join("repo-cg-ext");
+        assert!(
+            std::process::Command::new("git")
+                .args(["worktree", "add", "-b", "feat/ext", ext_wt.to_str().unwrap()])
+                .current_dir(&repo_dir)
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(
+            ext_wt.join("src/a.rs"),
+            "pub struct Engine;\nimpl Engine {\n    pub fn run(&self) -> i32 { helper(99) }\n}\npub fn helper(x: i32) -> i32 { x + 1 }\npub fn extra_boost() -> i32 { 7 }\n",
+        )
+        .unwrap();
+        for args in [vec!["add", "."], vec!["commit", "-m", "boost engine in external wt"]] {
+            assert!(std::process::Command::new("git").args(&args).current_dir(&ext_wt).status().unwrap().success());
+        }
+
+        let pmap2 = crate::codeindex::prompt_map(&ctx, "r1", None).expect("prompt_map with landscape");
+        assert!(pmap2.contains("## Repo landscape") && pmap2.contains("[external] feat/ext ↑1 ↓0"), "{pmap2}");
+
+        let rc = call("repo_context", json!({"include_prs": false})).await;
+        assert!(rc.contains("[external] branch=feat/ext ↑1 ↓0") && rc.contains("boost engine in external wt"), "{rc}");
+
+        let rc_branch = call("repo_context", json!({"branch": "feat/ext", "include_prs": false})).await;
+        assert!(
+            rc_branch.contains("~ src/a.rs:3 method Engine.run")
+                && rc_branch.contains("+ src/a.rs:6 fn extra_boost"),
+            "{rc_branch}"
+        );
     }
 }
 

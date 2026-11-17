@@ -289,6 +289,228 @@ pub fn standing_memories(ctx: &Ctx) -> String {
     s
 }
 
+pub fn session_search(
+    ctx: &Ctx,
+    query: &str,
+    project: Option<&str>,
+    repo_only: bool,
+    limit: usize,
+) -> Result<Value, String> {
+    session_search_at(ctx, &home(), query, project, repo_only, limit)
+}
+
+fn strip_system_reminders(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(start) = rest.find("<system-reminder>") {
+        out.push_str(&rest[..start]);
+        if let Some(end) = rest[start..].find("</system-reminder>") {
+            rest = &rest[start + end + "</system-reminder>".len()..];
+        } else {
+            rest = "";
+            break;
+        }
+    }
+    out.push_str(rest);
+    out.trim().to_string()
+}
+
+fn matches_repo(working_dir: &str, project: Option<&str>) -> bool {
+    let Some(proj) = project.filter(|p| !p.is_empty()) else {
+        return false;
+    };
+    if working_dir.starts_with(proj) || proj.starts_with(working_dir) {
+        return true;
+    }
+    let proj_name = Path::new(proj).file_name().and_then(|s| s.to_str()).unwrap_or("");
+    !proj_name.is_empty()
+        && (working_dir.ends_with(&format!("/{proj_name}"))
+            || working_dir.contains(&format!("/{proj_name}/"))
+            || working_dir.contains(&format!("/{proj_name}-")))
+}
+
+pub fn session_search_at(
+    ctx: &Ctx,
+    home_dir: &Path,
+    query: &str,
+    project: Option<&str>,
+    repo_only: bool,
+    limit: usize,
+) -> Result<Value, String> {
+    let limit = limit.clamp(1, 25);
+    let terms: Vec<String> = query
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
+        .filter(|s| s.len() >= 2)
+        .map(str::to_string)
+        .collect();
+    let mut candidates: Vec<(i64, Value)> = vec![];
+
+    // 1. Philium agents & HAL session transcripts
+    let agents = ctx
+        .db
+        .query(
+            "SELECT a.id, a.name, a.role, a.state, a.task_title, a.branch, a.hal_session_id, a.last_active_at, r.path AS repo_path \
+             FROM agents a LEFT JOIN repos r ON r.id=a.repo_id ORDER BY a.last_active_at DESC LIMIT 60",
+            [],
+        )
+        .unwrap_or_default();
+    for a in agents {
+        let rpath = a["repo_path"].as_str().unwrap_or("");
+        let same_repo = matches_repo(rpath, project);
+        if repo_only && project.is_some() && !same_repo {
+            continue;
+        }
+        let header_hay = format!(
+            "{} {} {} {}",
+            a["name"].as_str().unwrap_or(""),
+            a["task_title"].as_str().unwrap_or(""),
+            a["branch"].as_str().unwrap_or(""),
+            a["role"].as_str().unwrap_or("")
+        )
+        .to_lowercase();
+        let mut score: i64 = if same_repo { 20 } else { 0 };
+        for t in &terms {
+            if header_hay.contains(t) {
+                score += 15;
+            }
+        }
+        let mut excerpts = vec![];
+        if let Some(sid) = a["hal_session_id"].as_str().filter(|s| !s.is_empty()) {
+            let ev_path = ctx.root.join("hal/sessions").join(sid).join("events.jsonl");
+            if let Ok(raw) = std::fs::read_to_string(&ev_path) {
+                for line in raw.lines().take(200) {
+                    let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+                    let role = match v["t"].as_str() {
+                        Some("user") => "user",
+                        Some("assistant") => "assistant",
+                        _ => continue,
+                    };
+                    let txt = v["text"].as_str().unwrap_or("").trim();
+                    if txt.is_empty() {
+                        continue;
+                    }
+                    let low = txt.to_lowercase();
+                    let term_hits = terms.iter().filter(|t| low.contains(t.as_str())).count();
+                    if terms.is_empty() || term_hits > 0 {
+                        score += (term_hits as i64) * 10;
+                        if excerpts.len() < 3 {
+                            excerpts.push(json!({
+                                "role": role,
+                                "text": txt.chars().take(280).collect::<String>(),
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+        if terms.is_empty() || score > if same_repo { 20 } else { 0 } {
+            candidates.push((
+                score,
+                json!({
+                    "source": "philium",
+                    "session_id": a["id"],
+                    "name": a["name"],
+                    "branch": a["branch"],
+                    "task_title": a["task_title"],
+                    "working_dir": rpath,
+                    "updated_at": a["last_active_at"],
+                    "same_repo": same_repo,
+                    "excerpts": excerpts,
+                }),
+            ));
+        }
+    }
+
+    // 2. Jcode sessions (~/.jcode/sessions/*.json)
+    let jcode_dir = home_dir.join(".jcode/sessions");
+    if let Ok(rd) = std::fs::read_dir(&jcode_dir) {
+        let mut files: Vec<(std::time::SystemTime, PathBuf)> = rd
+            .flatten()
+            .filter_map(|e| {
+                let p = e.path();
+                let name = p.file_name()?.to_str()?;
+                if !name.ends_with(".json") || name.contains("canary") {
+                    return None;
+                }
+                let m = e.metadata().ok()?.modified().ok()?;
+                Some((m, p))
+            })
+            .collect();
+        files.sort_by(|a, b| b.0.cmp(&a.0));
+        for (_, p) in files.into_iter().take(120) {
+            let Ok(raw) = std::fs::read_to_string(&p) else { continue };
+            let Ok(v) = serde_json::from_str::<Value>(&raw) else { continue };
+            if v["debug"].as_bool() == Some(true) || v["canary"].as_bool() == Some(true) {
+                continue;
+            }
+            let wd = v["working_dir"].as_str().unwrap_or("");
+            let same_repo = matches_repo(wd, project);
+            if repo_only && project.is_some() && !same_repo {
+                continue;
+            }
+            let short = v["short_name"].as_str().unwrap_or("");
+            let title = v["title"].as_str().unwrap_or("");
+            let sid = v["id"].as_str().unwrap_or("");
+            let meta_low = format!("{short} {title} {wd} {sid}").to_lowercase();
+            let mut score: i64 = if same_repo { 25 } else { 0 };
+            for t in &terms {
+                if meta_low.contains(t) {
+                    score += 15;
+                }
+            }
+            let mut excerpts = vec![];
+            if let Some(msgs) = v["messages"].as_array() {
+                for m in msgs.iter().take(120) {
+                    let role = m["role"].as_str().unwrap_or("");
+                    if role != "user" && role != "assistant" {
+                        continue;
+                    }
+                    let Some(blocks) = m["content"].as_array() else { continue };
+                    for b in blocks {
+                        if b["type"].as_str() != Some("text") {
+                            continue;
+                        }
+                        let clean = strip_system_reminders(b["text"].as_str().unwrap_or(""));
+                        if clean.is_empty() {
+                            continue;
+                        }
+                        let low = clean.to_lowercase();
+                        let hits = terms.iter().filter(|t| low.contains(t.as_str())).count();
+                        if terms.is_empty() || hits > 0 {
+                            score += (hits as i64) * 12;
+                            if excerpts.len() < 3 {
+                                excerpts.push(json!({
+                                    "role": role,
+                                    "text": clean.chars().take(280).collect::<String>(),
+                                }));
+                            }
+                        }
+                    }
+                }
+            }
+            if (terms.is_empty() && !excerpts.is_empty()) || score > if same_repo { 25 } else { 0 } {
+                candidates.push((
+                    score,
+                    json!({
+                        "source": "jcode",
+                        "session_id": sid,
+                        "name": short,
+                        "title": title,
+                        "working_dir": wd,
+                        "updated_at": v["updated_at"],
+                        "same_repo": same_repo,
+                        "excerpts": excerpts,
+                    }),
+                ));
+            }
+        }
+    }
+
+    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+    Ok(Value::Array(candidates.into_iter().take(limit).map(|(_, v)| v).collect()))
+}
+
 pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, String> {
     match method {
         "status" => Ok(json!({
@@ -302,6 +524,13 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
         }
         "skills" => skill_list(ctx),
         "memories" => memory_search(ctx, args["q"].as_str().unwrap_or(""), None, args["limit"].as_i64().unwrap_or(50)),
+        "sessions" => session_search(
+            ctx,
+            args["q"].as_str().unwrap_or(""),
+            args["project"].as_str(),
+            args["repo_only"].as_bool().unwrap_or(false),
+            args["limit"].as_u64().unwrap_or(8) as usize,
+        ),
         "forget" => {
             ctx.db.exec("UPDATE memories SET active=0 WHERE id=?1", [crate::ctx::arg_str(&args, "id")?])?;
             Ok(Value::Null)
@@ -328,6 +557,19 @@ mod tests {
         let hash = jcode_project_hash(&h.join("Developer/philium"));
         let p = json!({"memories": {"p1": {"id":"p1","category":{"custom":"x"},"content":"Philium quit must finish under one second","created_at":"2026-01-03"}}});
         std::fs::write(h.join(format!(".jcode/memory/projects/{hash}.json")), p.to_string()).unwrap();
+        std::fs::create_dir_all(h.join(".jcode/sessions")).unwrap();
+        let sess1 = json!({
+            "id": "session_dolphin_1",
+            "short_name": "dolphin",
+            "title": "Codegraph PageRank optimization",
+            "working_dir": h.join("Developer/philium").to_string_lossy(),
+            "updated_at": "2026-04-19T12:00:00Z",
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "<system-reminder>noisy</system-reminder>Make code_outline token optimal"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "Added tree-sitter AST symbol ranges and bidirectional code_refs."}]}
+            ]
+        });
+        std::fs::write(h.join(".jcode/sessions/session_dolphin_1.json"), sess1.to_string()).unwrap();
         h
     }
 
@@ -375,6 +617,16 @@ mod tests {
         assert!(standing.contains("Co-authored-by") && standing.contains("Prefers Philium"), "{standing}");
         assert!(!standing.contains("retired"));
         assert!(memory_save(&ctx, "x", "bogus", None, "t").is_err());
+
+        let shits = session_search_at(&ctx, &home, "code_outline bidirectional", Some(&proj), true, 5).unwrap();
+        let arr = shits.as_array().unwrap();
+        assert_eq!(arr.len(), 1, "{shits}");
+        assert_eq!(arr[0]["source"], "jcode");
+        assert_eq!(arr[0]["name"], "dolphin");
+        assert_eq!(arr[0]["same_repo"], true);
+        let ex_text = arr[0]["excerpts"][0]["text"].as_str().unwrap();
+        assert!(ex_text.contains("Make code_outline token optimal") && !ex_text.contains("noisy"), "{ex_text}");
+
         let _ = std::fs::remove_dir_all(home);
     }
 }

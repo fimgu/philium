@@ -723,8 +723,296 @@ fn dispatch(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, String> 
             }
             Ok(Value::Null)
         }
+        "landscape" => repo_landscape(
+            ctx,
+            &arg_str(&args, "repo_id")?,
+            args["include_prs"].as_bool().unwrap_or(true),
+        ),
         _ => Err(format!("workspace.{method}: unknown method")),
     }
+}
+
+/// Parse `git worktree list --porcelain` on `repo_path` into `(path, branch, head_sha)`.
+/// Discovers all existing worktrees on disk (main checkout, Philium-managed, and external checkouts).
+pub fn git_worktrees(repo_path: &Path) -> Vec<(PathBuf, String, String)> {
+    let Ok(out) = git(repo_path, &["worktree", "list", "--porcelain"]) else {
+        return vec![];
+    };
+    let mut res = vec![];
+    let mut cur_path: Option<PathBuf> = None;
+    let mut cur_head = String::new();
+    let mut cur_branch = String::new();
+    let flush = |res: &mut Vec<(PathBuf, String, String)>, p: Option<PathBuf>, b: &str, h: &str| {
+        if let Some(p) = p {
+            if p.is_dir() {
+                let branch = if b.is_empty() {
+                    format!("detached@{}", &h[..h.len().min(7)])
+                } else {
+                    b.to_string()
+                };
+                res.push((p, branch, h.to_string()));
+            }
+        }
+    };
+    for line in out.lines() {
+        if line.is_empty() {
+            flush(&mut res, cur_path.take(), &cur_branch, &cur_head);
+            cur_head.clear();
+            cur_branch.clear();
+        } else if let Some(w) = line.strip_prefix("worktree ") {
+            cur_path = Some(PathBuf::from(w));
+        } else if let Some(h) = line.strip_prefix("HEAD ") {
+            cur_head = h.trim().to_string();
+        } else if let Some(b) = line.strip_prefix("branch ") {
+            cur_branch = b.trim().trim_start_matches("refs/heads/").to_string();
+        }
+    }
+    flush(&mut res, cur_path.take(), &cur_branch, &cur_head);
+    res
+}
+
+fn path_status(path: &Path, target: &str) -> Value {
+    let dirty = git(path, &["status", "--porcelain=v1", "-z", "--untracked-files=all"]).unwrap_or_default();
+    let dirty_files: Vec<&str> = dirty.split('\0').filter(|s| !s.is_empty()).collect();
+    let counts = git(path, &["rev-list", "--left-right", "--count", &format!("{target}...HEAD")]).unwrap_or_default();
+    let mut n = counts.split_whitespace().filter_map(|v| v.parse::<u64>().ok());
+    let behind = n.next().unwrap_or(0);
+    let ahead = n.next().unwrap_or(0);
+    let last = git(path, &["log", "-1", "--format=%H%n%s%n%an%n%ct"]).unwrap_or_default();
+    let mut l = last.lines();
+    json!({
+        "dirty": !dirty_files.is_empty(),
+        "dirty_count": dirty_files.len(),
+        "dirty_files": dirty_files.into_iter().take(40).collect::<Vec<_>>(),
+        "ahead": ahead,
+        "behind": behind,
+        "last_commit": {
+            "hash": l.next().unwrap_or(""),
+            "subject": l.next().unwrap_or(""),
+            "author": l.next().unwrap_or(""),
+            "timestamp": l.next().unwrap_or(""),
+        }
+    })
+}
+
+/// Discover all worktrees of `repo_id` (main checkout + Philium-managed + pre-existing external git worktrees).
+pub fn discover_worktrees(ctx: &Ctx, repo_id: &str) -> Result<Vec<Value>, String> {
+    let r = ctx.db.query("SELECT * FROM repos WHERE id=?1", [repo_id])?.into_iter().next().ok_or("Unknown repository")?;
+    let repo_path = repo_dir(&r)?;
+    let target = r["integration_branch"]
+        .as_str()
+        .or(r["default_branch"].as_str())
+        .unwrap_or("main");
+    let main_canon = std::fs::canonicalize(&repo_path).unwrap_or_else(|_| repo_path.clone());
+    let managed = ctx.db.query(
+        "SELECT w.*, a.name AS agent_name FROM worktrees w LEFT JOIN agents a ON a.id=w.agent_id WHERE w.repo_id=?1",
+        [repo_id],
+    )?;
+    let mut by_canon: std::collections::HashMap<PathBuf, Value> = std::collections::HashMap::new();
+    for m in managed {
+        if let Some(ps) = m["path"].as_str() {
+            let p = PathBuf::from(ps);
+            let canon = std::fs::canonicalize(&p).unwrap_or(p);
+            by_canon.insert(canon, m);
+        }
+    }
+    let mut out = vec![];
+    for (p, branch, head) in git_worktrees(&repo_path) {
+        let canon = std::fs::canonicalize(&p).unwrap_or_else(|_| p.clone());
+        let st = path_status(&p, target);
+        if let Some(m) = by_canon.remove(&canon) {
+            out.push(json!({
+                "id": m["id"],
+                "repo_id": repo_id,
+                "path": p.to_string_lossy(),
+                "branch": branch,
+                "head": head,
+                "kind": "philium",
+                "agent_id": m["agent_id"],
+                "agent_name": m["agent_name"],
+                "status": st,
+            }));
+        } else if canon == main_canon {
+            out.push(json!({
+                "id": format!("local:{repo_id}"),
+                "repo_id": repo_id,
+                "path": p.to_string_lossy(),
+                "branch": branch,
+                "head": head,
+                "kind": "main",
+                "agent_id": Value::Null,
+                "agent_name": "Main checkout",
+                "status": st,
+            }));
+        } else {
+            let dir_name = p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "external".into());
+            out.push(json!({
+                "id": format!("ext:{repo_id}:{dir_name}"),
+                "repo_id": repo_id,
+                "path": p.to_string_lossy(),
+                "branch": branch,
+                "head": head,
+                "kind": "external",
+                "agent_id": Value::Null,
+                "agent_name": format!("External ({dir_name})"),
+                "status": st,
+            }));
+        }
+    }
+    Ok(out)
+}
+
+fn run_gh_bounded(repo_path: &Path, args: &[&str], timeout_ms: u64) -> Option<Value> {
+    let mut child = Command::new("gh")
+        .args(args)
+        .current_dir(repo_path)
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return None;
+                }
+                let out = child.wait_with_output().ok()?;
+                return serde_json::from_slice(&out.stdout).ok();
+            }
+            Ok(None) => {
+                if start.elapsed() > std::time::Duration::from_millis(timeout_ms) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+/// Cached open + recently merged GitHub PRs via `gh pr list` (60s TTL, 3.5s timeout).
+pub fn github_prs(repo_path: &Path) -> Value {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<PathBuf, (std::time::Instant, Value)>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    if let Ok(g) = cache.lock() {
+        if let Some((t, v)) = g.get(repo_path) {
+            if t.elapsed() < std::time::Duration::from_secs(60) {
+                return v.clone();
+            }
+        }
+    }
+    let open = run_gh_bounded(
+        repo_path,
+        &[
+            "pr",
+            "list",
+            "--state",
+            "open",
+            "--limit",
+            "15",
+            "--json",
+            "number,title,headRefName,baseRefName,author,isDraft,reviewDecision,updatedAt,url",
+        ],
+        3500,
+    )
+    .unwrap_or_else(|| json!([]));
+    let merged = run_gh_bounded(
+        repo_path,
+        &[
+            "pr",
+            "list",
+            "--state",
+            "merged",
+            "--limit",
+            "5",
+            "--json",
+            "number,title,headRefName,baseRefName,author,mergedAt,url",
+        ],
+        2500,
+    )
+    .unwrap_or_else(|| json!([]));
+    let val = json!({ "open": open, "recently_merged": merged });
+    if let Ok(mut g) = cache.lock() {
+        g.insert(repo_path.to_path_buf(), (std::time::Instant::now(), val.clone()));
+    }
+    val
+}
+
+/// Detailed view of a single GitHub PR (`gh pr view <num>`).
+pub fn github_pr_view(repo_path: &Path, pr_number: u64) -> Option<Value> {
+    let n = pr_number.to_string();
+    run_gh_bounded(
+        repo_path,
+        &[
+            "pr",
+            "view",
+            &n,
+            "--json",
+            "number,title,state,isDraft,headRefName,baseRefName,author,body,reviewDecision,statusCheckRollup,reviews,comments,files,url",
+        ],
+        4500,
+    )
+}
+
+/// Complete local + remote + GitHub landscape for a repository.
+pub fn repo_landscape(ctx: &Ctx, repo_id: &str, include_prs: bool) -> Result<Value, String> {
+    let r = ctx.db.query("SELECT * FROM repos WHERE id=?1", [repo_id])?.into_iter().next().ok_or("Unknown repository")?;
+    let p = repo_dir(&r)?;
+    let target = r["integration_branch"]
+        .as_str()
+        .or(r["default_branch"].as_str())
+        .unwrap_or("main");
+    let wts = discover_worktrees(ctx, repo_id).unwrap_or_default();
+    let raw_branches = git(
+        &p,
+        &[
+            "for-each-ref",
+            "--sort=-committerdate",
+            "--format=%(refname)%09%(refname:short)%09%(objectname)%09%(upstream:short)%09%(HEAD)%09%(committerdate:unix)%09%(contents:subject)",
+            "refs/heads",
+            "refs/remotes",
+        ],
+    )
+    .map(|s| parse_branches(&s))
+    .unwrap_or_default();
+    let mut branches = vec![];
+    for mut b in raw_branches.into_iter().take(35) {
+        if let Some(name) = b["name"].as_str() {
+            if name != target && name != format!("origin/{target}") {
+                if let Ok(c) = git(&p, &["rev-list", "--left-right", "--count", &format!("{target}...{name}")]) {
+                    let mut it = c.split_whitespace().filter_map(|x| x.parse::<u64>().ok());
+                    b["behind"] = json!(it.next().unwrap_or(0));
+                    b["ahead"] = json!(it.next().unwrap_or(0));
+                }
+            } else {
+                b["behind"] = json!(0);
+                b["ahead"] = json!(0);
+            }
+        }
+        branches.push(b);
+    }
+    let prs = if include_prs {
+        github_prs(&p)
+    } else {
+        json!({ "open": [], "recently_merged": [] })
+    };
+    Ok(json!({
+        "repo_id": repo_id,
+        "name": r["name"],
+        "path": p.to_string_lossy(),
+        "default_branch": target,
+        "remote_url": r["remote_url"],
+        "worktrees": wts,
+        "branches": branches,
+        "prs": prs,
+    }))
 }
 #[cfg(test)]
 mod tests {

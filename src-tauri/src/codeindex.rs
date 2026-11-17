@@ -1557,9 +1557,13 @@ fn changed_worktrees(ctx: &Ctx, repo_id: Option<&str>) -> Result<Vec<(String, Wt
         params![repo_id],
     )?;
     let mut out = vec![];
+    let mut seen_paths: HashSet<PathBuf> = HashSet::new();
     for r in rows {
         let Some(w) = ctx.db.query("SELECT * FROM worktrees WHERE id=?1", [r["id"].as_str().unwrap_or("")])?.into_iter().next() else { continue };
         let wt = wt_row(ctx, &w);
+        if let Ok(canon) = std::fs::canonicalize(&wt.path) {
+            seen_paths.insert(canon);
+        }
         let Ok(t) = target_for_repo(ctx, w["repo_id"].as_str().unwrap_or(""), Some(wt.clone())) else { continue };
         let Ok(base) = ensure_base(ctx, &t.repo_id, &t.repo_path, &t.branch) else { continue };
         let cs = change_set(&wt.path, &base);
@@ -1568,6 +1572,40 @@ fn changed_worktrees(ctx: &Ctx, repo_id: Option<&str>) -> Result<Vec<(String, Wt
         }
         if let Ok(v) = load_view(ctx, &t.repo_id, &base, Some(&wt.id)) {
             out.push((t.repo_id.clone(), wt, cs, v));
+        }
+    }
+    // Also include the main checkout and any pre-existing external git worktrees so
+    // clashes with non-Philium worktrees (e.g., manual `git worktree add` or Jcode/Herdr) are caught.
+    let repos = ctx.db.query(
+        "SELECT id FROM repos WHERE (?1 IS NULL OR id=?1) LIMIT 30",
+        params![repo_id],
+    ).unwrap_or_default();
+    for rr in repos {
+        let Some(rid) = rr["id"].as_str() else { continue };
+        let Ok(t) = target_for_repo(ctx, rid, None) else { continue };
+        let Ok(base) = ensure_base(ctx, &t.repo_id, &t.repo_path, &t.branch) else { continue };
+        let main_canon = std::fs::canonicalize(&t.repo_path).unwrap_or_else(|_| t.repo_path.clone());
+        for (p, branch, _) in crate::workspace::git_worktrees(&t.repo_path) {
+            let canon = std::fs::canonicalize(&p).unwrap_or_else(|_| p.clone());
+            if !seen_paths.insert(canon.clone()) {
+                continue;
+            }
+            let cs = change_set(&p, &base);
+            if cs.is_empty() {
+                continue;
+            }
+            let (id, label) = if canon == main_canon {
+                (format!("local:{rid}"), format!("main-checkout({branch})"))
+            } else {
+                let d = p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "ext".into());
+                (format!("ext:{rid}:{d}"), format!("worktree:{d}({branch})"))
+            };
+            let wt = Wt { id, path: p, label };
+            if ensure_delta(ctx, &t.repo_id, &base, &wt.id, &wt.path, false).is_ok() {
+                if let Ok(v) = load_view(ctx, &t.repo_id, &base, Some(&wt.id)) {
+                    out.push((t.repo_id.clone(), wt, cs, v));
+                }
+            }
         }
     }
     Ok(out)
@@ -1857,18 +1895,294 @@ pub fn prompt_map(ctx: &Ctx, repo_id: &str, wt_path: Option<&Path>) -> Option<St
         return None;
     }
     let map = render_map(&view, None, 2, 550);
+    let mut landscape_block = String::new();
+    if let Ok(land) = crate::workspace::repo_landscape(ctx, repo_id, false) {
+        let mut lines = vec![];
+        let def_br = land["default_branch"].as_str().unwrap_or("main");
+        if let Some(wts) = land["worktrees"].as_array() {
+            if !wts.is_empty() {
+                lines.push(format!("worktrees ({}, base `{}`):", wts.len(), def_br));
+                for w in wts.iter().take(8) {
+                    let kind = w["kind"].as_str().unwrap_or("wt");
+                    let br = w["branch"].as_str().unwrap_or("?");
+                    let path = w["path"].as_str().unwrap_or("");
+                    let ahead = w["status"]["ahead"].as_u64().unwrap_or(0);
+                    let behind = w["status"]["behind"].as_u64().unwrap_or(0);
+                    let dirty = w["status"]["dirty_count"].as_u64().unwrap_or(0);
+                    let subj = w["status"]["last_commit"]["subject"].as_str().unwrap_or("");
+                    lines.push(format!(
+                        "  [{kind}] {br} ↑{ahead} ↓{behind} dirty:{dirty} @ {path} — {subj}"
+                    ));
+                }
+            }
+        }
+        if let Some(brs) = land["branches"].as_array() {
+            let diverged: Vec<_> = brs
+                .iter()
+                .filter(|b| b["ahead"].as_u64().unwrap_or(0) > 0 && b["kind"].as_str() == Some("local"))
+                .take(8)
+                .collect();
+            if !diverged.is_empty() {
+                lines.push("diverged local branches:".into());
+                for b in diverged {
+                    lines.push(format!(
+                        "  {} ↑{} ↓{} — {}",
+                        b["name"].as_str().unwrap_or(""),
+                        b["ahead"].as_u64().unwrap_or(0),
+                        b["behind"].as_u64().unwrap_or(0),
+                        b["subject"].as_str().unwrap_or("")
+                    ));
+                }
+            }
+        }
+        if !lines.is_empty() {
+            landscape_block = format!(
+                "\n## Repo landscape (auto-discovered worktrees & active branches)\n\
+                 Use `repo_context {{}}` for full worktrees/branches/GitHub PRs, `repo_context {{branch}}` or `repo_context {{pr}}` for structural AST diff of any branch/PR, and `session_search {{q}}` to recall past Philium/Jcode/Claude sessions on this repo.\n\
+                 ```\n{}\n```\n",
+                lines.join("\n")
+            );
+        }
+    }
     Some(format!(
-        "\n## Codebase map (auto-indexed by tree-sitter, ranked by symbol centrality)\n\
+        "{}\n## Codebase map (auto-indexed by tree-sitter, ranked by symbol centrality)\n\
          Use `code_outline` / `code_map {{path}}` for a file's full symbol table, `code_symbol {{symbol}}` to read a symbol's exact AST source + callers/callees in one call, `code_find` to search, and `code_refs` / `code_impact` for call graph and blast radius.\n\
          ```\n{}\
          ```\n",
-        map
+        landscape_block, map
     ))
+}
+
+fn render_repo_context(ctx: &Ctx, l: &Loaded, a: &Value, cap: usize) -> String {
+    let mut b = Out::new(cap);
+    let include_prs = a["include_prs"].as_bool().unwrap_or(true);
+    if let Some(pr_num) = a["pr"].as_u64() {
+        if let Some(pr) = crate::workspace::github_pr_view(&l.t.repo_path, pr_num) {
+            b.line(format!(
+                "PR #{}: {} [{} / {}] ({} -> {}) by @{}",
+                pr["number"].as_u64().unwrap_or(pr_num),
+                pr["title"].as_str().unwrap_or(""),
+                pr["state"].as_str().unwrap_or(""),
+                pr["reviewDecision"].as_str().unwrap_or("PENDING"),
+                pr["headRefName"].as_str().unwrap_or(""),
+                pr["baseRefName"].as_str().unwrap_or(""),
+                pr["author"]["login"].as_str().unwrap_or("unknown"),
+            ));
+            if let Some(url) = pr["url"].as_str() {
+                b.line(format!("url: {url}"));
+            }
+            if let Some(body) = pr["body"].as_str().filter(|s| !s.trim().is_empty()) {
+                let preview: String = body.lines().take(20).collect::<Vec<_>>().join("\n  ");
+                b.line(format!("description:\n  {preview}"));
+            }
+            if let Some(checks) = pr["statusCheckRollup"].as_array().filter(|c| !c.is_empty()) {
+                b.line(format!("checks ({}):", checks.len()));
+                for c in checks.iter().take(15) {
+                    let name = c["name"].as_str().or(c["context"].as_str()).unwrap_or("check");
+                    let state = c["conclusion"].as_str().or(c["status"].as_str()).or(c["state"].as_str()).unwrap_or("?");
+                    b.line(format!("  [{state}] {name}"));
+                }
+            }
+            if let Some(files) = pr["files"].as_array().filter(|f| !f.is_empty()) {
+                b.line(format!("changed files ({}):", files.len()));
+                for f in files.iter().take(25) {
+                    b.line(format!(
+                        "  {} (+{} -{})",
+                        f["path"].as_str().unwrap_or(""),
+                        f["additions"].as_u64().unwrap_or(0),
+                        f["deletions"].as_u64().unwrap_or(0)
+                    ));
+                }
+            }
+            if let Some(reviews) = pr["reviews"].as_array().filter(|r| !r.is_empty()) {
+                b.line(format!("reviews ({}):", reviews.len()));
+                for r in reviews.iter().rev().take(8) {
+                    let author = r["author"]["login"].as_str().unwrap_or("?");
+                    let state = r["state"].as_str().unwrap_or("");
+                    let body = r["body"].as_str().unwrap_or("").lines().next().unwrap_or("");
+                    b.line(format!("  @{author} [{state}]: {body}"));
+                }
+            }
+            if let Some(head_ref) = pr["headRefName"].as_str() {
+                render_branch_ast_diff(&mut b, l, head_ref);
+            }
+        } else {
+            b.line(format!("PR #{pr_num}: could not fetch via `gh pr view` (offline or not a GitHub repo)"));
+        }
+        return b.finish("repo_context");
+    }
+    if let Some(branch_ref) = a["branch"].as_str().filter(|s| !s.trim().is_empty()) {
+        render_branch_ast_diff(&mut b, l, branch_ref.trim());
+        return b.finish("code_symbol <name> to inspect any changed symbol");
+    }
+    if let Ok(land) = crate::workspace::repo_landscape(ctx, &l.t.repo_id, include_prs) {
+        let def_br = land["default_branch"].as_str().unwrap_or(&l.t.branch);
+        b.line(format!(
+            "repo: {} ({}) default_branch={def_br}",
+            land["name"].as_str().unwrap_or(""),
+            land["path"].as_str().unwrap_or("")
+        ));
+        if let Some(wts) = land["worktrees"].as_array() {
+            b.line(format!("\nworktrees ({}):", wts.len()));
+            for w in wts {
+                let kind = w["kind"].as_str().unwrap_or("wt");
+                let br = w["branch"].as_str().unwrap_or("?");
+                let path = w["path"].as_str().unwrap_or("");
+                let agent = w["agent_name"].as_str().unwrap_or("");
+                let ahead = w["status"]["ahead"].as_u64().unwrap_or(0);
+                let behind = w["status"]["behind"].as_u64().unwrap_or(0);
+                let dirty = w["status"]["dirty_count"].as_u64().unwrap_or(0);
+                let subj = w["status"]["last_commit"]["subject"].as_str().unwrap_or("");
+                b.line(format!(
+                    "  [{kind}] branch={br} ↑{ahead} ↓{behind} dirty={dirty} ({agent}) @ {path} — {subj}"
+                ));
+                if let Some(df) = w["status"]["dirty_files"].as_array().filter(|d| !d.is_empty()) {
+                    let sample: Vec<&str> = df.iter().filter_map(|x| x.as_str()).take(8).collect();
+                    b.line(format!("    dirty files: {}", sample.join(", ")));
+                }
+            }
+        }
+        if let Ok(clashes) = clash_changes(ctx, Some(&l.t.repo_id)) {
+            if !clashes.is_empty() {
+                b.line(format!("\nactive cross-worktree clashes ({}):", clashes.len()));
+                for c in clashes {
+                    b.line(format!("  [{}] {} x {}: {}", c.severity, c.a, c.b, c.detail.join("; ")));
+                }
+            }
+        }
+        if let Some(brs) = land["branches"].as_array() {
+            b.line(format!("\nbranches (top {} by recency vs {def_br}):", brs.len().min(20)));
+            for br in brs.iter().take(20) {
+                let kind = br["kind"].as_str().unwrap_or("local");
+                let name = br["name"].as_str().unwrap_or("");
+                let ahead = br["ahead"].as_u64().unwrap_or(0);
+                let behind = br["behind"].as_u64().unwrap_or(0);
+                let subj = br["subject"].as_str().unwrap_or("");
+                b.line(format!("  [{kind}] {name} ↑{ahead} ↓{behind} — {subj}"));
+            }
+        }
+        if let Some(open) = land["prs"]["open"].as_array().filter(|p| !p.is_empty()) {
+            b.line(format!("\nopen GitHub PRs ({}):", open.len()));
+            for p in open {
+                let draft = if p["isDraft"].as_bool() == Some(true) { " [DRAFT]" } else { "" };
+                let rev = p["reviewDecision"].as_str().filter(|s| !s.is_empty()).unwrap_or("PENDING");
+                b.line(format!(
+                    "  #{} {}{} ({} -> {}) [{}] by @{}",
+                    p["number"].as_u64().unwrap_or(0),
+                    p["title"].as_str().unwrap_or(""),
+                    draft,
+                    p["headRefName"].as_str().unwrap_or(""),
+                    p["baseRefName"].as_str().unwrap_or(""),
+                    rev,
+                    p["author"]["login"].as_str().unwrap_or("?"),
+                ));
+            }
+        }
+        if let Some(merged) = land["prs"]["recently_merged"].as_array().filter(|p| !p.is_empty()) {
+            b.line(format!("\nrecently merged PRs ({}):", merged.len()));
+            for p in merged {
+                b.line(format!(
+                    "  #{} {} ({}) merged {}",
+                    p["number"].as_u64().unwrap_or(0),
+                    p["title"].as_str().unwrap_or(""),
+                    p["headRefName"].as_str().unwrap_or(""),
+                    p["mergedAt"].as_str().unwrap_or(""),
+                ));
+            }
+        }
+    }
+    b.finish("repo_context {branch} or repo_context {pr} for AST diff")
+}
+
+fn sym_body<'a>(lines: &[&'a str], s: &Sym) -> String {
+    let start = (s.line.saturating_sub(1) as usize).min(lines.len());
+    let end = (s.end as usize).min(lines.len());
+    lines.get(start..end).map(|sl| sl.join("\n")).unwrap_or_default()
+}
+
+fn render_branch_ast_diff(b: &mut Out, l: &Loaded, branch_ref: &str) {
+    let repo_path = &l.t.repo_path;
+    let resolved = if git(repo_path, &["rev-parse", "--verify", branch_ref]).is_ok() {
+        branch_ref.to_string()
+    } else if git(repo_path, &["rev-parse", "--verify", &format!("origin/{branch_ref}")]).is_ok() {
+        format!("origin/{branch_ref}")
+    } else {
+        b.line(format!("branch `{branch_ref}` not found locally or under origin/*"));
+        return;
+    };
+    let mb = git(repo_path, &["merge-base", &l.t.branch, &resolved])
+        .unwrap_or_else(|_| l.base.clone());
+    b.line(format!(
+        "\nbranch comparison: `{resolved}` vs `{}` (merge-base {})",
+        l.t.branch,
+        &mb[..mb.len().min(10)]
+    ));
+    if let Ok(log) = git(repo_path, &["log", "--oneline", "-n", "20", &format!("{mb}..{resolved}")]) {
+        let lines: Vec<&str> = log.lines().filter(|s| !s.is_empty()).collect();
+        b.line(format!("commits ahead ({}):", lines.len()));
+        for c in lines {
+            b.line(format!("  {c}"));
+        }
+    }
+    let Ok(names) = git(repo_path, &["diff", "-z", "--name-only", &mb, &resolved]) else {
+        return;
+    };
+    let files: Vec<&str> = names.split('\0').filter(|s| !s.is_empty()).collect();
+    b.line(format!("changed files ({}):", files.len()));
+    let mut touched_syms: Vec<String> = vec![];
+    for f in files.iter().take(30) {
+        b.line(format!("  {f}"));
+        if lang_of(f).is_none() {
+            continue;
+        }
+        let new_src = git(repo_path, &["show", &format!("{resolved}:{f}")]).ok();
+        let old_src = git(repo_path, &["show", &format!("{mb}:{f}")]).ok();
+        match (old_src, new_src) {
+            (Some(ob), Some(nb)) => {
+                let (op_syms, _) = parse(f, &ob);
+                let (np_syms, _) = parse(f, &nb);
+                let o_lines: Vec<&str> = ob.lines().collect();
+                let n_lines: Vec<&str> = nb.lines().collect();
+                let old_map: HashMap<(String, String), &Sym> =
+                    op_syms.iter().map(|s| ((s.name.clone(), s.parent.clone()), s)).collect();
+                for ns in &np_syms {
+                    let k = (ns.name.clone(), ns.parent.clone());
+                    let label = if ns.parent.is_empty() {
+                        ns.name.clone()
+                    } else {
+                        format!("{}.{}", ns.parent, ns.name)
+                    };
+                    match old_map.get(&k) {
+                        None => touched_syms.push(format!("+ {f}:{} {} {label}", ns.line, ns.kind)),
+                        Some(os) => {
+                            if sym_body(&o_lines, os) != sym_body(&n_lines, ns) {
+                                touched_syms.push(format!("~ {f}:{} {} {label}", ns.line, ns.kind));
+                            }
+                        }
+                    }
+                }
+            }
+            (None, Some(nb)) => {
+                let (np_syms, _) = parse(f, &nb);
+                for ns in np_syms.iter().take(10) {
+                    touched_syms.push(format!("+ {f}:{} {} {}", ns.line, ns.kind, ns.name));
+                }
+            }
+            _ => {}
+        }
+    }
+    if !touched_syms.is_empty() {
+        b.line(format!("AST symbols added/modified on `{resolved}` ({}):", touched_syms.len()));
+        for s in touched_syms.iter().take(35) {
+            b.line(format!("  {s}"));
+        }
+    }
 }
 
 pub fn mcp_tools() -> Vec<Value> {
     let s = json!({ "type": "string" });
     let i = json!({ "type": "integer" });
+    let b = json!({ "type": "boolean" });
     let t = |name: &str, desc: &str, props: Value, req: &[&str]| {
         json!({ "name": name, "description": desc, "inputSchema": { "type": "object", "properties": props, "required": req } })
     };
@@ -1885,6 +2199,8 @@ pub fn mcp_tools() -> Vec<Value> {
           json!({ "symbol": s }), &["symbol"]),
         t("code_impact", "What your uncommitted and committed changes touch: changed symbols vs merge-base, 2-level dependent callers (`exact` and `possible`), plus any active symbol/file clashes with other agents' worktrees. Run before finishing.",
           json!({}), &[]),
+        t("repo_context", "Complete local + remote + GitHub repository landscape: all git worktrees (main checkout, Philium agents, and external git worktrees) with dirty files and ahead/behind counts, active cross-worktree clashes, local/remote branches, and open/merged GitHub PRs. Pass `branch` (e.g. 'feat/x' or 'origin/feat/x') for a structural AST symbol diff of that branch vs default_branch, or `pr` (PR number) for full GitHub PR details, CI checks, reviews, and AST diff.",
+          json!({ "branch": s, "pr": i, "include_prs": b }), &[]),
     ]
 }
 
@@ -1914,6 +2230,7 @@ pub async fn mcp_call(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Resu
             }
             imp
         }
+        "repo_context" => render_repo_context(ctx, &l, &a, cap),
         _ => return Err(format!("unknown tool {name}")),
     };
     Ok(Value::String(l.header.clone() + &text))
