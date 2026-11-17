@@ -30,6 +30,7 @@ mod reaper;
 mod sandbox;
 mod secrets;
 mod drafts;
+mod capture;
 mod selfdev;
 mod stats;
 mod terminals;
@@ -367,17 +368,54 @@ fn main() {
             });
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![hal, rpc, drafts::drafts_load, drafts::drafts_save])
+        .invoke_handler(tauri::generate_handler![hal, rpc, drafts::drafts_load, drafts::drafts_save, drafts::drafts_put_blob, drafts::drafts_blob, capture::capture_screenshot, capture::agent_attachment])
         .build(tauri::generate_context!())
         .expect("error while building Philium");
     tauri_app.run(|handle, event| {
         if let RunEvent::Exit = event {
             if let Some(app) = handle.try_state::<App>() {
-                agents::shutdown(&app.ctx);
-                terminals::shutdown(&app.ctx);
-                let _ = reaper::shutdown(&app.ctx);
-                if let Some(h) = app.ctx.desk() {
-                    h.stop();
+                // Drop UI emits first so the shutdown thread can never queue
+                // into tao while the main thread waits for it.
+                app.ctx.begin_exit();
+                // Run shutdown work on a dedicated OS thread and join with a
+                // bounded timeout.
+                //
+                // Root cause: RunEvent::Exit fires on the main thread while tao's
+                // event-dispatch loop is active and holds its internal event-queue
+                // mutex.  The shutdown helpers call ctx.emit() (set_state →
+                // "agents:changed", reaper::release → "reaper:changed", log_event →
+                // "event"), which routes through AppHandle::emit →
+                // tao::AppState::queue_event → pthread_mutex_lock — the same mutex
+                // the event-dispatch loop already holds.  The main thread deadlocks
+                // on itself.  Moving the work off the main thread breaks that cycle.
+                //
+                // Additional benefit: Hal::stop sleeps up to 3 s and
+                // reaper::stop_process sleeps up to 5 s per process; keeping those
+                // sleeps off the main thread prevents the UI from stalling visibly
+                // while waiting for child processes.
+                let ctx = app.ctx.clone();
+                let handle = std::thread::Builder::new()
+                    .name("philium-shutdown".into())
+                    .spawn(move || {
+                        agents::shutdown(&ctx);
+                        terminals::shutdown(&ctx);
+                        let _ = reaper::shutdown(&ctx);
+                        if let Some(h) = ctx.desk() {
+                            h.stop();
+                        }
+                    });
+                if let Ok(thread) = handle {
+                    // Bounded wait: HAL stop takes up to 3 s, reaper stop up to
+                    // 5 s. Past the deadline we exit anyway; child processes are
+                    // in Philium's process group and the reaper ledger is
+                    // reconciled on next launch.
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                    while !thread.is_finished() && std::time::Instant::now() < deadline {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    if thread.is_finished() {
+                        let _ = thread.join();
+                    }
                 }
             }
         }

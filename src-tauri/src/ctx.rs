@@ -40,6 +40,10 @@ pub struct Ctx {
     pub changes: tokio::sync::broadcast::Sender<String>,
     /// The desk HAL (plain chat, subscription discovery). Err = start failure.
     pub desk: std::sync::RwLock<Result<Arc<crate::hal::Hal>, String>>,
+    /// Set when the app is exiting. UI emits are dropped from then on: the
+    /// webview is going away, and emitting from a shutdown thread would wait
+    /// on tao's event-queue mutex that the exiting main thread holds.
+    exiting: std::sync::atomic::AtomicBool,
 }
 
 impl Ctx {
@@ -55,7 +59,12 @@ impl Ctx {
             handle: OnceLock::new(),
             changes: tokio::sync::broadcast::channel(64).0,
             desk: std::sync::RwLock::new(Err("starting".into())),
+            exiting: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    pub fn begin_exit(&self) {
+        self.exiting.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn set_handle(&self, h: tauri::AppHandle) {
@@ -72,6 +81,9 @@ impl Ctx {
 
     /// Push an event to the UI. No-op in tests (no app handle).
     pub fn emit(&self, topic: &str, payload: impl serde::Serialize + Clone) {
+        if self.exiting.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
         if let Some(h) = self.handle.get() {
             let _ = h.emit(topic, payload);
         }
