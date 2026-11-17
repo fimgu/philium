@@ -10,7 +10,8 @@ extern "C" {
     fn CGRequestScreenCaptureAccess() -> bool;
 }
 
-pub const SCREEN_PERMISSION: &str = "Philium needs Screen Recording permission to take screenshots. Turn on Philium in System Settings > Privacy & Security > Screen & System Audio Recording, then quit and reopen Philium. You can still paste, drop or choose images.";
+/// Stable code the composer maps to a notice with an "Open Settings" action.
+pub const SCREEN_PERMISSION: &str = "screen-permission";
 
 /// macOS only grants capture to the responsible app (Philium), not to the
 /// screencapture child. Without it the tool exits as if cancelled, so check
@@ -82,4 +83,14 @@ pub async fn agent_attachment(app: tauri::State<'_, crate::App>, id: String, sha
         .await
         .map_err(|_| "Attachment worker failed".to_string())?
         .map(|(_, bytes)| Response::new(bytes))
+}
+
+/// Opens the Screen Recording pane of System Settings. Fixed URL, no input.
+#[tauri::command]
+pub async fn open_screen_settings() -> Result<(), String> {
+    std::process::Command::new("/usr/bin/open")
+        .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")
+        .status()
+        .map_err(|_| "Cannot open System Settings".to_string())
+        .map(|_| ())
 }

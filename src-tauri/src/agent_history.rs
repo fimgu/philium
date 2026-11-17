@@ -22,13 +22,19 @@ pub(super) fn attachment(ctx: &Ctx, raw: &str, sha256: &str) -> Result<(String, 
         return Err("invalid attachment reference".into());
     }
     let (path, session) = locate(ctx, raw)?.ok_or("agent has no saved session")?;
-    with_db(&path, |db| {
+    attachment_at(&path, &session, sha256)
+}
+
+/// Scoped read against one HAL database: only blobs referenced by a user
+/// message's `$.images` in `session`. Shared with the real-HAL e2e test.
+pub(crate) fn attachment_at(path: &Path, session: &str, sha256: &str) -> Result<(String, Vec<u8>), String> {
+    with_db(path, |db| {
         let found: Option<(String, i64)> = db
             .query_row(
                 "SELECT b.media_type, length(b.data) FROM blobs b WHERE b.session_id=?1 AND b.sha256=?2 AND EXISTS (
                     SELECT 1 FROM messages m, json_each(m.content, '$.images') i
                     WHERE m.session_id=b.session_id AND m.role='user' AND json_extract(i.value, '$.sha256')=b.sha256)",
-                [&session, sha256],
+                [session, sha256],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()
@@ -41,7 +47,7 @@ pub(super) fn attachment(ctx: &Ctx, raw: &str, sha256: &str) -> Result<(String, 
             return Err("attachment type cannot be previewed".into());
         }
         let bytes: Vec<u8> = db
-            .query_row("SELECT data FROM blobs WHERE session_id=?1 AND sha256=?2", [&session, sha256], |r| r.get(0))
+            .query_row("SELECT data FROM blobs WHERE session_id=?1 AND sha256=?2", [session, sha256], |r| r.get(0))
             .map_err(|e| e.to_string())?;
         Ok((media, bytes))
     })

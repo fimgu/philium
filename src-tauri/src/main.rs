@@ -368,7 +368,7 @@ fn main() {
             });
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![hal, rpc, drafts::drafts_load, drafts::drafts_save, drafts::drafts_put_blob, drafts::drafts_blob, capture::capture_screenshot, capture::agent_attachment])
+        .invoke_handler(tauri::generate_handler![hal, rpc, drafts::drafts_load, drafts::drafts_save, drafts::drafts_put_blob, drafts::drafts_blob, capture::capture_screenshot, capture::open_screen_settings, capture::agent_attachment])
         .build(tauri::generate_context!())
         .expect("error while building Philium");
     tauri_app.run(|handle, event| {
@@ -589,6 +589,54 @@ mod e2e {
         assert!(failed.to_string().contains("Philium guard blocked"), "{failed}");
         assert_eq!(seen.lk().len(), before, "blocked request reached upstream");
 
+        h.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Images through the real bundled HAL: the gateway forwards image content
+    /// upstream, HAL stores the blob, and Philium's scoped transcript reader
+    /// returns exactly those bytes for the user message and nothing else.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sent_image_reaches_model_and_renders_from_hal_history() {
+        if !hal::server_path().exists() {
+            eprintln!("skipping: no sidecar at {}", hal::server_path().display());
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("philium-e2e-img-{}", hal::random_token()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (up_url, seen) = upstream(dir.join("unused")).await;
+        let gw = Gateway::new(hal::random_token(), None);
+        let gl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gateway_url = format!("http://{}", gl.local_addr().unwrap());
+        let r = gw.router();
+        tokio::spawn(async move { axum::serve(gl, r).await.unwrap() });
+        let ctx = Ctx::new(db::Db::memory(), dir.join("data"), dir.join("root"), gw.clone(), gateway_url);
+        let p = Provider { id: "cn".into(), name: "CN".into(), kind: Kind::OpenaiChat, base_url: up_url, trusted: false, guard: GuardMode::Redact, enabled: true, default_model: Some("up-model".into()) };
+        providers::upsert(&ctx, &p).unwrap();
+        gw.set_routes(vec![Route { provider: p.clone(), api_key: Some("KEY".into()) }]);
+        let c2 = ctx.clone();
+        tokio::task::spawn_blocking(move || refresh_desk(&c2)).await.unwrap();
+        let h = ctx.desk().expect("desk HAL starts");
+        let ws = dir.join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let s = h.call(reqwest::Method::POST, "/sessions", Some(chat_session_body(&ws, "img", None))).await.unwrap();
+        let sid = s["id"].as_str().or(s["session"]["id"].as_str()).unwrap().to_string();
+        // 1x1 PNG, the same shape the composer's sendableImages() produces.
+        let png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+        let png = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, png_b64).unwrap();
+        let sha: String = { use sha2::Digest; sha2::Sha256::digest(&png).iter().map(|b| format!("{b:02x}")).collect() };
+        h.call(reqwest::Method::POST, &format!("/sessions/{sid}/messages"),
+            Some(agents::message_body("what colour is this", json!([{ "data": png_b64, "media_type": "image/png", "name": "dot.png" }])))).await.unwrap();
+        let evs = wait_turn(&h, &sid).await;
+        let created = evs.as_array().unwrap().iter().find(|e| e["type"] == "message.created" && e["role"] == "user").cloned().expect("user message event");
+        assert_eq!(created["attachments"][0]["sha256"], sha, "event lacks attachment ref the UI renders: {created}");
+        assert!(seen.lk().iter().any(|(_, b)| b.contains(png_b64) || b.contains("image_url")), "image never reached upstream");
+        let db_path = std::fs::read_dir(dir.join("data/desk")).unwrap().flatten()
+            .map(|e| e.path().join("hal.db")).find(|p| p.exists()).expect("desk hal.db");
+        let (media, bytes) = agents::history::attachment_at(&db_path, &sid, &sha).expect("scoped read");
+        assert_eq!((media.as_str(), bytes), ("image/png", png));
+        assert!(agents::history::attachment_at(&db_path, "other-session", &sha).is_err(), "peer session could read image");
+        println!("real HAL image: forwarded upstream, stored as {sha}, scoped read ok, peer denied");
         h.stop();
         let _ = std::fs::remove_dir_all(&dir);
     }

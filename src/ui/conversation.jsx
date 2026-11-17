@@ -297,6 +297,8 @@ export function Composer(props) {
   const sending = () => record().sending();
   const [over, setOver] = createSignal(false);
   const [notice, setNotice] = createSignal("");
+  // Screen Recording not granted: macOS gives capture rights to Philium itself, never to its screencapture child.
+  const [permission, setPermission] = createSignal(false);
   const [adding, setAdding] = createSignal(0);
   const [menu, setMenu] = createSignal(false);
   let input, picker;
@@ -329,7 +331,15 @@ export function Composer(props) {
       if (!size) return; // Cancelled.
       const stamp = new Date().toTimeString().slice(0, 8).replaceAll(":", ".");
       await add([new File([bytes], `Screenshot ${stamp}.png`, { type: "image/png" })]);
-    } catch (e) { setNotice(String(e?.message ?? e)); }
+    } catch (e) {
+      const msg = String(e?.message ?? e);
+      if (msg === "screen-permission") setPermission(true);
+      else setNotice(msg);
+    }
+  };
+  const openScreenSettings = async () => {
+    try { const { invoke } = await import("@tauri-apps/api/core"); await invoke("open_screen_settings"); }
+    catch (e) { setNotice(String(e?.message ?? e)); }
   };
   createEffect(() => {
     const el = props.dropTarget?.();
@@ -395,7 +405,7 @@ export function Composer(props) {
             <div class="composer-menu" role="menu" onKeyDown={(e) => e.key === "Escape" && setMenu(false)}>
               <button type="button" role="menuitem" onClick={() => { setMenu(false); picker.click(); }}><Icon name="image" size={13} /> Choose images…</button>
               <button type="button" role="menuitem" onClick={capture}><Icon name="camera" size={13} /> Take screenshot…</button>
-              <div class="composer-menu-hint">Paste or drop images anywhere · PNG, JPEG, GIF, WebP · up to {MAX_IMAGES}</div>
+              <div class="composer-menu-hint">Paste or drop images anywhere · PNG, JPEG, GIF, WebP · up to {MAX_IMAGES}<br />No permission needed: press <kbd>⌃⇧⌘4</kbd>, then <kbd>⌘V</kbd> here</div>
             </div>
           </Show>
           <input ref={picker} type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden onChange={(e) => { add(e.currentTarget.files); e.currentTarget.value = ""; }} />
@@ -414,6 +424,11 @@ export function Composer(props) {
             props.effortPending ? "Updating effort…" :
             props.busy ? "Working. Your draft is kept. Stop interrupts." : ""}>
             <span class="composer-notice" role="alert">{notice()} <button type="button" class="link" onClick={() => setNotice("")}>Dismiss</button></span>
+          </Show>
+          <Show when={permission()}>
+            <span class="composer-notice composer-permission" role="alert">
+              Screenshots need Screen Recording for Philium. <button type="button" class="link" onClick={openScreenSettings}>Open Settings</button>, turn on Philium, then reopen it. Or press <kbd>⌃⇧⌘4</kbd> and paste with <kbd>⌘V</kbd>, no permission needed. <button type="button" class="link" onClick={() => setPermission(false)}>Dismiss</button>
+            </span>
           </Show>
           <Show when={record().error()}><span class="composer-notice" role="alert">{record().error()} <button type="button" class="link" disabled={record().loading() || record().pending()} onClick={() => record().retry?.()}>Retry</button></span></Show>
         </div>

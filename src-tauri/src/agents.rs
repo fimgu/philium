@@ -40,7 +40,7 @@ use crate::hal::{self, Hal};
 use crate::providers::{self, ConfigOpts};
 
 #[path = "agent_history.rs"]
-mod history;
+pub(crate) mod history;
 
 /// UI-only: image bytes the user sent in this agent's own conversation.
 pub fn sent_attachment(ctx: &Ctx, id: &str, sha256: &str) -> Result<(String, Vec<u8>), String> {

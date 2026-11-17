@@ -88,7 +88,8 @@ const stub = (fx, setName) => {
       if (cmd === "drafts_load") return structuredClone(window.__test.drafts?.[a.key] ?? { text: "", images: [] });
       if (cmd === "drafts_save") { (window.__test.drafts ??= {})[a.key] = structuredClone(a.draft); return null; }
       if (cmd === "agent_attachment") { (window.__test.attachmentCalls ??= []).push(a); const b = window.__test.blobs?.get(a.sha256); if (!b) throw "attachment not found in this conversation"; return b; }
-      if (cmd === "capture_screenshot") return window.__test.screenshot ?? new Uint8Array();
+      if (cmd === "capture_screenshot") { window.__test.captures = (window.__test.captures ?? 0) + 1; if (window.__test.screenshot === "denied") throw "screen-permission"; return window.__test.screenshot ?? new Uint8Array(); }
+      if (cmd === "open_screen_settings") { window.__test.settingsOpened = (window.__test.settingsOpened ?? 0) + 1; return null; }
       if (fixtures.__delay) await new Promise((r) => setTimeout(r, fixtures.__delay));
       if (fixtures.__fail && (cmd === "rpc" || cmd === "hal")) {
         window.__n = (window.__n ?? 0) + 1;

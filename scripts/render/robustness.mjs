@@ -25,6 +25,38 @@ export async function checkAgentMessaging(page) {
       await wait();
     };
     if (!input()) return ['composer missing'];
+    // Every attach path, headless: picker, drop, screenshot ok/cancel/denied.
+    const png = () => Uint8Array.from(atob('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aE3cAAAAASUVORK5CYII='), (c) => c.charCodeAt(0));
+    const count = () => document.querySelectorAll('.composer-images img').length;
+    const menuItem = (label) => { const btn = document.querySelector('[aria-label="Attach"]'); if (btn.getAttribute('aria-expanded') !== 'true') btn.click(); return [...document.querySelectorAll('.composer-menu [role="menuitem"]')].find((b) => b.textContent.includes(label)); };
+    const picker = document.querySelector('.composer input[type="file"]');
+    const chosen = new DataTransfer(); chosen.items.add(new File([png()], 'picked.png', { type: 'image/png' }));
+    if (!menuItem('Choose images')) errors.push('Choose images menu item missing');
+    picker.files = chosen.files; picker.dispatchEvent(new Event('change', { bubbles: true })); await wait();
+    if (count() !== 1) errors.push(`picker did not attach (${count()})`);
+    const dropped = new DataTransfer(); dropped.items.add(new File([png()], 'dropped.png', { type: 'image/png' }));
+    const target = document.querySelector('.agent-main') ?? input();
+    for (const type of ['dragenter', 'dragover', 'drop']) target.dispatchEvent(new DragEvent(type, { dataTransfer: dropped, bubbles: true, cancelable: true }));
+    await wait();
+    if (count() !== 2) errors.push(`drop did not attach (${count()})`);
+    const svg = new DataTransfer(); svg.items.add(new File(['<svg/>'], 'x.svg', { type: 'image/svg+xml' }));
+    for (const type of ['dragenter', 'dragover', 'drop']) target.dispatchEvent(new DragEvent(type, { dataTransfer: svg, bubbles: true, cancelable: true }));
+    await wait();
+    if (count() !== 2 || !/Unsupported image type/.test(document.querySelector('.composer-status')?.textContent ?? '')) errors.push('unsupported drop not rejected visibly');
+    window.__test.screenshot = png(); menuItem('Take screenshot').click(); await wait();
+    if (count() !== 3 || !document.querySelector('.composer-images img[alt^="Screenshot "]')) errors.push('screenshot did not attach');
+    window.__test.screenshot = new Uint8Array(); menuItem('Take screenshot').click(); await wait();
+    if (count() !== 3 || document.querySelector('.composer-permission')) errors.push('cancelled screenshot changed draft or showed error');
+    window.__test.screenshot = 'denied'; menuItem('Take screenshot').click(); await wait();
+    const perm = document.querySelector('.composer-permission');
+    if (!perm || !/Screen Recording/.test(perm.textContent) || !/⌃⇧⌘4/.test(perm.textContent)) errors.push('permission notice missing guidance');
+    [...(perm?.querySelectorAll('button') ?? [])].find((b) => b.textContent === 'Open Settings')?.click(); await wait();
+    if (window.__test.settingsOpened !== 1) errors.push('Open Settings did not invoke');
+    [...(perm?.querySelectorAll('button') ?? [])].find((b) => b.textContent === 'Dismiss')?.click(); await wait();
+    if (document.querySelector('.composer-permission')) errors.push('permission notice not dismissible');
+    window.__test.screenshot = undefined;
+    while (document.querySelector('.composer-images [aria-label^="Remove"]')) { document.querySelector('.composer-images [aria-label^="Remove"]').click(); await wait(); }
+    if (count() !== 0) errors.push('could not remove attachments');
     value('keep this draft');
     await paste('first.png');
     const navigate = (label) => [...document.querySelectorAll('.nav-item')].find((b) => b.textContent.trim() === label)?.click();
@@ -61,6 +93,8 @@ export async function checkAgentMessaging(page) {
     if (images.join() !== 'second.png') errors.push(`wrong attachments after acceptance: ${images}`);
     const retry = window.__test.sends[1];
     if (retry?.text !== 'keep this draft' || retry?.images?.[0]?.name !== 'first.png') errors.push('retry payload lost original draft');
+    const img = retry?.images?.[0] || {};
+    if (!/^[A-Za-z0-9+/]+=*$/.test(img.data || '') || !/^image\//.test(img.media_type || '') || JSON.stringify(retry).includes('blob:')) errors.push(`send payload not base64 image: ${JSON.stringify(img).slice(0, 120)}`);
     enter(); await wait(); window.__test.releaseSend?.(); await wait();
     if (input().value || document.querySelector('.composer-images img')) errors.push('accepted unchanged draft not cleared');
     if (window.__test.sends.length !== 3) errors.push('unexpected accepted send count');
