@@ -85,22 +85,33 @@ fn isolated_directory(preview: bool, dir: Option<&Path>) -> Result<&Path, String
     dir.ok_or_else(|| "Draft storage not initialized".into())
 }
 #[tauri::command]
-pub fn drafts_load(key: String) -> Result<Draft, String> {
-    if !key_valid(&key) { return Err("Invalid draft key".into()); }
-    let _guard = LOCK.lock().map_err(|_| "Draft storage unavailable")?;
-    Ok(load(directory()?)?.remove(&key).unwrap_or_default())
+pub async fn drafts_load(key: String) -> Result<Draft, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        if !key_valid(&key) { return Err("Invalid draft key".into()); }
+        let _guard = LOCK.lock().map_err(|_| "Draft storage unavailable")?;
+        Ok(load(directory()?)?.remove(&key).unwrap_or_default())
+    }).await.map_err(|_| "Draft storage worker failed".to_string())?
 }
 #[tauri::command]
-pub fn drafts_save(key: String, draft: Draft) -> Result<(), String> {
-    let _guard = LOCK.lock().map_err(|_| "Draft storage unavailable")?;
-    save(directory()?, &key, draft)
+pub async fn drafts_save(key: String, draft: Draft) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = LOCK.lock().map_err(|_| "Draft storage unavailable")?;
+        save(directory()?, &key, draft)
+    }).await.map_err(|_| "Draft storage worker failed".to_string())?
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn async_load_rejects_invalid_keys_before_storage_access() {
+        let result = drafts_load("../vault.json".into()).await;
+        assert!(matches!(result, Err(error) if error == "Invalid draft key"));
+    }
     fn temp() -> std::path::PathBuf {
-        let p = std::env::temp_dir().join(format!("philium-drafts-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!("philium-drafts-{}-{}-{sequence}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
         std::fs::create_dir(&p).unwrap(); p
     }
     #[test]

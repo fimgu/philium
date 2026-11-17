@@ -1,8 +1,18 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createDraftStore, clearSentDraft } from "./drafts.js";
+import { createDraftStore, clearSentDraft, validateDraftImages } from "./drafts.js";
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 const image = { data: "aGk=", media_type: "image/png", name: "test.png" };
+test("image admission matches backend MIME allowlist and byte boundary", () => {
+  const limit = 5 * 1024 * 1024;
+  for (const type of ["image/png", "image/jpeg", "image/gif", "image/webp"]) {
+    assert.doesNotThrow(() => validateDraftImages([{ type, size: limit }]));
+  }
+  for (const type of ["image/svg+xml", "image/heic", "image/bmp", "", "text/plain"]) {
+    assert.throws(() => validateDraftImages([{ type: "image/png", size: 1 }, { type, size: 1 }]), /Unsupported image type/);
+  }
+  assert.throws(() => validateDraftImages([{ type: "image/png", size: limit + 1 }]), /5 MiB/);
+});
 function backend() {
   const disk = new Map();
   return { disk, invoke: async (cmd, { key, draft }) => {

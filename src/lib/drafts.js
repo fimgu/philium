@@ -58,6 +58,12 @@ export function createDraftStore(invoke) {
   }
   return { draftFor: get };
 }
+export function validateDraftImages(files) {
+  const supported = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+  if (files.some((file) => !supported.has(file.type))) throw new Error("Unsupported image type. Use PNG, JPEG, GIF or WebP.");
+  if (files.some((file) => file.size > 5 * 1024 * 1024)) throw new Error("Images must be 5 MiB or smaller.");
+}
+
 export function newDraft() {
   const [text, setText] = createSignal("");
   const [images, setImages] = createSignal([]);

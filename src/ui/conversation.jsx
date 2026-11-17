@@ -8,7 +8,7 @@ import { AssistantReply } from "./markdown.jsx";
 import { ConversationActivity } from "./conversation-activity.jsx";
 import { ViewToggle } from "./conversation-view.jsx";
 import { conversationView } from "../lib/conversation-view.js";
-import { draftFor, newDraft, clearSentDraft } from "../lib/drafts.js";
+import { draftFor, newDraft, clearSentDraft, validateDraftImages } from "../lib/drafts.js";
 
 /** Fold a list of HAL events into display items. Pure, incremental-safe. */
 export function fold(events) {
@@ -236,7 +236,7 @@ export function Composer(props) {
     if (!target.ready()) return;
     const imgs = [...files].filter((f) => f.type.startsWith("image/"));
     try {
-      if (imgs.some((f) => f.size > 5 * 1024 * 1024)) throw new Error("Images must be 5 MiB or smaller.");
+      validateDraftImages(imgs);
       if (imgs.length) {
         const loaded = await Promise.all(imgs.map(readImage));
         target.setImages((current) => [...current, ...loaded].slice(0, 8));
