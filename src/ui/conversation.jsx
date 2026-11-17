@@ -126,7 +126,7 @@ function Tool(props) {
         <Show when={t().ms != null}><span class="faint xs">{(t().ms / 1000).toFixed(1)}s</span></Show>
         <span class="dim" aria-hidden="true">{expanded() ? "▾" : "▸"}</span>
       </button>
-      <Show when={short(t().tool) === "shell_run" && t().args?.command}><pre class="tool-command"><span class="dim">$ </span>{t().args.command}</pre></Show>
+      <Show when={short(t().tool) === "shell_run" && t().args?.command}><pre class="tool-command"><span class="dim">$ </span>{expanded() ? t().args.command : t().args.command.split("\n").slice(0, 2).join("\n").slice(0, 240)}</pre><Show when={!expanded() && (t().args.command.length > 240 || t().args.command.split("\n").length > 2)}><span class="tool-preview-label">Command shortened · expand to read all</span></Show></Show>
       <Show when={!expanded() && resultText()}><pre class="tool-output-preview">{resultText().split("\n").slice(-4).join("\n").slice(-1200)}</pre><span class="tool-preview-label">Output preview · expand for details</span></Show>
       <Show when={t().running}>
         <div class="xs dim" role="status">{active()
@@ -195,7 +195,7 @@ export function Conversation(props) {
                   </Show>
                 </div>
               </Match>
-              <Match when={it().kind === "error"}><div class="msg error">{it().text}</div></Match>
+              <Match when={it().kind === "error"}><div class="msg error"><Show when={String(it().text).includes("philium_guard")} fallback={it().text}><strong>Request blocked by secret guard</strong><p class="small">This conversation contains content the guard identified as a secret. This request was not sent to the provider. Start a fresh conversation without sensitive content.</p><details class="tool-raw"><summary>Error details</summary><pre class="conv-pre">{it().text}</pre></details></Show></div></Match>
               <Match when={it().kind === "note"}><div class="faint xs" style={{ "align-self": "center" }}>{it().text}</div></Match>
             </Switch>
           )}
