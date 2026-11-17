@@ -133,6 +133,14 @@ test('Conversation Markdown DOM, streaming, unsafe content and clipboard matrix'
     assert.equal(await page.$eval('.assistant-markdown a', el => el.rel), 'noopener noreferrer');
     assert.deepEqual(requests, []);
     assert.deepEqual(errors, []);
+    await set('# Long history\n\n' + 'Paragraph in restored history.\n\n'.repeat(80) + '~~~js\nconst value = 1;\n~~~');
+    await page.evaluate(() => { const conv = document.querySelector('.conv'); conv.style.height = '300px'; conv.style.flex = 'none'; conv.scrollTop = conv.scrollHeight; });
+    assert.equal(await page.evaluate(() => {
+      const conv = document.querySelector('.conv').getBoundingClientRect();
+      const controls = document.querySelector('.conversation-view-control').getBoundingClientRect();
+      return controls.top >= conv.top && controls.bottom <= conv.bottom;
+    }), true, 'view switch stays visible at bottom of long history');
+    assert.match(await page.$eval('.assistant-markdown code', el => getComputedStyle(el).fontFamily), /monospace|Menlo/);
   } catch (error) { console.error(error); throw error; }
   finally { await browser?.close(); server.httpServer?.closeAllConnections(); await server.close(); }
 });

@@ -11,7 +11,7 @@
 .assistant-markdown li > p { margin: .25em 0; }
 .assistant-markdown blockquote { margin: .7em 0; padding-left: 1em; border-left: 3px solid var(--line); color: var(--text-dim); }
 .assistant-markdown a { color: var(--accent); text-decoration: underline; }
-.assistant-markdown code { font-family: var(--mono); font-size: .9em; background: var(--bg-raised); border-radius: 3px; padding: .1em .3em; }
+.assistant-markdown code { font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; font-size: .9em; background: var(--bg-raised); border-radius: 3px; padding: .1em .3em; }
 .assistant-markdown pre { overflow-x: auto; white-space: pre; margin: 0; padding: 12px; }
 .assistant-markdown pre code { padding: 0; background: none; }
 .markdown-code { background: var(--bg-raised); border: 1px solid var(--line); border-radius: var(--radius); margin: .7em 0; overflow: hidden; }

@@ -1,4 +1,4 @@
-.conversation-view-control { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 12px; padding: 8px 16px; }
+.conversation-view-control { position: sticky; top: 0; z-index: 3; flex-shrink: 0; background: var(--bg); border-bottom: 1px solid var(--line); display: flex; align-items: center; flex-wrap: wrap; gap: 6px 12px; padding: 8px 16px; }
 .conversation-view-toggle { display: inline-flex; gap: 2px; border: 1px solid var(--line); border-radius: var(--radius, 6px); padding: 2px; }
 .conversation-view-toggle button { font: inherit; font-size: var(--fs-s, 12px); color: var(--text-dim); background: transparent; border: 1px solid transparent; border-radius: 4px; padding: 5px 9px; cursor: pointer; }
 .conversation-view-toggle button[aria-pressed="true"] { color: var(--text); background: var(--surface); border-color: var(--line); }
