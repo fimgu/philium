@@ -28,6 +28,7 @@ const P = {
   camera: "M3 6h3l1.5-2h5L14 6h3v10H3zM10 13.5a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5Z",
   send: "M10 16V4m0 0-5 5m5-5 5 5",
   pr: "M6 3v14M6 3a2 2 0 1 0 0 .01M14 17a2 2 0 1 0 0 .01M14 15V8a2 2 0 0 0-2-2H9",
+  grid: "M3 3h6v6H3zM11 3h6v6h-6zM3 11h6v6H3zM11 11h6v6h-6z",
 };
 
 export function Icon(props) {

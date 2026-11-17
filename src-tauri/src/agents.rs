@@ -195,7 +195,7 @@ fn instructions(name: &str, strict: bool, worktree: Option<&Path>) -> String {
          Snapshot again after every navigation. browser_screenshot when layout matters. Philium asks the human to approve browser tool calls; wait for that decision, and respect a denial. Never use curl or wget to \"visit\" a page for the human.\n\
          - Commands: shell_run types into your persistent shell (cd and exports persist). Dev servers and watchers: shell_run with background=true, then open the URL in your browser. \
          A second interactive session: shell_open {{name}}, then shell_run with shell={{name}}. The built-in shell tool is disabled.\n\
-         - Code questions: code_map (what is where), code_find (locate a symbol), code_refs (callers and uses), code_impact (what your change touches). Use these before grep or reading whole files.\n\
+         - Code questions: check the `## Codebase map` in your prompt first, then use `code_outline` / `code_map` (file or directory structure with line spans), `code_symbol` (read a symbol's exact AST source + callers/callees in one call), `code_find` (locate a symbol), `code_refs` (bidirectional call graph: callees and callers), and `code_impact` (what your change touches + cross-agent clashes). Use these before grep or reading whole files.\n\
          - Other agents and the human: board_* for tasks (claim before working, keep the lease alive), mail_send / mail_read for messages. mail_send to \"you\" reaches the human.\n\
          - Jobs like commit, open_pr, review_pr, release: playbook_get first and follow it. Finished work lands as a GitHub pull request.\n\
          \n\
@@ -357,6 +357,11 @@ async fn provision(ctx: &Arc<Ctx>, id: &str, fresh: bool, brief: Option<String>)
     // Personal memories only reach agents on trusted providers.
     if !strict {
         extra.push_str(&crate::library::standing_memories(ctx));
+    }
+    if let Some(repo_id) = row["repo_id"].as_str() {
+        if let Some(cmap) = crate::codeindex::prompt_map(ctx, repo_id, worktree.as_deref()) {
+            extra.push_str(&cmap);
+        }
     }
     config["prompt"] = json!({ "extra": extra });
     if let Some(url) = ctx.mcp_url.get() {

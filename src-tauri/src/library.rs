@@ -43,7 +43,7 @@ CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
 pub const DEFAULT_RULES: &str = "\
 ## Filip's standing rules
 - Keep replies short. Lead with the result. Separate what you verified from what you did not.
-- Read lean: locate with code_find/code_map, then read bounded ranges. Filter noisy build/test output to failures.
+- Read lean: locate with code_map/code_outline/code_find, read exact symbol spans with code_symbol or bounded file ranges, and check call graphs with code_refs/code_impact. Filter noisy build/test output to failures.
 - Delegate broad exploration to a helper (agent_spawn) and ask for a short summary with file:line references.
 - Clean up everything you create before reporting done: containers (run with --rm; register others with resource_register), compose projects (`down -v --rmi local`), worktrees and branches you made, scratch files in $TMPDIR. Never leave uncommitted work silently: push it or say so. Never delete what you did not create. Your final reply states what was removed or kept and why.
 - PR reviews and readiness checks: skill_get review-pr first and follow it. Test the real user workflow, not just unit tests. Never call a partial pass end-to-end verified.

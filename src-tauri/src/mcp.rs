@@ -372,7 +372,10 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
             crate::browser::mcp_call(ctx, agent, &me, row["strict"].as_i64() == Some(1), n, a).await
         }
         "graph_query" => {
-            let path = crate::agents::runtime(agent).map(|r| r.cwd.clone()).ok_or("agent not running")?;
+            let path = crate::agents::runtime(agent)
+                .map(|r| r.cwd.clone())
+                .or_else(|| crate::codeindex::resolve_agent(ctx, agent).ok().map(|t| t.wt.map(|w| w.path).unwrap_or(t.repo_path)))
+                .ok_or("agent not running")?;
             let g = crate::graph::call(ctx, "get", json!({ "repo_path": path })).await?;
             Ok(match a["path"].as_str() {
                 Some(p) => focus(&g, p),
@@ -380,7 +383,7 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
             })
         }
         // --- codeindex tools ---
-        "code_map" | "code_find" | "code_refs" | "code_impact" => crate::codeindex::mcp_call(ctx, agent, name, a).await,
+        "code_map" | "code_outline" | "code_symbol" | "code_find" | "code_refs" | "code_impact" => crate::codeindex::mcp_call(ctx, agent, name, a).await,
         // --- end codeindex tools ---
         "playbook_get" => {
             let repo = crate::agents::runtime(agent).map(|r| r.cwd.clone());
@@ -422,7 +425,9 @@ fn focus(g: &Value, path: &str) -> Value {
         .map(|e| {
             e.iter()
                 .filter(|e| {
-                    e["from"].as_str().is_some_and(|f| f.ends_with(path)) || e["to"].as_str().is_some_and(|t| t.ends_with(path))
+                    let src = e["source"].as_str().or_else(|| e["from"].as_str());
+                    let dst = e["target"].as_str().or_else(|| e["to"].as_str());
+                    src.is_some_and(|f| f.ends_with(path)) || dst.is_some_and(|t| t.ends_with(path))
                 })
                 .collect()
         })
@@ -598,6 +603,70 @@ mod tests {
         assert!(inside(&base, Some("..")).is_err());
         assert!(inside(&base, Some("/etc")).is_err());
         assert_eq!(inside(&base, None).unwrap(), base);
+    }
+
+    #[tokio::test]
+    async fn codegraph_tools_and_focus_edges_work_end_to_end() {
+        let ctx = Ctx::test();
+        crate::codeindex::init(&ctx).unwrap();
+        crate::graph::init(&ctx).unwrap();
+        let repo_dir = ctx.data_dir.join("repo-cg");
+        std::fs::create_dir_all(repo_dir.join("src")).unwrap();
+        std::fs::write(
+            repo_dir.join("src/a.rs"),
+            "pub struct Engine;\nimpl Engine {\n    pub fn run(&self) -> i32 { helper(41) }\n}\npub fn helper(x: i32) -> i32 { x + 1 }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo_dir.join("src/b.rs"),
+            "use crate::a::{Engine, helper};\npub fn entry() -> i32 { let e = Engine; e.run() + helper(1) }\n",
+        )
+        .unwrap();
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["config", "user.email", "t@example.com"],
+            vec!["config", "user.name", "t"],
+            vec!["add", "."],
+            vec!["commit", "-m", "init"],
+        ] {
+            assert!(std::process::Command::new("git").args(&args).current_dir(&repo_dir).status().unwrap().success());
+        }
+        let repo_str = repo_dir.to_string_lossy().to_string();
+        ctx.db
+            .exec("INSERT INTO repos(id,name,path,default_branch,added_at) VALUES('r1','cg',?1,'main',0)", [&repo_str])
+            .unwrap();
+        ctx.db
+            .exec(
+                "INSERT INTO agents(id,name,model_ref,repo_id,created_at,last_active_at) VALUES('a1','lion','p/m','r1',0,0)",
+                [],
+            )
+            .unwrap();
+
+        let pmap = crate::codeindex::prompt_map(&ctx, "r1", None).expect("prompt_map should render");
+        assert!(pmap.contains("struct Engine:1") && pmap.contains("fn entry:2"), "{pmap}");
+
+        let call = |name: &'static str, args: Value| {
+            let ctx = ctx.clone();
+            async move {
+                let r = dispatch(&ctx, "a1", json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":name,"arguments":args}}))
+                    .await
+                    .unwrap();
+                assert_ne!(r["result"]["isError"], true, "{r}");
+                r["result"]["content"][0]["text"].as_str().unwrap().to_string()
+            }
+        };
+
+        let outline = call("code_outline", json!({"path":"src/a.rs"})).await;
+        assert!(outline.contains("outline src/a.rs:") && outline.contains("Engine.run") && outline.contains("helper"), "{outline}");
+
+        let sym = call("code_symbol", json!({"symbol":"Engine.run"})).await;
+        assert!(sym.contains("symbol Engine.run (method) in src/a.rs:3-3") && sym.contains("helper(41)"), "{sym}");
+
+        let refs = call("code_refs", json!({"symbol":"Engine.run"})).await;
+        assert!(refs.contains("calls (1 indexed symbols): helper"), "{refs}");
+
+        let gq: Value = serde_json::from_str(&call("graph_query", json!({"path":"src/b.rs"})).await).unwrap();
+        assert!(!gq["edges"].as_array().unwrap().is_empty(), "graph_query(path) must preserve source/target edges: {gq}");
     }
 }
 

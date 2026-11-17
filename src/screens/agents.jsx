@@ -401,15 +401,131 @@ function AgentView(props) {
   );
 }
 
+export function AgentGridCard(props) {
+  const a = () => props.agent;
+  const [events, setEvents] = createSignal([]);
+  const [text, setText] = createSignal("");
+  const [sending, setSending] = createSignal(false);
+  let generation = 0;
+
+  const merge = (previous, incoming) => {
+    const bySeq = new Map(previous.map((event) => [event.seq, event]));
+    for (const event of incoming) if (!bySeq.has(event.seq)) bySeq.set(event.seq, event);
+    return [...bySeq.values()].sort((x, y) => x.seq - y.seq);
+  };
+
+  const load = async (id) => {
+    const req = ++generation;
+    try {
+      const evs = await rpc("agents.events", { id, after: 0, limit: 250 }, { local: true });
+      if (req === generation && Array.isArray(evs)) setEvents((cur) => merge(cur, evs));
+    } catch {}
+  };
+
+  onCleanup(() => generation++);
+  createEffect(on(() => a()?.id, (id) => { if (id) load(id); }));
+  useEvent("agents:events", (p) => {
+    if (p.id !== a()?.id) return;
+    setEvents((cur) => merge(cur, p.events ?? []));
+  });
+
+  const live = () => !!a()?.live;
+  const busy = () => ["running", "waiting"].includes(a()?.state);
+
+  const send = async (e) => {
+    e?.preventDefault();
+    const msg = text().trim();
+    if (!msg || !live() || sending()) return;
+    setSending(true);
+    try {
+      await rpc("agents.send", { id: a().id, text: msg, images: [] }, { action: true });
+      setText("");
+    } catch (err) {
+      toast(sendError(err), "danger");
+    } finally {
+      setSending(false);
+    }
+  };
+
+  const decide = (request_id, decision, scope) =>
+    live() ? rpc("agents.permission", { id: a().id, request_id, decision, scope }, { action: true }).catch((e) => toast(String(e), "danger")) : Promise.resolve();
+
+  return (
+    <div class={`agent-card ${a()?.state === "waiting" ? "needs-you" : busy() ? "active" : ""}`} data-agent-card={a()?.name}>
+      <div class="agent-card-head" onClick={() => props.onOpen?.(a().id)}>
+        <Dot state={stateDot(a()?.state)} title={stateLabel(a()?.state)} />
+        <AgentChip name={a()?.name} />
+        <span class="xs dim">{stateLabel(a()?.state)}</span>
+        <Show when={a()?.strict}><Badge tone="strict">Strict</Badge></Show>
+        <Show when={a()?.state === "waiting"}><Badge tone="strict">Needs you</Badge></Show>
+        <span class="xs faint ellipsis grow" title={a()?.task_title || a()?.branch || a()?.model_ref}>
+          {a()?.task_title || a()?.repo_name || a()?.branch || a()?.model_ref}
+        </span>
+        <span class="mono xs faint">{(a()?.model_ref ?? "").split("/").pop()}</span>
+        <div class="row gap-4" onClick={(e) => e.stopPropagation()}>
+          <Show when={live()} fallback={
+            <Button size="sm" onClick={() => rpc("agents.resume", { id: a().id }, { action: true }).catch((e) => toast(String(e), "danger"))} title="Resume agent">
+              <Icon name="play" size={11} />
+            </Button>
+          }>
+            <Show when={busy()}>
+              <Button size="sm" onClick={() => rpc("agents.cancel", { id: a().id }, { action: true }).catch((e) => toast(String(e), "danger"))} title="Cancel current turn">
+                Cancel
+              </Button>
+            </Show>
+            <Button size="sm" onClick={() => rpc("agents.stop", { id: a().id }, { action: true }).catch((e) => toast(String(e), "danger"))} title="Stop agent">
+              <Icon name="stop" size={11} />
+            </Button>
+          </Show>
+          <Button size="sm" variant="ghost" onClick={() => props.onOpen?.(a().id)} title="Open full workspace (shell, browser, diff)">
+            <Icon name="external" size={12} />
+          </Button>
+        </div>
+      </div>
+      <Show when={a()?.error}><div class="shield danger xs" style={{ margin: "6px 10px 0" }}>{a().error}</div></Show>
+      <div class="agent-card-body">
+        <Conversation
+          events={events()}
+          busy={busy()}
+          readOnly={!live()}
+          loadAttachment={agentAttachmentLoader(a().id)}
+          emptyText={live() ? `Send a message to ${a()?.name} below.` : "Stopped. Press play to resume."}
+          onApprove={(id, scope) => decide(id, "approve", scope)}
+          onDeny={(id) => decide(id, "deny")}
+        />
+      </div>
+      <form class="agent-card-foot" onSubmit={send}>
+        <input
+          type="text"
+          class="input agent-card-input"
+          value={text()}
+          disabled={!live() || sending()}
+          placeholder={live() ? `Message ${a()?.name}…` : `${a()?.name} is stopped`}
+          onInput={(e) => setText(e.currentTarget.value)}
+        />
+        <Button size="sm" variant="primary" type="submit" disabled={!live() || sending() || !text().trim()}>
+          <Icon name="send" size={12} />
+        </Button>
+      </form>
+    </div>
+  );
+}
+
 export default function Agents() {
   const [list, { refetch }] = createResource(() => rpc("agents.list").catch(() => []));
   const [spawn, setSpawn] = createSignal(null);
   const [filter, setFilter] = createSignal("all");
+  const [viewMode, setViewModeRaw] = createSignal(localStorage.getItem("agents.viewMode") || "grid");
+  const setViewMode = (m) => { setViewModeRaw(m); localStorage.setItem("agents.viewMode", m); };
   let t;
   useEvent("agents:changed", () => { clearTimeout(t); t = setTimeout(refetch, 150); });
   onCleanup(() => clearTimeout(t));
 
-  registerCommands([{ id: "agent.new", label: "New agent", run: () => setSpawn({}) }]);
+  registerCommands([
+    { id: "agent.new", label: "New agent", run: () => setSpawn({}) },
+    { id: "agent.grid", label: "Agents: Grid view (all agents side-by-side)", run: () => setViewMode("grid") },
+    { id: "agent.split", label: "Agents: Focus view (single agent + shell/browser)", run: () => setViewMode("split") },
+  ]);
 
   // Tree order: parents first, children indented beneath.
   const tree = createMemo(() => {
@@ -432,31 +548,52 @@ export default function Agents() {
     return { live: l.filter((a) => a.live).length, waiting: l.filter((a) => a.state === "waiting").length, strict: l.filter((a) => a.strict).length };
   });
 
+  const openAgentFocus = (id) => {
+    setViewMode("split");
+    go("agents", { id });
+  };
+
   return (
     <Page title="Agents" flush
       sub={<Show when={(list() ?? []).length}>{`${counts().live} running · ${counts().waiting} need you · ${counts().strict} strict`}</Show>}
-      actions={<Button variant="primary" onClick={() => setSpawn({})}><Icon name="plus" size={12} /> New agent</Button>}>
+      actions={<div class="row" style={{ gap: "8px" }}>
+        <Show when={(list() ?? []).length}>
+          <Segmented value={filter()} onChange={setFilter} options={[{ value: "all", label: "All" }, { value: "live", label: "Running" }, { value: "waiting", label: "Need you" }]} />
+          <Segmented value={viewMode()} onChange={setViewMode} options={[
+            { value: "grid", label: <span class="row gap-4" title="Watch and control all agents side-by-side"><Icon name="grid" size={12} /> Grid</span> },
+            { value: "split", label: <span class="row gap-4" title="Single agent with live terminal & browser"><Icon name="agents" size={12} /> Focus</span> },
+          ]} />
+        </Show>
+        <Button variant="primary" onClick={() => setSpawn({})}><Icon name="plus" size={12} /> New agent</Button>
+      </div>}>
       <Show when={(list() ?? []).length} fallback={
         <Empty icon={<Icon name="agents" size={28} />} title="No agents yet"
           action={<Button variant="primary" onClick={() => setSpawn({})}>Start your first agent</Button>}>
           An agent is a named worker with its own model session, worktree and terminals. Give it a brief and it works on its own, coordinating with other agents through the board.
         </Empty>}>
-        <div class="split">
-          <div class="agent-list">
-            <div style={{ padding: "8px" }}>
-              <Segmented value={filter()} onChange={setFilter} options={[{ value: "all", label: "All" }, { value: "live", label: "Running" }, { value: "waiting", label: "Need you" }]} />
+        <Show when={viewMode() === "grid"} fallback={
+          <div class="split">
+            <div class="agent-list">
+              <For each={tree()}>{({ a, d }) => <AgentRow agent={a} depth={d} selected={a.id === selected()} onClick={() => go("agents", { id: a.id })} />}</For>
             </div>
-            <For each={tree()}>{({ a, d }) => <AgentRow agent={a} depth={d} selected={a.id === selected()} onClick={() => go("agents", { id: a.id })} />}</For>
+            <Show when={selected()} keyed>{(id) => (
+              <Show when={list.loading || (list() ?? []).some((a) => a.id === id)} fallback={
+                <NotFound title="Agent not found" action={<Button onClick={() => go("agents", {})}>Back to agents</Button>}>
+                  This agent was removed or never existed.
+                </NotFound>}>
+                <AgentView id={id} agent={(list() ?? []).find((a) => a.id === id)} />
+              </Show>
+            )}</Show>
           </div>
-          <Show when={selected()} keyed>{(id) => (
-            <Show when={list.loading || (list() ?? []).some((a) => a.id === id)} fallback={
-              <NotFound title="Agent not found" action={<Button onClick={() => go("agents", {})}>Back to agents</Button>}>
-                This agent was removed or never existed.
-              </NotFound>}>
-              <AgentView id={id} agent={(list() ?? []).find((a) => a.id === id)} />
+        }>
+          <div class="agents-grid-wrap">
+            <Show when={tree().length} fallback={<Empty title="No matching agents">Switch the filter above to see all agents.</Empty>}>
+              <div class={`agents-grid count-${Math.min(tree().length, 4)}`}>
+                <For each={tree()}>{({ a }) => <AgentGridCard agent={a} onOpen={openAgentFocus} />}</For>
+              </div>
             </Show>
-          )}</Show>
-        </div>
+          </div>
+        </Show>
       </Show>
       <Show when={spawn()}>
         <SpawnModal preset={spawn()} onClose={(a) => { setSpawn(null); if (a) { refetch(); go("agents", { id: a.id }); } }} />

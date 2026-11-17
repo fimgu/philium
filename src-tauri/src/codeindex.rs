@@ -829,7 +829,7 @@ fn rank_names(v: &View) -> HashMap<&str, f64> {
 struct FileEntry {
     rel: String,
     rank: f64,
-    syms: Vec<(String, String)>,
+    syms: Vec<(String, String, u32, u32)>,
 }
 
 fn render_dir(entries: Vec<FileEntry>, indent: usize, depth: usize, out: &mut Out) {
@@ -859,7 +859,9 @@ fn render_dir(entries: Vec<FileEntry>, indent: usize, depth: usize, out: &mut Ou
     for it in items {
         match it {
             Item::F(f) => {
-                let shown: Vec<String> = f.syms.iter().take(8).map(|(k, n)| format!("{k} {n}")).collect();
+                let shown: Vec<String> = f.syms.iter().take(8).map(|(k, n, l, e)| {
+                    if *e > *l { format!("{k} {n}:{l}-{e}") } else { format!("{k} {n}:{l}") }
+                }).collect();
                 let more = if f.syms.len() > 8 { format!(" +{}", f.syms.len() - 8) } else { String::new() };
                 out.line(format!("{pad}{}  {}{more}", f.rel, shown.join(", ")));
             }
@@ -877,8 +879,82 @@ fn render_dir(entries: Vec<FileEntry>, indent: usize, depth: usize, out: &mut Ou
     }
 }
 
+/// Complete structural outline of a single file: imports, all symbols (including methods)
+/// with exact `line-end` spans, signatures, and incoming/outgoing cross-file edges.
+pub fn render_outline(v: &View, path: &str, cap: usize) -> String {
+    let clean = path.trim_matches('/');
+    let target_path = v
+        .syms
+        .iter()
+        .map(|s| s.path.as_str())
+        .chain(v.refs.iter().map(|r| r.path.as_str()))
+        .find(|p| *p == clean || p.ends_with(&format!("/{clean}")))
+        .unwrap_or(clean);
+    let mut syms: Vec<&Sym> = v.syms.iter().filter(|s| s.path == target_path).collect();
+    syms.sort_by_key(|s| (s.line, s.end));
+    let mut out = Out::new(cap);
+    if syms.is_empty() {
+        out.line(format!("outline {target_path}: no indexed symbols (check path with code_map)"));
+        return out.finish("code_map");
+    }
+    let imports: Vec<&str> = v
+        .refs
+        .iter()
+        .filter(|r| r.path == target_path && r.kind == "import")
+        .map(|r| r.name.as_str())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    out.line(format!("outline {target_path}: {} symbols", syms.len()));
+    if !imports.is_empty() {
+        out.line(format!("  imports: {}", imports.iter().take(20).copied().collect::<Vec<_>>().join(", ")));
+    }
+    let mut incoming_by_name: HashMap<&str, usize> = HashMap::new();
+    let mut outgoing_by_from: HashMap<&str, usize> = HashMap::new();
+    let mut ext_callers: BTreeSet<String> = BTreeSet::new();
+    let sym_names: HashSet<&str> = syms.iter().map(|s| s.name.as_str()).collect();
+    for r in &v.refs {
+        if r.kind == "import" {
+            continue;
+        }
+        if sym_names.contains(r.name.as_str()) && r.path != target_path {
+            *incoming_by_name.entry(r.name.as_str()).or_default() += 1;
+            ext_callers.insert(r.path.clone());
+        } else if r.path == target_path && sym_names.contains(r.name.as_str()) {
+            *incoming_by_name.entry(r.name.as_str()).or_default() += 1;
+        }
+        if r.path == target_path && !r.from.is_empty() {
+            *outgoing_by_from.entry(r.from.as_str()).or_default() += 1;
+        }
+    }
+    if !ext_callers.is_empty() {
+        out.line(format!(
+            "  referenced by {} files: {}",
+            ext_callers.len(),
+            ext_callers.iter().take(10).cloned().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    for s in syms {
+        let indent = if s.parent.is_empty() { "  " } else { "    " };
+        let qual = if s.parent.is_empty() { s.name.clone() } else { format!("{}.{}", s.parent, s.name) };
+        let inc = incoming_by_name.get(s.name.as_str()).copied().unwrap_or(0);
+        let outc = outgoing_by_from.get(s.name.as_str()).copied().unwrap_or(0);
+        let deg = match (inc, outc) {
+            (0, 0) => String::new(),
+            (i, 0) => format!(" [in:{i}]"),
+            (0, o) => format!(" [out:{o}]"),
+            (i, o) => format!(" [in:{i} out:{o}]"),
+        };
+        out.line(format!("{indent}{}-{} {} {}{}  {}", s.line, s.end, s.kind, qual, deg, s.sig));
+    }
+    out.finish("code_symbol <name> to read a symbol's exact source")
+}
+
 pub fn render_map(v: &View, path: Option<&str>, depth: usize, cap: usize) -> String {
     let prefix = path.unwrap_or("").trim_matches('/').to_string();
+    if !prefix.is_empty() && v.syms.iter().any(|s| s.path == prefix) && !v.syms.iter().any(|s| s.path.starts_with(&format!("{prefix}/"))) {
+        return render_outline(v, &prefix, cap);
+    }
     let rank = rank_names(v);
     let mut by_file: BTreeMap<&str, Vec<&Sym>> = BTreeMap::new();
     for s in &v.syms {
@@ -900,7 +976,7 @@ pub fn render_map(v: &View, path: Option<&str>, depth: usize, cap: usize) -> Str
         top.sort_by(|a, b| rank.get(b.name.as_str()).unwrap_or(&0.0).partial_cmp(rank.get(a.name.as_str()).unwrap_or(&0.0)).unwrap_or(std::cmp::Ordering::Equal));
         nsyms += ss.len();
         let r = ss.iter().map(|s| rank.get(s.name.as_str()).copied().unwrap_or(0.0)).sum();
-        entries.push(FileEntry { rel, rank: r, syms: top.iter().map(|s| (s.kind.clone(), s.name.clone())).collect() });
+        entries.push(FileEntry { rel, rank: r, syms: top.iter().map(|s| (s.kind.clone(), s.name.clone(), s.line, s.end)).collect() });
     }
     let mut out = Out::new(cap);
     out.line(format!("map {}: {} files, {} symbols, ranked by use", if prefix.is_empty() { "." } else { &prefix }, entries.len(), nsyms));
@@ -908,7 +984,7 @@ pub fn render_map(v: &View, path: Option<&str>, depth: usize, cap: usize) -> Str
         out.line("no indexed files here. Check the path, or use code_find.");
     }
     render_dir(entries, 0, depth.max(1), &mut out);
-    out.finish("path=<dir> or depth=<n>")
+    out.finish("path=<dir|file> or depth=<n>")
 }
 
 fn fuzzy(q: &str, s: &str) -> bool {
@@ -957,7 +1033,8 @@ pub fn render_find(v: &View, q: &str, kind: Option<&str>, cap: usize) -> String 
             out.line(format!("{}:", s.path));
             last = &s.path;
         }
-        out.line(format!("  {} {} {}{}  {}", s.line, s.kind, par, s.name, s.sig));
+        let span = if s.end > s.line { format!(" [lines {}-{}]", s.line, s.end) } else { String::new() };
+        out.line(format!("  {} {} {}{}  {}{}", s.line, s.kind, par, s.name, s.sig, span));
     }
     out.finish("a longer query or kind=<fn|class|struct|...>")
 }
@@ -1075,10 +1152,33 @@ pub fn render_refs(v: &View, sym: &str, cap: usize) -> String {
         return format!("no symbol named \"{sym}\". Try code_find with part of the name.\n");
     }
     for d in &defs {
-        out.line(format!("def {}:{} {} {}", d.path, d.line, d.kind, d.sig));
+        let span = if d.end > d.line { format!(" [lines {}-{}]", d.line, d.end) } else { String::new() };
+        out.line(format!("def {}:{} {} {}{}", d.path, d.line, d.kind, d.sig, span));
     }
     if defs.len() > 1 {
         out.line(format!("note: {} definitions share this name. Qualify as Parent.name to separate them.", defs.len()));
+    }
+    if !defs.is_empty() {
+        let mut callees: BTreeSet<String> = BTreeSet::new();
+        for d in &defs {
+            for r in &v.refs {
+                if r.path == d.path && r.from == d.name && r.line >= d.line && r.line <= d.end && r.kind != "import" && r.name != d.name {
+                    let target_defs: Vec<&Sym> = v.syms.iter().filter(|s| s.name == r.name).collect();
+                    if target_defs.len() == 1 {
+                        callees.insert(format!("{} ({}:{})", r.name, target_defs[0].path, target_defs[0].line));
+                    } else if !target_defs.is_empty() {
+                        callees.insert(r.name.clone());
+                    }
+                }
+            }
+        }
+        if !callees.is_empty() {
+            out.line(format!(
+                "calls ({} indexed symbols): {}",
+                callees.len(),
+                callees.into_iter().take(20).collect::<Vec<_>>().join(", ")
+            ));
+        }
     }
     for (label, exact, note) in [("exact", true, "resolved through the file, an import or a qualified path"), ("possible", false, "same name only, NOT confirmed. Verify before relying on it")] {
         let list: Vec<&RefHit> = hits.iter().filter(|h| h.exact == exact).collect();
@@ -1095,6 +1195,80 @@ pub fn render_refs(v: &View, sym: &str, cap: usize) -> String {
         }
     }
     out.finish("Parent.name or a more specific symbol")
+}
+
+/// Read the exact AST source span of a symbol (`line..=end`, plus leading doc comments)
+/// alongside its direct callers and callees from the tree-sitter graph.
+pub fn render_symbol(v: &View, root: &Path, sym: &str, path_filter: Option<&str>, cap: usize) -> String {
+    let clean_path = path_filter.map(|p| p.trim_matches('/')).filter(|p| !p.is_empty());
+    let path_ok = |p: &str| match clean_path {
+        Some(f) => p == f || p.ends_with(&format!("/{f}")),
+        None => true,
+    };
+    let (mut defs, hits) = refs_of(v, sym);
+    defs.retain(|d| path_ok(&d.path));
+    if defs.is_empty() {
+        let (_, name) = split_symbol(sym);
+        defs = find_items(v, name, None).into_iter().filter(|d| path_ok(&d.path)).take(2).collect();
+    }
+    if defs.is_empty() {
+        return format!("no symbol matching \"{sym}\". Try code_find or code_map.\n");
+    }
+    let mut out = Out::new(cap);
+    for (idx, d) in defs.iter().take(3).enumerate() {
+        if idx > 0 {
+            out.line("---");
+        }
+        let qual = if d.parent.is_empty() { d.name.clone() } else { format!("{}.{}", d.parent, d.name) };
+        out.line(format!("symbol {} ({}) in {}:{}-{}", qual, d.kind, d.path, d.line, d.end));
+        let exact_callers: Vec<String> = hits
+            .iter()
+            .filter(|h| h.exact && h.r.kind != "import")
+            .take(10)
+            .map(|h| {
+                if h.r.from.is_empty() {
+                    format!("{}:{}", h.r.path, h.r.line)
+                } else {
+                    format!("{}:{} [{}]", h.r.path, h.r.line, h.r.from)
+                }
+            })
+            .collect();
+        if !exact_callers.is_empty() {
+            out.line(format!("  called by: {}", exact_callers.join(", ")));
+        }
+        let mut callees: BTreeSet<String> = BTreeSet::new();
+        for r in &v.refs {
+            if r.path == d.path && r.from == d.name && r.line >= d.line && r.line <= d.end && r.kind != "import" && r.name != d.name {
+                if let Some(td) = v.syms.iter().find(|s| s.name == r.name) {
+                    callees.insert(format!("{} ({}:{})", r.name, td.path, td.line));
+                }
+            }
+        }
+        if !callees.is_empty() {
+            out.line(format!("  calls: {}", callees.into_iter().take(12).collect::<Vec<_>>().join(", ")));
+        }
+        if let Ok(src) = std::fs::read_to_string(root.join(&d.path)) {
+            let lines: Vec<&str> = src.lines().collect();
+            let mut start = d.line.saturating_sub(1) as usize;
+            while start > 0 && start + 4 >= d.line as usize {
+                let prev = lines.get(start - 1).map(|l| l.trim()).unwrap_or("");
+                if prev.starts_with("//") || prev.starts_with('#') || prev.starts_with("#[") || prev.starts_with('@') || prev.starts_with("/*") || prev.starts_with('*') {
+                    start -= 1;
+                } else {
+                    break;
+                }
+            }
+            let end = (d.end as usize).min(lines.len()).max(start + 1);
+            let max_end = end.min(start + 120);
+            for (i, line) in lines[start..max_end].iter().enumerate() {
+                out.line(format!("  {:>4} | {}", start + i + 1, line));
+            }
+            if end > max_end {
+                out.line(format!("  ... ({} more lines in symbol, lines {}-{} of {})", end - max_end, max_end + 1, end, d.path));
+            }
+        }
+    }
+    out.finish("path=<file> or a more specific symbol name")
 }
 
 fn is_noise(kind: &str, name: &str) -> bool {
@@ -1662,6 +1836,36 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
 
 // ---------------------------------------------------------------- MCP glue (called from mcp.rs)
 
+/// Compact, cache-friendly codebase architecture map injected into every repo agent's
+/// system prompt so Turn 1 starts with full structural orientation at zero tool round-trips.
+pub fn prompt_map(ctx: &Ctx, repo_id: &str, wt_path: Option<&Path>) -> Option<String> {
+    let t = target_for_repo(ctx, repo_id, None).ok()?;
+    let wt_row = wt_path.and_then(|p| {
+        let ps = p.to_string_lossy().to_string();
+        ctx.db
+            .query("SELECT id FROM worktrees WHERE path=?1 AND state='active' LIMIT 1", [ps])
+            .ok()
+            .and_then(|r| r.into_iter().next())
+            .and_then(|r| r["id"].as_str().map(str::to_string))
+    });
+    let wt_arg = match (&wt_row, wt_path) {
+        (Some(id), Some(p)) => Some((id.as_str(), p)),
+        _ => None,
+    };
+    let (view, _) = index_target(ctx, &t.repo_id, &t.repo_path, &t.branch, wt_arg, false).ok()?;
+    if view.syms.is_empty() {
+        return None;
+    }
+    let map = render_map(&view, None, 2, 550);
+    Some(format!(
+        "\n## Codebase map (auto-indexed by tree-sitter, ranked by symbol centrality)\n\
+         Use `code_outline` / `code_map {{path}}` for a file's full symbol table, `code_symbol {{symbol}}` to read a symbol's exact AST source + callers/callees in one call, `code_find` to search, and `code_refs` / `code_impact` for call graph and blast radius.\n\
+         ```\n{}\
+         ```\n",
+        map
+    ))
+}
+
 pub fn mcp_tools() -> Vec<Value> {
     let s = json!({ "type": "string" });
     let i = json!({ "type": "integer" });
@@ -1669,13 +1873,17 @@ pub fn mcp_tools() -> Vec<Value> {
         json!({ "name": name, "description": desc, "inputSchema": { "type": "object", "properties": props, "required": req } })
     };
     vec![
-        t("code_map", "USE FIRST for 'what is in this repo/dir' questions, before ls, grep or reading files. Returns a small ranked outline of directories, files and their key symbols for your worktree. Pass `path` to zoom into a directory. Verify by reading the cited lines before editing.",
+        t("code_map", "USE FIRST for 'what is in this repo/dir/file' questions, before ls, grep or reading files. Returns a PageRank-sorted outline of directories, files and their key symbols with exact line spans (`start-end`). Pass a directory `path` to zoom in, or a file `path` for its complete symbol outline.",
           json!({ "path": s, "depth": i }), &[]),
-        t("code_find", "USE BEFORE grep to locate a function, class, struct or type by name. Returns `path:line kind name signature` lines (ranked, fuzzy). Results are index hits: read the cited lines to verify before editing.",
+        t("code_outline", "Complete structural outline of one file: imports, every symbol and method with exact `start-end` line numbers, signatures, and incoming/outgoing call counts. Use instead of reading a whole file to find a function.",
+          json!({ "path": s }), &["path"]),
+        t("code_symbol", "Read the exact AST source code (`start..=end` lines) of a function, method, struct, class or type by name, PLUS its direct callers and callees from the call graph, in one call. Accepts `Parent.name` or `name` and optional `path`.",
+          json!({ "symbol": s, "path": s }), &["symbol"]),
+        t("code_find", "USE BEFORE grep to locate a function, class, struct or type by name. Returns `path:line kind name signature [lines start-end]` (ranked, fuzzy).",
           json!({ "query": s, "kind": s }), &["query"]),
-        t("code_refs", "USE BEFORE grep to see where a symbol is defined and who calls or uses it. Returns the definition and every caller with path:line and the source line. Accepts `Parent.name`. Each ref is labelled exact (resolved via file/import/qualified path) or possible (same name only, unconfirmed). Read the cited lines to verify before editing.",
+        t("code_refs", "USE BEFORE grep to see where a symbol is defined, what symbols it calls (`calls:`), and every caller (`exact` via file/import/qualified path, or `possible` by name). Accepts `Parent.name`.",
           json!({ "symbol": s }), &["symbol"]),
-        t("code_impact", "What your uncommitted and committed changes touch: changed symbols vs merge-base plus the code that depends on them (2 levels). Dependents are labelled exact or possible (name match only). Use before finishing, then read the cited lines to verify.",
+        t("code_impact", "What your uncommitted and committed changes touch: changed symbols vs merge-base, 2-level dependent callers (`exact` and `possible`), plus any active symbol/file clashes with other agents' worktrees. Run before finishing.",
           json!({}), &[]),
     ]
 }
@@ -1683,12 +1891,29 @@ pub fn mcp_tools() -> Vec<Value> {
 pub async fn mcp_call(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Result<Value, String> {
     let t = resolve_agent(ctx, agent)?;
     let l = load(ctx, t).await?;
-    let cap = cap_of(&a);
+    let cap = a["max_tokens"].as_u64().map(|n| n as usize).unwrap_or(4000).clamp(100, 60000);
+    let root = l.t.wt.as_ref().map(|w| w.path.as_path()).unwrap_or(l.t.repo_path.as_path());
     let text = match name {
         "code_map" => render_map(&l.view, a["path"].as_str(), a["depth"].as_u64().unwrap_or(2) as usize, cap),
+        "code_outline" => render_outline(&l.view, a["path"].as_str().ok_or("missing `path`")?, cap),
+        "code_symbol" => render_symbol(&l.view, root, a["symbol"].as_str().ok_or("missing `symbol`")?, a["path"].as_str(), cap),
         "code_find" => render_find(&l.view, a["query"].as_str().ok_or("missing `query`")?, a["kind"].as_str(), cap),
         "code_refs" => render_refs(&l.view, a["symbol"].as_str().ok_or("missing `symbol`")?, cap),
-        "code_impact" => render_impact(&l.view, &changes_of(&l)?, cap),
+        "code_impact" => {
+            let mut imp = render_impact(&l.view, &changes_of(&l)?, cap);
+            if let Some(wt) = &l.t.wt {
+                if let Ok(clashes) = clash_changes(ctx, Some(&l.t.repo_id)) {
+                    let mine: Vec<&Clash> = clashes.iter().filter(|c| c.a == wt.label || c.b == wt.label).collect();
+                    if !mine.is_empty() {
+                        imp.push_str(&format!("\nactive clashes with other agents ({}):\n", mine.len()));
+                        for c in mine {
+                            imp.push_str(&format!("  {} {} x {}: {}\n", c.severity, c.a, c.b, c.detail.join("; ")));
+                        }
+                    }
+                }
+            }
+            imp
+        }
         _ => return Err(format!("unknown tool {name}")),
     };
     Ok(Value::String(l.header.clone() + &text))
@@ -1872,7 +2097,11 @@ mod tests {
         let f = render_find(&v, "helpr", None, 1500);
         assert!(f.contains("src/a.rs:") && f.contains("7 fn helper"), "{f}");
         let x = render_refs(&v, "Cfg.load", 1500);
-        assert!(x.contains("def src/a.rs:3"), "{x}");
+        assert!(x.contains("def src/a.rs:3") && x.contains("calls (1 indexed symbols): helper (src/a.rs:7)"), "{x}");
+        let ol = render_map(&v, Some("src/a.rs"), 2, 1500);
+        assert!(ol.contains("outline src/a.rs:") && ol.contains("Cfg.load"), "{ol}");
+        let sym = render_symbol(&v, &r, "Cfg.load", None, 1500);
+        assert!(sym.contains("symbol Cfg.load (method) in src/a.rs:3-5") && sym.contains("helper(self.x)"), "{sym}");
     }
 }
 
