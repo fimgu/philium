@@ -8,7 +8,9 @@ test('native CSP permits local attachment previews without remote image or scrip
     const [name, ...values] = part.trim().split(/\s+/);
     return [name, values];
   }));
-  assert.deepEqual(directives['img-src'], ["'self'", 'data:']);
+  // blob: is app-created object URLs for draft and sent image previews; no remote sources.
+  assert.deepEqual(directives['img-src'], ["'self'", 'data:', 'blob:']);
+  assert.equal(directives['script-src'], undefined, 'scripts fall back to default-src self');
   assert.deepEqual(directives['default-src'], ["'self'"]);
   assert.deepEqual(directives['connect-src'], ['ipc:', 'http://ipc.localhost']);
 });
