@@ -206,10 +206,23 @@ fn usage_json(u: &Value) -> Value {
     out
 }
 
+pub const CACHE_BREAK_MARKER: &str = "<!-- PHILIUM_CACHE_BREAK -->";
+
 fn mark_block_ephemeral(content: &mut Value) {
     let ep = json!({"type": "ephemeral"});
     match content {
         Value::String(s) if !s.is_empty() => {
+            if let Some((shared, tail)) = s.split_once(CACHE_BREAK_MARKER) {
+                let shared = shared.trim_end();
+                let tail = tail.trim_start();
+                if !shared.is_empty() && !tail.is_empty() {
+                    *content = json!([
+                        {"type": "text", "text": shared, "cache_control": ep},
+                        {"type": "text", "text": tail}
+                    ]);
+                    return;
+                }
+            }
             *content = json!([{"type": "text", "text": s.clone(), "cache_control": ep}]);
         }
         Value::Array(blocks) => {
@@ -507,6 +520,19 @@ mod tests {
         assert_eq!(oai["messages"][1]["content"], "u1");
         assert_eq!(oai["messages"][2]["content"][0]["cache_control"], json!({"type": "ephemeral"}));
         assert_eq!(oai["messages"][3]["content"][0]["cache_control"], json!({"type": "ephemeral"}));
+
+        let mut split_ant = request(&json!({
+            "model": "claude-sonnet-5-5",
+            "messages": [
+                {"role": "system", "content": format!("SHARED_REPO_PREFIX\n{CACHE_BREAK_MARKER}\nAgent: lion (orchestrator)")},
+                {"role": "user", "content": "go"}
+            ]
+        }), true);
+        inject_cache_breakpoints(&mut split_ant, true);
+        assert_eq!(split_ant["system"][0]["text"], "SHARED_REPO_PREFIX");
+        assert_eq!(split_ant["system"][0]["cache_control"], json!({"type": "ephemeral"}));
+        assert_eq!(split_ant["system"][1]["text"], "Agent: lion (orchestrator)");
+        assert!(split_ant["system"][1].get("cache_control").is_none());
     }
 
     #[test]

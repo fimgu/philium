@@ -1628,8 +1628,19 @@ fn clash_key(c: &Clash) -> String {
     format!("{}|{}|{}|{}", c.a, c.b, c.severity, c.detail.join(","))
 }
 
+fn latest_clashes() -> &'static Mutex<Vec<Value>> {
+    static L: OnceLock<Mutex<Vec<Value>>> = OnceLock::new();
+    L.get_or_init(Default::default)
+}
+
+pub fn cached_clashes() -> Vec<Value> {
+    latest_clashes().lk().clone()
+}
+
 /// Emit `codeindex:clashes` and log `code_clash` for clashes not announced before.
 fn publish(ctx: &Ctx, cl: &[Clash]) {
+    let js: Vec<Value> = cl.iter().map(clash_json).collect();
+    *latest_clashes().lk() = js.clone();
     let keys: HashSet<String> = cl.iter().map(clash_key).collect();
     let mut prev = announced().lk();
     if *prev == keys {
@@ -1641,7 +1652,7 @@ fn publish(ctx: &Ctx, cl: &[Clash]) {
         }
     }
     *prev = keys;
-    ctx.emit("codeindex:clashes", cl.iter().map(clash_json).collect::<Vec<_>>());
+    ctx.emit("codeindex:clashes", js);
 }
 
 fn watcher(ctx: Arc<Ctx>) {
@@ -1651,7 +1662,7 @@ fn watcher(ctx: Arc<Ctx>) {
             continue;
         }
         let n = ctx.db.query("SELECT count(*) AS n FROM worktrees WHERE state='active' AND agent_id IS NOT NULL", []).ok().and_then(|r| r.first().and_then(|x| x["n"].as_i64())).unwrap_or(0);
-        if n < 2 {
+        if n < 1 {
             continue;
         }
         if let Ok(cl) = clash_changes(&ctx, None) {

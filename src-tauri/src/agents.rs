@@ -183,39 +183,90 @@ pub fn permission_rules(strict: bool) -> Value {
     json!({ "default": "ask", "ask_timeout_secs": 3600, "rules": rules })
 }
 
-fn instructions(name: &str, strict: bool, worktree: Option<&Path>) -> String {
-    let mut s = format!(
-        "You are agent \"{name}\" inside Philium, a workstation where many agents work in parallel. \
-         The human sees your chat with your own terminal and your own browser beside it, live. \
-         Philium's tools (prefixed mcp_philium_) are already connected: call them directly, no setup needed.\n\
+pub fn desk_instructions() -> String {
+    "You are running inside Philium. Philium's conversation UI natively renders rich Markdown blocks:\n\
+     - Fenced `mermaid` blocks (` ```mermaid `) render live as interactive vector diagrams (flowcharts, sequence, state, class, ER, architecture, mindmap, gantt). Use `mermaid` diagrams proactively whenever explaining architecture, control flow, hierarchies, state machines, or execution plans.\n\
+     - Fenced `diff` or `patch` blocks render with syntax-colored +/- diff highlighting.\n\
+     - Fenced `svg` blocks render inline as sanitized vector graphics with a source toggle.\n\
+     - Fenced `math` / `latex` blocks and `$$...$$` blocks render formatted mathematical notation.\n\
+     - Fenced `csv` or `json-table` blocks render as interactive data tables.\n\
+     - Standard GFM tables, task lists (`- [x]`), and blockquotes render with native styling.\n"
+        .to_string()
+}
+
+/// Shared invariant instructions placed FIRST in the system prompt so all agents on the same
+/// repo share an identical token prefix for LLM KV caching (OpenAI prefix cache & Anthropic ephemeral cache).
+fn shared_instructions(strict: bool) -> String {
+    let mut s = String::from(
+        "You are an autonomous software engineering agent inside Philium, a multi-agent workstation where a human engineer commands a hierarchy of Orchestrators, Reviewers, and Worker agents in parallel. \
+         The human sees your conversation, your interactive terminal, your browser, and your AST code footprint live. \
+         Philium's MCP tools (prefixed `mcp_philium_`) are already connected: call them directly, no setup needed.\n\
          \n\
-         ## Pick the right tool\n\
+         ## Hierarchy Architecture (Human -> Orchestrator -> Workers / Reviewers)\n\
+         - **Human (`\"you\"`)**: Top of the food chain. Gives high-level goals, resolves genuine blockers, and approves final PRs. Keep human interruptions minimal and high-signal.\n\
+         - **Orchestrator (`role = \"orchestrator\"`)**: Owns a cluster/mission. Decomposes the goal into board tasks (`board_create`), spawns a bounded pool of child workers/reviewers (`agent_spawn`), monitors progress (`agent_status`, `mail_read`), checks cross-worktree AST clashes (`code_impact`, `repo_context`), verifies worker branches (`repo_context {branch}`), and sends a single consolidated synthesis to `\"you\"`.\n\
+         - **Worker (`role = \"worker\"` / `\"helper\"`)**: Owns an isolated git worktree and branch. Executes its assigned task end-to-end, runs focused tests (`shell_run`), checks `code_impact`, and reports completion or blockers to its parent Orchestrator via `mail_send` (or to `\"you\"` if it has no parent).\n\
+         - **Reviewer (`role = \"reviewer\"`)**: Audits a branch or GitHub PR using `repo_context {branch/pr}`, `code_impact`, `code_symbol`, and test execution, then reports a structured verdict.\n\
+         \n\
+         ## Rich Rendering (Native in Philium UI)\n\
+         - **Mermaid diagrams (` ```mermaid `)**: Rendered live into interactive SVG diagrams with zoom and source toggles. Use `mermaid` blocks for architecture overviews, cluster/task plans, call graphs, sequence flows, and PR impact summaries.\n\
+         - **Diffs (` ```diff `)**, **SVGs (` ```svg `)**, **Math (` ```math `)**, **Data Tables (` ```csv ` / GFM tables)**: Rendered natively. Prefer structured tables and `mermaid` diagrams over walls of prose.\n\
+         \n\
+         ## Pick the Right Tool\n\
          - Web pages (\"open X\", \"go to google.com\", check a site, sign-in flows, test a web app): use YOUR browser. \
-         browser_open {{url}}, then browser_snapshot to read the page and get numbered refs, then browser_click / browser_type / browser_press with those refs. \
-         Snapshot again after every navigation. browser_screenshot when layout matters. Philium asks the human to approve browser tool calls; wait for that decision, and respect a denial. Never use curl or wget to \"visit\" a page for the human.\n\
-         - Commands: shell_run types into your persistent shell (cd and exports persist). Dev servers and watchers: shell_run with background=true, then open the URL in your browser. \
-         A second interactive session: shell_open {{name}}, then shell_run with shell={{name}}. The built-in shell tool is disabled.\n\
+         `browser_open {url}`, then `browser_snapshot` to read the page and get numbered refs, then `browser_click` / `browser_type` / `browser_press` with those refs. \
+         Snapshot again after every navigation. `browser_screenshot` when layout matters. Philium asks the human to approve browser tool calls; wait for that decision, and respect a denial. Never use curl or wget to \"visit\" a page for the human.\n\
+         - Commands: `shell_run` types into your persistent shell (cd and exports persist). Dev servers and watchers: `shell_run` with `background=true`, then open the URL in your browser. \
+         A second interactive session: `shell_open {name}`, then `shell_run` with `shell={name}`. The built-in shell tool is disabled.\n\
          - Code questions: check the `## Codebase map` in your prompt first, then use `code_outline` / `code_map` (file or directory structure with line spans), `code_symbol` (read a symbol's exact AST source + callers/callees in one call), `code_find` (locate a symbol), `code_refs` (bidirectional call graph: callees and callers), and `code_impact` (what your change touches + cross-agent clashes). Use these before grep or reading whole files.\n\
          - Branches, worktrees, GitHub PRs & past sessions: check `## Repo landscape` in your prompt first, then use `repo_context` (all git worktrees including external checkouts, local/remote branches with ahead/behind, cross-worktree clashes, open/merged GitHub PRs, or pass `branch` / `pr` for a structural AST symbol diff of any branch or PR) and `session_search` (search prior Philium and Jcode `~/.jcode/sessions` transcripts for past architectural decisions or unfinished work).\n\
-         - Other agents and the human: board_* for tasks (claim before working, keep the lease alive), mail_send / mail_read for messages. mail_send to \"you\" reaches the human.\n\
-         - Jobs like commit, open_pr, review_pr, release: playbook_get first and follow it. Finished work lands as a GitHub pull request.\n\
+         - Other agents and the human: `board_*` for tasks (claim before working, keep the lease alive), `mail_send` / `mail_read` for messages. `mail_send` to `\"you\"` reaches the human.\n\
+         - Jobs like commit, open_pr, review_pr, release: `playbook_get` first and follow it. Finished work lands as a GitHub pull request.\n\
          \n\
-         - Run builds and test suites with background=true and poll shell_read. Foreground calls return after at most 30 seconds without killing the command. A running result or transport error does not mean the command stopped: inspect the existing terminal before retrying. Never enqueue duplicate tests. Keep progress visible rather than piping live output to tail.\n\
+         - Run builds and test suites with `background=true` and poll `shell_read`. Foreground calls return after at most 30 seconds without killing the command. A running result or transport error does not mean the command stopped: inspect the existing terminal before retrying. Never enqueue duplicate tests. Keep progress visible rather than piping live output to tail.\n\
          - Minimize model round trips: batch independent inspections, use bounded file ranges and focused tests before broad suites. Do not repeatedly sleep in foreground tools while waiting for a job.\n\
-         - Before reporting completion, inspect every started job's finished state and exit_code. Report changed files, checks actually run, failures and remaining blockers. Idle is not proof that the task succeeded.\n\
+         - Before reporting completion, inspect every started job's finished state and `exit_code`. Report changed files, checks actually run, failures and remaining blockers. Idle is not proof that the task succeeded.\n\
          ## Rules\n\
          - Do what was asked with the most direct tool. Do not inspect Philium itself (its source, config, env or proxy) unless the task is about Philium.\n\
          - If a tool returns an error you cannot fix from your side, tell the human the exact error in one line and stop. Do not work around Philium's limits.\n\
          - Never add Co-authored-by trailers, \"Generated with\" lines or agent signatures to commits or PRs.\n\
          - Servers use the 20 ports starting at $PHILIUM_PORT_BASE. Throwaway files go in $TMPDIR.\n\
-         - Register anything you create outside Philium's tools (containers, clusters, processes) with resource_register so it is cleaned up.\n"
+         - Register anything you create outside Philium's tools (containers, clusters, processes) with `resource_register` so it is cleaned up.\n"
     );
-    if let Some(w) = worktree {
-        s.push_str(&format!("- Your git worktree is {} on your own branch. Stay inside it.\n", w.display()));
-    }
     if strict {
         s.push_str("- You run in Strict mode. You can read and run every tool on this machine except private data (credentials, personal folders). You can write your worktree, $TMPDIR and folders granted for this repo. \
             Shell network goes through Philium's proxy, which only allows approved hosts (package registries and similar): a 403 \"host not on allowlist\" is expected, so use your browser for websites instead.\n");
+    }
+    s
+}
+
+/// Per-agent identity tail placed AFTER `CACHE_BREAK_MARKER` so it never invalidates the shared repo KV cache prefix.
+fn agent_identity_tail(name: &str, role: &str, parent_name: Option<&str>, worktree: Option<&Path>) -> String {
+    let mut s = format!("## Agent Identity & Assignment\n- Your agent name is \"{name}\" (role: `{role}`).\n");
+    if let Some(p) = parent_name {
+        s.push_str(&format!(
+            "- Your parent Orchestrator is \"{p}\". Send progress updates, questions, and completion reports to \"{p}\" via `mail_send {{to: \"{p}\", body: ...}}` rather than interrupting the human directly.\n"
+        ));
+    }
+    match role {
+        "orchestrator" | "coordinator" => {
+            s.push_str(
+                "- **Orchestrator Protocol**:\n\
+                 1. Inspect `## Repo landscape` and `## Codebase map` (and `repo_context` / `session_search` if needed).\n\
+                 2. Break multi-part missions into clear board tasks (`board_create`) and spawn focused child workers (`agent_spawn` with `role: \"worker\"` or `\"reviewer\"` and `task_id`). Keep worker concurrency bounded (2-6 workers per cluster).\n\
+                 3. Coordinate workers via `agent_status` and `mail_read`. Before finishing, verify worker branches with `repo_context {branch}` and `code_impact` to ensure zero unresolved AST clashes.\n\
+                 4. Present the human with a clean executive summary (use a `mermaid` diagram + GFM summary table).\n",
+            );
+        }
+        "reviewer" => {
+            s.push_str(
+                "- **Reviewer Protocol**: Use `repo_context {pr}` or `repo_context {branch}` to inspect the structural AST symbol diff, `code_impact` to check blast radius and clashes, and run real verification checks via `shell_run` before delivering a concise verdict table.\n",
+            );
+        }
+        _ => {}
+    }
+    if let Some(w) = worktree {
+        s.push_str(&format!("- Your git worktree is {} on your own branch. Stay inside it.\n", w.display()));
     }
     s
 }
@@ -352,7 +403,12 @@ async fn provision(ctx: &Arc<Ctx>, id: &str, fresh: bool, brief: Option<String>)
     config["server"]["workspace"] = json!(cwd);
     config["permissions"] = permission_rules(strict);
     config["limits"] = json!({ "workspace": { "allow_outside": false } });
-    let mut extra = instructions(&name, strict, worktree.as_deref());
+    let role = row["role"].as_str().unwrap_or("worker").to_string();
+    let parent_name = row["parent_id"]
+        .as_str()
+        .and_then(|pid| get_row(ctx, pid))
+        .and_then(|pr| pr["name"].as_str().map(str::to_string));
+    let mut extra = shared_instructions(strict);
     extra.push('\n');
     extra.push_str(&crate::library::rules(ctx));
     // Personal memories only reach agents on trusted providers.
@@ -364,6 +420,8 @@ async fn provision(ctx: &Arc<Ctx>, id: &str, fresh: bool, brief: Option<String>)
             extra.push_str(&cmap);
         }
     }
+    extra.push_str("\n<!-- PHILIUM_CACHE_BREAK -->\n");
+    extra.push_str(&agent_identity_tail(&name, &role, parent_name.as_deref(), worktree.as_deref()));
     config["prompt"] = json!({ "extra": extra });
     if let Some(url) = ctx.mcp_url.get() {
         config["mcp"] = json!({ "servers": { "philium": {
@@ -683,6 +741,7 @@ pub fn init(ctx: &Arc<Ctx>) -> Result<(), String> {
 
 fn with_live(ctx: &Ctx, mut row: Value) -> Value {
     let id = row["id"].as_str().unwrap_or_default().to_string();
+    let name = row["name"].as_str().unwrap_or_default().to_string();
     row["live"] = json!(runtime(&id).is_some());
     row["strict"] = json!(row["strict"].as_i64() == Some(1));
     if let Some(e) = ctx.db.kv_get(&format!("agent_error.{id}")).filter(|e| !e.is_empty()) {
@@ -692,6 +751,80 @@ fn with_live(ctx: &Ctx, mut row: Value) -> Value {
         row["cwd"] = json!(rt.cwd);
         row["pid"] = json!(rt.hal.pid);
     }
+    let stats = ctx.gateway.agent_stats();
+    let kv = stats.get(&name).cloned().unwrap_or_else(|| {
+        json!({
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cached_tokens": 0,
+            "cache_hit_pct": 0,
+            "last_input_tokens": 0,
+            "last_cached_tokens": 0,
+            "last_cache_hit_pct": 0,
+            "guard_alerts": 0,
+            "rate_limits": 0,
+            "errors": 0,
+            "avg_ttft_ms": Value::Null,
+        })
+    });
+    let clashes: Vec<Value> = crate::codeindex::cached_clashes()
+        .into_iter()
+        .filter(|c| c["a"].as_str() == Some(&name) || c["b"].as_str() == Some(&name))
+        .collect();
+    let mut warnings: Vec<Value> = vec![];
+    if row["state"].as_str() == Some("waiting") {
+        warnings.push(json!({ "kind": "waiting", "severity": "high", "text": "Waiting for human approval" }));
+    }
+    if row["state"].as_str() == Some("failed") || row.get("error").and_then(Value::as_str).is_some() {
+        let msg = row["error"].as_str().unwrap_or("Agent failed");
+        warnings.push(json!({ "kind": "failed", "severity": "high", "text": msg }));
+    }
+    for c in &clashes {
+        let peer = if c["a"].as_str() == Some(&name) {
+            c["b"].as_str().unwrap_or("peer")
+        } else {
+            c["a"].as_str().unwrap_or("peer")
+        };
+        let detail = c["detail"]
+            .as_array()
+            .map(|a| a.iter().filter_map(Value::as_str).take(2).collect::<Vec<_>>().join("; "))
+            .unwrap_or_default();
+        warnings.push(json!({
+            "kind": "clash",
+            "severity": if c["severity"].as_str() == Some("symbol") { "high" } else { "med" },
+            "text": format!("AST {} clash with {peer}: {detail}", c["severity"].as_str().unwrap_or("file")),
+        }));
+    }
+    let reqs = kv["requests"].as_u64().unwrap_or(0);
+    let inp = kv["input_tokens"].as_u64().unwrap_or(0);
+    let hit = kv["cache_hit_pct"].as_u64().unwrap_or(0);
+    if reqs >= 2 && inp >= 8_000 && hit < 25 {
+        warnings.push(json!({
+            "kind": "kv_cache",
+            "severity": "med",
+            "text": format!("Cold KV cache ({hit}% hit across {}k input tokens)", inp / 1000),
+        }));
+    }
+    let guard_alerts = kv["guard_alerts"].as_u64().unwrap_or(0);
+    if guard_alerts > 0 {
+        warnings.push(json!({
+            "kind": "guard",
+            "severity": "high",
+            "text": format!("Outbound secret guard triggered ({guard_alerts}x)"),
+        }));
+    }
+    let rl = kv["rate_limits"].as_u64().unwrap_or(0);
+    if rl > 0 {
+        warnings.push(json!({
+            "kind": "rate_limit",
+            "severity": "med",
+            "text": format!("Provider rate-limited 429 ({rl}x)"),
+        }));
+    }
+    row["kv"] = kv;
+    row["clashes"] = json!(clashes);
+    row["warnings"] = json!(warnings);
     row
 }
 
@@ -703,7 +836,47 @@ pub fn list(ctx: &Ctx) -> Result<Value, String> {
          ORDER BY a.created_at",
         [],
     )?;
-    Ok(Value::Array(rows.into_iter().map(|r| with_live(ctx, r)).collect()))
+    let mut by_id: HashMap<String, (String, Option<String>)> = HashMap::new();
+    let mut children_count: HashMap<String, usize> = HashMap::new();
+    for r in &rows {
+        if let Some(id) = r["id"].as_str() {
+            let name = r["name"].as_str().unwrap_or_default().to_string();
+            let pid = r["parent_id"].as_str().filter(|s| !s.is_empty()).map(str::to_string);
+            if let Some(p) = &pid {
+                *children_count.entry(p.clone()).or_default() += 1;
+            }
+            by_id.insert(id.to_string(), (name, pid));
+        }
+    }
+    let root_of = |start_id: &str| -> (String, String) {
+        let mut cur = start_id.to_string();
+        for _ in 0..8 {
+            if let Some((_, Some(p))) = by_id.get(&cur) {
+                if by_id.contains_key(p) {
+                    cur = p.clone();
+                    continue;
+                }
+            }
+            break;
+        }
+        let cname = by_id.get(&cur).map(|(n, _)| n.clone()).unwrap_or_default();
+        (cur, cname)
+    };
+    let enriched: Vec<Value> = rows
+        .into_iter()
+        .map(|r| {
+            let mut v = with_live(ctx, r);
+            let id = v["id"].as_str().unwrap_or_default().to_string();
+            let pid = v["parent_id"].as_str().filter(|s| !s.is_empty()).map(str::to_string);
+            v["parent_name"] = json!(pid.as_ref().and_then(|p| by_id.get(p)).map(|(n, _)| n.clone()));
+            let (cid, cname) = root_of(&id);
+            v["cluster_id"] = json!(cid);
+            v["cluster_name"] = json!(cname);
+            v["children_count"] = json!(children_count.get(&id).copied().unwrap_or(0));
+            v
+        })
+        .collect();
+    Ok(Value::Array(enriched))
 }
 
 async fn hal_get(id: &str, path: &str) -> Result<Value, String> {
@@ -874,6 +1047,92 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
                 Some(w) => crate::workspace::call(ctx, "diff", json!({ "worktree_id": w })).await,
                 None => Ok(json!({ "stat": "", "patch": "" })),
             }
+        }
+        "broadcast" => {
+            let text = ctx::arg_str(&args, "text")?;
+            let cluster_id = ctx::arg_opt_str(&args, "cluster_id");
+            let repo_id = ctx::arg_opt_str(&args, "repo_id");
+            let only_orchestrator = args["only_orchestrator"].as_bool().unwrap_or(false);
+            let all = list(ctx)?.as_array().cloned().unwrap_or_default();
+            let mut sent = 0usize;
+            for a in all {
+                if a["live"].as_bool() != Some(true) {
+                    continue;
+                }
+                let aid = a["id"].as_str().unwrap_or_default();
+                if let Some(cid) = &cluster_id {
+                    if a["cluster_id"].as_str() != Some(cid.as_str()) && aid != cid {
+                        continue;
+                    }
+                    if only_orchestrator && aid != cid {
+                        continue;
+                    }
+                }
+                if let Some(rid) = &repo_id {
+                    if a["repo_id"].as_str() != Some(rid.as_str()) {
+                        continue;
+                    }
+                }
+                if send(ctx, aid, &text).await.is_ok() {
+                    sent += 1;
+                }
+            }
+            Ok(json!({ "sent": sent }))
+        }
+        "batch_permission" => {
+            let decision = ctx::arg_str(&args, "decision")?;
+            if !matches!(decision.as_str(), "approve" | "deny") {
+                return Err("decision must be approve or deny".into());
+            }
+            let scope = ctx::arg_opt_str(&args, "scope").unwrap_or_else(|| "session".into());
+            let cluster_id = ctx::arg_opt_str(&args, "cluster_id");
+            let repo_id = ctx::arg_opt_str(&args, "repo_id");
+            let all = list(ctx)?.as_array().cloned().unwrap_or_default();
+            let mut resolved = 0usize;
+            for a in all {
+                if a["state"].as_str() != Some("waiting") || a["live"].as_bool() != Some(true) {
+                    continue;
+                }
+                let aid = a["id"].as_str().unwrap_or_default();
+                if let Some(cid) = &cluster_id {
+                    if a["cluster_id"].as_str() != Some(cid.as_str()) && aid != cid {
+                        continue;
+                    }
+                }
+                if let Some(rid) = &repo_id {
+                    if a["repo_id"].as_str() != Some(rid.as_str()) {
+                        continue;
+                    }
+                }
+                if let Ok(r) = rt(aid) {
+                    if let Ok(perms) = r.hal.call(reqwest::Method::GET, &format!("/sessions/{}/permissions", r.session), None).await {
+                        if let Some(arr) = perms.as_array() {
+                            for p in arr {
+                                if let Some(rid) = p["request_id"].as_str().or_else(|| p["id"].as_str()) {
+                                    let body = if decision == "approve" { Some(json!({ "scope": scope })) } else { None };
+                                    if r.hal.call(reqwest::Method::POST, &format!("/sessions/{}/permissions/{rid}/{decision}", r.session), body).await.is_ok() {
+                                        resolved += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(json!({ "resolved": resolved }))
+        }
+        "stop_cluster" => {
+            let cid = ctx::arg_str(&args, "cluster_id")?;
+            let all = list(ctx)?.as_array().cloned().unwrap_or_default();
+            let mut stopped = 0usize;
+            for a in all {
+                let aid = a["id"].as_str().unwrap_or_default();
+                if (a["cluster_id"].as_str() == Some(cid.as_str()) || aid == cid) && a["live"].as_bool() == Some(true) {
+                    stop(ctx, aid, "stopped");
+                    stopped += 1;
+                }
+            }
+            Ok(json!({ "stopped": stopped }))
         }
         _ => Err(format!("unknown agents.{method}")),
     }

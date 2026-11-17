@@ -14,13 +14,100 @@
 .assistant-markdown code { font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; font-size: .9em; background: var(--bg-raised); border-radius: 3px; padding: .1em .3em; }
 .assistant-markdown pre { overflow-x: auto; white-space: pre; margin: 0; padding: 12px; }
 .assistant-markdown pre code { padding: 0; background: none; }
-.markdown-code { background: var(--bg-raised); border: 1px solid var(--line); border-radius: var(--radius); margin: .7em 0; overflow: hidden; }
-.markdown-code > .markdown-copy { display: block; margin: 5px 5px 0 auto; }
-.markdown-copy { color: var(--text-dim); background: var(--surface); border: 1px solid var(--line); border-radius: 4px; padding: 4px 8px; font: inherit; font-size: .8em; cursor: pointer; }
-.markdown-copy:hover { color: var(--text); border-color: var(--accent); }
-.markdown-copy:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.markdown-code, .markdown-rich { background: var(--bg-raised); border: 1px solid var(--line); border-radius: var(--radius); margin: .75em 0; overflow: hidden; }
+.markdown-code-bar, .markdown-rich-bar {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 5px 10px; border-bottom: 1px solid var(--line); background: var(--surface);
+  font-size: 11px; color: var(--text-dim);
+}
+.markdown-code-lang, .markdown-rich-badge {
+  font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
+  font-weight: 600; letter-spacing: .04em; text-transform: uppercase; color: var(--text-dim);
+}
+.markdown-rich-actions { display: flex; align-items: center; gap: 4px; }
+.markdown-rich-btn, .markdown-copy {
+  color: var(--text-dim); background: var(--bg-raised); border: 1px solid var(--line);
+  border-radius: 4px; padding: 2px 7px; font: inherit; font-size: 11px; cursor: pointer;
+}
+.markdown-rich-btn:hover, .markdown-copy:hover { color: var(--text); border-color: var(--accent); }
+.markdown-copy:focus-visible, .markdown-rich-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .markdown-actions { display: flex; justify-content: flex-end; margin-top: 8px; }
-.markdown-table { overflow-x: auto; }
-.assistant-markdown table { border-collapse: collapse; margin: .6em 0; }
-.assistant-markdown :is(th,td) { border: 1px solid var(--line); padding: .35em .65em; text-align: left; }
+.markdown-table, .markdown-table-wrap { overflow-x: auto; }
+.assistant-markdown table { border-collapse: collapse; margin: .4em 0; width: 100%; font-size: 12.5px; }
+.assistant-markdown :is(th,td) { border: 1px solid var(--line); padding: .4em .7em; text-align: left; }
+.assistant-markdown th { background: var(--surface); font-weight: 600; }
 .markdown-image { color: var(--text-dim); }
+
+/* Mermaid Diagram Canvas */
+.mermaid-canvas {
+  display: flex; justify-content: center; align-items: center;
+  padding: 16px; overflow: auto; background: var(--bg);
+}
+.mermaid-svg {
+  color: var(--text); font-family: inherit; user-select: none;
+}
+.mermaid-shape {
+  fill: var(--surface); stroke: var(--accent); stroke-width: 1.5;
+}
+.mermaid-shape-diamond {
+  fill: var(--bg-raised); stroke: var(--accent); stroke-width: 1.5;
+}
+.mermaid-label {
+  fill: var(--text); font-size: 12px; font-weight: 500;
+}
+.mermaid-edge-path {
+  stroke: var(--text-dim);
+}
+.mermaid-edge { color: var(--text-dim); }
+.mermaid-edge-bg {
+  fill: var(--bg-raised); stroke: var(--line); stroke-width: 1;
+}
+.mermaid-edge-label {
+  fill: var(--text-dim); font-size: 11px; font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+.mermaid-subgraph-box {
+  fill: color-mix(in srgb, var(--surface) 55%, transparent);
+  stroke: var(--line); stroke-width: 1.2; stroke-dasharray: 4,3;
+}
+.mermaid-subgraph-title {
+  fill: var(--text-dim); font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em;
+}
+.mermaid-lifeline {
+  stroke: var(--line); stroke-width: 1.2;
+}
+.mermaid-note-box {
+  fill: color-mix(in srgb, var(--accent) 12%, var(--surface));
+  stroke: var(--accent); stroke-width: 1;
+}
+.mermaid-gantt { width: 100%; display: flex; flex-direction: column; gap: 6px; }
+.mermaid-gantt-title { font-weight: 600; font-size: 12.5px; margin-bottom: 4px; color: var(--text); }
+.mermaid-gantt-row { display: grid; grid-template-columns: 95px 150px 1fr; align-items: center; gap: 8px; font-size: 11.5px; }
+.mermaid-gantt-sec { color: var(--text-dim); font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mermaid-gantt-lbl { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mermaid-gantt-track { background: var(--surface); border: 1px solid var(--line); border-radius: 4px; height: 22px; display: flex; align-items: center; padding: 2px; }
+.mermaid-gantt-bar { background: color-mix(in srgb, var(--accent) 26%, var(--surface)); border: 1px solid var(--accent); border-radius: 3px; height: 100%; padding: 0 8px; display: flex; align-items: center; font-size: 10.5px; color: var(--text); white-space: nowrap; overflow: hidden; }
+.mermaid-gantt-bar.state-done { border-color: var(--ok, #22c55e); background: color-mix(in srgb, var(--ok, #22c55e) 22%, var(--surface)); }
+.mermaid-gantt-bar.state-crit { border-color: var(--err, #ef4444); background: color-mix(in srgb, var(--err, #ef4444) 22%, var(--surface)); }
+.mermaid-timeline { width: 100%; }
+.mermaid-timeline-row { display: flex; gap: 10px; overflow-x: auto; padding: 4px 0; }
+.mermaid-timeline-step { min-width: 130px; flex: 1; background: var(--surface); border: 1px solid var(--line); border-top: 3px solid var(--accent); border-radius: 4px; padding: 8px 10px; }
+.mermaid-timeline-period { font-weight: 600; font-size: 11.5px; color: var(--accent); margin-bottom: 4px; }
+.mermaid-timeline-detail { font-size: 11.5px; color: var(--text); }
+
+/* Diff Rendering */
+.diff-stat-add { color: var(--ok, #22c55e); margin-left: 6px; }
+.diff-stat-del { color: var(--err, #ef4444); margin-left: 4px; }
+.diff-lines { font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; font-size: 12px; line-height: 1.45; overflow-x: auto; padding: 6px 0; }
+.diff-line { display: flex; gap: 10px; padding: 1px 12px; white-space: pre; }
+.diff-ln { width: 28px; flex-shrink: 0; text-align: right; color: var(--text-dim); opacity: .55; user-select: none; font-size: 10.5px; }
+.diff-code { flex: 1; }
+.diff-line-add { background: color-mix(in srgb, var(--ok, #22c55e) 14%, transparent); color: var(--text); }
+.diff-line-del { background: color-mix(in srgb, var(--err, #ef4444) 14%, transparent); color: var(--text); }
+.diff-line-hunk { background: color-mix(in srgb, var(--accent) 12%, transparent); color: var(--accent); font-weight: 600; }
+.diff-line-file { color: var(--text-dim); font-weight: 600; }
+
+/* Math Block */
+.markdown-math-body {
+  padding: 14px 18px; font-family: "STIX Two Math", "Cambria Math", Georgia, serif;
+  font-size: 15px; letter-spacing: .01em; color: var(--text); text-align: center; overflow-x: auto;
+}

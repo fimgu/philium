@@ -72,7 +72,8 @@ fn chat_session_body(ws: &std::path::Path, title: &str, model: Option<&str>) -> 
 /// plain chat view and subscription model discovery.
 pub fn refresh_desk(ctx: &Arc<Ctx>) {
     let dir = ctx.data_dir.join("desk");
-    let setup = providers::hal_setup(ctx, &dir.join("hal"), &providers::ConfigOpts::default());
+    let mut setup = providers::hal_setup(ctx, &dir.join("hal"), &providers::ConfigOpts::default());
+    setup.config["prompt"] = json!({ "extra": agents::desk_instructions() });
     if let Some(h) = ctx.desk() {
         if h.config == setup.config && h.alive() {
             return;

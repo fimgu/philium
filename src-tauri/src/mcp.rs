@@ -314,8 +314,19 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
         "agent_status" => {
             let all = crate::agents::list(ctx)?;
             let pick = |r: &Value| {
-                json!({ "name": r["name"], "state": r["state"], "role": r["role"], "model": r["model_ref"],
-                        "task": r["task_title"], "branch": r["branch"] })
+                json!({
+                    "name": r["name"],
+                    "state": r["state"],
+                    "role": r["role"],
+                    "model": r["model_ref"],
+                    "parent": r["parent_name"],
+                    "cluster": r["cluster_name"],
+                    "children_count": r["children_count"],
+                    "task": r["task_title"],
+                    "branch": r["branch"],
+                    "warnings": r["warnings"],
+                    "kv_cache_hit_pct": r["kv"]["cache_hit_pct"],
+                })
             };
             match a["name"].as_str() {
                 Some(n) => all

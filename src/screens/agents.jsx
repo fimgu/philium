@@ -1,5 +1,6 @@
 // Agents: every named agent, its live conversation, approvals, terminals and
-// changes. Untrusted-provider agents are marked Strict everywhere.
+// changes. Supports Human -> Orchestrator -> Worker/Reviewer hierarchies,
+// shared-prefix KV cache telemetry, AST clash/health warnings, and Fleet Command Grid.
 import { For, Show, createSignal, createResource, createMemo, createEffect, on, onCleanup, Suspense } from "solid-js";
 import { NotFound, Page, Button, Badge, Dot, Empty, Modal, Field, Input, TextArea, Select, Toggle, Segmented, confirm, toast } from "../ui/kit.jsx";
 import { Icon } from "../ui/icons.jsx";
@@ -34,7 +35,59 @@ export function AgentChip(props) {
   return <span class="agent-chip" style={{ "--h": agentHue(props.name) }}>{props.name}</span>;
 }
 
-/** Spawn dialog: name, model (live list), repo, task, brief, Strict. */
+export function RoleBadge(props) {
+  const role = () => (props.role || "worker").toLowerCase();
+  return (
+    <span class={`role-badge role-${role()}`} title={`Role: ${role()}`}>
+      {role() === "orchestrator" ? "ORCH" : role() === "reviewer" ? "REV" : "WORK"}
+    </span>
+  );
+}
+
+export function KvBadge(props) {
+  const kv = () => props.kv || {};
+  const reqs = () => kv().requests || 0;
+  const hit = () => kv().cache_hit_pct ?? 0;
+  const inp = () => kv().input_tokens || 0;
+  const cached = () => kv().cached_tokens || 0;
+  const ttft = () => kv().avg_ttft_ms;
+  const tone = () => (hit() >= 60 ? "ok" : hit() >= 25 ? "warn" : inp() >= 8000 ? "bad" : "neutral");
+  return (
+    <Show when={reqs() > 0}>
+      <span
+        class={`kv-badge kv-${tone()}`}
+        title={`KV Cache: ${hit()}% hit (${(cached() / 1000).toFixed(1)}k cached / ${(inp() / 1000).toFixed(1)}k input across ${reqs()} reqs)${ttft() ? ` · avg TTFT ${ttft()}ms` : ""}`}
+      >
+        KV {hit()}%
+      </span>
+    </Show>
+  );
+}
+
+export function WarningPills(props) {
+  const warnings = () => props.warnings ?? [];
+  return (
+    <Show when={warnings().length}>
+      <div class="agent-warnings">
+        <For each={warnings().slice(0, props.max ?? 3)}>
+          {(w) => (
+            <span class={`warn-pill warn-${w.severity || "med"} warn-kind-${w.kind}`} title={w.text}>
+              {w.kind === "clash" ? "⚡ Clash" :
+               w.kind === "kv_cache" ? "❄ Cold KV" :
+               w.kind === "guard" ? "🛡 Guard" :
+               w.kind === "rate_limit" ? "⏳ 429" :
+               w.kind === "waiting" ? "✋ Approval" :
+               "⚠ Alert"}
+              <Show when={!props.compact}><span class="warn-pill-detail">{w.text}</span></Show>
+            </span>
+          )}
+        </For>
+      </div>
+    </Show>
+  );
+}
+
+/** Spawn dialog: name, role, model (live list), repo, task, brief, Strict. */
 export function SpawnModal(props) {
   const [names] = createResource(() => rpc("agents.names"));
   const [models] = createResource(() => rpc("providers.models", {}).catch(() => []));
@@ -43,6 +96,7 @@ export function SpawnModal(props) {
   const [tasks] = createResource(() => rpc("board.list", { status: "open" }).catch(() => []));
   const [def] = createResource(() => rpc("providers.default").catch(() => null));
   const [name, setName] = createSignal(props.preset?.name ?? "");
+  const [role, setRole] = createSignal(props.preset?.role ?? "orchestrator");
   const [model, setModel] = createSignal("");
   const [repo, setRepo] = createSignal(props.preset?.repo_id ?? "");
   const [task, setTask] = createSignal(props.preset?.task_id ?? "");
@@ -75,22 +129,35 @@ export function SpawnModal(props) {
     setBusy(true); setErr("");
     try {
       const a = await rpc("agents.spawn", {
-        name: name().trim() || null, model: chosen() || null, repo_id: repo() || null,
-        task_id: task() || null, brief: brief(), strict: strict() || forcedStrict(),
+        name: name().trim() || null,
+        role: role() || "worker",
+        parent_id: props.preset?.parent_id || null,
+        model: chosen() || null,
+        repo_id: repo() || null,
+        task_id: task() || null,
+        brief: brief(),
+        strict: strict() || forcedStrict(),
       });
-      toast(`${a.name} is starting`, "secure");
+      toast(`${a.name} (${role()}) is starting`, "secure");
       props.onClose(a);
     } catch (e) { setErr(String(e)); } finally { setBusy(false); }
   };
 
   return (
-    <Modal title="New agent" onClose={() => props.onClose(null)} footer={<>
+    <Modal title="New agent / cluster lead" onClose={() => props.onClose(null)} footer={<>
       <Button onClick={() => props.onClose(null)}>Cancel</Button>
-      <Button variant="primary" busy={busy()} onClick={submit}>Start agent</Button>
+      <Button variant="primary" busy={busy()} onClick={submit}>Start {role() === "orchestrator" ? "Orchestrator" : "Agent"}</Button>
     </>}>
       <div class="grid-2">
         <Field label="Name" hint={`Leave empty for ${names()?.[0] ?? "a free name"}`}>
           <Input value={name()} placeholder={names()?.[0] ?? "lion"} onValue={(v) => setName(v.toLowerCase().replace(/[^a-z0-9-]/g, ""))} />
+        </Field>
+        <Field label="Hierarchy Role" hint="Orchestrators decompose & spawn workers">
+          <Select value={role()} onValue={setRole} options={[
+            { value: "orchestrator", label: "Orchestrator (Cluster Lead — spawns workers & reviewers)" },
+            { value: "worker", label: "Worker (Focused implementation in isolated worktree)" },
+            { value: "reviewer", label: "Reviewer (Audits diffs, tests & PR readiness)" },
+          ]} />
         </Field>
         <Field label="Model" hint="From your providers, discovered live">
           <Select value={chosen()} onValue={setModel} options={modelOptions()} placeholder="Choose a model" />
@@ -102,8 +169,8 @@ export function SpawnModal(props) {
           <Select value={task()} onValue={setTask} options={[{ value: "", label: "None" }, ...(tasks() ?? []).map((t) => ({ value: t.id, label: t.title }))]} />
         </Field>
       </div>
-      <Field label="Brief" hint="The first message. The agent starts working right away.">
-        <TextArea rows={5} value={brief()} onValue={setBrief} placeholder="What should this agent do?" />
+      <Field label="Mission Brief" hint="The first instruction. Orchestrators will automatically plan, spawn workers on disjoint files, and synthesize results.">
+        <TextArea rows={5} value={brief()} onValue={setBrief} placeholder="Describe the mission, target PR, or task..." />
       </Field>
       <div class="row" style={{ "margin-top": "8px" }}>
         <Toggle tone="strict" on={strict() || forcedStrict()} disabled={forcedStrict() || isSub()} onChange={setStrict} label="Strict mode" />
@@ -124,12 +191,15 @@ function AgentRow(props) {
     <div class={`list-item agent-row ${props.selected ? "on" : ""}`} style={{ "padding-left": `${12 + props.depth * 16}px` }} onClick={props.onClick}>
       <Dot state={stateDot(a().state)} title={stateLabel(a().state)} />
       <div class="grow" style={{ "min-width": 0 }}>
-        <div class="row" style={{ gap: "6px" }}>
+        <div class="row" style={{ gap: "5px", "flex-wrap": "wrap" }}>
           <AgentChip name={a().name} />
+          <RoleBadge role={a().role} />
+          <KvBadge kv={a().kv} />
           <Show when={a().strict}><Badge tone="strict" title="Untrusted provider: sandboxed and fully observed">Strict</Badge></Show>
           <Show when={a().state === "waiting"}><Badge tone="strict">Needs you</Badge></Show>
+          <Show when={(a().warnings ?? []).some((w) => w.kind === "clash")}><Badge tone="danger">Clash</Badge></Show>
         </div>
-        <div class="xs faint ellipsis">{a().task_title || a().repo_name || a().model_ref}</div>
+        <div class="xs faint ellipsis">{a().task_title || a().repo_name || a().branch || a().model_ref}</div>
       </div>
       <span class="xs faint">{fmt.ago(a().last_active_at)}</span>
     </div>
@@ -198,10 +268,13 @@ function Changes(props) {
 
 function Details(props) {
   const a = () => props.agent;
+  const kv = () => a()?.kv || {};
   return (
     <div class="page-body agent-details">
       <div class="grid-2">
+        <div><div class="xs faint">Role & Cluster</div><div class="row gap-4"><RoleBadge role={a().role} /><span class="small">{a().cluster_name ? `Cluster ${a().cluster_name}` : "Root"}</span></div></div>
         <div><div class="xs faint">Model</div><div class="mono small">{a().model_ref}</div></div>
+        <div><div class="xs faint">KV Cache Hit Rate</div><div class="mono small">{kv().cache_hit_pct ?? 0}% ({((kv().cached_tokens || 0) / 1000).toFixed(1)}k cached / {((kv().input_tokens || 0) / 1000).toFixed(1)}k in)</div></div>
         <div><div class="xs faint">Security</div>
           <Show when={a().strict} fallback={<Badge tone="secure">Standard: trusted provider</Badge>}>
             <Badge tone="strict">Strict: sandboxed, network allowlist</Badge>
@@ -212,6 +285,10 @@ function Details(props) {
         <div><div class="xs faint">Ports</div><div class="mono small">{a().port_base}–{a().port_base + 19}</div></div>
         <div><div class="xs faint">Started</div><div class="small">{fmt.ago(a().created_at)}</div></div>
       </div>
+      <Show when={(a().warnings ?? []).length}>
+        <h3 class="section-title">Active Warnings</h3>
+        <WarningPills warnings={a().warnings} max={10} />
+      </Show>
       <h3 class="section-title">Resources owned</h3>
       <Show when={(a().resources ?? []).length} fallback={<div class="small faint">Nothing yet.</div>}>
         <table class="table">
@@ -224,8 +301,18 @@ function Details(props) {
         </table>
       </Show>
       <Show when={(a().children ?? []).length}>
-        <h3 class="section-title">Helpers</h3>
-        <div class="row" style={{ "flex-wrap": "wrap" }}><For each={a().children}>{(c) => <span onClick={() => go("agents", { id: c.id })} style={{ cursor: "pointer" }}><AgentChip name={c.name} /></span>}</For></div>
+        <h3 class="section-title">Sub-Agents ({a().children.length})</h3>
+        <div class="row" style={{ "flex-wrap": "wrap", gap: "6px" }}>
+          <For each={a().children}>
+            {(c) => (
+              <span onClick={() => go("agents", { id: c.id })} style={{ cursor: "pointer" }} class="row gap-4">
+                <Dot state={stateDot(c.state)} />
+                <AgentChip name={c.name} />
+                <RoleBadge role={c.role} />
+              </span>
+            )}
+          </For>
+        </div>
       </Show>
     </div>
   );
@@ -233,7 +320,6 @@ function Details(props) {
 
 function AgentView(props) {
   const [tab, setTab] = createSignal("chat");
-  // Side panel: what the agent is doing, live. Remembered across agents.
   const [aside, setAsideRaw] = createSignal(localStorage.getItem("agent.aside") ?? "none");
   const setAside = (v) => { setAsideRaw(v); localStorage.setItem("agent.aside", v); };
   const [asideW, setAsideW] = createSignal(Number(localStorage.getItem("agent.aside.w")) || 520);
@@ -270,7 +356,6 @@ function AgentView(props) {
       if (request !== generation || props.id !== id) return;
       if (!Array.isArray(evs)) throw new Error("Invalid history response");
       setEvents((current) => merge(current, evs));
-      // Cursor belongs to the fetched page, never to newer SSE events merged above.
       const next = evs.at(-1)?.seq ?? after;
       setHistoryCursor(next);
       setHistoryMore(evs.length === 5000 && next > after);
@@ -351,9 +436,16 @@ function AgentView(props) {
       <div class="agent-head">
         <Dot state={stateDot(a()?.state)} />
         <AgentChip name={a()?.name} />
+        <RoleBadge role={a()?.role} />
         <span class="small dim">{stateLabel(a()?.state)}</span>
+        <KvBadge kv={a()?.kv} />
         <Show when={a()?.strict}><Badge tone="strict"><Icon name="shield" size={11} /> Strict</Badge></Show>
-        <span class="mono xs faint ellipsis">{a()?.model_ref}</span>
+        <Show when={a()?.parent_id}>
+          <span class="xs faint" style={{ cursor: "pointer" }} onClick={() => go("agents", { id: a().parent_id })}>
+            ↳ lead: <b>{a()?.parent_name || "parent"}</b>
+          </span>
+        </Show>
+        <span class="mono xs faint ellipsis">{a()?.branch ? `${a()?.repo_name || ""}#${a()?.branch}` : a()?.model_ref}</span>
         <div class="grow" />
         <Segmented value={tab()} onChange={setTab} options={[{ value: "chat", label: "Conversation" }, { value: "terms", label: "Commands" }, { value: "changes", label: "Changes" }, { value: "info", label: "Details" }]} />
         <Segmented value={aside()} onChange={setAside} options={[
@@ -366,7 +458,24 @@ function AgentView(props) {
         </Show>
         <Button size="sm" variant="ghost" title="Remove agent and clean up" onClick={remove}><Icon name="trash" size={12} /></Button>
       </div>
+      <Show when={(a()?.children ?? []).length}>
+        <div class="cluster-subbar">
+          <span class="xs faint">Sub-agents ({a().children.length}):</span>
+          <For each={a().children}>
+            {(c) => (
+              <button type="button" class="cluster-subpill" onClick={() => go("agents", { id: c.id })}>
+                <Dot state={stateDot(c.state)} />
+                <span>{c.name}</span>
+                <RoleBadge role={c.role} />
+              </button>
+            )}
+          </For>
+        </div>
+      </Show>
       <Show when={a()?.error}><div class="shield danger" style={{ margin: "8px 16px 0" }}>{a().error}</div></Show>
+      <Show when={(a()?.warnings ?? []).length}>
+        <div style={{ padding: "6px 16px 0" }}><WarningPills warnings={a().warnings} max={6} /></div>
+      </Show>
       <div class="agent-body">
         <div class="agent-main" ref={agentMain}>
           <Show when={tab() === "chat"}>
@@ -431,6 +540,7 @@ export function AgentGridCard(props) {
 
   const live = () => !!a()?.live;
   const busy = () => ["running", "waiting"].includes(a()?.state);
+  const hasClash = () => (a()?.warnings ?? []).some((w) => w.kind === "clash");
 
   const send = async (e) => {
     e?.preventDefault();
@@ -451,18 +561,30 @@ export function AgentGridCard(props) {
     live() ? rpc("agents.permission", { id: a().id, request_id, decision, scope }, { action: true }).catch((e) => toast(String(e), "danger")) : Promise.resolve();
 
   return (
-    <div class={`agent-card ${a()?.state === "waiting" ? "needs-you" : busy() ? "active" : ""}`} data-agent-card={a()?.name}>
+    <div
+      class={`agent-card role-card-${a()?.role || "worker"} ${a()?.state === "waiting" ? "needs-you" : hasClash() ? "has-clash" : busy() ? "active" : ""}`}
+      data-agent-card={a()?.name}
+    >
       <div class="agent-card-head" onClick={() => props.onOpen?.(a().id)}>
         <Dot state={stateDot(a()?.state)} title={stateLabel(a()?.state)} />
         <AgentChip name={a()?.name} />
+        <RoleBadge role={a()?.role} />
         <span class="xs dim">{stateLabel(a()?.state)}</span>
+        <KvBadge kv={a()?.kv} />
         <Show when={a()?.strict}><Badge tone="strict">Strict</Badge></Show>
         <Show when={a()?.state === "waiting"}><Badge tone="strict">Needs you</Badge></Show>
+        <Show when={a()?.parent_name}><span class="xs faint" title={`Sub-agent of ${a().parent_name}`}>↳ {a().parent_name}</span></Show>
+        <Show when={(a()?.children_count ?? 0) > 0}><span class="xs faint" title="Spawned sub-agents">◈ {a().children_count}</span></Show>
         <span class="xs faint ellipsis grow" title={a()?.task_title || a()?.branch || a()?.model_ref}>
-          {a()?.task_title || a()?.repo_name || a()?.branch || a()?.model_ref}
+          {a()?.repo_name ? `${a().repo_name}${a().branch ? `@${a().branch}` : ""}` : (a()?.task_title || a()?.branch || a()?.model_ref)}
         </span>
         <span class="mono xs faint">{(a()?.model_ref ?? "").split("/").pop()}</span>
         <div class="row gap-4" onClick={(e) => e.stopPropagation()}>
+          <Show when={a()?.role === "orchestrator"}>
+            <Button size="sm" variant="ghost" onClick={() => props.onSpawnChild?.(a())} title="Spawn worker under this orchestrator">
+              <Icon name="plus" size={11} />
+            </Button>
+          </Show>
           <Show when={live()} fallback={
             <Button size="sm" onClick={() => rpc("agents.resume", { id: a().id }, { action: true }).catch((e) => toast(String(e), "danger"))} title="Resume agent">
               <Icon name="play" size={11} />
@@ -482,6 +604,11 @@ export function AgentGridCard(props) {
           </Button>
         </div>
       </div>
+      <Show when={(a()?.warnings ?? []).length}>
+        <div class="agent-card-warnings">
+          <WarningPills warnings={a().warnings} max={3} />
+        </div>
+      </Show>
       <Show when={a()?.error}><div class="shield danger xs" style={{ margin: "6px 10px 0" }}>{a().error}</div></Show>
       <div class="agent-card-body">
         <Conversation
@@ -511,26 +638,137 @@ export function AgentGridCard(props) {
   );
 }
 
+/** Ultra-dense tile for Fleet Heatmap view (100+ agents on screen). */
+function FleetHeatmapTile(props) {
+  const a = () => props.agent;
+  const warnings = () => a()?.warnings ?? [];
+  return (
+    <div
+      class={`fleet-tile state-${a()?.state} ${warnings().length ? "has-warning" : ""}`}
+      onClick={() => props.onOpen?.(a().id)}
+      title={`${a()?.name} (${a()?.role}) · ${stateLabel(a()?.state)}${a()?.repo_name ? ` · ${a().repo_name}` : ""}${a()?.branch ? `@${a().branch}` : ""}`}
+    >
+      <div class="fleet-tile-top">
+        <Dot state={stateDot(a()?.state)} />
+        <AgentChip name={a()?.name} />
+        <RoleBadge role={a()?.role} />
+        <div class="grow" />
+        <KvBadge kv={a()?.kv} />
+      </div>
+      <div class="fleet-tile-mid xs faint ellipsis">
+        {a()?.repo_name ? `${a().repo_name}${a().branch ? `@${a().branch}` : ""}` : (a()?.task_title || (a()?.model_ref ?? "").split("/").pop())}
+      </div>
+      <Show when={warnings().length}>
+        <WarningPills warnings={warnings()} compact max={2} />
+      </Show>
+      <div class="fleet-tile-foot" onClick={(e) => e.stopPropagation()}>
+        <span class="xs faint">{stateLabel(a()?.state)}</span>
+        <Show when={a()?.parent_name}><span class="xs faint">↳{a().parent_name}</span></Show>
+        <div class="grow" />
+        <Show when={a()?.live} fallback={
+          <button type="button" class="fleet-mini-btn" onClick={() => rpc("agents.resume", { id: a().id }, { action: true }).catch((e) => toast(String(e), "danger"))} title="Resume">▶</button>
+        }>
+          <button type="button" class="fleet-mini-btn" onClick={() => rpc("agents.stop", { id: a().id }, { action: true }).catch((e) => toast(String(e), "danger"))} title="Stop">■</button>
+        </Show>
+      </div>
+    </div>
+  );
+}
+
+/** Quick Mission Dispatch Bar: 1-line launch for an Orchestrator cluster or Worker. */
+function MissionDispatchBar(props) {
+  const [repos] = createResource(() => rpc("workspace.repos_list").catch(() => []));
+  const [repoId, setRepoId] = createSignal("");
+  const [role, setRole] = createSignal("orchestrator");
+  const [brief, setBrief] = createSignal("");
+  const [busy, setBusy] = createSignal(false);
+
+  const dispatch = async (e) => {
+    e?.preventDefault();
+    const text = brief().trim();
+    if (!text || busy()) return;
+    setBusy(true);
+    try {
+      const a = await rpc("agents.spawn", {
+        role: role(),
+        repo_id: repoId() || null,
+        brief: text,
+      });
+      setBrief("");
+      toast(`Dispatched ${role()} ${a.name}`, "secure");
+      props.onSpawned?.(a);
+    } catch (err) {
+      toast(String(err), "danger");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <form class="mission-dispatch-bar" onSubmit={dispatch}>
+      <span class="mission-dispatch-tag">HUMAN → ORCHESTRATOR</span>
+      <select class="select mission-select" value={role()} onChange={(e) => setRole(e.currentTarget.value)} aria-label="Agent hierarchy role">
+        <option value="orchestrator">Orchestrator (Cluster Lead)</option>
+        <option value="worker">Worker (Single Task)</option>
+        <option value="reviewer">Reviewer (PR / Diff Audit)</option>
+      </select>
+      <select class="select mission-select" value={repoId()} onChange={(e) => setRepoId(e.currentTarget.value)} aria-label="Target repository">
+        <option value="">Any / Scratch Repo</option>
+        <For each={repos() ?? []}>{(r) => <option value={r.id}>{r.name}</option>}</For>
+      </select>
+      <input
+        type="text"
+        class="input mission-input"
+        value={brief()}
+        disabled={busy()}
+        onInput={(e) => setBrief(e.currentTarget.value)}
+        placeholder="Give a high-level directive (e.g. 'Decompose auth refactor across workers, verify tests, and render a Mermaid architecture diagram')…"
+      />
+      <Button size="sm" variant="primary" type="submit" busy={busy()} disabled={!brief().trim()}>
+        <Icon name="send" size={12} /> Dispatch
+      </Button>
+    </form>
+  );
+}
+
 export default function Agents() {
   const [list, { refetch }] = createResource(() => rpc("agents.list").catch(() => []));
   const [spawn, setSpawn] = createSignal(null);
   const [filter, setFilter] = createSignal("all");
-  const [viewMode, setViewModeRaw] = createSignal(localStorage.getItem("agents.viewMode") || "grid");
+  const [search, setSearch] = createSignal("");
+  const [broadcastText, setBroadcastText] = createSignal("");
+  const [viewMode, setViewModeRaw] = createSignal(localStorage.getItem("agents.viewMode") || "clusters");
   const setViewMode = (m) => { setViewModeRaw(m); localStorage.setItem("agents.viewMode", m); };
   let t;
   useEvent("agents:changed", () => { clearTimeout(t); t = setTimeout(refetch, 150); });
   onCleanup(() => clearTimeout(t));
 
   registerCommands([
-    { id: "agent.new", label: "New agent", run: () => setSpawn({}) },
+    { id: "agent.new", label: "New agent / orchestrator", run: () => setSpawn({}) },
+    { id: "agent.clusters", label: "Agents: Cluster hierarchy view (Orchestrator -> Workers)", run: () => setViewMode("clusters") },
     { id: "agent.grid", label: "Agents: Grid view (all agents side-by-side)", run: () => setViewMode("grid") },
+    { id: "agent.fleet", label: "Agents: Fleet heatmap view (100+ agents)", run: () => setViewMode("fleet") },
     { id: "agent.split", label: "Agents: Focus view (single agent + shell/browser)", run: () => setViewMode("split") },
   ]);
 
+  const filtered = createMemo(() => {
+    const q = search().trim().toLowerCase();
+    return (list() ?? []).filter((a) => {
+      if (filter() === "live" && !a.live) return false;
+      if (filter() === "waiting" && a.state !== "waiting") return false;
+      if (filter() === "warnings" && !(a.warnings ?? []).length) return false;
+      if (filter() === "orchestrators" && a.role !== "orchestrator") return false;
+      if (q) {
+        const hay = `${a.name} ${a.role} ${a.repo_name || ""} ${a.branch || ""} ${a.task_title || ""} ${a.cluster_name || ""}`.toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
+      return true;
+    });
+  });
+
   // Tree order: parents first, children indented beneath.
   const tree = createMemo(() => {
-    const all = (list() ?? []).filter((a) =>
-      filter() === "all" ? true : filter() === "live" ? a.live : a.state === "waiting");
+    const all = filtered();
     const byParent = new Map();
     for (const a of all) {
       const p = all.some((x) => x.id === a.parent_id) ? a.parent_id : null;
@@ -542,10 +780,57 @@ export default function Agents() {
     walk(null, 0);
     return out;
   });
+
+  // Group into Clusters (each root Orchestrator or standalone agent forms a cluster)
+  const clusters = createMemo(() => {
+    const groups = new Map();
+    for (const { a, d } of tree()) {
+      const cid = a.cluster_id || a.id;
+      if (!groups.has(cid)) {
+        groups.set(cid, {
+          id: cid,
+          name: a.cluster_name || a.name,
+          repo: a.repo_name,
+          lead: a,
+          members: [],
+        });
+      }
+      const g = groups.get(cid);
+      if (a.id === cid) g.lead = a;
+      g.members.push({ a, d });
+    }
+    return [...groups.values()];
+  });
+
   const selected = () => params().id ?? tree()[0]?.a.id;
-  const counts = createMemo(() => {
+
+  const telemetry = createMemo(() => {
     const l = list() ?? [];
-    return { live: l.filter((a) => a.live).length, waiting: l.filter((a) => a.state === "waiting").length, strict: l.filter((a) => a.strict).length };
+    let totalIn = 0, totalCached = 0, warnings = 0, clashes = 0;
+    const allAlerts = [];
+    for (const a of l) {
+      totalIn += a.kv?.input_tokens || 0;
+      totalCached += a.kv?.cached_tokens || 0;
+      for (const w of a.warnings ?? []) {
+        warnings++;
+        if (w.kind === "clash") clashes++;
+        allAlerts.push({ agent: a, warning: w });
+      }
+    }
+    const kvPct = totalIn > 0 ? Math.round((totalCached * 100) / totalIn) : 0;
+    return {
+      total: l.length,
+      live: l.filter((a) => a.live).length,
+      waiting: l.filter((a) => a.state === "waiting").length,
+      strict: l.filter((a) => a.strict).length,
+      orchestrators: l.filter((a) => a.role === "orchestrator").length,
+      kvPct,
+      totalIn,
+      totalCached,
+      warnings,
+      clashes,
+      allAlerts,
+    };
   });
 
   const openAgentFocus = (id) => {
@@ -553,25 +838,118 @@ export default function Agents() {
     go("agents", { id });
   };
 
+  const approveAllWaiting = async (clusterId = null) => {
+    try {
+      const res = await rpc("agents.batch_permission", {
+        decision: "approve",
+        scope: "session",
+        cluster_id: clusterId,
+      });
+      toast(`Approved ${res?.resolved ?? 0} waiting permission request(s)`, "secure");
+      refetch();
+    } catch (e) {
+      toast(String(e), "danger");
+    }
+  };
+
+  const sendBroadcast = async (e) => {
+    e?.preventDefault();
+    const txt = broadcastText().trim();
+    if (!txt) return;
+    try {
+      const res = await rpc("agents.broadcast", { text: txt, only_orchestrator: true });
+      setBroadcastText("");
+      toast(`Broadcast sent to ${res?.sent ?? 0} orchestrator(s)`, "secure");
+    } catch (err) {
+      toast(String(err), "danger");
+    }
+  };
+
   return (
     <Page title="Agents" flush
-      sub={<Show when={(list() ?? []).length}>{`${counts().live} running · ${counts().waiting} need you · ${counts().strict} strict`}</Show>}
-      actions={<div class="row" style={{ gap: "8px" }}>
+      sub={
         <Show when={(list() ?? []).length}>
-          <Segmented value={filter()} onChange={setFilter} options={[{ value: "all", label: "All" }, { value: "live", label: "Running" }, { value: "waiting", label: "Need you" }]} />
+          <span class="fleet-sub-telemetry">
+            <span>{telemetry().live}/{telemetry().total} running</span>
+            <span>· {clusters().length} cluster{clusters().length === 1 ? "" : "s"}</span>
+            <span>· {telemetry().waiting} need you</span>
+            <Show when={telemetry().totalIn > 0}>
+              <span>· KV cache {telemetry().kvPct}% ({(telemetry().totalCached / 1000).toFixed(0)}k cached)</span>
+            </Show>
+            <Show when={telemetry().warnings > 0}>
+              <span class="warn-text">· {telemetry().warnings} warning{telemetry().warnings === 1 ? "" : "s"}</span>
+            </Show>
+          </span>
+        </Show>
+      }
+      actions={<div class="row" style={{ gap: "8px", "flex-wrap": "wrap" }}>
+        <Show when={(list() ?? []).length}>
+          <input
+            type="search"
+            class="input fleet-search"
+            placeholder="Filter agent, repo, branch, role…"
+            value={search()}
+            onInput={(e) => setSearch(e.currentTarget.value)}
+          />
+          <Segmented value={filter()} onChange={setFilter} options={[
+            { value: "all", label: "All" },
+            { value: "live", label: "Running" },
+            { value: "waiting", label: `Need you${telemetry().waiting ? ` (${telemetry().waiting})` : ""}` },
+            { value: "warnings", label: `Warnings${telemetry().warnings ? ` (${telemetry().warnings})` : ""}` },
+            { value: "orchestrators", label: "Orchestrators" },
+          ]} />
           <Segmented value={viewMode()} onChange={setViewMode} options={[
+            { value: "clusters", label: <span class="row gap-4" title="Hierarchical Orchestrator -> Worker clusters"><Icon name="board" size={12} /> Clusters</span> },
             { value: "grid", label: <span class="row gap-4" title="Watch and control all agents side-by-side"><Icon name="grid" size={12} /> Grid</span> },
+            { value: "fleet", label: <span class="row gap-4" title="Dense heatmap for 100+ agents"><Icon name="terminal" size={12} /> Fleet</span> },
             { value: "split", label: <span class="row gap-4" title="Single agent with live terminal & browser"><Icon name="agents" size={12} /> Focus</span> },
           ]} />
         </Show>
         <Button variant="primary" onClick={() => setSpawn({})}><Icon name="plus" size={12} /> New agent</Button>
       </div>}>
+      <MissionDispatchBar onSpawned={() => refetch()} />
+
+      <Show when={telemetry().allAlerts.length > 0 || telemetry().orchestrators > 1}>
+        <div class="fleet-triage-strip">
+          <Show when={telemetry().waiting > 0}>
+            <Button size="sm" variant="primary" onClick={() => approveAllWaiting(null)}>
+              ✓ Approve All Waiting ({telemetry().waiting})
+            </Button>
+          </Show>
+          <div class="fleet-triage-alerts">
+            <For each={telemetry().allAlerts.slice(0, 6)}>
+              {({ agent, warning }) => (
+                <button
+                  type="button"
+                  class={`triage-alert-chip sev-${warning.severity}`}
+                  onClick={() => openAgentFocus(agent.id)}
+                  title={warning.text}
+                >
+                  <b>{agent.name}</b>: {warning.text}
+                </button>
+              )}
+            </For>
+          </div>
+          <div class="grow" />
+          <form class="fleet-broadcast-form" onSubmit={sendBroadcast}>
+            <input
+              type="text"
+              class="input fleet-broadcast-input"
+              value={broadcastText()}
+              onInput={(e) => setBroadcastText(e.currentTarget.value)}
+              placeholder="Broadcast directive to all cluster orchestrators…"
+            />
+            <Button size="sm" type="submit" disabled={!broadcastText().trim()}>Broadcast</Button>
+          </form>
+        </div>
+      </Show>
+
       <Show when={(list() ?? []).length} fallback={
         <Empty icon={<Icon name="agents" size={28} />} title="No agents yet"
-          action={<Button variant="primary" onClick={() => setSpawn({})}>Start your first agent</Button>}>
-          An agent is a named worker with its own model session, worktree and terminals. Give it a brief and it works on its own, coordinating with other agents through the board.
+          action={<Button variant="primary" onClick={() => setSpawn({})}>Start your first Orchestrator</Button>}>
+          Dispatch a high-level goal in the Mission Bar above to launch an Orchestrator. It will map the repo, spawn parallel Workers in isolated git worktrees, and coordinate PR delivery with minimal human interference.
         </Empty>}>
-        <Show when={viewMode() === "grid"} fallback={
+        <Show when={viewMode() !== "split"} fallback={
           <div class="split">
             <div class="agent-list">
               <For each={tree()}>{({ a, d }) => <AgentRow agent={a} depth={d} selected={a.id === selected()} onClick={() => go("agents", { id: a.id })} />}</For>
@@ -588,9 +966,71 @@ export default function Agents() {
         }>
           <div class="agents-grid-wrap">
             <Show when={tree().length} fallback={<Empty title="No matching agents">Switch the filter above to see all agents.</Empty>}>
-              <div class={`agents-grid count-${Math.min(tree().length, 4)}`}>
-                <For each={tree()}>{({ a }) => <AgentGridCard agent={a} onOpen={openAgentFocus} />}</For>
-              </div>
+              <Show when={viewMode() === "clusters"}>
+                <div class="clusters-stack">
+                  <For each={clusters()}>
+                    {(cl) => (
+                      <section class="cluster-section">
+                        <header class="cluster-header">
+                          <span class="cluster-badge">CLUSTER</span>
+                          <AgentChip name={cl.name} />
+                          <RoleBadge role={cl.lead?.role} />
+                          <Show when={cl.repo}><span class="mono xs dim">{cl.repo}</span></Show>
+                          <span class="xs faint">{cl.members.filter((m) => m.a.live).length}/{cl.members.length} live</span>
+                          <KvBadge kv={cl.lead?.kv} />
+                          <div class="grow" />
+                          <Show when={cl.members.some((m) => m.a.state === "waiting")}>
+                            <Button size="sm" variant="primary" onClick={() => approveAllWaiting(cl.id)}>
+                              Approve Cluster
+                            </Button>
+                          </Show>
+                          <Button size="sm" variant="ghost" onClick={() => setSpawn({ parent_id: cl.id, role: "worker", repo_id: cl.lead?.repo_id })}>
+                            <Icon name="plus" size={11} /> Add Worker
+                          </Button>
+                          <Show when={cl.members.some((m) => m.a.live)}>
+                            <Button size="sm" variant="ghost" onClick={() => rpc("agents.stop_cluster", { cluster_id: cl.id }).then(refetch)}>
+                              Stop Cluster
+                            </Button>
+                          </Show>
+                        </header>
+                        <div class={`agents-grid count-${Math.min(cl.members.length, 4)}`}>
+                          <For each={cl.members}>
+                            {({ a }) => (
+                              <AgentGridCard
+                                agent={a}
+                                onOpen={openAgentFocus}
+                                onSpawnChild={(parent) => setSpawn({ parent_id: parent.id, role: "worker", repo_id: parent.repo_id })}
+                              />
+                            )}
+                          </For>
+                        </div>
+                      </section>
+                    )}
+                  </For>
+                </div>
+              </Show>
+
+              <Show when={viewMode() === "grid"}>
+                <div class={`agents-grid count-${Math.min(tree().length, 4)}`}>
+                  <For each={tree()}>
+                    {({ a }) => (
+                      <AgentGridCard
+                        agent={a}
+                        onOpen={openAgentFocus}
+                        onSpawnChild={(parent) => setSpawn({ parent_id: parent.id, role: "worker", repo_id: parent.repo_id })}
+                      />
+                    )}
+                  </For>
+                </div>
+              </Show>
+
+              <Show when={viewMode() === "fleet"}>
+                <div class="fleet-heatmap-grid">
+                  <For each={tree()}>
+                    {({ a }) => <FleetHeatmapTile agent={a} onOpen={openAgentFocus} />}
+                  </For>
+                </div>
+              </Show>
             </Show>
           </div>
         </Show>

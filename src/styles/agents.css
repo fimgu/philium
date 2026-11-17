@@ -170,3 +170,123 @@ details.msg summary { cursor: pointer; display: flex; align-items: center; gap: 
   font-size: var(--fs-xs);
 }
 
+/* Role, KV Cache & Warning Badges */
+.role-badge {
+  display: inline-flex; align-items: center; height: 18px; padding: 0 6px;
+  border-radius: 4px; font-family: var(--mono); font-size: 10px; font-weight: 700;
+  letter-spacing: 0.04em; text-transform: uppercase;
+  background: rgba(255,255,255,0.06); color: var(--text-dim); border: 1px solid var(--line);
+}
+.role-badge.role-orchestrator {
+  background: rgba(232, 168, 85, 0.16); color: #f3c178; border-color: rgba(232, 168, 85, 0.4);
+}
+.role-badge.role-reviewer {
+  background: rgba(86, 194, 214, 0.16); color: #7ce2f5; border-color: rgba(86, 194, 214, 0.4);
+}
+
+.kv-badge {
+  display: inline-flex; align-items: center; height: 18px; padding: 0 6px;
+  border-radius: 4px; font-family: var(--mono); font-size: 10px; font-weight: 600;
+  border: 1px solid var(--line); background: rgba(255,255,255,0.04); color: var(--text-dim);
+}
+.kv-badge.kv-ok { color: #7fd5a1; border-color: rgba(127, 213, 161, 0.35); background: rgba(127, 213, 161, 0.1); }
+.kv-badge.kv-warn { color: #e8a855; border-color: rgba(232, 168, 85, 0.35); background: rgba(232, 168, 85, 0.1); }
+.kv-badge.kv-bad { color: #ef7b7b; border-color: rgba(239, 123, 123, 0.35); background: rgba(239, 123, 123, 0.1); }
+
+.agent-warnings { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; }
+.agent-card-warnings { padding: 5px 10px; border-bottom: 1px solid var(--line); background: rgba(239, 123, 123, 0.05); }
+.warn-pill {
+  display: inline-flex; align-items: center; gap: 5px; padding: 2px 7px;
+  border-radius: 5px; font-size: 10.5px; font-weight: 600;
+  background: rgba(232, 168, 85, 0.14); color: #f3c178; border: 1px solid rgba(232, 168, 85, 0.35);
+}
+.warn-pill.warn-high {
+  background: rgba(239, 123, 123, 0.14); color: #f59898; border-color: rgba(239, 123, 123, 0.4);
+}
+.warn-pill-detail { font-weight: 400; color: var(--text); max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.warn-text { color: #e8a855; font-weight: 600; }
+
+/* Mission Dispatch Bar */
+.mission-dispatch-bar {
+  display: flex; align-items: center; gap: 8px; padding: 8px 14px;
+  border-bottom: 1px solid var(--line); background: rgba(255,255,255,0.015); flex-wrap: wrap;
+}
+.mission-dispatch-tag {
+  font-family: var(--mono); font-size: 10px; font-weight: 700; letter-spacing: 0.05em;
+  color: #f3c178; background: rgba(232, 168, 85, 0.12); border: 1px solid rgba(232, 168, 85, 0.3);
+  padding: 3px 7px; border-radius: 4px; white-space: nowrap;
+}
+.mission-select { height: 30px; font-size: var(--fs-xs); max-width: 210px; }
+.mission-input { flex: 1; min-width: 240px; height: 30px; font-size: var(--fs-xs); }
+
+/* Fleet Triage & Broadcast Strip */
+.fleet-triage-strip {
+  display: flex; align-items: center; gap: 8px; padding: 7px 14px;
+  border-bottom: 1px solid var(--line); background: rgba(232, 168, 85, 0.06); flex-wrap: wrap;
+}
+.fleet-triage-alerts { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.triage-alert-chip {
+  display: inline-flex; align-items: center; gap: 4px; padding: 3px 8px;
+  border-radius: 5px; font-size: 11px; cursor: pointer;
+  background: var(--surface); color: var(--text); border: 1px solid rgba(232, 168, 85, 0.4);
+  max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.triage-alert-chip.sev-high { border-color: rgba(239, 123, 123, 0.5); background: rgba(239, 123, 123, 0.1); }
+.triage-alert-chip:hover { border-color: var(--accent); }
+.fleet-broadcast-form { display: flex; align-items: center; gap: 6px; min-width: 280px; }
+.fleet-broadcast-input { height: 28px; font-size: var(--fs-xs); width: 240px; }
+.fleet-search { height: 28px; font-size: var(--fs-xs); width: 200px; }
+.fleet-sub-telemetry { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+
+/* Cluster Hierarchy View */
+.clusters-stack { display: flex; flex-direction: column; gap: 16px; }
+.cluster-section {
+  border: 1px solid var(--line); border-radius: 10px; background: rgba(255,255,255,0.01);
+  overflow: hidden;
+}
+.cluster-header {
+  display: flex; align-items: center; gap: 8px; padding: 8px 12px;
+  border-bottom: 1px solid var(--line); background: rgba(255,255,255,0.025); flex-wrap: wrap;
+}
+.cluster-badge {
+  font-family: var(--mono); font-size: 10px; font-weight: 700; letter-spacing: 0.05em;
+  color: var(--text-dim); padding: 2px 6px; border-radius: 4px; background: rgba(255,255,255,0.05);
+}
+.cluster-section > .agents-grid { padding: 10px; min-height: auto; grid-auto-rows: minmax(340px, 420px); }
+.agent-card.role-card-orchestrator { border-top: 2px solid rgba(232, 168, 85, 0.65); }
+.agent-card.has-clash { border-color: rgba(239, 123, 123, 0.65); }
+
+.cluster-subbar {
+  display: flex; align-items: center; gap: 6px; padding: 6px 16px;
+  border-bottom: 1px solid var(--line); background: rgba(255,255,255,0.015); overflow-x: auto;
+}
+.cluster-subpill {
+  display: inline-flex; align-items: center; gap: 5px; padding: 2px 8px;
+  border-radius: 6px; border: 1px solid var(--line); background: var(--surface);
+  color: var(--text); font-size: 11px; cursor: pointer;
+}
+.cluster-subpill:hover { border-color: var(--accent); }
+
+/* Fleet Heatmap View (100+ agents) */
+.fleet-heatmap-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(215px, 1fr));
+  gap: 8px;
+}
+.fleet-tile {
+  display: flex; flex-direction: column; gap: 5px; padding: 8px 10px;
+  border: 1px solid var(--line); border-radius: 8px; background: var(--surface, #13161f);
+  cursor: pointer; transition: border-color 0.12s ease, transform 0.12s ease;
+}
+.fleet-tile:hover { border-color: var(--accent); transform: translateY(-1px); }
+.fleet-tile.state-waiting { border-color: #e8a855; }
+.fleet-tile.state-failed, .fleet-tile.has-warning { border-color: rgba(239, 123, 123, 0.6); }
+.fleet-tile-top, .fleet-tile-foot { display: flex; align-items: center; gap: 5px; min-width: 0; }
+.fleet-mini-btn {
+  border: 1px solid var(--line); background: rgba(255,255,255,0.04); color: var(--text-dim);
+  border-radius: 4px; width: 20px; height: 20px; font-size: 10px; cursor: pointer;
+  display: inline-grid; place-items: center;
+}
+.fleet-mini-btn:hover { color: var(--text); border-color: var(--accent); }
+
+

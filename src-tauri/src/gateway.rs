@@ -200,6 +200,86 @@ impl Gateway {
         self.log.lk().iter().map(|r| r.summary.clone()).collect()
     }
 
+    /// Aggregate KV cache, token, latency, guard, and rate-limit telemetry per agent name.
+    pub fn agent_stats(&self) -> HashMap<String, Value> {
+        #[derive(Default)]
+        struct Acc {
+            requests: u64,
+            input_tokens: u64,
+            output_tokens: u64,
+            cached_tokens: u64,
+            last_input_tokens: u64,
+            last_cached_tokens: u64,
+            guard_alerts: u64,
+            rate_limits: u64,
+            errors: u64,
+            ttft_sum: u64,
+            ttft_count: u64,
+        }
+        let mut map: HashMap<String, Acc> = HashMap::new();
+        for r in self.log.lk().iter() {
+            let s = &r.summary;
+            let Some(agent) = s.agent.as_deref() else { continue };
+            let a = map.entry(agent.to_string()).or_default();
+            a.requests += 1;
+            let inp = s.input_tokens.unwrap_or(0);
+            let out = s.output_tokens.unwrap_or(0);
+            let cac = s.cached_tokens.unwrap_or(0);
+            a.input_tokens += inp;
+            a.output_tokens += out;
+            a.cached_tokens += cac;
+            if inp > 0 {
+                a.last_input_tokens = inp;
+                a.last_cached_tokens = cac;
+            }
+            if s.guard != "pass" {
+                a.guard_alerts += 1;
+            }
+            if s.status == Some(429) {
+                a.rate_limits += 1;
+            }
+            if matches!(s.state, "error" | "blocked") {
+                a.errors += 1;
+            }
+            if let Some(t) = s.ttft_ms {
+                a.ttft_sum += t;
+                a.ttft_count += 1;
+            }
+        }
+        map.into_iter()
+            .map(|(k, a)| {
+                let hit_pct = if a.input_tokens > 0 {
+                    ((a.cached_tokens.min(a.input_tokens) * 100) / a.input_tokens) as u64
+                } else {
+                    0
+                };
+                let last_hit_pct = if a.last_input_tokens > 0 {
+                    ((a.last_cached_tokens.min(a.last_input_tokens) * 100) / a.last_input_tokens) as u64
+                } else {
+                    0
+                };
+                let avg_ttft_ms = if a.ttft_count > 0 { Some(a.ttft_sum / a.ttft_count) } else { None };
+                (
+                    k,
+                    json!({
+                        "requests": a.requests,
+                        "input_tokens": a.input_tokens,
+                        "output_tokens": a.output_tokens,
+                        "cached_tokens": a.cached_tokens,
+                        "cache_hit_pct": hit_pct,
+                        "last_input_tokens": a.last_input_tokens,
+                        "last_cached_tokens": a.last_cached_tokens,
+                        "last_cache_hit_pct": last_hit_pct,
+                        "guard_alerts": a.guard_alerts,
+                        "rate_limits": a.rate_limits,
+                        "errors": a.errors,
+                        "avg_ttft_ms": avg_ttft_ms,
+                    }),
+                )
+            })
+            .collect()
+    }
+
     pub fn detail(&self, id: u64) -> Option<Value> {
         let log = self.log.lk();
         let r = log.iter().find(|r| r.summary.id == id)?;
