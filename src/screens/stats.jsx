@@ -15,6 +15,7 @@ import {
   Empty,
   VirtualList,
 } from "../ui/kit.jsx";
+import { KvTelemetryBar } from "../ui/conversation.jsx";
 import { rpc, useEvent, fmt } from "../lib/rpc.js";
 import { go } from "../lib/nav.js";
 import "../styles/terminals.css";
@@ -154,9 +155,21 @@ export default function Stats() {
         <Show when={error()}>
           <p role="alert">{error()}</p>
         </Show>
+        <div style={{ "margin-bottom": "14px" }}>
+          <KvTelemetryBar kv={totals()} />
+        </div>
         <div class="lane-stats">
           <Stat label="Requests" value={fmt.int(totals().requests)} />
           <Stat label="Input tokens" value={fmt.compact(totals().tokens_in)} />
+          <Stat
+            label="Cached prefix"
+            value={fmt.compact(totals().tokens_cached)}
+            sub={
+              totals().tokens_in > 0
+                ? `${Math.round(((totals().tokens_cached || 0) / totals().tokens_in) * 100)}% KV cache hit`
+                : "Shared repo & conversation prefix"
+            }
+          />
           <Stat
             label="Output tokens"
             value={fmt.compact(totals().tokens_out)}

@@ -1,9 +1,9 @@
 // Chat: quick conversations with any model, no tools. Runs on the desk HAL
 // behind the gateway. For real work, start an agent instead.
 import { For, Show, createSignal, createResource, createMemo, createEffect, on, onCleanup } from "solid-js";
-import { NotFound, Page, Button, Select, toast } from "../ui/kit.jsx";
+import { NotFound, Page, Button, ModelPicker, toast } from "../ui/kit.jsx";
 import { Icon } from "../ui/icons.jsx";
-import { Conversation, Composer, speedEffort, effortSpeed } from "../ui/conversation.jsx";
+import { Conversation, Composer, KvTelemetryBar, speedEffort, effortSpeed } from "../ui/conversation.jsx";
 import { rpc, hal, fmt, sendError } from "../lib/rpc.js";
 import { go, params } from "../lib/nav.js";
 import "../styles/agents.css";
@@ -23,12 +23,54 @@ export default function Chat() {
   const current = () => (sessions() ?? []).find((s) => s.id === selected());
 
   const provById = createMemo(() => Object.fromEntries((providers() ?? []).map((p) => [p.id, p])));
-  const modelOptions = createMemo(() => (models() ?? []).filter((m) => m.enabled !== 0).map((m) => ({
-    value: m.ref,
-    label: `${m.provider_name} / ${m.display || m.model_id}${provById()[m.provider_id]?.trusted === false ? "  (untrusted)" : ""}`,
-  })));
   const chosen = () => model() || current()?.model || def() || "";
   const untrusted = () => provById()[(chosen() || "").split("/")[0]]?.trusted === false;
+
+  const sessionKv = createMemo(() => {
+    let reqs = 0, inp = 0, cached = 0, out = 0;
+    for (const ev of events()) {
+      const u = ev?.data?.usage;
+      if (u && (u.input_tokens || u.output_tokens || u.prompt_tokens)) {
+        reqs += 1;
+        inp += Number(u.input_tokens || u.prompt_tokens || 0);
+        cached += Number(u.cached_tokens || u.cache_read_input_tokens || 0);
+        out += Number(u.output_tokens || u.completion_tokens || 0);
+      }
+    }
+    return { requests: reqs, input_tokens: inp, cached_tokens: cached, output_tokens: out };
+  });
+
+  const changeChatModel = async (newRef) => {
+    setModel(newRef);
+    const id = selected();
+    if (id && newRef && newRef !== current()?.model) {
+      try {
+        await hal("PATCH", `/sessions/${id}`, { model: newRef });
+        await refetch();
+        toast(`Switched chat model to ${newRef} (0 tokens used)`, "secure");
+      } catch (e) {
+        toast(String(e), "danger");
+        return false;
+      }
+    }
+    return true;
+  };
+
+  const handleSlashModel = async (query) => {
+    if (!query) {
+      toast(`Current model: ${chosen()} (use /model <name>)`, "info");
+      return true;
+    }
+    const q = query.toLowerCase();
+    const match =
+      (models() ?? []).find((m) => m.enabled !== 0 && (m.ref.toLowerCase() === q || m.model_id.toLowerCase() === q)) ||
+      (models() ?? []).find((m) => m.enabled !== 0 && `${m.provider_name || ""} ${m.display || ""} ${m.ref}`.toLowerCase().includes(q));
+    if (!match) {
+      toast(`No model matching "${query}"`, "danger");
+      return false;
+    }
+    return await changeChatModel(match.ref);
+  };
 
   let after = 0;
   let timer;
@@ -96,7 +138,15 @@ export default function Chat() {
   return (
     <Page title="Chat" flush sub="Conversation only. No tools, no files. Start an agent for real work."
       actions={<>
-        <div style={{ width: "320px" }}><Select value={chosen()} onValue={setModel} options={modelOptions()} placeholder="Model" /></div>
+        <ModelPicker
+          compact
+          value={chosen()}
+          onValue={changeChatModel}
+          models={models() ?? []}
+          providers={providers() ?? []}
+          allowUntrusted={true}
+          currentProvider={(chosen() || "").split("/")[0]}
+        />
         <Button variant="primary" onClick={newChat}><Icon name="plus" size={12} /> New chat</Button>
       </>}>
       <div class="split">
@@ -117,6 +167,9 @@ export default function Chat() {
           </Show>
         </div>
         <div class="agent-view">
+          <div style={{ padding: "8px 16px 0" }}>
+            <KvTelemetryBar kv={sessionKv()} compact />
+          </div>
           <Show when={untrusted()}>
             <div class="shield strict small" style={{ margin: "8px 16px 0" }}>
               <Icon name="shield" size={12} /> Untrusted provider. Everything you type here goes through the gateway, which removes secrets it recognizes, but assume the provider can read the rest.
@@ -127,8 +180,8 @@ export default function Chat() {
           </Show>
           <Conversation hidden={!!(params().session && sessions.state === "ready" && !current())} events={events()} busy={busy()} emptyText="Ask anything. This chat has no access to files, commands or the web." />
           <Composer onSend={send} busy={busy()} onCancel={() => hal("POST", `/sessions/${selected()}/cancel`).catch((e) => toast(String(e), "danger"))}
-            speed={effortSpeed(current()?.effort)} onSpeed={setSpeed}
-            placeholder={`Message ${chosen() || "a model"}`} />
+            effort={current()?.effort || "default"} speed={effortSpeed(current()?.effort)} onEffort={setSpeed} onSpeed={setSpeed} onSlashModel={handleSlashModel}
+            placeholder={`Message ${chosen() || "a model"} (or /effort, /model)`} />
         </div>
       </div>
     </Page>

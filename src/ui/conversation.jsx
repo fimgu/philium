@@ -171,7 +171,31 @@ export function Conversation(props) {
             <Switch>
               <Match when={it().kind === "user"}><div class="msg user"><SentImages item={it()} load={props.loadAttachment} />{it().text}</div></Match>
               <Match when={it().kind === "assistant"}>
-                <div class={`msg assistant ${it().live && props.busy && !props.readOnly ? "live" : ""}`}><AssistantReply text={it().text} live={it().live && props.busy && !props.readOnly} /></div>
+                <div class={`msg assistant ${it().live && props.busy && !props.readOnly ? "live" : ""}`}>
+                  <AssistantReply text={it().text} live={it().live && props.busy && !props.readOnly} />
+                  <Show when={it().usage && (it().usage.input_tokens || it().usage.output_tokens)}>
+                    {(() => {
+                      const u = it().usage || {};
+                      const inp = Number(u.input_tokens || u.prompt_tokens || 0);
+                      const cached = Number(u.cached_tokens || u.cache_read_input_tokens || 0);
+                      const out = Number(u.output_tokens || u.completion_tokens || 0);
+                      const pct = inp > 0 ? Math.round((cached / inp) * 100) : 0;
+                      return (
+                        <div class="turn-kv-meta mono xs faint">
+                          <Show when={inp > 0}>
+                            <span class={`turn-kv-hit ${pct >= 60 ? "hot" : pct >= 25 ? "warm" : "cold"}`}>
+                              ⚡ {pct}% cached
+                            </span>
+                            <span>· {(cached / 1000).toFixed(1)}k cached / {(inp / 1000).toFixed(1)}k in</span>
+                          </Show>
+                          <Show when={out > 0}>
+                            <span>· {out >= 1000 ? `${(out / 1000).toFixed(1)}k` : out} out</span>
+                          </Show>
+                        </div>
+                      );
+                    })()}
+                  </Show>
+                </div>
               </Match>
               <Match when={it().kind === "tool"}><Tool item={it()} active={props.busy && !props.readOnly} terminal={conversationView() === "terminal"} /></Match>
               <Match when={it().kind === "file"}>
@@ -276,13 +300,73 @@ export function agentAttachmentLoader(id) {
   return agentCaches.get(id).load;
 }
 
+/**
+ * AffectUI-style live KV Cache & Context Token Bar.
+ * Visualizes Cached Prefix (emerald) vs Fresh Uncached Input (blue) vs Output (violet),
+ * plus Hit %, TTFT (ms), and request count. 100% out-of-band (0 LLM tokens used).
+ */
+export function KvTelemetryBar(props) {
+  const kv = () => props.kv || {};
+  const reqs = () => Number(kv().requests || 0);
+  const inp = () => Number(kv().input_tokens || kv().tokens_in || 0);
+  const cached = () => Math.min(inp(), Number(kv().cached_tokens || kv().tokens_cached || 0));
+  const fresh = () => Math.max(0, inp() - cached());
+  const out = () => Number(kv().output_tokens || kv().tokens_out || 0);
+  const total = () => Math.max(1, cached() + fresh() + out());
+  const hitPct = () => (inp() > 0 ? Math.round((cached() / inp()) * 100) : 0);
+  const ttft = () => kv().avg_ttft_ms ?? kv().p50_ttft_ms;
+  const tone = () => (hitPct() >= 60 ? "hot" : hitPct() >= 25 ? "warm" : reqs() > 0 ? "cold" : "idle");
+  const fmtTok = (n) => (n >= 1_000_000 ? `${(n / 1_000_000).toFixed(2)}M` : n >= 1_000 ? `${(n / 1_000).toFixed(1)}k` : String(Math.round(n)));
+
+  return (
+    <div class={`kv-telemetry-bar ${props.compact ? "compact" : ""}`} title="Out-of-band Gateway KV Cache & Token Telemetry (0 extra prompt tokens)">
+      <div class="kv-telemetry-top">
+        <span class={`kv-hit-pill ${tone()}`}>
+          <span class="kv-hit-dot" />
+          KV {reqs() > 0 ? `${hitPct()}%` : "—"}
+        </span>
+        <span class="kv-legend-item cached" title="Cached prefix tokens (shared repo map + conversation prefix)">
+          <i /> Cached <b>{fmtTok(cached())}</b>
+        </span>
+        <span class="kv-legend-item fresh" title="Uncached fresh input tokens">
+          <i /> Fresh <b>{fmtTok(fresh())}</b>
+        </span>
+        <span class="kv-legend-item out" title="Generated output tokens">
+          <i /> Out <b>{fmtTok(out())}</b>
+        </span>
+        <div class="grow" />
+        <Show when={ttft() != null}>
+          <span class="mono xs faint" title="Average Time To First Token">TTFT {Math.round(ttft())}ms</span>
+        </Show>
+        <span class="mono xs faint">{reqs()} req{reqs() === 1 ? "" : "s"}</span>
+      </div>
+      <div class="kv-bar-track" role="img" aria-label={`KV cache hit rate ${hitPct()}%`}>
+        <div class="kv-bar-seg cached" style={{ width: `${reqs() > 0 ? (cached() / total()) * 100 : 0}%` }} />
+        <div class="kv-bar-seg fresh" style={{ width: `${reqs() > 0 ? (fresh() / total()) * 100 : 0}%` }} />
+        <div class="kv-bar-seg out" style={{ width: `${reqs() > 0 ? (out() / total()) * 100 : 0}%` }} />
+      </div>
+    </div>
+  );
+}
+
 /** Effort presets. Names are not guarantees of latency, cost or quality. */
 export const SPEEDS = [
   { value: "fast", label: "Fast", effort: "low", hint: "Requests low reasoning effort, not guaranteed speed" },
   { value: "normal", label: "Normal", effort: "default", hint: "The model's default effort" },
   { value: "deep", label: "Deep", effort: "high", hint: "Requests high reasoning effort, not guaranteed quality" },
 ];
-export const speedEffort = (v) => SPEEDS.find((s) => s.value === v)?.effort ?? "default";
+export const EFFORTS = [
+  { value: "none", label: "None", budget: "0t", hint: "Requests no extended thinking (0 thinking tokens)" },
+  { value: "low", label: "Low", budget: "2k", hint: "Requests low reasoning effort (~2,048 thinking token budget on Claude)" },
+  { value: "default", label: "Auto", budget: "def", hint: "The model's default effort" },
+  { value: "medium", label: "Med", budget: "8k", hint: "Requests medium reasoning effort (~8,192 thinking token budget on Claude)" },
+  { value: "high", label: "High", budget: "16k", hint: "Requests high reasoning effort (~16,384 thinking token budget on Claude)" },
+  { value: "xhigh", label: "Max", budget: "32k", hint: "Requests maximum reasoning effort (~32,000 thinking token budget on Claude)" },
+];
+export const speedEffort = (v) => {
+  if (EFFORTS.some((e) => e.value === v) || v === "minimal" || v === "max") return v === "max" ? "xhigh" : v === "minimal" ? "low" : v;
+  return SPEEDS.find((s) => s.value === v)?.effort ?? "default";
+};
 export const effortSpeed = (e) => (e === "low" || e === "minimal" || e === "none" ? "fast" : e === "high" || e === "xhigh" || e === "max" ? "deep" : "normal");
 
 /** Composer card: attachments, text, then one toolbar row.
@@ -303,6 +387,25 @@ export function Composer(props) {
   const [menu, setMenu] = createSignal(false);
   let input, picker;
   const canAttach = () => record().ready() && !props.disabled;
+  const currentEffort = () => {
+    const raw = props.effort || speedEffort(props.speed || "normal");
+    return raw === "max" ? "xhigh" : raw === "minimal" ? "low" : raw;
+  };
+  const selectEffort = (val) => {
+    if (props.onEffort) props.onEffort(val);
+    else if (props.onSpeed) props.onSpeed(val);
+  };
+  const slashHint = createMemo(() => {
+    const t = text().trimStart();
+    if (!t.startsWith("/")) return null;
+    if (t.startsWith("/effort")) {
+      return { kind: "effort", label: "Zero-token local command: /effort none | low | default | medium | high | max" };
+    }
+    if (t.startsWith("/model")) {
+      return { kind: "model", label: "Zero-token in-session model switch: /model <provider/model or substring>" };
+    }
+    return null;
+  });
   const add = async (files) => {
     const target = record();
     if (!target.ready()) return;
@@ -357,6 +460,31 @@ export function Composer(props) {
     const draft = target.text(), attached = target.images();
     const t = draft.trim();
     if (!target.ready() || (!t && !attached.length) || props.disabled || props.busy || sending() || adding()) return;
+    // Intercept /effort and /model locally with 0 LLM tokens spent
+    if (!attached.length && /^\/effort(\s+.*)?$/i.test(t)) {
+      const arg = t.replace(/^\/effort\s*/i, "").trim().toLowerCase();
+      const alias = { auto: "default", normal: "default", fast: "low", deep: "high", med: "medium", max: "xhigh", off: "none" };
+      const resolved = alias[arg] || arg;
+      if (!resolved) {
+        toast(`Current effort: ${currentEffort()} (use /effort none|low|default|medium|high|max)`, "info");
+        clearSentDraft(target, draft, attached);
+        return;
+      }
+      if (["default", "none", "minimal", "low", "medium", "high", "xhigh", "max"].includes(resolved)) {
+        selectEffort(resolved === "max" ? "xhigh" : resolved);
+        toast(`Reasoning effort set to ${resolved} (0 tokens used)`, "secure");
+        clearSentDraft(target, draft, attached);
+        return;
+      }
+      toast(`Unknown effort "${arg}". Choose: none, low, default, medium, high, max`, "danger");
+      return;
+    }
+    if (!attached.length && /^\/model(\s+.*)?$/i.test(t) && props.onSlashModel) {
+      const arg = t.replace(/^\/model\s*/i, "").trim();
+      const ok = await props.onSlashModel(arg);
+      if (ok !== false) clearSentDraft(target, draft, attached);
+      return;
+    }
     target.setSending(true);
     try {
       const accepted = await props.onSend(t, await sendableImages(attached));
@@ -372,6 +500,24 @@ export function Composer(props) {
       onDragLeave={(e) => { if (!props.dropTarget && !e.currentTarget.contains(e.relatedTarget)) setOver(false); }}
       onDrop={(e) => { if (props.dropTarget) return; e.preventDefault(); setOver(false); if (canAttach()) add(e.dataTransfer.files); }}>
       <Show when={over()}><div class="composer-drop" aria-hidden="true"><Icon name="image" size={16} /> Drop images to attach</div></Show>
+      <Show when={slashHint()}>
+        {(h) => (
+          <div class="composer-slash-bar xs">
+            <span class="mono">{h().label}</span>
+            <Show when={h().kind === "effort"}>
+              <div class="row gap-4">
+                <For each={EFFORTS}>
+                  {(ef) => (
+                    <button type="button" class="btn sm ghost" onClick={() => { selectEffort(ef.value); setText(""); }}>
+                      {ef.label} ({ef.budget})
+                    </button>
+                  )}
+                </For>
+              </div>
+            </Show>
+          </div>
+        )}
+      </Show>
       <Show when={images().length || adding()}>
         <div class="composer-images" role="list" aria-label="Attached images">
           <For each={images()}>
@@ -391,7 +537,7 @@ export function Composer(props) {
         ref={input}
         class="textarea composer-input"
         rows="1"
-        placeholder={props.placeholder ?? "Message"}
+        placeholder={props.placeholder ?? "Message (or /effort, /model)"}
         value={text()}
         disabled={props.disabled || !record().ready()}
         onInput={(e) => setText(e.currentTarget.value)}
@@ -410,11 +556,20 @@ export function Composer(props) {
           </Show>
           <input ref={picker} type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden onChange={(e) => { add(e.currentTarget.files); e.currentTarget.value = ""; }} />
         </div>
-        <Show when={props.onSpeed}>
-          <div class="speed" role="group" aria-label="Reasoning effort" aria-describedby="effort-caveat" title="Reasoning effort. Requests more or less thinking. Support varies by provider and model, and speed, cost and quality are not guaranteed.">
-            <span id="effort-caveat" class="sr-only">Support varies by provider and model, and speed, cost and quality are not guaranteed.</span>
-            <For each={SPEEDS}>{(s) => (
-              <button type="button" disabled={props.disabled || props.effortPending} aria-pressed={(props.speed || "normal") === s.value} classList={{ on: (props.speed || "normal") === s.value }} onClick={() => props.onSpeed(s.value)} title={s.hint}>{s.label}</button>
+        <Show when={props.onEffort || props.onSpeed}>
+          <div class="speed" role="group" aria-label="Reasoning effort" aria-describedby="effort-caveat" title="Reasoning effort (or type /effort in composer). Support varies by provider and model, and speed, cost and quality are not guaranteed.">
+            <span id="effort-caveat" class="sr-only">Requests a reasoning effort level. Support varies by provider and model, and speed, cost and quality are not guaranteed.</span>
+            <For each={EFFORTS}>{(s) => (
+              <button
+                type="button"
+                disabled={props.disabled || props.effortPending}
+                aria-pressed={currentEffort() === s.value}
+                classList={{ on: currentEffort() === s.value }}
+                onClick={() => selectEffort(s.value)}
+                title={`${s.hint} (/effort ${s.value})`}
+              >
+                {s.label}
+              </button>
             )}</For>
           </div>
         </Show>

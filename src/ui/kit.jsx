@@ -321,3 +321,271 @@ export function Menu(props) {
     </>
   );
 }
+
+/**
+ * Clean, provider-scoped ModelPicker popover.
+ * Respects session trust boundaries:
+ * - Standard session (`strict === false` and `!allowUntrusted`): only accepted trusted providers.
+ * - Strict session (`strict === true` and `lockedProvider`): only models on that locked provider.
+ * - Spawn / New Chat (`allowUntrusted === true`): all enabled providers, clearly badged.
+ */
+export function ModelPicker(props) {
+  const [open, setOpen] = createSignal(false);
+  const [q, setQ] = createSignal("");
+  const [provFilter, setProvFilter] = createSignal("all");
+  const [pos, setPos] = createSignal({ top: 60, left: 60, width: 360 });
+  let btn, searchEl;
+
+  const provById = createMemo(() =>
+    Object.fromEntries((props.providers ?? []).map((p) => [p.id, p]))
+  );
+  const currentProvId = () => (props.value || "").split("/")[0] || "";
+
+  const normalized = createMemo(() => {
+    const raw = props.models ?? [];
+    const pmap = provById();
+    return raw
+      .filter((m) => m.enabled !== 0)
+      .map((m) => {
+        const pid = m.provider_id || (m.ref || m.value || "").split("/")[0] || "provider";
+        const p = pmap[pid] || {};
+        const ref = m.ref || m.value || `${pid}/${m.model_id || m.id}`;
+        const modelId = m.model_id || ref.split("/").slice(1).join("/") || ref;
+        const display = m.display || m.label || modelId;
+        const provName = m.provider_name || p.name || pid;
+        const trusted = p.trusted !== false;
+        const kind = p.kind || "";
+        return {
+          ref,
+          pid,
+          provName,
+          modelId,
+          display,
+          trusted,
+          kind,
+          priceIn: m.price_in,
+          priceOut: m.price_out,
+        };
+      });
+  });
+
+  const accepted = createMemo(() => {
+    const locked = props.lockedProvider || (props.strict ? currentProvId() : "");
+    return normalized().filter((m) => {
+      if (locked) return m.pid === locked;
+      if (!props.allowUntrusted && !m.trusted) return false;
+      return true;
+    });
+  });
+
+  const hiddenUntrustedCount = createMemo(() => {
+    if (props.allowUntrusted || props.strict) return 0;
+    return normalized().filter((m) => !m.trusted).length;
+  });
+
+  const acceptedProviders = createMemo(() => {
+    const seen = new Map();
+    for (const m of accepted()) {
+      if (!seen.has(m.pid)) seen.set(m.pid, { id: m.pid, name: m.provName, trusted: m.trusted, kind: m.kind });
+    }
+    return [...seen.values()];
+  });
+
+  const filtered = createMemo(() => {
+    const needle = q().trim().toLowerCase();
+    const pf = provFilter();
+    return accepted().filter((m) => {
+      if (pf !== "all" && m.pid !== pf) return false;
+      if (!needle) return true;
+      return (
+        m.display.toLowerCase().includes(needle) ||
+        m.modelId.toLowerCase().includes(needle) ||
+        m.provName.toLowerCase().includes(needle) ||
+        m.ref.toLowerCase().includes(needle)
+      );
+    });
+  });
+
+  const grouped = createMemo(() => {
+    const map = new Map();
+    for (const m of filtered()) {
+      if (!map.has(m.pid)) map.set(m.pid, { pid: m.pid, name: m.provName, trusted: m.trusted, kind: m.kind, items: [] });
+      map.get(m.pid).items.push(m);
+    }
+    return [...map.values()];
+  });
+
+  const activeItem = createMemo(() =>
+    normalized().find((m) => m.ref === props.value) || (props.value ? {
+      ref: props.value,
+      pid: currentProvId(),
+      provName: currentProvId(),
+      display: props.value.split("/").slice(1).join("/") || props.value,
+      trusted: provById()[currentProvId()]?.trusted !== false,
+    } : null)
+  );
+
+  const toggle = (e) => {
+    e.stopPropagation();
+    if (props.disabled) return;
+    if (open()) {
+      setOpen(false);
+      return;
+    }
+    const r = btn.getBoundingClientRect();
+    const w = Math.max(360, Math.min(440, r.width));
+    const left = Math.max(12, Math.min(r.left, window.innerWidth - w - 12));
+    const top = r.bottom + 6 + 380 > window.innerHeight ? Math.max(12, r.top - 380) : r.bottom + 6;
+    setPos({ top, left, width: w });
+    setQ("");
+    setProvFilter("all");
+    setOpen(true);
+    queueMicrotask(() => searchEl?.focus());
+  };
+
+  const close = () => setOpen(false);
+  onMount(() => {
+    document.addEventListener("click", close);
+    window.addEventListener("resize", close);
+  });
+  onCleanup(() => {
+    document.removeEventListener("click", close);
+    window.removeEventListener("resize", close);
+  });
+
+  return (
+    <>
+      <button
+        ref={btn}
+        type="button"
+        disabled={props.disabled}
+        class={`model-picker-btn ${props.size ?? ""}`}
+        onClick={toggle}
+        title={props.title ?? (activeItem() ? `Model: ${activeItem().ref} (click to switch in-session)` : "Choose a model")}
+      >
+        <Show when={activeItem()} fallback={<span class="dim">{props.placeholder ?? "Choose model…"}</span>}>
+          {(it) => (
+            <>
+              <span class={`model-picker-prov ${it().trusted ? "trusted" : "strict"}`}>{it().provName}</span>
+              <span class="model-picker-name ellipsis">{it().display}</span>
+            </>
+          )}
+        </Show>
+        <span class="model-picker-caret" aria-hidden="true">▾</span>
+      </button>
+      <Show when={open()}>
+        <Portal>
+          <div
+            class="model-picker-pop"
+            role="listbox"
+            style={{ top: `${pos().top}px`, left: `${pos().left}px`, width: `${pos().width}px` }}
+            onClick={(e) => e.stopPropagation()}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") setOpen(false);
+              if (e.key === "Enter" && filtered().length === 1) {
+                props.onValue?.(filtered()[0].ref);
+                setOpen(false);
+              }
+            }}
+          >
+            <div class="model-picker-head">
+              <input
+                ref={searchEl}
+                type="text"
+                class="input sm model-picker-search"
+                placeholder="Filter accepted models or providers…"
+                value={q()}
+                onInput={(e) => setQ(e.currentTarget.value)}
+                spellcheck={false}
+              />
+              <Show when={acceptedProviders().length > 1}>
+                <div class="model-picker-provs">
+                  <button
+                    type="button"
+                    class={`model-prov-chip ${provFilter() === "all" ? "on" : ""}`}
+                    onClick={() => setProvFilter("all")}
+                  >
+                    All ({accepted().length})
+                  </button>
+                  <For each={acceptedProviders()}>
+                    {(p) => (
+                      <button
+                        type="button"
+                        class={`model-prov-chip ${provFilter() === p.id ? "on" : ""}`}
+                        onClick={() => setProvFilter(p.id)}
+                      >
+                        {p.name}
+                      </button>
+                    )}
+                  </For>
+                </div>
+              </Show>
+            </div>
+            <div class="model-picker-list">
+              <Show when={grouped().length} fallback={<div class="xs dim" style={{ padding: "14px" }}>No matching models in accepted providers.</div>}>
+                <For each={grouped()}>
+                  {(g) => (
+                    <div class="model-picker-group">
+                      <div class="model-picker-group-head">
+                        <b>{g.name}</b>
+                        <span class={`model-trust-tag ${g.trusted ? "ok" : "strict"}`}>
+                          {g.trusted ? (["chatgpt_oauth", "claude_oauth"].includes(g.kind) ? "Subscription · Trusted" : "API · Trusted") : "Untrusted · Strict"}
+                        </span>
+                        <Show when={currentProvId() && g.pid === currentProvId()}>
+                          <span class="model-kv-tag" title="Same provider as active session: shared system prefix keeps KV cache warm">⚡ Warm KV</span>
+                        </Show>
+                      </div>
+                      <For each={g.items}>
+                        {(m) => {
+                          const active = () => m.ref === props.value;
+                          return (
+                            <button
+                              type="button"
+                              role="option"
+                              aria-selected={active()}
+                              class={`model-picker-item ${active() ? "on" : ""}`}
+                              onClick={() => {
+                                props.onValue?.(m.ref);
+                                setOpen(false);
+                              }}
+                            >
+                              <div class="grow" style={{ "min-width": 0 }}>
+                                <div class="row gap-4">
+                                  <span class="model-item-title ellipsis">{m.display}</span>
+                                  <Show when={m.display !== m.modelId}>
+                                    <span class="mono xs faint ellipsis">{m.modelId}</span>
+                                  </Show>
+                                </div>
+                              </div>
+                              <Show when={m.priceIn != null && m.priceOut != null}>
+                                <span class="mono xs faint">${m.priceIn}/${m.priceOut}</span>
+                              </Show>
+                              <Show when={active()}>
+                                <span class="model-item-check">✓</span>
+                              </Show>
+                            </button>
+                          );
+                        }}
+                      </For>
+                    </div>
+                  )}
+                </For>
+              </Show>
+            </div>
+            <div class="model-picker-foot xs faint">
+              <Show when={props.strict}>
+                <span>Strict session: locked to accepted provider <b>{currentProvId()}</b>.</span>
+              </Show>
+              <Show when={!props.strict && hiddenUntrustedCount() > 0}>
+                <span>{hiddenUntrustedCount()} untrusted-provider model(s) hidden (spawn a Strict agent to use them).</span>
+              </Show>
+              <Show when={!props.strict && hiddenUntrustedCount() === 0}>
+                <span>Switches model in-place in this session · Tip: type <code>/model &lt;name&gt;</code></span>
+              </Show>
+            </div>
+          </div>
+        </Portal>
+      </Show>
+    </>
+  );
+}

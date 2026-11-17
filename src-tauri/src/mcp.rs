@@ -190,6 +190,8 @@ pub fn tool_list() -> Vec<Value> {
           json!({ "q": s, "repo_only": b, "limit": i }), &[]),
         t("resource_register", "Declare something you created outside Philium's tools (container, cluster, process, temp dir) so it is cleaned up with you.",
           json!({ "kind": s, "handle": s, "note": s }), &["kind", "handle"]),
+        t("kind_cluster", "Manage an isolated Kubernetes-in-Docker (kind) test cluster scoped to your agent (`philium-<agent>-<suffix>`), pre-registered in Philium's Reaper and wired to your isolated KUBECONFIG and port block. action: create | list | delete.",
+          json!({ "action": s, "suffix": s, "cluster": s }), &["action"]),
     ].into_iter().chain(crate::browser::mcp_tools()).chain(crate::codeindex::mcp_tools()).collect()
 }
 
@@ -437,6 +439,12 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
             let id = crate::reaper::register(ctx, Some(agent), kind, arg(&a, "handle")?, json!({ "note": a["note"], "by": "agent" }));
             Ok(json!({ "resource_id": id }))
         }
+        "kind_cluster" => match arg(&a, "action")? {
+            "list" => crate::agents::call(ctx, "kind_list", json!({ "id": agent })).await,
+            "create" => crate::agents::call(ctx, "kind_create", json!({ "id": agent, "suffix": a["suffix"] })).await,
+            "delete" => crate::agents::call(ctx, "kind_delete", json!({ "cluster": arg(&a, "cluster")? })).await,
+            other => Err(format!("unknown kind_cluster action `{other}` (use create, list, or delete)")),
+        },
         _ => Err(format!("unknown tool {name}")),
     }
 }

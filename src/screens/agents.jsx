@@ -2,9 +2,9 @@
 // changes. Supports Human -> Orchestrator -> Worker/Reviewer hierarchies,
 // shared-prefix KV cache telemetry, AST clash/health warnings, and Fleet Command Grid.
 import { For, Show, createSignal, createResource, createMemo, createEffect, on, onCleanup, Suspense } from "solid-js";
-import { NotFound, Page, Button, Badge, Dot, Empty, Modal, Field, Input, TextArea, Select, Toggle, Segmented, confirm, toast } from "../ui/kit.jsx";
+import { NotFound, Page, Button, Badge, Dot, Empty, Modal, Field, Input, TextArea, Select, Toggle, Segmented, ModelPicker, confirm, toast } from "../ui/kit.jsx";
 import { Icon } from "../ui/icons.jsx";
-import { Conversation, Composer, speedEffort, effortSpeed, agentAttachmentLoader } from "../ui/conversation.jsx";
+import { Conversation, Composer, KvTelemetryBar, speedEffort, effortSpeed, agentAttachmentLoader } from "../ui/conversation.jsx";
 import { AgentTerminals } from "../ui/agent-terminals.jsx";
 import { AgentBrowser } from "../ui/agent-browser.jsx";
 import { rpc, useEvent, fmt, sendError } from "../lib/rpc.js";
@@ -160,7 +160,14 @@ export function SpawnModal(props) {
           ]} />
         </Field>
         <Field label="Model" hint="From your providers, discovered live">
-          <Select value={chosen()} onValue={setModel} options={modelOptions()} placeholder="Choose a model" />
+          <ModelPicker
+            value={chosen()}
+            onValue={setModel}
+            models={models() ?? []}
+            providers={providers() ?? []}
+            allowUntrusted={true}
+            placeholder="Choose a model"
+          />
         </Field>
         <Field label="Repo" hint="The agent gets its own worktree and branch">
           <Select value={repo()} onValue={setRepo} options={[{ value: "", label: "No repo (scratch only)" }, ...(repos() ?? []).map((r) => ({ value: r.id, label: r.name }))]} />
@@ -269,12 +276,47 @@ function Changes(props) {
 function Details(props) {
   const a = () => props.agent;
   const kv = () => a()?.kv || {};
+  const [kindInfo, { refetch: refetchKind }] = createResource(
+    () => a()?.id,
+    (id) => rpc("agents.kind_list", { id }).catch(() => ({ installed: false, clusters: [] }))
+  );
+  const [kindBusy, setKindBusy] = createSignal(false);
+
+  const createKind = async () => {
+    setKindBusy(true);
+    try {
+      const res = await rpc("agents.kind_create", { id: a().id }, { action: true });
+      toast(`Created kind cluster ${res.cluster} (HTTP :${res.http_port})`, "secure");
+      refetchKind();
+      props.onRefetch?.();
+    } catch (e) {
+      toast(String(e), "danger");
+    } finally {
+      setKindBusy(false);
+    }
+  };
+
+  const deleteKind = async (name) => {
+    setKindBusy(true);
+    try {
+      await rpc("agents.kind_delete", { id: a().id, name }, { action: true });
+      toast(`Deleted kind cluster ${name}`);
+      refetchKind();
+      props.onRefetch?.();
+    } catch (e) {
+      toast(String(e), "danger");
+    } finally {
+      setKindBusy(false);
+    }
+  };
+
   return (
     <div class="page-body agent-details">
-      <div class="grid-2">
+      <KvTelemetryBar kv={kv()} />
+      <div class="grid-2" style={{ "margin-top": "12px" }}>
         <div><div class="xs faint">Role & Cluster</div><div class="row gap-4"><RoleBadge role={a().role} /><span class="small">{a().cluster_name ? `Cluster ${a().cluster_name}` : "Root"}</span></div></div>
         <div><div class="xs faint">Model</div><div class="mono small">{a().model_ref}</div></div>
-        <div><div class="xs faint">KV Cache Hit Rate</div><div class="mono small">{kv().cache_hit_pct ?? 0}% ({((kv().cached_tokens || 0) / 1000).toFixed(1)}k cached / {((kv().input_tokens || 0) / 1000).toFixed(1)}k in)</div></div>
+        <div><div class="xs faint">Reasoning Effort</div><div class="mono small">{a().effort ?? "default"}</div></div>
         <div><div class="xs faint">Security</div>
           <Show when={a().strict} fallback={<Badge tone="secure">Standard: trusted provider</Badge>}>
             <Badge tone="strict">Strict: sandboxed, network allowlist</Badge>
@@ -282,9 +324,45 @@ function Details(props) {
         </div>
         <div><div class="xs faint">Workspace</div><div class="mono xs ellipsis" title={a().cwd ?? a().worktree}>{a().cwd ?? a().worktree ?? "not running"}</div></div>
         <div><div class="xs faint">Branch</div><div class="mono small">{a().branch ?? "none"}</div></div>
-        <div><div class="xs faint">Ports</div><div class="mono small">{a().port_base}–{a().port_base + 19}</div></div>
+        <div><div class="xs faint">Ports</div><div class="mono small">{a().port_base}–{a().port_base + 19} (kind HTTP :{a().port_base + 10}, HTTPS :{a().port_base + 11})</div></div>
         <div><div class="xs faint">Started</div><div class="small">{fmt.ago(a().created_at)}</div></div>
       </div>
+
+      <h3 class="section-title">Kubernetes-in-Docker (kind) Test Clusters</h3>
+      <div class="card" style={{ padding: "12px", "margin-bottom": "12px" }}>
+        <div class="row" style={{ "margin-bottom": "8px", "flex-wrap": "wrap" }}>
+          <span class="small dim grow">
+            Spin up an isolated <code class="mono">kind</code> Kubernetes cluster pre-mapped to this agent's port range (<code class="mono">:{a().port_base + 10}</code> HTTP, <code class="mono">:{a().port_base + 11}</code> HTTPS) and registered with the Reaper for automatic teardown.
+          </span>
+          <Button size="sm" variant="primary" busy={kindBusy()} onClick={createKind}>
+            <Icon name="plus" size={11} /> Create kind Cluster
+          </Button>
+        </div>
+        <Show when={(kindInfo()?.clusters ?? []).length} fallback={
+          <div class="xs faint">
+            {kindInfo()?.installed === false
+              ? "kind CLI not detected on PATH (install with `brew install kind`), or let the agent run `kind_cluster` via MCP."
+              : "No active kind clusters for this agent."}
+          </div>
+        }>
+          <div class="list">
+            <For each={kindInfo()?.clusters ?? []}>
+              {(cl) => (
+                <div class="list-item">
+                  <Dot state="live" />
+                  <span class="mono small grow">{cl.name}</span>
+                  <span class="mono xs faint">HTTP :{cl.http_port} · HTTPS :{cl.https_port}</span>
+                  <span class="mono xs faint ellipsis" style={{ "max-width": "240px" }} title={cl.kubeconfig}>{cl.kubeconfig}</span>
+                  <Button size="sm" variant="ghost" disabled={kindBusy()} onClick={() => deleteKind(cl.name)}>
+                    <Icon name="trash" size={12} /> Delete
+                  </Button>
+                </div>
+              )}
+            </For>
+          </div>
+        </Show>
+      </div>
+
       <Show when={(a().warnings ?? []).length}>
         <h3 class="section-title">Active Warnings</h3>
         <WarningPills warnings={a().warnings} max={10} />
@@ -335,6 +413,8 @@ function AgentView(props) {
   };
   const [events, setEvents] = createSignal([]);
   const [info, { refetch }] = createResource(() => props.id, (id) => rpc("agents.get", { id }));
+  const [models] = createResource(() => rpc("providers.models", {}).catch(() => []));
+  const [providers] = createResource(() => rpc("providers.list").catch(() => []));
   const [historyLoading, setHistoryLoading] = createSignal(false);
   const [historyError, setHistoryError] = createSignal("");
   const [historyCursor, setHistoryCursor] = createSignal(0);
@@ -401,6 +481,45 @@ function AgentView(props) {
     }
   };
   const live = () => a()?.id === props.id ? a()?.live : props.agent?.live;
+
+  const changeModel = async (newRef) => {
+    if (!newRef || newRef === a()?.model_ref) return true;
+    try {
+      await rpc("agents.set_model", { id: props.id, model: newRef });
+      toast(`Switched ${a()?.name ?? "agent"} model to ${newRef} (0 tokens used)`, "secure");
+      refetch();
+      return true;
+    } catch (e) {
+      toast(String(e), "danger");
+      return false;
+    }
+  };
+
+  const handleSlashModel = async (query) => {
+    if (!query) {
+      toast(`Current model: ${a()?.model_ref} (use /model <name> or click the model picker in the header)`, "info");
+      return true;
+    }
+    const q = query.toLowerCase();
+    const provMap = Object.fromEntries((providers() ?? []).map((p) => [p.id, p]));
+    const curProv = (a()?.model_ref || "").split("/")[0];
+    const allowed = (models() ?? []).filter((m) => {
+      if (m.enabled === 0) return false;
+      const p = provMap[m.provider_id];
+      if (!p || p.enabled === false) return false;
+      if (a()?.strict) return m.provider_id === curProv;
+      return !!p.trusted;
+    });
+    const match =
+      allowed.find((m) => m.ref.toLowerCase() === q || m.model_id.toLowerCase() === q) ||
+      allowed.find((m) => `${m.provider_name || ""} ${m.display || ""} ${m.ref}`.toLowerCase().includes(q));
+    if (!match) {
+      toast(`No accepted model matching "${query}" in this session's trust boundary.`, "danger");
+      return false;
+    }
+    return await changeModel(match.ref);
+  };
+
   let observedId, observedLive;
   createEffect(() => {
     const id = props.id, value = live();
@@ -438,14 +557,24 @@ function AgentView(props) {
         <AgentChip name={a()?.name} />
         <RoleBadge role={a()?.role} />
         <span class="small dim">{stateLabel(a()?.state)}</span>
-        <KvBadge kv={a()?.kv} />
+        <ModelPicker
+          compact
+          value={a()?.model_ref || ""}
+          onValue={changeModel}
+          models={models() ?? []}
+          providers={providers() ?? []}
+          strict={!!a()?.strict}
+          currentProvider={(a()?.model_ref || "").split("/")[0]}
+        />
         <Show when={a()?.strict}><Badge tone="strict"><Icon name="shield" size={11} /> Strict</Badge></Show>
         <Show when={a()?.parent_id}>
           <span class="xs faint" style={{ cursor: "pointer" }} onClick={() => go("agents", { id: a().parent_id })}>
             ↳ lead: <b>{a()?.parent_name || "parent"}</b>
           </span>
         </Show>
-        <span class="mono xs faint ellipsis">{a()?.branch ? `${a()?.repo_name || ""}#${a()?.branch}` : a()?.model_ref}</span>
+        <Show when={a()?.branch}>
+          <span class="mono xs faint ellipsis">{`${a()?.repo_name || ""}#${a()?.branch}`}</span>
+        </Show>
         <div class="grow" />
         <Segmented value={tab()} onChange={setTab} options={[{ value: "chat", label: "Conversation" }, { value: "terms", label: "Commands" }, { value: "changes", label: "Changes" }, { value: "info", label: "Details" }]} />
         <Segmented value={aside()} onChange={setAside} options={[
@@ -458,6 +587,11 @@ function AgentView(props) {
         </Show>
         <Button size="sm" variant="ghost" title="Remove agent and clean up" onClick={remove}><Icon name="trash" size={12} /></Button>
       </div>
+      <Show when={tab() === "chat"}>
+        <div style={{ padding: "6px 16px 0" }}>
+          <KvTelemetryBar kv={a()?.kv} compact />
+        </div>
+      </Show>
       <Show when={(a()?.children ?? []).length}>
         <div class="cluster-subbar">
           <span class="xs faint">Sub-agents ({a().children.length}):</span>
@@ -485,12 +619,12 @@ function AgentView(props) {
             <Conversation events={events()} busy={busy()} readOnly={!live()} loadAttachment={agentAttachmentLoader(props.id)} emptyText={historyLoading() ? "Loading saved conversation…" : historyError() ? "History could not be loaded. Retry above." : live() ? "Send the first message to start." : "No saved messages. This agent is stopped. Resume it to continue."}
               onApprove={(id, scope) => decide(id, "approve", scope)} onDeny={(id) => decide(id, "deny")} />
             <Composer draftKey={`agent:${props.id}`} dropTarget={() => agentMain} onSend={send} busy={busy()} disabled={!live()} onCancel={() => rpc("agents.cancel", { id: props.id }, { action: true }).catch((e) => toast(String(e), "danger"))}
-              speed={effortSpeed(effort())} effortPending={effortPending()} onSpeed={changeEffort}
-              placeholder={live() ? `Message ${a()?.name ?? ""}` : "Agent is stopped"} />
+              effort={effort()} speed={effortSpeed(effort())} effortPending={effortPending()} onEffort={changeEffort} onSpeed={changeEffort} onSlashModel={handleSlashModel}
+              placeholder={live() ? `Message ${a()?.name ?? ""} (or /effort, /model)` : "Agent is stopped"} />
           </Show>
           <Show when={tab() === "terms"}><Terminals id={props.id} /></Show>
           <Show when={tab() === "changes"}><Changes id={props.id} /></Show>
-          <Show when={tab() === "info" && info()}><Details agent={info()} /></Show>
+          <Show when={tab() === "info" && info()}><Details agent={info()} onRefetch={refetch} /></Show>
         </div>
         <div class="agent-aside" classList={{ hidden: aside() === "none" }} style={{ width: `${asideW()}px` }}>
             <div class="aside-grip" onPointerDown={drag} title="Drag to resize" />

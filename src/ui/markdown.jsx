@@ -1,12 +1,10 @@
 import { createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
-import { Marked } from "marked";
+import { marked } from "marked";
 import { decodeHTML } from "entities";
 import { MermaidBlock } from "./mermaid.jsx";
 import "./markdown.css";
 
 // Do not use innerHTML here; the security regression test checks this file.
-const markdown = new Marked({ gfm: true, breaks: true });
-
 export function safeLink(raw) {
   if (typeof raw !== "string") return undefined;
   const trimmed = raw.trim();
@@ -20,21 +18,25 @@ export function safeLink(raw) {
 }
 
 function CopyButton(props) {
-  const [copied, setCopied] = createSignal(false);
+  const [state, setState] = createSignal("idle");
   let timer;
   onCleanup(() => clearTimeout(timer));
   const copy = async (e) => {
-    e.stopPropagation();
+    e?.stopPropagation?.();
+    clearTimeout(timer);
     try {
-      await navigator.clipboard?.writeText(props.text || "");
-      setCopied(true);
-      clearTimeout(timer);
-      timer = setTimeout(() => setCopied(false), 1200);
-    } catch {}
+      await navigator.clipboard.writeText(props.text ?? "");
+      setState("success");
+    } catch {
+      setState("failure");
+    }
+    timer = setTimeout(() => setState("idle"), 2500);
   };
   return (
     <button type="button" class={props.class || "markdown-copy"} onClick={copy} aria-label={props.label}>
-      {copied() ? "Copied" : props.textLabel || "Copy"}
+      <span aria-live="polite">
+        {state() === "success" ? "Copied!" : state() === "failure" ? "Copy failed, try again" : (props.textLabel || props.label)}
+      </span>
     </button>
   );
 }
@@ -340,84 +342,68 @@ function CodeBlock(props) {
   );
 }
 
-function Inline(props) {
-  const raw = (token) => decodeHTML(token.raw ?? token.text ?? "");
-  return <For each={props.tokens || []}>{(token) => {
-    switch (token.type) {
-      case "escape":
-      case "text": return token.tokens ? <Inline tokens={token.tokens} /> : decodeHTML(token.text || "");
-      case "strong": return <strong><Inline tokens={token.tokens} /></strong>;
-      case "em": return <em><Inline tokens={token.tokens} /></em>;
-      case "del": return <del><Inline tokens={token.tokens} /></del>;
-      case "codespan": return <code>{decodeHTML(token.text || "")}</code>;
-      case "br": return <br />;
-      case "image": return <span class="markdown-image">[Image: {decodeHTML(token.text || "image omitted")}]</span>;
-      case "link": {
-        const href = safeLink(token.href);
-        const label = token.tokens?.length ? <Inline tokens={token.tokens} /> : decodeHTML(token.text || token.href || "");
-        return href ? <a href={href} target="_blank" rel="noopener noreferrer">{label}</a> : <span>{raw(token)}</span>;
-      }
-      default: return raw(token);
-    }
-  }}</For>;
-}
-
 function Tokens(props) {
-  const children = (token) => token.tokens ? <Inline tokens={token.tokens} /> : decodeHTML(token.text || "");
   return <For each={props.tokens || []}>{(token) => {
+    const children = () => <Tokens tokens={token.tokens || []} source={props.source} />;
     switch (token.type) {
       case "space": return null;
+      case "heading": {
+        return token.depth === 1 ? <h1>{children()}</h1> : token.depth === 2 ? <h2>{children()}</h2> : token.depth === 3 ? <h3>{children()}</h3> : token.depth === 4 ? <h4>{children()}</h4> : token.depth === 5 ? <h5>{children()}</h5> : <h6>{children()}</h6>;
+      }
       case "paragraph": {
         const t = (token.text || "").trim();
         if (t.startsWith("$$") && t.endsWith("$$") && t.length > 4) {
           return <MathBlock code={t.slice(2, -2)} />;
         }
-        return <p>{children(token)}</p>;
+        return <p>{children()}</p>;
       }
-      case "text": return <p>{children(token)}</p>;
-      case "heading": {
-        const depth = Math.min(Math.max(token.depth || 1, 1), 6);
-        if (depth === 1) return <h1>{children(token)}</h1>;
-        if (depth === 2) return <h2>{children(token)}</h2>;
-        if (depth === 3) return <h3>{children(token)}</h3>;
-        if (depth === 4) return <h4>{children(token)}</h4>;
-        if (depth === 5) return <h5>{children(token)}</h5>;
-        return <h6>{children(token)}</h6>;
-      }
-      case "blockquote": return <blockquote><Tokens tokens={token.tokens} source={props.source} /></blockquote>;
+      case "text": return token.tokens ? children() : decodeHTML(token.text);
+      case "escape": return token.text;
+      case "strong": return <strong>{children()}</strong>;
+      case "em": return <em>{children()}</em>;
+      case "del": return <del>{children()}</del>;
+      case "codespan": return <code>{token.text}</code>;
+      case "br": return <br />;
       case "hr": return <hr />;
+      case "blockquote": return <blockquote>{children()}</blockquote>;
+      case "link": return <Show when={safeLink(token.href)} fallback={children()}>{(href) => <a href={href()} target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer">{children()}</a>}</Show>;
+      case "image": return <span class="markdown-image">[Image: {decodeHTML(token.text || "image omitted")}]</span>;
+      case "html": return token.raw;
       case "code": return <CodeBlock token={token} source={props.source} />;
+      case "checkbox": return <input type="checkbox" disabled checked={token.checked} />;
       case "list": {
-        const items = <For each={token.items || []}>{(item) => <li>
-          {item.task && <input type="checkbox" checked={Boolean(item.checked)} disabled />}
-          <Tokens tokens={item.tokens} source={props.source} />
-        </li>}</For>;
-        return token.ordered ? <ol start={token.start || 1}>{items}</ol> : <ul>{items}</ul>;
+        const items = () => <For each={token.items}>{(item) => <li><Tokens tokens={item.tokens} source={props.source} /></li>}</For>;
+        return token.ordered ? <ol start={token.start}>{items()}</ol> : <ul>{items()}</ul>;
       }
       case "table": return <div class="markdown-table-wrap"><table>
-        <thead><tr><For each={token.header || []}>{(cell, idx) => <th style={{ "text-align": token.align?.[idx()] || undefined }}><Inline tokens={cell.tokens} /></th>}</For></tr></thead>
-        <tbody><For each={token.rows || []}>{(row) => <tr><For each={row}>{(cell, idx) => <td style={{ "text-align": token.align?.[idx()] || undefined }}><Inline tokens={cell.tokens} /></td>}</For></tr>}</For></tbody>
+        <thead><tr><For each={token.header}>{(cell) => <th><Tokens tokens={cell.tokens} source={props.source} /></th>}</For></tr></thead>
+        <tbody><For each={token.rows}>{(row) => <tr><For each={row}>{(cell) => <td><Tokens tokens={cell.tokens} source={props.source} /></td>}</For></tr>}</For></tbody>
       </table></div>;
-      default: return <pre class="markdown-raw"><code>{token.raw || token.text || ""}</code></pre>;
+      default: return token.raw || token.text || "";
     }
   }}</For>;
 }
 
 export function Markdown(props) {
-  const source = () => typeof props.text === "string" ? props.text : String(props.text ?? "");
   const tokens = createMemo(() => {
-    try { return markdown.lexer(source()); } catch { return null; }
+    const source = props.text || "";
+    const normalized = source.replace(/\r\n|\r/g, "\n");
+    const parsed = marked.lexer(source, { gfm: true });
+    let cursor = 0;
+    marked.walkTokens(parsed, (token) => {
+      if (token.type !== "code") return;
+      const start = normalized.indexOf(token.raw, cursor);
+      if (start >= 0) { token.sourceStart = start; cursor = start + token.raw.length; }
+    });
+    return parsed;
   });
-  return <div class="assistant-markdown">
-    {tokens() ? <Tokens tokens={tokens()} source={source()} /> : <div style={{ "white-space": "pre-wrap" }}>{source()}</div>}
-  </div>;
+  return <div class="assistant-markdown"><Tokens tokens={tokens()} source={props.text || ""} /></div>;
 }
 
 export function AssistantReply(props) {
-  const source = () => typeof props.text === "string" ? props.text : String(props.text ?? "");
   return <>
-    <Markdown text={source()} />
+    <Markdown text={props.text} />
     <Show when={props.live}><span class="caret" /></Show>
-    <div class="markdown-actions"><CopyButton label="Copy reply" textLabel="Copy reply" text={source()} /></div>
+    <div class="markdown-actions"><CopyButton label="Copy reply" text={props.text} /></div>
   </>;
 }

@@ -1010,14 +1010,138 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
             if !["default", "none", "minimal", "low", "medium", "high", "xhigh", "max"].contains(&effort.as_str()) {
                 return Err(format!("unknown effort `{effort}`"));
             }
-            let rt = runtime(&id).ok_or("agent is not running")?;
-            rt.hal.call(reqwest::Method::PATCH, &format!("/sessions/{}", rt.session), Some(json!({ "effort": effort }))).await?;
+            if let Some(rt) = runtime(&id) {
+                rt.hal.call(reqwest::Method::PATCH, &format!("/sessions/{}", rt.session), Some(json!({ "effort": effort }))).await?;
+            }
             ctx.db.kv_set(&format!("agent.effort.{id}"), &effort)?;
+            ctx.emit("agents:changed", json!({ "id": id, "effort": effort }));
             Ok(json!(effort))
         }
         // The agent's main shell (opened on demand while it runs). Null when stopped.
         "shell" => Ok(json!(crate::agentshell::current(ctx, &id()?, crate::agentshell::MAIN, args["open"].as_bool() == Some(true)).await)),
         "get_effort" => Ok(json!(ctx.db.kv_get(&format!("agent.effort.{}", id()?)).unwrap_or_else(|| "default".into()))),
+        "kind_list" => {
+            let agent_filter = ctx::arg_opt_str(&args, "id")
+                .and_then(|raw| get_row(ctx, &raw))
+                .and_then(|r| r["id"].as_str().map(str::to_string));
+            let rows = ctx.db.query(
+                "SELECT r.*, a.name AS agent_name, a.port_base AS port_base
+                 FROM resources r LEFT JOIN agents a ON a.id=r.agent_id
+                 WHERE r.kind='kind_cluster' AND r.state!='released'
+                   AND (?1 IS NULL OR r.agent_id=?1)
+                 ORDER BY r.created_at DESC",
+                rusqlite::params![agent_filter],
+            )?;
+            Ok(json!(rows))
+        }
+        "kind_create" => {
+            let aid = id()?;
+            let row = get_row(ctx, &aid).ok_or("gone")?;
+            let aname = row["name"].as_str().ok_or("missing agent name")?.to_string();
+            let port_base = row["port_base"].as_i64().unwrap_or(42000);
+            let raw_suffix = ctx::arg_opt_str(&args, "suffix").unwrap_or_else(|| "test".into());
+            let suffix: String = raw_suffix
+                .chars()
+                .filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-')
+                .take(16)
+                .collect();
+            let suffix = if suffix.is_empty() { "test".to_string() } else { suffix };
+            let cluster_name = format!("philium-{aname}-{suffix}");
+            let kubeconfig = ctx.agent_dir(&aname).join("kubeconfig");
+            let _ = std::fs::create_dir_all(ctx.agent_dir(&aname));
+            let rid = crate::reaper::register(
+                ctx,
+                Some(&aid),
+                "kind_cluster",
+                &cluster_name,
+                json!({
+                    "agent_name": aname,
+                    "kubeconfig": kubeconfig.to_string_lossy(),
+                    "http_port": port_base + 10,
+                    "https_port": port_base + 11,
+                }),
+            );
+            let cfg_path = ctx.agent_dir(&aname).join(format!("kind-{suffix}.yaml"));
+            let kind_cfg = format!(
+                "kind: Cluster\napiVersion: kind.x-k8s.io/v1alpha4\nnodes:\n- role: control-plane\n  extraPortMappings:\n  - containerPort: 30080\n    hostPort: {}\n    protocol: TCP\n  - containerPort: 30443\n    hostPort: {}\n    protocol: TCP\n",
+                port_base + 10,
+                port_base + 11
+            );
+            let _ = std::fs::write(&cfg_path, kind_cfg);
+            let cname = cluster_name.clone();
+            let kc = kubeconfig.clone();
+            let cp = cfg_path.clone();
+            let out = tokio::task::spawn_blocking(move || {
+                std::process::Command::new("kind")
+                    .args([
+                        "create",
+                        "cluster",
+                        "--name",
+                        &cname,
+                        "--config",
+                        &cp.to_string_lossy(),
+                        "--kubeconfig",
+                        &kc.to_string_lossy(),
+                        "--wait",
+                        "60s",
+                    ])
+                    .output()
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+            match out {
+                Ok(o) if o.status.success() => {
+                    ctx.emit("agents:changed", json!({ "id": aid }));
+                    Ok(json!({
+                        "resource_id": rid,
+                        "cluster": cluster_name,
+                        "kubeconfig": kubeconfig.to_string_lossy(),
+                        "http_port": port_base + 10,
+                        "https_port": port_base + 11,
+                    }))
+                }
+                Ok(o) => {
+                    crate::reaper::release(ctx, &rid);
+                    Err(format!("kind create failed: {}", String::from_utf8_lossy(&o.stderr).trim()))
+                }
+                Err(e) => {
+                    crate::reaper::release(ctx, &rid);
+                    Err(format!("kind binary not available or failed to start: {e}"))
+                }
+            }
+        }
+        "kind_delete" => {
+            let cluster = ctx::arg_str(&args, "cluster")?;
+            if !cluster.starts_with("philium-") {
+                return Err("refusing to delete non-philium kind cluster".into());
+            }
+            let rows = ctx.db.query(
+                "SELECT id, agent_id FROM resources WHERE kind='kind_cluster' AND handle=?1 AND state!='released'",
+                [&cluster],
+            )?;
+            let cname = cluster.clone();
+            let out = tokio::task::spawn_blocking(move || {
+                std::process::Command::new("kind")
+                    .args(["delete", "cluster", "--name", &cname])
+                    .output()
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+            if let Ok(o) = out {
+                if !o.status.success() {
+                    return Err(format!("kind delete failed: {}", String::from_utf8_lossy(&o.stderr).trim()));
+                }
+            }
+            for r in rows {
+                if let Some(rid) = r["id"].as_str() {
+                    crate::reaper::release(ctx, rid);
+                }
+                if let Some(aid) = r["agent_id"].as_str() {
+                    ctx.emit("agents:changed", json!({ "id": aid }));
+                }
+            }
+            Ok(json!({ "deleted": cluster }))
+        }
         "set_model" => {
             let id = id()?;
             let model = ctx::arg_str(&args, "model")?;
