@@ -917,9 +917,6 @@ async fn hal_get(id: &str, path: &str) -> Result<Value, String> {
     r.hal.call(reqwest::Method::GET, &format!("/sessions/{}{path}", r.session), None).await
 }
 
-// Avoid competing for the same fixed ports/kubeconfig while a node image is pulled.
-static KIND_OPERATION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
 fn local_kind_limit(ctx: &Ctx) -> u32 {
     ctx.setting("kind.local_limit", "1").parse::<u32>().unwrap_or(1).min(8)
 }
@@ -1110,7 +1107,7 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
             let suffix = if suffix.is_empty() { "test".to_string() } else { suffix };
             let cluster_name = format!("philium-{aname}-{suffix}");
             let kubeconfig = ctx.agent_dir(&aname).join("kubeconfig");
-            let _op = KIND_OPERATION.try_lock().map_err(|_| "Another kind operation is in progress. Try again when it finishes.")?;
+            let _op = ctx.kind_operation.try_lock().map_err(|_| "Another kind operation is in progress. Try again when it finishes.")?;
             let inventory = tokio::task::spawn_blocking(|| std::process::Command::new("kind").args(["get", "clusters"]).output())
                 .await.map_err(|e| e.to_string())?.map_err(|e| format!("Cannot inspect local kind capacity: {e}"))?;
             if !inventory.status.success() { return Err(format!("Cannot inspect local kind capacity: {}", String::from_utf8_lossy(&inventory.stderr).trim())); }
@@ -1187,7 +1184,7 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
             if !cluster.starts_with(&format!("philium-{aname}-")) {
                 return Err("Cluster does not belong to this agent".into());
             }
-            let _op = KIND_OPERATION.try_lock().map_err(|_| "Another kind operation is in progress. Try again when it finishes.")?;
+            let _op = ctx.kind_operation.try_lock().map_err(|_| "Another kind operation is in progress. Try again when it finishes.")?;
             let rows = ctx.db.query(
                 "SELECT id, agent_id FROM resources WHERE kind='kind_cluster' AND handle=?1 AND state!='released'",
                 [&cluster],

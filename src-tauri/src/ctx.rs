@@ -30,6 +30,8 @@ pub struct Ctx {
     pub root: PathBuf,
     pub gateway: Arc<Gateway>,
     pub gateway_url: String,
+    /// Serialize this workstation's managed kind create/delete operations.
+    pub kind_operation: tokio::sync::Mutex<()>,
     /// Loopback URL of Philium's agent MCP server (`mcp.rs`), set after bind.
     pub mcp_url: OnceLock<String>,
     /// Loopback egress proxy for Strict agents (`sandbox.rs`), set after bind.
@@ -54,6 +56,7 @@ impl Ctx {
             root,
             gateway,
             gateway_url,
+            kind_operation: tokio::sync::Mutex::new(()),
             mcp_url: OnceLock::new(),
             egress_url: OnceLock::new(),
             handle: OnceLock::new(),
