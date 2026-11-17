@@ -5,6 +5,9 @@ import { For, Index, Show, Switch, Match, createSignal, createMemo, createEffect
 import { Badge, Button, toast } from "./kit.jsx";
 import { Icon } from "./icons.jsx";
 import { AssistantReply } from "./markdown.jsx";
+import { ConversationActivity } from "./conversation-activity.jsx";
+import { ViewToggle } from "./conversation-view.jsx";
+import { conversationView } from "../lib/conversation-view.js";
 import { draftFor, newDraft } from "../lib/drafts.js";
 
 /** Fold a list of HAL events into display items. Pure, incremental-safe. */
@@ -13,7 +16,7 @@ export function fold(events) {
   const tools = new Map();
   let streaming = null;
   let turnText = false;
-  const endPendingTools = () => { for (const t of tools.values()) if (t.running) t.inactive = true; };
+  const endPendingTools = () => { for (const t of tools.values()) if (t.running) t.inactive = true; if (streaming) streaming.live = false; };
   for (const e of events) {
     switch (e.type) {
       case "message.created":
@@ -35,6 +38,7 @@ export function fold(events) {
         turnText = false;
         break;
       case "tool.started": {
+        if (streaming) streaming.live = false;
         const t = { kind: "tool", tool: e.tool, args: e.arguments, out: "", seq: e.seq, running: true };
         tools.set(e.call_id, t); items.push(t); streaming = null;
         break;
@@ -82,8 +86,13 @@ function argSummary(tool, args) {
 }
 
 function Tool(props) {
-  const [open, setOpen] = createSignal(false);
+  const [open, setOpen] = createSignal(null);
+  const expanded = () => open() ?? props.terminal;
   const t = () => props.item;
+  const resultText = () => {
+    const value = t().result ?? t().out ?? "";
+    return typeof value === "string" ? value : JSON.stringify(value, null, 2);
+  };
   const active = () => props.active && !t().inactive;
   const [elapsed, setElapsed] = createSignal(0);
   const [silent, setSilent] = createSignal(0);
@@ -107,20 +116,20 @@ function Tool(props) {
   });
   return (
     <div class="msg tool conv-tool">
-      <div class="row" style={{ cursor: "pointer" }} onClick={() => setOpen(!open())}>
+      <button type="button" class="row conv-tool-toggle" aria-expanded={!!expanded()} onClick={() => setOpen(!expanded())}>
         <span class={`dot ${t().running ? active() ? "busy" : "" : t().ok === false ? "bad" : "live"}`} />
         <b>{short(t().tool)}</b>
         <span class="ellipsis dim grow">{argSummary(t().tool, t().args)}</span>
         <Show when={t().ms != null}><span class="faint xs">{(t().ms / 1000).toFixed(1)}s</span></Show>
-      </div>
+      </button>
       <Show when={t().running}>
         <div class="xs dim" role="status">{active()
           ? `Awaiting tool completion · observed ${elapsed()}s${silent() >= 30 ? ` · No new output for ${silent()}s. It may be working or waiting for approval. This is not a completion signal.` : ""}`
           : "No tool completion recorded in loaded history."}</div>
       </Show>
-      <Show when={open()}>
+      <Show when={expanded()}>
         <pre class="conv-pre">{JSON.stringify(t().args, null, 2)}</pre>
-        <Show when={t().out || t().result}><pre class="conv-pre">{(t().result || t().out || "").slice(0, 20000)}</pre></Show>
+        <Show when={resultText()}><pre class="conv-pre">{resultText().slice(0, 20000)}</pre><Show when={resultText().length > 20000}><span class="xs dim">Showing the first 20,000 characters of tool output.</span></Show></Show>
       </Show>
     </div>
   );
@@ -137,10 +146,11 @@ export function Conversation(props) {
     if (stick() && el) queueMicrotask(() => (el.scrollTop = el.scrollHeight));
   }));
   return (
-    <div class="conv" style={props.hidden ? { display: "none" } : undefined} ref={el} onScroll={(e) => {
+    <div class={`conv conv-${conversationView()}`} style={props.hidden ? { display: "none" } : undefined} ref={el} onScroll={(e) => {
       const d = e.currentTarget;
       setStick(d.scrollHeight - d.scrollTop - d.clientHeight < 60);
     }}>
+      <ViewToggle />
       <div class="timeline">
         <Show when={items().length === 0}>
           <div class="conv-empty">{props.emptyText ?? "No messages yet."}</div>
@@ -150,9 +160,9 @@ export function Conversation(props) {
             <Switch>
               <Match when={it().kind === "user"}><div class="msg user">{it().text}</div></Match>
               <Match when={it().kind === "assistant"}>
-                <div class={`msg assistant ${it().live ? "live" : ""}`}><AssistantReply text={it().text} live={it().live} /></div>
+                <div class={`msg assistant ${it().live && props.busy && !props.readOnly ? "live" : ""}`}><AssistantReply text={it().text} live={it().live && props.busy && !props.readOnly} /></div>
               </Match>
-              <Match when={it().kind === "tool"}><Tool item={it()} active={props.busy && !props.readOnly} /></Match>
+              <Match when={it().kind === "tool"}><Tool item={it()} active={props.busy && !props.readOnly} terminal={conversationView() === "terminal"} /></Match>
               <Match when={it().kind === "file"}>
                 <details class="msg tool">
                   <summary><Icon name="repo" size={12} /> edited <b>{it().path}</b></summary>
@@ -183,6 +193,7 @@ export function Conversation(props) {
             </Switch>
           )}
         </Index>
+        <ConversationActivity events={props.events ?? []} busy={props.busy} readOnly={props.readOnly || props.hidden} />
       </div>
     </div>
   );

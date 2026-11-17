@@ -12,7 +12,7 @@
 .conv.conv-conversation .msg.assistant { align-self: flex-start; }
 .conv.conv-conversation .msg.user { align-self: flex-end; }
 
-.conv.conv-terminal { font-family: var(--mono, ui-monospace, monospace); }
+.conv.conv-terminal { font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; }
 .conv.conv-terminal .timeline { gap: 6px; padding: 12px 16px; max-width: none; }
 .conv.conv-terminal .msg { align-self: stretch; max-width: none; border-radius: 0; border-width: 0 0 0 2px; border-color: var(--line); background: transparent; padding: 6px 10px; font-family: inherit; font-size: var(--fs-s, 12px); line-height: 1.45; }
 .conv.conv-terminal .msg.user { background: transparent; border-color: var(--accent); }

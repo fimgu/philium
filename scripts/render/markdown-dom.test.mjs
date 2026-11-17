@@ -9,7 +9,7 @@ import puppeteer from 'puppeteer-core';
 const fixtureId = new URL('./__markdown-fixture.jsx', import.meta.url).pathname;
 const fixture = `import { render } from 'solid-js/web';
 import { createSignal } from 'solid-js';
-import { Conversation } from '/src/ui/conversation.jsx';
+import { Conversation, Composer } from '/src/ui/conversation.jsx';
 import '/src/styles/tokens.css';
 import '/src/styles/components.css';
 import '/src/styles/agents.css';
@@ -19,7 +19,7 @@ window.copies = [];
 Object.defineProperty(navigator, 'clipboard', { configurable: true, value: {
   writeText: async value => { if (window.failCopy) throw Error('denied'); window.copies.push(value); }
 } });
-render(() => <Conversation events={events()} busy={true} />, document.getElementById('app'));
+render(() => <><Conversation events={events()} busy={true} /><Composer busy={true} /></>, document.getElementById('app'));
 `;
 
 test('Conversation Markdown DOM, streaming, unsafe content and clipboard matrix', async () => {
@@ -97,6 +97,34 @@ test('Conversation Markdown DOM, streaming, unsafe content and clipboard matrix'
     assert.equal(await page.evaluate(() => window.copies.at(-1)), 'same\r\n');
     await set('Entities: &amp; &lt;img src=x&gt; and `&amp;`');
     assert.equal(await page.$eval('.assistant-markdown', el => el.textContent), 'Entities: & <img src=x> and &amp;');
+    await page.type('textarea', 'Keep this draft through view changes');
+    await page.evaluate(() => { window.originalComposer = document.querySelector('textarea'); window.originalConversation = document.querySelector('.conv'); });
+    await page.click('.conversation-view-toggle button:nth-child(2)');
+    assert.ok(await page.$('.conv-terminal'));
+    assert.equal(await page.$eval('.conversation-view-toggle button:nth-child(2)', el => el.getAttribute('aria-pressed')), 'true');
+    assert.equal(await page.$eval('textarea', el => el.value), 'Keep this draft through view changes');
+    assert.equal(await page.evaluate(() => document.querySelector('textarea') === window.originalComposer && document.querySelector('.conv') === window.originalConversation), true);
+    assert.equal(await page.evaluate(() => localStorage.getItem('philium.conversation.view')), 'terminal');
+    await page.click('.conversation-view-toggle button:first-child');
+    assert.ok(await page.$('.conv-conversation'));
+    assert.equal(await page.$eval('textarea', el => el.value), 'Keep this draft through view changes');
+    await page.evaluate(() => window.setEvents([{type:'turn.started',turn_id:'active',seq:1},{type:'model.started',seq:2}]));
+    assert.equal(await page.$eval('.conversation-activity [role="status"]', el => el.textContent), 'Waiting for model response');
+    await page.evaluate(() => window.setEvents([{type:'turn.started',turn_id:'active',seq:1},{type:'model.retrying',attempt:2,max_attempts:3,seq:2}]));
+    assert.equal(await page.$eval('.conversation-activity [role="status"]', el => el.textContent), 'Retrying model request (2/3)');
+    await page.evaluate(() => window.setEvents([{type:'turn.started',turn_id:'active',seq:1},{type:'tool.started',call_id:'x',tool:'shell_run',arguments:{},seq:2},{type:'permission.requested',request_id:'p',action:'shell',resource:'test',seq:3}]));
+    assert.equal(await page.$eval('.conversation-activity [role="status"]', el => el.textContent), 'Waiting for your approval');
+    await page.click('.conversation-view-toggle button:nth-child(2)');
+    assert.equal(await page.$eval('.conv-tool-toggle', el => el.getAttribute('aria-expanded')), 'true');
+    await page.focus('.conv-tool-toggle');
+    await page.keyboard.press('Enter');
+    assert.equal(await page.$eval('.conv-tool-toggle', el => el.getAttribute('aria-expanded')), 'false');
+    await page.evaluate(() => window.setEvents([{type:'turn.started',turn_id:'active',seq:1},{type:'model.delta',delta:'partial',seq:2},{type:'turn.cancelled',seq:3}]));
+    assert.equal(await page.$('.conversation-activity'), null);
+    assert.equal(await page.$('.caret'), null);
+    await page.reload();
+    await page.waitForFunction(() => typeof window.setEvents === 'function');
+    assert.ok(await page.$('.conv-terminal'));
     const unsafe = '<script>window.pwned=1</script>\n\n<img src="https://tracking.invalid/pixel" onerror="window.pwned=2">\n\n[bad](javascript:alert(1)) [data](data:text/html,bad) [encoded](jav&#x61;script:alert(1))\n\n![pixel](https://tracking.invalid/pixel)\n\n[good](https://example.com)';
     await set(unsafe);
     assert.equal(await page.$('.assistant-markdown script, .assistant-markdown img, .assistant-markdown iframe'), null);

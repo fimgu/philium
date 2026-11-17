@@ -1,0 +1,6 @@
+.conversation-activity { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 12px 14px; color: var(--text-dim); font-size: var(--fs-s); }
+.conversation-activity .activity-dot { width: 6px; height: 6px; flex: none; border-radius: 50%; background: currentColor; }
+.conversation-activity .activity-elapsed { color: var(--text-faint); font-variant-numeric: tabular-nums; }
+.conversation-activity .activity-hint { flex-basis: 100%; padding-left: 14px; font-size: var(--fs-xs); color: var(--text-faint); }
+.conv-tool-toggle { width: 100%; background: none; border: 0; padding: 0; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.conv-tool-toggle:focus-visible { outline: 2px solid currentColor; outline-offset: 3px; }
