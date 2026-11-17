@@ -98,7 +98,7 @@ export function SpawnModal(props) {
   const [tasks] = createResource(() => rpc("board.list", { status: "open" }).catch(() => []));
   const def = store.defaultModel;
   const [name, setName] = createSignal(props.preset?.name ?? "");
-  const [role, setRole] = createSignal(props.preset?.role ?? "orchestrator");
+  const [role, setRole] = createSignal(props.preset?.role ?? "worker");
   const [model, setModel] = createSignal("");
   const [repo, setRepo] = createSignal(props.preset?.repo_id ?? activeRepoId() ?? "");
   const [task, setTask] = createSignal(props.preset?.task_id ?? "");
@@ -146,19 +146,19 @@ export function SpawnModal(props) {
   };
 
   return (
-    <Modal title="New agent / cluster lead" onClose={() => props.onClose(null)} footer={<>
+    <Modal title="New agent" onClose={() => props.onClose(null)} footer={<>
       <Button onClick={() => props.onClose(null)}>Cancel</Button>
-      <Button variant="primary" busy={busy()} onClick={submit}>Start {role() === "orchestrator" ? "Orchestrator" : "Agent"}</Button>
+      <Button variant="primary" busy={busy()} onClick={submit}>Start Agent</Button>
     </>}>
       <div class="grid-2">
         <Field label="Name" hint={`Leave empty for ${names()?.[0] ?? "a free name"}`}>
           <Input value={name()} placeholder={names()?.[0] ?? "lion"} onValue={(v) => setName(v.toLowerCase().replace(/[^a-z0-9-]/g, ""))} />
         </Field>
-        <Field label="Hierarchy Role" hint="Orchestrators decompose & spawn workers">
+        <Field label="Role" hint="Standard agent or multi-agent orchestrator">
           <Select value={role()} onValue={setRole} options={[
-            { value: "orchestrator", label: "Orchestrator (Cluster Lead — spawns workers & reviewers)" },
-            { value: "worker", label: "Worker (Focused implementation in isolated worktree)" },
-            { value: "reviewer", label: "Reviewer (Audits diffs, tests & PR readiness)" },
+            { value: "worker", label: "Agent (Standard)" },
+            { value: "orchestrator", label: "Orchestrator (Spawns sub-agents)" },
+            { value: "reviewer", label: "Reviewer (Audits diffs & PRs)" },
           ]} />
         </Field>
         <Field label="Model" hint="From your providers, discovered live">
@@ -197,18 +197,15 @@ export function SpawnModal(props) {
 function AgentRow(props) {
   const a = () => props.agent;
   return (
-    <div class={`list-item agent-row ${props.selected ? "on" : ""}`} style={{ "padding-left": `${12 + props.depth * 16}px` }} onClick={props.onClick}>
+    <div class={`list-item agent-row ${props.selected ? "on" : ""}`} style={{ "padding-left": `${12 + props.depth * 14}px` }} onClick={props.onClick}>
       <Dot state={stateDot(a().state)} title={stateLabel(a().state)} />
       <div class="grow" style={{ "min-width": 0 }}>
-        <div class="row" style={{ gap: "5px", "flex-wrap": "wrap" }}>
+        <div class="row" style={{ gap: "6px" }}>
           <AgentChip name={a().name} />
-          <RoleBadge role={a().role} />
-          <KvBadge kv={a().kv} />
-          <Show when={a().strict}><Badge tone="strict" title="Untrusted provider: sandboxed and fully observed">Strict</Badge></Show>
           <Show when={a().state === "waiting"}><Badge tone="strict">Needs you</Badge></Show>
           <Show when={(a().warnings ?? []).some((w) => w.kind === "clash")}><Badge tone="danger">Clash</Badge></Show>
         </div>
-        <div class="xs faint ellipsis">{a().task_title || a().repo_name || a().branch || a().model_ref}</div>
+        <div class="xs faint ellipsis">{a().task_title || a().repo_name || a().branch || (a().model_ref ?? "").split("/").pop()}</div>
       </div>
       <span class="xs faint">{fmt.ago(a().last_active_at)}</span>
     </div>
@@ -901,7 +898,7 @@ export default function Agents() {
   const [filter, setFilter] = createSignal("all");
   const [search, setSearch] = createSignal("");
   const [broadcastText, setBroadcastText] = createSignal("");
-  const [viewMode, setViewModeRaw] = createSignal(localStorage.getItem("agents.viewMode") || "clusters");
+  const [viewMode, setViewModeRaw] = createSignal(localStorage.getItem("agents.viewMode") || "split");
   const setViewMode = (m) => { setViewModeRaw(m); localStorage.setItem("agents.viewMode", m); };
 
   registerCommands([
@@ -1040,10 +1037,8 @@ export default function Agents() {
         <Show when={(list() ?? []).length}>
           <span class="fleet-sub-telemetry">
             <span>{telemetry().live}/{telemetry().total} running</span>
-            <span>· {clusters().length} cluster{clusters().length === 1 ? "" : "s"}</span>
-            <span>· {telemetry().waiting} need you</span>
-            <Show when={telemetry().totalIn > 0}>
-              <span>· KV cache {telemetry().kvPct}% ({(telemetry().totalCached / 1000).toFixed(0)}k cached)</span>
+            <Show when={telemetry().waiting > 0}>
+              <span>· {telemetry().waiting} need you</span>
             </Show>
             <Show when={telemetry().warnings > 0}>
               <span class="warn-text">· {telemetry().warnings} warning{telemetry().warnings === 1 ? "" : "s"}</span>
@@ -1056,7 +1051,7 @@ export default function Agents() {
           <input
             type="search"
             class="input fleet-search"
-            placeholder="Filter agent, repo, branch, role…"
+            placeholder="Filter agents…"
             value={search()}
             onInput={(e) => setSearch(e.currentTarget.value)}
           />
@@ -1064,21 +1059,17 @@ export default function Agents() {
             { value: "all", label: "All" },
             { value: "live", label: "Running" },
             { value: "waiting", label: `Need you${telemetry().waiting ? ` (${telemetry().waiting})` : ""}` },
-            { value: "warnings", label: `Warnings${telemetry().warnings ? ` (${telemetry().warnings})` : ""}` },
-            { value: "orchestrators", label: "Orchestrators" },
           ]} />
           <Segmented value={viewMode()} onChange={setViewMode} options={[
-            { value: "clusters", label: <span class="row gap-4" title="Hierarchical Orchestrator -> Worker clusters"><Icon name="board" size={12} /> Clusters</span> },
-            { value: "grid", label: <span class="row gap-4" title="Watch and control all agents side-by-side"><Icon name="grid" size={12} /> Grid</span> },
-            { value: "fleet", label: <span class="row gap-4" title="Dense heatmap for 100+ agents"><Icon name="terminal" size={12} /> Fleet</span> },
             { value: "split", label: <span class="row gap-4" title="Single agent with live terminal & browser"><Icon name="agents" size={12} /> Focus</span> },
+            { value: "grid", label: <span class="row gap-4" title="Watch and control all agents side-by-side"><Icon name="grid" size={12} /> Grid</span> },
+            { value: "clusters", label: <span class="row gap-4" title="Grouped by cluster"><Icon name="board" size={12} /> Clusters</span> },
           ]} />
         </Show>
         <Button variant="primary" onClick={() => setSpawn({})}><Icon name="plus" size={12} /> New agent</Button>
       </div>}>
-      <MissionDispatchBar onSpawned={() => refetch()} />
 
-      <Show when={telemetry().allAlerts.length > 0 || telemetry().orchestrators > 1}>
+      <Show when={telemetry().allAlerts.length > 0}>
         <div class="fleet-triage-strip">
           <Show when={telemetry().waiting > 0}>
             <Button size="sm" variant="primary" onClick={() => approveAllWaiting(null)}>
