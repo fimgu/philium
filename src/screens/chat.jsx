@@ -6,6 +6,7 @@ import { Icon } from "../ui/icons.jsx";
 import { Conversation, Composer, KvTelemetryBar, speedEffort, effortSpeed } from "../ui/conversation.jsx";
 import { rpc, hal, useEvent, fmt, sendError } from "../lib/rpc.js";
 import { go, params } from "../lib/nav.js";
+import { createSessionPoller } from "../lib/session-poller.js";
 import "../styles/agents.css";
 
 const TERMINAL = new Set(["assistant.completed", "turn.failed", "turn.cancelled"]);
@@ -74,29 +75,23 @@ export default function Chat() {
     return await changeChatModel(match.ref);
   };
 
-  let after = 0;
-  let timer;
-  const poll = async (id) => {
-    clearTimeout(timer);
-    try {
-      const evs = await hal("GET", `/sessions/${id}/events?after=${after}`);
-      if (id !== selected()) return;
-      if (evs?.length) {
-        after = evs.at(-1).seq;
-        setEvents((x) => x.concat(evs));
-        for (const event of evs) {
-          if (event.type === "turn.started") setBusy(true);
-          else if (TERMINAL.has(event.type)) setBusy(false);
-        }
+  const poller = createSessionPoller({
+    fetchEvents: (id, after) => hal("GET", `/sessions/${id}/events?after=${after}`),
+    isBusy: busy,
+    onEvents(evs) {
+      setEvents((x) => x.concat(evs));
+      for (const event of evs) {
+        if (event.type === "turn.started") setBusy(true);
+        else if (TERMINAL.has(event.type)) setBusy(false);
       }
-    } catch { /* desk restarting */ }
-    if (busy()) timer = setTimeout(() => poll(id), 400);
-  };
+    },
+  });
+  const poll = (id) => poller.poll(id);
   createEffect(on(selected, (id) => {
-    clearTimeout(timer); setEvents([]); after = 0; setBusy(false);
-    if (id) poll(id);
+    setEvents([]); setBusy(false);
+    poller.select(id);
   }));
-  onCleanup(() => clearTimeout(timer));
+  onCleanup(() => poller.dispose());
 
   const newChat = async () => {
     try {
