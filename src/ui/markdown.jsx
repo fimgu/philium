@@ -77,8 +77,9 @@ function Tokens(props) {
       case "image": return <span class="markdown-image">[Image: {decodeHTML(token.text || "image omitted")}]</span>;
       case "html": return token.raw;
       case "code": return <div class="markdown-code"><CopyButton label="Copy code" text={codeContents(token, props.source)} /><pre><code>{token.text}</code></pre></div>;
+      case "checkbox": return <input type="checkbox" disabled checked={token.checked} />;
       case "list": {
-        const items = () => <For each={token.items}>{item => <li><Show when={item.task}><input type="checkbox" disabled checked={item.checked} /></Show><Tokens tokens={item.tokens} source={props.source} /></li>}</For>;
+        const items = () => <For each={token.items}>{item => <li><Tokens tokens={item.tokens} source={props.source} /></li>}</For>;
         return token.ordered ? <ol start={token.start}>{items()}</ol> : <ul>{items()}</ul>;
       }
       case "table": return <div class="markdown-table"><table><thead><tr><For each={token.header}>{cell => <th><Tokens tokens={cell.tokens} source={props.source} /></th>}</For></tr></thead><tbody><For each={token.rows}>{row => <tr><For each={row}>{cell => <td><Tokens tokens={cell.tokens} source={props.source} /></td>}</For></tr>}</For></tbody></table></div>;

@@ -10,6 +10,7 @@ const fixtureId = new URL('./__markdown-fixture.jsx', import.meta.url).pathname;
 const fixture = `import { render } from 'solid-js/web';
 import { createSignal } from 'solid-js';
 import { Conversation } from '/src/ui/conversation.jsx';
+import '/src/styles/tokens.css';
 import '/src/styles/components.css';
 import '/src/styles/agents.css';
 const [events, setEvents] = createSignal([]);
@@ -59,6 +60,7 @@ test('Conversation Markdown DOM, streaming, unsafe content and clipboard matrix'
     assert.deepEqual(await page.evaluate(() => ['h1','strong','em','code','li','blockquote','table'].map(s => !!document.querySelector('.assistant-markdown ' + s))), Array(7).fill(true));
     assert.ok(await page.$('.assistant-markdown del'));
     assert.equal(await page.$eval('.assistant-markdown input', el => el.checked && el.disabled), true);
+    assert.equal(await page.$$eval('.assistant-markdown li', els => els.at(-1).textContent), 'done');
     if (process.env.MARKDOWN_SCREENSHOT) await page.screenshot({ path: process.env.MARKDOWN_SCREENSHOT, fullPage: true });
     assert.equal(await page.$eval('.msg.user', el => el.textContent), '**literal user** <img src=x>');
     assert.equal(await page.$('.msg.user strong'), null);
