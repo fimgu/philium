@@ -33,6 +33,19 @@ details.msg summary { cursor: pointer; display: flex; align-items: center; gap: 
 .conv-pre { max-height: 320px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
 .conv-tool .row > b { flex: none; }
 
+/* Keep commands in the conversation. The optional terminal is an inspector. */
+.agent-main .conv.conv-conversation .msg.assistant { border: 0; background: transparent; padding: 8px 0; max-width: 100%; }
+.agent-main .conv.conv-conversation .msg.user { border-radius: 10px; }
+.conv .msg.conv-tool { align-self: stretch; max-width: none; border: 0; border-left: 2px solid var(--line); border-radius: 0; background: transparent; padding: 8px 14px; }
+.conv-tool-toggle { width: 100%; }
+.tool-command, .tool-output-preview, .conv .conv-pre { font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; font-size: 12px; line-height: 1.6; }
+.tool-command { margin: 8px 0 4px; color: var(--text); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 144px; overflow: auto; user-select: text; }
+.tool-output-preview { margin: 4px 0; padding-left: 12px; border-left: 1px solid var(--line); color: var(--text-dim); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 100px; overflow: auto; user-select: text; }
+.tool-preview-label { font-size: 10px; color: var(--text-faint); }
+.tool-raw { margin-top: 10px; color: var(--text-faint); font-size: var(--fs-xs); }
+.tool-raw summary { cursor: pointer; }
+.agent-main .conversation-view-hint { display: none; }
+
 /* Agent split view: chat on the left, live terminal or browser on the right. */
 .agent-body { flex: 1; min-height: 0; display: flex; }
 .agent-main { flex: 1; min-width: 360px; display: flex; flex-direction: column; min-height: 0; overflow: hidden; }

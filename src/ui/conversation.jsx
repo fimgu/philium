@@ -85,13 +85,15 @@ function argSummary(tool, args) {
   return s.length > 120 ? s.slice(0, 120) + "…" : s;
 }
 
+import { toolOutput, cleanTerminalText, shellStatus } from "../lib/tool-presentation.js";
+
 function Tool(props) {
   const [open, setOpen] = createSignal(null);
   const expanded = () => open() ?? props.terminal;
   const t = () => props.item;
+  const state = () => shellStatus(t().result);
   const resultText = () => {
-    const value = t().result ?? t().out ?? "";
-    return typeof value === "string" ? value : JSON.stringify(value, null, 2);
+    return cleanTerminalText(toolOutput(t().result, t().out));
   };
   const active = () => props.active && !t().inactive;
   const [elapsed, setElapsed] = createSignal(0);
@@ -117,19 +119,24 @@ function Tool(props) {
   return (
     <div class="msg tool conv-tool">
       <button type="button" class="row conv-tool-toggle" aria-expanded={!!expanded()} onClick={() => setOpen(!expanded())}>
-        <span class={`dot ${t().running ? active() ? "busy" : "" : t().ok === false ? "bad" : "live"}`} />
-        <b>{short(t().tool)}</b>
-        <span class="ellipsis dim grow">{argSummary(t().tool, t().args)}</span>
+        <span class={`dot ${t().running ? active() ? "busy" : "" : t().ok === false || (state()?.startsWith("Exit ") && state() !== "Exit 0") ? "bad" : state() === "Still running" ? "busy" : "live"}`} />
+        <b>{short(t().tool) === "shell_run" ? "Shell" : short(t().tool) === "shell_read" ? "Shell output" : short(t().tool)}</b>
+        <span class="ellipsis dim grow">{t().args?.description ?? t().args?.intent ?? (short(t().tool) === "shell_run" ? t().args?.shell ?? "Command" : argSummary(t().tool, t().args))}</span>
+        <span class="xs dim">{t().running ? active() ? "Running" : "Unconfirmed" : t().ok === false ? "Failed" : shellStatus(t().result) ?? "Returned"}</span>
         <Show when={t().ms != null}><span class="faint xs">{(t().ms / 1000).toFixed(1)}s</span></Show>
+        <span class="dim" aria-hidden="true">{expanded() ? "▾" : "▸"}</span>
       </button>
+      <Show when={short(t().tool) === "shell_run" && t().args?.command}><pre class="tool-command"><span class="dim">$ </span>{t().args.command}</pre></Show>
+      <Show when={!expanded() && resultText()}><pre class="tool-output-preview">{resultText().split("\n").slice(-4).join("\n").slice(-1200)}</pre><span class="tool-preview-label">Output preview · expand for details</span></Show>
       <Show when={t().running}>
         <div class="xs dim" role="status">{active()
           ? `Awaiting tool completion · observed ${elapsed()}s${silent() >= 30 ? ` · No new output for ${silent()}s. It may be working or waiting for approval. This is not a completion signal.` : ""}`
           : "No tool completion recorded in loaded history."}</div>
       </Show>
       <Show when={expanded()}>
-        <pre class="conv-pre">{JSON.stringify(t().args, null, 2)}</pre>
+        <Show when={short(t().tool) !== "shell_run"}><pre class="conv-pre">{JSON.stringify(t().args, null, 2)}</pre></Show>
         <Show when={resultText()}><pre class="conv-pre">{resultText().slice(0, 20000)}</pre><Show when={resultText().length > 20000}><span class="xs dim">Showing the first 20,000 characters of tool output.</span></Show></Show>
+        <details class="tool-raw"><summary>Raw tool data</summary><pre class="conv-pre">{JSON.stringify({ arguments: t().args, result: t().result }, null, 2)?.slice(0, 20000)}</pre></details>
       </Show>
     </div>
   );

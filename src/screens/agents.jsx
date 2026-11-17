@@ -234,7 +234,7 @@ function Details(props) {
 function AgentView(props) {
   const [tab, setTab] = createSignal("chat");
   // Side panel: what the agent is doing, live. Remembered across agents.
-  const [aside, setAsideRaw] = createSignal(localStorage.getItem("agent.aside") ?? "terminal");
+  const [aside, setAsideRaw] = createSignal(localStorage.getItem("agent.aside") ?? "none");
   const setAside = (v) => { setAsideRaw(v); localStorage.setItem("agent.aside", v); };
   const [asideW, setAsideW] = createSignal(Number(localStorage.getItem("agent.aside.w")) || 520);
   const [browserPing, setBrowserPing] = createSignal(false);
@@ -356,9 +356,9 @@ function AgentView(props) {
         <div class="grow" />
         <Segmented value={tab()} onChange={setTab} options={[{ value: "chat", label: "Conversation" }, { value: "terms", label: "Commands" }, { value: "changes", label: "Changes" }, { value: "info", label: "Details" }]} />
         <Segmented value={aside()} onChange={setAside} options={[
-          { value: "terminal", label: <span class="row gap-4" title="The agent's live terminal"><Icon name="terminal" size={12} /> Terminal</span> },
+          { value: "terminal", label: <span class="row gap-4" title="Open the agent's live terminal alongside its conversation"><Icon name="terminal" size={12} /> Live shell</span> },
           { value: "browser", label: <span class="row gap-4" title="The agent's live browser"><Icon name="globe" size={12} /> Browser<Show when={browserPing()}><span class="ping" /></Show></span> },
-          { value: "none", label: <span title="Hide the side panel">Hide</span> },
+          { value: "none", label: <span title="Focus on the conversation and inline command output">Focus</span> },
         ]} />
         <Show when={live()} fallback={<Button size="sm" onClick={() => rpc("agents.resume", { id: props.id }, { action: true }).catch((e) => toast(String(e), "danger"))}><Icon name="play" size={11} /> Resume</Button>}>
           <Button size="sm" onClick={() => rpc("agents.stop", { id: props.id }, { action: true }).catch((e) => toast(String(e), "danger"))}><Icon name="stop" size={11} /> Stop</Button>

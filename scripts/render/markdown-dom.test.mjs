@@ -141,6 +141,18 @@ test('Conversation Markdown DOM, streaming, unsafe content and clipboard matrix'
       return controls.top >= conv.top && controls.bottom <= conv.bottom;
     }), true, 'view switch stays visible at bottom of long history');
     assert.match(await page.$eval('.assistant-markdown code', el => getComputedStyle(el).fontFamily), /monospace|Menlo/);
+    await page.click('.conversation-view-toggle button:first-child');
+    await page.evaluate(() => window.setEvents([
+      {type:'tool.started', call_id:'shell-ui', tool:'mcp_philium_shell_run', arguments:{command:'printf hello'}, seq:1},
+      {type:'tool.finished', call_id:'shell-ui', ok:true, result:{content:[{type:'text',text:JSON.stringify({output:'hello\n',running:true,exit_code:null})}]}, seq:2}
+    ]));
+    await page.waitForSelector('.tool-command');
+    assert.equal(await page.$eval('.tool-command', el => el.textContent), '$ printf hello');
+    assert.match(await page.$eval('.conv-tool-toggle', el => el.textContent), /Still running/);
+    assert.match(await page.$eval('.tool-output-preview', el => el.textContent), /hello/);
+    await page.click('.conv-tool-toggle');
+    assert.equal(await page.$eval('.tool-raw', el => el.open), false);
+    assert.equal(await page.$eval('.conv-tool > .conv-pre', el => el.textContent), 'hello\n');
   } catch (error) { console.error(error); throw error; }
   finally { await browser?.close(); server.httpServer?.closeAllConnections(); await server.close(); }
 });
