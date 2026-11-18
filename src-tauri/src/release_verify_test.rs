@@ -36,8 +36,11 @@ fn commit(p: &Path) -> String {
     );
     git(p, &["rev-parse", "HEAD"])
 }
+// The comparison lane runs one comparison at a time by design. Tests that use it take turns.
+static LANE_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 #[tokio::test]
 async fn reviewed_disposable_change() {
+    let _turn = LANE_TESTS.lock().await;
     let tmp = std::env::var_os("PHILIUM_SCRATCH_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
@@ -266,4 +269,92 @@ fn every_cause_gets_its_own_sentence() {
     let d = explain(Some(true), None, &members, &down, None).join("\n");
     let o = explain(None, None, &Value::Null, &Value::Null, Some("Membership discovery: Origin unavailable")).join("\n");
     assert!(a.contains("No deployment observer is configured") && d.contains("Deployment unavailable before the checks") && o.contains("Origin could not be reconfirmed") && o.contains("Landed pull requests were not established"), "{a}\n{d}\n{o}");
+}
+
+#[test]
+fn a_target_counts_only_with_its_own_identity() {
+    let t = |name: &str, before: &str, after: &str| json!({"name":name,"identity_before":{"state":before},"identity_after":{"state":after}});
+    let c = |target: &str, state: &str| json!({"id":format!("{target}-{state}"),"target":target,"state":state});
+    let both = [t("env01", "match", "match"), t("local", "match", "match")];
+    assert_eq!(with_targets("scoped_pass", &both, &json!([c("env01", "pass"), c("local", "pass")])), "scoped_pass");
+    // One environment without an identity: observed, never counted, never blocking.
+    let unknown = [t("env01", "absent", "absent"), t("local", "match", "match")];
+    assert_eq!(with_targets("scoped_pass", &unknown, &json!([c("env01", "pass"), c("local", "pass")])), "inconclusive");
+    assert_eq!(with_targets("scoped_pass", &unknown, &json!([c("env01", "mismatch"), c("local", "pass")])), "inconclusive");
+    // A mismatch on a matching deployment blocks, whatever the other target says.
+    assert_eq!(with_targets("scoped_pass", &both, &json!([c("env01", "mismatch"), c("local", "pass")])), "blocked");
+    assert_eq!(with_targets("inconclusive", &both, &json!([c("env01", "pass"), c("local", "mismatch")])), "blocked");
+    // Wrong or changed deployment, unobserved checks, or a target with no checks: inconclusive.
+    for targets in [[t("env01", "mismatch", "mismatch"), t("local", "match", "match")], [t("env01", "match", "unknown"), t("local", "match", "match")]] {
+        assert_eq!(with_targets("scoped_pass", &targets, &json!([c("env01", "pass"), c("local", "pass")])), "inconclusive");
+    }
+    assert_eq!(with_targets("scoped_pass", &both, &json!([c("env01", "unknown"), c("local", "pass")])), "inconclusive");
+    assert_eq!(with_targets("scoped_pass", &both, &json!([c("local", "pass")])), "inconclusive");
+    // Targets never upgrade a failed or moved base result.
+    assert_eq!(with_targets("blocked", &both, &json!([c("env01", "pass"), c("local", "pass")])), "blocked");
+    assert_eq!(with_targets("superseded", &both, &json!([c("env01", "pass"), c("local", "pass")])), "superseded");
+    assert_eq!(with_targets("inconclusive", &both, &json!([c("env01", "pass"), c("local", "pass")])), "inconclusive");
+    assert_eq!(with_targets("scoped_pass", &[], &json!([])), "scoped_pass");
+    // Each target's state gets its own sentence, named.
+    let receipt = json!({"artifact":format!("sha256:{}", "b".repeat(64)),"release_records":true,"cases":[],"checks_confirmed_ms":1,
+        "live_cases":[c("env01", "unknown"), c("local", "mismatch"), c("stage", "pass")],
+        "targets":[t("env01", "absent", "absent"), t("local", "match", "match"), t("stage", "mismatch", "mismatch")],
+        "review_attestation":{"recorded":false}});
+    let why = explain(Some(true), None, &json!({"missing":0,"ambiguous":0}), &receipt, None).join("\n");
+    for needle in [
+        "env01: the confirmed checks include no identity command",
+        "env01-unknown (env01): the command did not return the same readable output twice",
+        "local-mismatch (local): the environment returned a different value",
+        "stage: Wrong deployment before the checks",
+    ] {
+        assert!(why.contains(needle), "{needle}\n{why}");
+    }
+    assert!(!why.contains("No deployment observer is configured"), "{why}");
+}
+
+#[tokio::test]
+async fn a_check_on_a_file_new_in_the_release_is_not_missing_evidence() {
+    let _turn = LANE_TESTS.lock().await;
+    let tmp = std::env::var_os("PHILIUM_SCRATCH_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join(format!("review-new-{}", hal::random_token()));
+    fs::create_dir(&tmp).unwrap();
+    let _cleanup = Scratch(tmp.clone());
+    let (p, d) = (tmp.join("product"), tmp.join("driver"));
+    for dir in [&p, &d] {
+        fs::create_dir(dir).unwrap();
+        git(dir, &["init", "-q"]);
+        git(dir, &["config", "core.hooksPath", "/dev/null"]);
+    }
+    git(&p, &["remote", "add", "origin", "https://github.com/philium-fixture/fresh.git"]);
+    let ctx = Ctx::new(Db::open(&tmp.join("db")).unwrap(), tmp.clone(), tmp.clone(), Gateway::new(hal::random_token(), None), String::new());
+    workspace::init(&ctx).unwrap();
+    let reg = |dir: &Path| workspace::call(&ctx, "repo_add", json!({"path":dir}));
+    let product = reg(&p).await.unwrap();
+    let repo = product["id"].as_str().unwrap();
+    let driver = reg(&d).await.unwrap();
+    fs::write(p.join("kept.json"), r#"{"k":0}"#).unwrap();
+    let base = commit(&p);
+    fs::write(p.join("added.json"), r#"{"k":1}"#).unwrap();
+    let head = commit(&p);
+    fs::create_dir_all(d.join("philium")).unwrap();
+    // The SQLite lane runs in the packaged executable, so this test uses committed files.
+    fs::write(d.join("philium/sql-contracts.json"), json!({"cases":[
+        {"id":"new-file","document":"added.json","pointer":"/k","expect":1},
+        {"id":"new-file-wrong","document":"added.json","pointer":"/k","expect":2},
+        {"id":"never-there","document":"never.json","pointer":"/k","expect":1},
+        {"id":"kept","document":"kept.json","pointer":"/k","expect":0}]}).to_string()).unwrap();
+    commit(&d);
+    let call = |op: &'static str, args| release_intake::call(&ctx, op, args);
+    call("sql_enroll", json!({"repo_id":repo,"driver":driver["id"]})).await.unwrap();
+    let first = release_intake::record(&ctx.db, repo, "philium-fixture/fresh", 3, &json!({"number":3,"url":"https://github.com/philium-fixture/fresh/pull/3","baseRefOid":base,"headRefOid":head})).unwrap();
+    let args = json!({"repo_id":repo,"generation":first["generation"]});
+    let r = call("sql_compare", args).await.unwrap();
+    let state = |i: usize| (r["cases"][i]["state"].as_str().unwrap().to_owned(), r["cases"][i]["new_at_head"] == true);
+    assert_eq!(state(0), ("candidate_pass".to_owned(), true), "{}", r["cases"]);
+    // New, but wrong on the head: not a pass, and not credited as new.
+    assert_eq!(state(1), ("incomplete".to_owned(), false), "{}", r["cases"]);
+    // Absent everywhere: still missing evidence.
+    assert_eq!(state(2), ("incomplete".to_owned(), false), "{}", r["cases"]);
+    // A file the target already had is compared as before.
+    assert_eq!(state(3), ("candidate_pass".to_owned(), false), "{}", r["cases"]);
+    assert!(r["checks_confirmed_ms"].as_i64().is_some());
 }

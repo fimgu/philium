@@ -46,17 +46,25 @@ fn finish(
             && v["head"] == first["head"]
             && v["base"] == first["base"]
     });
+    let targets = receipt["targets"].as_array().cloned().unwrap_or_default();
+    let loopback: Vec<Value> = receipt["live_cases"].as_array().into_iter().flatten().filter(|c| c.get("target").is_none()).cloned().collect();
     let outcome = match current {
         None => "origin_unconfirmed",
-        Some(ok) => crate::release_scope::scoped_result(
-            &receipt["cases"],
-            &receipt["live_cases"],
-            receipt["deployment_identity"]["state"]
-                .as_str()
-                .unwrap_or(""),
-            receipt["deployment_after"]["state"].as_str().unwrap_or(""),
-            ok,
-        ),
+        Some(ok) => {
+            let base = if targets.is_empty() || !loopback.is_empty() {
+                crate::release_scope::scoped_result(
+                    &receipt["cases"],
+                    &json!(loopback),
+                    receipt["deployment_identity"]["state"].as_str().unwrap_or(""),
+                    receipt["deployment_after"]["state"].as_str().unwrap_or(""),
+                    ok,
+                )
+            } else {
+                // Command targets stand in for the loopback lane: judge the local contracts alone.
+                crate::release_scope::scoped_result(&receipt["cases"], &json!([{"state":"pass"}]), "match", "match", ok)
+            };
+            with_targets(base, &targets, &receipt["live_cases"])
+        }
     };
     let m = members.as_ref().unwrap_or(&Value::Null);
     let decision = match outcome {
@@ -65,7 +73,9 @@ fn finish(
         "scoped_pass"
             if m["missing"] == 0
                 && m["ambiguous"] == 0
-                && receipt["review_scope_verified"] == true =>
+                && receipt["review_scope_verified"] == true
+                // Nothing counts as ready until the person confirmed these exact checks by pinning.
+                && receipt["checks_confirmed_ms"].as_i64().is_some() =>
         {
             "ready_for_reviewed_scope"
         }
@@ -79,6 +89,27 @@ fn finish(
         rusqlite::params![repo, first["generation"].as_i64(), v.to_string()],
     )?;
     Ok(v)
+}
+/// A target's checks count only with that target's own identity matching before and after.
+/// A mismatch on a matching deployment blocks. Anything unidentified or unobserved is inconclusive.
+fn with_targets(base: &'static str, targets: &[Value], live: &Value) -> &'static str {
+    if targets.is_empty() || matches!(base, "superseded" | "blocked") {
+        return base;
+    }
+    let mut all_pass = true;
+    for t in targets {
+        let matched = t["identity_before"]["state"] == "match" && t["identity_after"]["state"] == "match";
+        let cases: Vec<&Value> = live.as_array().into_iter().flatten().filter(|c| c["target"] == t["name"]).collect();
+        if matched && cases.iter().any(|c| c["state"] == "mismatch") {
+            return "blocked";
+        }
+        all_pass &= matched && !cases.is_empty() && cases.iter().all(|c| c["state"] == "pass");
+    }
+    if base == "scoped_pass" && all_pass {
+        "scoped_pass"
+    } else {
+        "inconclusive"
+    }
 }
 /// Every cause that keeps this from being a ship decision, in the operator's words. One line
 /// per cause, so a moved head, missing or altered evidence, a wrong or absent deployment and an
@@ -142,32 +173,63 @@ fn explain(
         receipt["deployment_identity"]["state"].as_str().unwrap_or(""),
         receipt["deployment_after"]["state"].as_str().unwrap_or(""),
     );
-    let live = receipt["live_cases"].as_array().map_or(0, Vec::len);
-    let deployment = |state: &str, when: &str| match state {
+    let targets: Vec<&Value> = receipt["targets"].as_array().into_iter().flatten().collect();
+    let all_live: Vec<&Value> = receipt["live_cases"].as_array().into_iter().flatten().collect();
+    let loopback: Vec<&Value> = all_live.iter().copied().filter(|c| c.get("target").is_none()).collect();
+    let no_record = receipt["artifact"].is_null();
+    let deployment = |state: &str, when: &str, place: &str| match state {
         "match" => None,
-        "absent" => Some("No deployment observer is configured for this checkout, so the running product was not observed.".to_owned()),
-        "mismatch" => Some(format!("Wrong deployment {when}: the running replicas report a different revision or artifact than this head.")),
-        "mixed" => Some(format!("Mixed deployment {when}: replicas report different revisions or artifacts.")),
-        "not_ready" => Some(format!("Deployment {when}: the matching replicas are not ready.")),
-        _ if receipt["artifact"].is_null() => Some("No independent artifact record exists for this exact head, so the deployment cannot be matched to it.".to_owned()),
-        _ => Some(format!("Deployment unavailable {when}: the observer did not answer, or its report was stale or incomplete.")),
+        "absent" if place.is_empty() => Some("No deployment observer is configured for this checkout, so the running product was not observed.".to_owned()),
+        "absent" => Some(format!("{place}the confirmed checks include no identity command, so the revision and artifact this environment runs are unknown. Its behavior is shown but cannot count toward a decision.")),
+        "mismatch" => Some(format!("{place}Wrong deployment {when}: the running replicas report a different revision or artifact than this head.")),
+        "mixed" => Some(format!("{place}Mixed deployment {when}: replicas report different revisions or artifacts.")),
+        "not_ready" => Some(format!("{place}Deployment {when}: the matching replicas are not ready.")),
+        _ if no_record => Some(format!("{place}No independent artifact record exists for this exact head, so the deployment cannot be matched to it.")),
+        _ if !place.is_empty() => Some(format!("{place}its identity command did not return a complete, well-formed answer {when}. Check that you are signed in to this environment.")),
+        _ => Some(format!("{place}Deployment unavailable {when}: the observer did not answer, or its report was stale or incomplete.")),
     };
-    if let Some(line) = deployment(before, "before the checks") {
-        why.push(line);
-    } else if live > 0 {
-        if let Some(line) = deployment(after, "after the checks") {
+    // The loopback observer lane, unless the verifier uses command targets only.
+    if targets.is_empty() || !loopback.is_empty() {
+        if let Some(line) = deployment(before, "before the checks", "") {
+            why.push(line);
+        } else if !loopback.is_empty() {
+            if let Some(line) = deployment(after, "after the checks", "") {
+                why.push(line);
+            }
+        }
+        for c in &loopback {
+            let id = c["id"].as_str().unwrap_or("?");
+            match c["state"].as_str() {
+                Some("mismatch") => why.push(format!("{id}: the running product returned a different value than the contract expects.")),
+                Some("unknown") if before == "match" => why.push(format!("{id}: the running product could not be observed twice with the pinned revision and artifact.")),
+                _ => {}
+            }
+        }
+    }
+    // Each command target is one environment with its own identity.
+    for t in &targets {
+        let name = t["name"].as_str().unwrap_or("?");
+        let place = format!("{name}: ");
+        let state = t["identity_before"]["state"].as_str().unwrap_or("");
+        let sampled = matches!(state, "match" | "absent");
+        if let Some(line) = deployment(state, "before the checks", &place) {
+            why.push(line);
+        } else if let Some(line) = deployment(t["identity_after"]["state"].as_str().unwrap_or(""), "after the checks", &place) {
             why.push(line);
         }
-    }
-    for c in receipt["live_cases"].as_array().into_iter().flatten() {
-        let id = c["id"].as_str().unwrap_or("?");
-        match c["state"].as_str() {
-            Some("mismatch") => why.push(format!("{id}: the running product returned a different value than the contract expects.")),
-            Some("unknown") if before == "match" => why.push(format!("{id}: the running product could not be observed twice with the pinned revision and artifact.")),
-            _ => {}
+        for c in all_live.iter().filter(|c| c["target"] == t["name"]) {
+            let id = c["id"].as_str().unwrap_or("?");
+            match c["state"].as_str() {
+                Some("mismatch") => why.push(format!("{id} ({name}): the environment returned a different value than the confirmed check expects.")),
+                Some("unknown") if sampled => why.push(format!("{id} ({name}): the command did not return the same readable output twice. Check that you are signed in and that the endpoint exists.")),
+                _ => {}
+            }
         }
     }
-    if live == 0 && receipt["release_records"] == true {
+    if receipt.get("checks_confirmed_ms").is_some_and(Value::is_null) {
+        why.push("These checks were pinned before confirmations were recorded. Open the setup, read them and pin again.".to_owned());
+    }
+    if all_live.is_empty() && receipt["release_records"] == true {
         why.push("The verifier declares no running-product checks, so product behavior was not exercised.".to_owned());
     }
     let att = &receipt["review_attestation"];

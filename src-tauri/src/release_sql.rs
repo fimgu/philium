@@ -94,7 +94,24 @@ fn spec(raw: &str) -> Result<Value, String> {
             }
         }
     }
+    let mut ids: BTreeSet<String> = seen.into_iter().map(str::to_owned).collect();
+    crate::release_command::validate(&v, &mut ids)?;
     Ok(v)
+}
+/// What the person is about to confirm, in a shape the form can list line by line.
+fn preview(v: &Value) -> Value {
+    let cases: Vec<Value> = v["cases"].as_array().into_iter().flatten().map(|c| match c["document"].as_str() {
+        Some(doc) => json!({"id":c["id"],"kind":"committed file","what":format!("{doc} at {}", c["pointer"].as_str().unwrap_or("")),"expect":c["expect"]}),
+        None => json!({"id":c["id"],"kind":"SQLite contract","what":c["query"],"expect":c["expect"]}),
+    }).collect();
+    let live: Vec<Value> = v["live_cases"].as_array().into_iter().flatten().map(|c| json!({"id":c["id"],"kind":"running product (loopback observer)","what":format!("GET {} at {}", c["path"].as_str().unwrap_or(""), c["pointer"].as_str().unwrap_or("")),"expect":c["expect"]})).collect();
+    let line = |c: &Value| format!("{} {}", c["program"].as_str().unwrap_or(""), c["args"].as_array().into_iter().flatten().filter_map(Value::as_str).map(|a| if a.contains(' ') { format!("'{a}'") } else { a.to_owned() }).collect::<Vec<_>>().join(" "));
+    let targets: Vec<Value> = v["targets"].as_array().into_iter().flatten().map(|t| {
+        let checks: Vec<Value> = t["cases"].as_array().into_iter().flatten().map(|c| json!({"id":c["id"],"what":line(c),"expect":if c["pointer"].is_string(){json!({"at":c["pointer"],"equals":c["expect"]})}else if c["expect_text"].is_string(){json!({"output":c["expect_text"]})}else{json!({"output contains":c["expect_contains"]})}})).collect();
+        let identity = if t["identity"].is_object() { json!({"what":line(&t["identity"]),"revision":t["identity"]["revision"],"digest":t["identity"]["digest"]}) } else { Value::Null };
+        json!({"name":t["name"],"identity":identity,"cases":checks})
+    }).collect();
+    json!({"cases":cases,"live_cases":live,"targets":targets,"programs":crate::release_command::programs(v),"release_records":v["release_records"]==true})
 }
 fn observe(schema: &str, c: &Value) -> Option<String> {
     let mut db = Connection::open_in_memory().ok()?;
@@ -280,6 +297,10 @@ async fn run_sql(path: &Path, oid: &str, v: &Value) -> Option<Value> {
     .ok()
     .flatten()
 }
+/// True only when the commit is readable and the path is not in its tree.
+async fn missing(path: &Path, rev: &str, file: &str) -> bool {
+    local_git(path, &["ls-tree", "--name-only", rev, "--", file]).await.is_ok_and(|out| out.is_empty())
+}
 fn stable<'a>(obs: &'a Value, i: usize) -> Option<&'a str> {
     let a = obs[i][0].as_str()?;
     if Some(a) == obs[i][1].as_str() {
@@ -298,7 +319,18 @@ pub async fn call(
     path: &Path,
 ) -> Result<Value, String> {
     ctx.db.with(|c| c.execute_batch(DB))?;
-    ctx.db.with(|c|c.execute_batch("CREATE TABLE IF NOT EXISTS release_stage_ports(repo TEXT PRIMARY KEY REFERENCES repos(id) ON DELETE CASCADE,port INTEGER NOT NULL)"))?;
+    ctx.db.with(|c|c.execute_batch("CREATE TABLE IF NOT EXISTS release_stage_ports(repo TEXT PRIMARY KEY REFERENCES repos(id) ON DELETE CASCADE,port INTEGER NOT NULL);CREATE TABLE IF NOT EXISTS release_observer_programs(repo TEXT NOT NULL REFERENCES repos(id) ON DELETE CASCADE,name TEXT NOT NULL,path TEXT NOT NULL,PRIMARY KEY(repo,name));CREATE TABLE IF NOT EXISTS release_confirmations(repo TEXT PRIMARY KEY REFERENCES repos(id) ON DELETE CASCADE,pin TEXT NOT NULL,confirmed INTEGER NOT NULL)"))?;
+    // Read-only look at a verifier's current checks, before the person confirms them by pinning.
+    if method == "sql_preview" {
+        let driver = a["driver"].as_str().filter(|d| *d != repo).ok_or("Choose a separate trusted driver checkout")?;
+        let r = ctx.db.query("SELECT path FROM repos WHERE id=?", [driver])?.pop().ok_or("Driver not registered")?;
+        let p = Path::new(r["path"].as_str().ok_or("Missing driver path")?);
+        let pin = local_git(p, &["rev-parse", "--verify", "HEAD^{commit}"]).await?;
+        let raw = local_git(p, &["cat-file", "blob", &format!("{pin}:philium/sql-contracts.json")]).await.map_err(|_| "This checkout has no committed philium/sql-contracts.json")?;
+        let mut out = preview(&spec(&raw)?);
+        out["pin"] = json!(pin);
+        return Ok(out);
+    }
     if method == "sql_drivers" {
         return Ok(json!(ctx.db.query(
             "SELECT id,name FROM repos WHERE id!=? ORDER BY name,id LIMIT 200",
@@ -308,8 +340,17 @@ pub async fn call(
     if method == "sql_profile" {
         return Ok(ctx
             .db
-            .query("SELECT p.driver,p.pin,d.name AS driver_name,d.path AS driver_path,(SELECT port FROM release_stage_ports s WHERE s.repo=p.repo) AS observer_port FROM sql_profiles p LEFT JOIN repos d ON d.id=p.driver WHERE p.repo=?", [repo])?
+            .query("SELECT p.driver,p.pin,p.blob,d.name AS driver_name,d.path AS driver_path,(SELECT port FROM release_stage_ports s WHERE s.repo=p.repo) AS observer_port,(SELECT confirmed FROM release_confirmations c WHERE c.repo=p.repo AND c.pin=p.pin) AS confirmed FROM sql_profiles p LEFT JOIN repos d ON d.id=p.driver WHERE p.repo=?", [repo])?
             .pop()
+            .map(|mut row| {
+                let checks = row["blob"].as_str().and_then(|b| spec(b).ok()).map(|v| preview(&v)).unwrap_or(Value::Null);
+                row["checks"] = checks;
+                row["programs"] = json!(ctx.db.query("SELECT name,path FROM release_observer_programs WHERE repo=? ORDER BY name", [repo]).unwrap_or_default());
+                if let Some(o) = row.as_object_mut() {
+                    o.remove("blob");
+                }
+                row
+            })
             .unwrap_or(Value::Null));
     }
     if method == "sql_enroll" {
@@ -353,6 +394,13 @@ pub async fn call(
         if snapshot.len() > 32768 {
             return Err("Driver exceeds 32 KiB".into());
         }
+        // Client programs the contract's command checks run. The person says where each one is.
+        let mut enrolled = vec![];
+        let entered = a["programs"].as_object().cloned().unwrap_or_default();
+        for name in crate::release_command::programs(&v) {
+            let given = entered.get(&name).and_then(Value::as_str).filter(|s| !s.trim().is_empty()).ok_or_else(|| format!("These checks run the {name} client. Enter the absolute path of that program."))?;
+            enrolled.push((name.clone(), crate::release_command::enroll_path(&name, given, &[p, path])?));
+        }
         let port = if a["stage_port"].is_null() {
             0
         } else {
@@ -371,6 +419,12 @@ pub async fn call(
                 "INSERT OR REPLACE INTO release_stage_ports(repo,port) VALUES(?,?)",
                 params![repo, port as i64],
             )?;
+            tx.execute("DELETE FROM release_observer_programs WHERE repo=?", params![repo])?;
+            for (name, path) in &enrolled {
+                tx.execute("INSERT INTO release_observer_programs(repo,name,path) VALUES(?,?,?)", params![repo, name, path])?;
+            }
+            // Pinning is the person's confirmation of exactly these checks.
+            tx.execute("INSERT OR REPLACE INTO release_confirmations(repo,pin,confirmed) VALUES(?,?,?)", params![repo, pin, now()])?;
             tx.commit()
         })?;
         return Ok(json!({"pin":pin,"cases":v["cases"].as_array().unwrap().len()}));
@@ -584,7 +638,12 @@ pub async fn call(
         let b = s(base);
         let h = s(head);
         let pass = |r: Option<&str>| r.is_some_and(|s| s.starts_with("pass:"));
+        // A check on a file the target does not have is new in this release. There is nothing
+        // to compare it with, which is different from a comparison that could not be made.
+        let source = c["document"].as_str().or(v["schema"].as_str()).unwrap_or("");
+        let fresh = b.is_none() && pass(h) && !source.is_empty() && missing(path, base, source).await && missing(path, ancestor, source).await;
         let state = match (b, h) {
+            _ if fresh => "candidate_pass",
             (Some(_), Some(_)) if pass(h) => "candidate_pass",
             (Some(_), Some(_)) if b == h => "same_failure_on_target",
             (Some(_), Some(_)) if pass(b) && pass(s(ancestor)) => {
@@ -598,7 +657,7 @@ pub async fn call(
             _ => "incomplete",
         };
         let landed_evidence=children.iter().map(|(pr,oid)|{let child=s(oid);json!({"pr":pr,"oid":oid,"result":if child.is_none(){"untested"}else if pass(child){"pass"}else if child==h{"same_failure_as_candidate"}else{"different_failure"}})}).collect::<Vec<_>>();
-        cases.push(json!({"id":c["id"],"state":state,"landed_evidence":landed_evidence}));
+        cases.push(json!({"id":c["id"],"state":state,"landed_evidence":landed_evidence,"new_at_head":fresh}));
     }
     let blocked = cases.iter().any(|c| {
         matches!(
@@ -646,7 +705,48 @@ pub async fn call(
         };
         live.push(json!({"id":c["id"],"state":s,"observations":observations}));
     }
-    let after = if live.is_empty() {
+    // Observation through client programs the person enrolled (a hosted environment's own
+    // CLI, kubectl for a local cluster). The commands are the pinned, confirmed ones.
+    let home = crate::pilot::real_home().or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from)).unwrap_or_default();
+    let program = |name: &str| ctx.db.query("SELECT path FROM release_observer_programs WHERE repo=? AND name=?", params![repo, name]).ok().and_then(|mut r| r.pop()).and_then(|r| r["path"].as_str().map(str::to_owned));
+    let argv = |c: &Value| c["args"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect::<Vec<_>>()).unwrap_or_default();
+    let expected_artifact = v["artifacts"][head].as_str().unwrap_or("").to_owned();
+    let mut targets = vec![];
+    for t in v["targets"].as_array().cloned().unwrap_or_default() {
+        let ident = t["identity"].clone();
+        let identify = || async {
+            if !ident.is_object() {
+                return json!({"state":"absent","count":0});
+            }
+            let out = match program(ident["program"].as_str().unwrap_or("")) {
+                Some(path) => crate::release_command::run(&path, &argv(&ident), &home).await,
+                None => None,
+            };
+            let report = out.map(|o| crate::release_command::identity_report(&o, &ident, now())).unwrap_or_else(|| json!({}));
+            crate::release_stage::assess(head, &expected_artifact, &report, now())
+        };
+        let before = identify().await;
+        for c in t["cases"].as_array().into_iter().flatten() {
+            let mut observations = vec![];
+            // With a declared identity only a matching deployment is sampled. Without one the
+            // behavior is still shown, but it can never count toward a decision.
+            if before["state"] == "match" || before["state"] == "absent" {
+                if let Some(path) = program(c["program"].as_str().unwrap_or("")) {
+                    for _ in 0..2 {
+                        observations.push(crate::release_command::run(&path, &argv(c), &home).await.and_then(|o| crate::release_command::judge(&o, c)));
+                    }
+                }
+            }
+            let s = match observations.as_slice() {
+                [Some(a), Some(b)] if a == b => if a.starts_with("pass:") { "pass" } else { "mismatch" },
+                _ => "unknown",
+            };
+            live.push(json!({"id":c["id"],"state":s,"observations":observations,"target":t["name"]}));
+        }
+        let after = identify().await;
+        targets.push(json!({"name":t["name"],"identity_before":before,"identity_after":after}));
+    }
+    let after = if live.iter().all(|c| c.get("target").is_some()) {
         Value::Null
     } else {
         stage_probe(port, head, v["artifacts"][head].as_str().unwrap_or("")).await
@@ -658,6 +758,8 @@ pub async fn call(
     report["artifact"] = v["artifacts"][head].clone();
     report["release_records"] = json!(records);
     report["observer_configured"] = json!(port.is_some());
+    report["targets"] = json!(targets);
+    report["checks_confirmed_ms"] = ctx.db.query("SELECT confirmed FROM release_confirmations WHERE repo=? AND pin=?", params![repo, profile["pin"].as_str()])?.pop().map(|r| r["confirmed"].clone()).unwrap_or(Value::Null);
     let att = &v["release_review"];
     report["review_attestation"] = if att.is_object() {
         json!({"recorded":true,"all_changes_accounted_for":att["all_changes_accounted_for"]==true,"code_review_complete":att["code_review_complete"]==true,"cleanup_verified":att["cleanup_verified"]==true,"unresolved_findings":att["unresolved_findings"].as_array().map(Vec::len),"required_cases":att["required_cases"]})

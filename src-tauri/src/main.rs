@@ -21,6 +21,7 @@ mod release_scope;
 mod release_sql;
 mod release_members;
 mod release_composition;
+mod release_command;
 mod release_document;
 mod release_stage;
 mod environments;
