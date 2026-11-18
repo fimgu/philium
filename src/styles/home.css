@@ -9,3 +9,7 @@
 .home-board { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 10px; }
 .home-num { font-size: 20px; font-weight: 600; font-variant-numeric: tabular-nums; }
 .home-feed { max-height: 320px; overflow: auto; }
+.checkout-home { display: grid; gap: 16px; padding: 16px; max-width: 980px; }
+.checkout-home > *, .checkout-row > * { min-width: 0; overflow-wrap: anywhere; }
+.checkout-row { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding: 6px 0; border-bottom: 1px solid var(--line); }
+.checkout-row small { color: var(--dim); }

@@ -969,6 +969,9 @@ fn reserve_local_kind(ctx: &Ctx, aid: &str, name: &str, meta: Value) -> Result<S
 }
 
 pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, String> {
+    if crate::pilot::active() && matches!(method,"kind_create" | "kind_delete") {
+        return Err("Host cluster changes are disabled in the side-by-side pilot".into());
+    }
     let id = || -> Result<String, String> {
         let raw = ctx::arg_str(&args, "id")?;
         get_row(ctx, &raw)

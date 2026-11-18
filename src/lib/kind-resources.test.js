@@ -25,13 +25,14 @@ test("empty arrays do not imply missing CLI and bad metadata remains renderable"
 const source = readFileSync(new URL("../screens/agents.jsx", import.meta.url), "utf8");
 const start = source.indexOf("function Details(props) {") + "function Details(props) {".length;
 const setup = source.slice(start, source.indexOf("  return (", start));
-function detailsHarness() {
+function detailsHarness({ pilot=false, approve=true }={}) {
   let agent = { id: "a" }, info, fetcher;
   const calls = [], messages = [];
   const rpc = async (method, args, options) => { calls.push({ method, args, options }); return [row]; };
   const context = {
     props: { get agent() { return agent; } }, kindResources, rpc,
-    createResource(key, fetch) { fetcher = fetch; return [() => info, { refetch() {} }]; },
+    createResource(key, fetch) { if (!fetch) return [() => ({pilot})]; fetcher = fetch; return [() => info, { refetch() {} }]; },
+    confirm: async () => approve,
     createSignal(initial) { let value = initial; return [() => value, next => { value = next; }]; },
     toast: text => messages.push(text),
   };
@@ -59,6 +60,13 @@ test("Details deletion sends exact owner id and cluster handle contract", async 
   assert.equal(h.calls[0].method, "agents.kind_delete");
   assert.equal(JSON.stringify(h.calls[0].args), JSON.stringify({ id: "a", cluster: row.handle }));
   assert.equal(h.calls[0].options.action, true);
+});
+
+test('pilot, cancellation and owner switch never dispatch cluster deletion', async () => {
+  for (const options of [{pilot:true},{approve:false}]) {
+    const h=detailsHarness(options); await h.api.deleteKind(row.handle); assert.equal(h.calls.length,0);
+  }
+  const h=detailsHarness(); const pending=h.api.deleteKind(row.handle); h.select('b'); await pending; assert.equal(h.calls.length,0);
 });
 
 test("Details JSX renders handle and metadata without inventing CLI installation state", () => {

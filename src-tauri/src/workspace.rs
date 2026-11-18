@@ -540,6 +540,16 @@ fn parse_branches(out: &str) -> Vec<Value> {
 }
 fn dispatch(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, String> {
     match method {
+        "overview" => {
+            let id = arg_str(&args, "repo_id")?;
+            let r = repo(ctx, &id).ok_or("Unknown repository")?;
+            // IDs only. No host scan, kubeconfig access, Git invocation, or legacy name inference.
+            let tasks = ctx.db.query("SELECT id,title,status FROM tasks WHERE repo_id=?1 AND status!='done' ORDER BY updated_at DESC,id LIMIT 21", [&id])?;
+            let agents = ctx.db.query("SELECT id,name,state FROM agents WHERE repo_id=?1 ORDER BY CASE state WHEN 'waiting' THEN 0 WHEN 'failed' THEN 1 ELSE 2 END,last_active_at DESC,id LIMIT 21", [&id])?;
+            let worktrees = ctx.db.query("SELECT id,branch,path,state FROM worktrees WHERE repo_id=?1 ORDER BY created_at DESC,id LIMIT 21", [&id])?;
+            let resources = ctx.db.query("SELECT r.kind,r.handle,r.state,a.name AS owner FROM resources r JOIN agents a ON a.id=r.agent_id WHERE a.repo_id=?1 AND r.state!='released' ORDER BY CASE r.state WHEN 'leaked' THEN 0 ELSE 1 END,r.created_at DESC,r.id LIMIT 21", [&id])?;
+            Ok(json!({"repo_id":id,"path":r["path"],"tasks":tasks,"agents":agents,"worktrees":worktrees,"resources":resources,"pilot":crate::pilot::active()}))
+        }
         "repos_list" => {
             let mut rows=ctx.db.query("SELECT r.*,(SELECT count(*) FROM worktrees w WHERE w.repo_id=r.id) AS worktree_count FROM repos r ORDER BY name",[])?;
             for r in &mut rows {

@@ -73,6 +73,9 @@ pub fn init(ctx: &Arc<Ctx>) -> Result<(), String> {
     Ok(())
 }
 pub fn open(ctx: &Arc<Ctx>, o: Opts) -> Result<String, String> {
+    open_in_repo(ctx, o, None)
+}
+fn open_in_repo(ctx: &Arc<Ctx>, o: Opts, repo_id: Option<&str>) -> Result<String, String> {
     let command = o.command.unwrap_or_else(|| {
         vec![
             std::env::var("SHELL").unwrap_or_else(|_| {
@@ -122,7 +125,7 @@ pub fn open(ctx: &Arc<Ctx>, o: Opts) -> Result<String, String> {
         e.to_string()
     })?;
     let id = db::new_id();
-    if let Err(e) = ctx.db.exec("INSERT INTO terminals(id,agent_id,title,command,cwd,pid,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7)", rusqlite::params![id,o.agent_id,o.title,serde_json::to_string(&command).unwrap(),o.cwd.to_string_lossy(),child.process_id(),db::now()]) { let _ = child.kill(); let _ = child.wait(); return Err(e); }
+    if let Err(e) = ctx.db.exec("INSERT INTO terminals(id,agent_id,title,command,cwd,pid,created_at,repo_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)", rusqlite::params![id,o.agent_id,o.title,serde_json::to_string(&command).unwrap(),o.cwd.to_string_lossy(),child.process_id(),db::now(),repo_id]) { let _ = child.kill(); let _ = child.wait(); return Err(e); }
     let pid = child.process_id();
     let killer = child.clone_killer();
     // Personal shells are owned by the user, not orphaned agent resources.
@@ -321,7 +324,7 @@ pub fn shutdown(ctx: &Arc<Ctx>) {
 }
 pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, String> {
     if method == "list" {
-        return Ok(json!(ctx.db.query("SELECT t.*,a.name AS agent_name FROM terminals t LEFT JOIN agents a ON a.id=t.agent_id ORDER BY t.created_at", [])?));
+        return Ok(json!(ctx.db.query("SELECT t.*,a.name AS agent_name,COALESCE(a.repo_id,t.repo_id) AS workspace_id FROM terminals t LEFT JOIN agents a ON a.id=t.agent_id ORDER BY t.created_at", [])?));
     }
     if method == "open" {
         let command = match args.get("command").filter(|v| !v.is_null()) {
@@ -330,18 +333,20 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
             }
             None => None,
         };
-        return Ok(json!(open(
+        let repo_id = args["repo_id"].as_str();
+        let cwd = if let Some(id) = repo_id {
+            let r = crate::workspace::repo(ctx,id).ok_or("Unknown checkout for terminal")?;
+            crate::workspace::repo_dir(&r)?
+        } else { args["cwd"].as_str().map(PathBuf::from).unwrap_or_else(|| ctx.root.clone()) };
+        return Ok(json!(open_in_repo(
             ctx,
             Opts {
                 title: args["title"].as_str().unwrap_or("Terminal").into(),
                 command,
-                cwd: args["cwd"]
-                    .as_str()
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| ctx.root.clone()),
+                cwd,
                 env: vec![],
                 agent_id: None
-            }
+            }, repo_id
         )?));
     }
     let id = arg_str(&args, "id")?;

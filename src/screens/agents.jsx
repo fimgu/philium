@@ -278,6 +278,8 @@ function Changes(props) {
 
 function Details(props) {
   const a = () => props.agent;
+  const [host] = createResource(() => rpc("app.status").catch(() => null));
+  const canChangeClusters = () => host()?.pilot === false;
   const kv = () => a()?.kv || {};
   const [kindInfo, { refetch: refetchKind }] = createResource(
     () => a()?.id,
@@ -305,9 +307,12 @@ function Details(props) {
   };
 
   const deleteKind = async (cluster) => {
+    const owner = a().id;
+    if (!canChangeClusters() || !await confirm("Delete test cluster?", `Delete ${cluster} and the workloads inside it? This cannot be undone.`)) return;
+    if (a()?.id !== owner) return;
     setKindBusy(true);
     try {
-      await rpc("agents.kind_delete", { id: a().id, cluster }, { action: true });
+      await rpc("agents.kind_delete", { id: owner, cluster }, { action: true });
       toast(`Deleted kind cluster ${cluster}`);
       refetchKind();
       props.onRefetch?.();
@@ -342,10 +347,11 @@ function Details(props) {
           <span class="small dim grow">
             Spin up an isolated <code class="mono">kind</code> Kubernetes cluster pre-mapped to this agent's port range (<code class="mono">:{a().port_base + 10}</code> HTTP, <code class="mono">:{a().port_base + 11}</code> HTTPS) and registered with the Reaper for automatic teardown.
           </span>
-          <Button size="sm" variant="primary" busy={kindBusy()} onClick={createKind}>
+          <Button size="sm" variant="primary" disabled={!canChangeClusters()} busy={kindBusy()} onClick={createKind}>
             <Icon name="plus" size={11} /> Create kind Cluster
           </Button>
         </div>
+        <Show when={host()?.pilot}><p class="small faint">Cluster inventory is read-only in this pilot.</p></Show>
         <Show when={(kindState()?.clusters ?? []).length} fallback={
           <div class="xs faint" role={kindState()?.error ? "alert" : undefined}>
             {kindState()?.error
@@ -361,7 +367,7 @@ function Details(props) {
                   <span class="mono small grow">{cl.handle}</span>
                   <span class="mono xs faint">HTTP :{cl.meta.http_port ?? "?"} · HTTPS :{cl.meta.https_port ?? "?"}</span>
                   <span class="mono xs faint ellipsis" style={{ "max-width": "240px" }} title={cl.meta.kubeconfig}>{cl.meta.kubeconfig}</span>
-                  <Button size="sm" variant="ghost" disabled={kindBusy()} onClick={() => deleteKind(cl.handle)}>
+                  <Button size="sm" variant="ghost" disabled={!canChangeClusters() || kindBusy()} onClick={() => deleteKind(cl.handle)}>
                     <Icon name="trash" size={12} /> Delete
                   </Button>
                 </div>

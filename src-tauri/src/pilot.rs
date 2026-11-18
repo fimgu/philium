@@ -162,6 +162,33 @@ pub async fn check() -> Result<(), String> {
         let task = tasks[0]["id"].as_str().ok_or("Missing alpha task")?;
         let denied = crate::rpc_inner(&app,"agents.spawn".into(),Some(json!({"repo_id":beta,"task_id":task}))).await;
         if !matches!(denied, Err(ref msg) if msg.contains("Choose a task from the agent's workspace")) { return Err("Sibling task was not rejected before provisioning".into()); }
+        for (rid, label) in [(&alpha,"alpha"),(&beta,"beta")] {
+            if phase == "seed" {
+                ctx.db.exec("INSERT INTO agents(id,name,model_ref,repo_id,created_at,last_active_at) VALUES(?1,?1,'fixture',?2,1,1)", rusqlite::params![label,rid])?;
+                crate::reaper::register(&ctx,Some(label),"kind_cluster",label,json!({}));
+                let tid=crate::rpc_inner(&app,"terminals.open".into(),Some(json!({"repo_id":rid,"cwd":base,"title":label,"command":["/bin/pwd"]}))).await?;
+                let tid=tid.as_str().ok_or("Missing terminal ID")?;
+                let expected=base.join(label).join("same");
+                let mut correct=false;
+                for _ in 0..100 {
+                    let bytes=crate::terminals::since(&ctx,tid,0).unwrap_or_default();
+                    if String::from_utf8_lossy(&bytes).trim()==expected.to_string_lossy() { correct=true; break; }
+                    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                }
+                if !correct {return Err("Terminal did not start in its registered checkout".into());}
+            }
+            let terms=crate::rpc_inner(&app,"terminals.list".into(),None).await?;
+            let scoped: Vec<_>=terms.as_array().ok_or("Invalid terminal list")?.iter().filter(|t|t["workspace_id"].as_str()==Some(rid.as_str())).collect();
+            if scoped.len()!=1 || scoped[0]["title"]!=label {return Err("Terminal checkout identity not preserved".into());}
+            let d = crate::rpc_inner(&app,"workspace.overview".into(),Some(json!({"repo_id":rid}))).await?;
+            for (items,field) in [("tasks","title"),("agents","name"),("resources","handle")] {
+                if d[items].as_array().map(Vec::len)!=Some(1) || d[items][0][field]!=label {return Err(format!("{items} escaped checkout scope"));}
+            }
+        }
+        for method in ["agents.kind_create","agents.kind_delete"] {
+            let result=crate::rpc_inner(&app,method.into(),Some(json!({"id":"alpha","cluster":"alpha"}))).await;
+            if !matches!(result,Err(ref e) if e.contains("disabled in the side-by-side pilot")) {return Err(format!("Missing pilot guard for {method}"));}
+        }
         if phase == "seed" {
             let session = desk
                 .call(
@@ -197,6 +224,7 @@ pub async fn check() -> Result<(), String> {
         Ok(())
     }
     .await;
+    crate::terminals::shutdown(&ctx);
     desk.stop();
     result?;
     println!("Pilot {phase}: selected workspace tasks isolated, both IDs preserved, bundled HAL session recovered.");

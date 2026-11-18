@@ -4,6 +4,8 @@ import { Page, Button, Badge, Dot, Empty, Stat, Card, toast } from "../ui/kit.js
 import { Icon } from "../ui/icons.jsx";
 import { rpc, useEvent, fmt } from "../lib/rpc.js";
 import { go } from "../lib/nav.js";
+import { activeRepoId } from "../lib/store.js";
+import CheckoutHome from "./checkout-home.jsx";
 import { AgentChip, SpawnModal } from "./agents.jsx";
 import "../styles/home.css";
 
@@ -23,6 +25,10 @@ function Section(props) {
 }
 
 export default function Home() {
+  return <Show when={activeRepoId()} keyed fallback={<GlobalHome />}>{id => <CheckoutHome id={id} />}</Show>;
+}
+
+function GlobalHome() {
   const [agents, ag] = createResource(() => rpc("agents.list").catch(() => []));
   const [tasks, tk] = createResource(() => rpc("board.list", {}).catch(() => []));
   const [proposals, pr] = createResource(() => rpc("reaper.proposals").catch(() => []));

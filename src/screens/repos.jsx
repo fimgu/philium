@@ -1,5 +1,6 @@
 import { createSignal, createMemo, createEffect, on, onMount, Show, For } from "solid-js";
 import { repoLabels } from "../lib/repo-labels.js";
+import { params as routeParams } from "../lib/nav.js";
 import { Page, Empty, Button, Input, Field, Badge, Modal, Select, Segmented, VirtualList, Menu, confirm, toast } from "../ui/kit.jsx";
 import { Icon } from "../ui/icons.jsx";
 import { rpc, useEvent, fmt } from "../lib/rpc.js";
@@ -105,7 +106,7 @@ function Branches(props) {
 }
 
 export default function Repos() {
-  const [repos, setRepos] = createSignal([]), [selected, setSelected] = createSignal(null);
+  const [repos, setRepos] = createSignal([]), [selected, setSelected] = createSignal(routeParams()?.repo_id ?? null);
   const labels = createMemo(() => repoLabels(repos()));
   const [trees, setTrees] = createSignal([]), [branches, setBranches] = createSignal([]);
   const [error, setError] = createSignal(""), [busy, setBusy] = createSignal(false), [loading, setLoading] = createSignal(true);

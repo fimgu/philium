@@ -10,4 +10,6 @@ With `JCODE_SCRATCH_DIR` pointing to a writable scratch directory, run `python3 
 
 ## What remains untested
 
+For the daily loop, select a registered checkout and open Home. Its unfinished tasks, agents, worktrees and unreleased agent resources are fetched by registered ID. The resource list is the local ledger, not a pod health monitor. Use **Open terminals** to run the project's existing commands yourself, **Review changes** for the code view, and **Review evidence** for saved packets. A newly opened checkout terminal records its repo ID; pre-existing human terminals with no ID stay available under All Workspaces. Neither reading an overview nor switching repos starts a command or sends data to a model. The pilot refuses its built-in kind create/delete operations, including calls from agent tools. This is not a sandbox for commands a human explicitly runs in a shell.
+
 This path starts the real packaged HAL and calls backend RPC, not the Tauri window, event loop or graphical quit sequence. Next use a disposable graphical login for repository switching, quit/reopen twice and rollback; do not automate the user's live desktop. Exo/Sentinel responsiveness over a workday, explicit recipient/payload grants, bounded local execution, independent base/candidate findings and approved private nightlies remain outside this check.

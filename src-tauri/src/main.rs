@@ -178,6 +178,7 @@ async fn app_call(app: &App, m: &str, args: Value) -> Result<Value, String> {
                 "root": ctx.root,
                 "data_dir": ctx.data_dir,
                 "version": env!("CARGO_PKG_VERSION"),
+                "pilot": pilot::active(),
             }))
         }
         "settings_get" => {

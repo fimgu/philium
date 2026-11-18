@@ -159,6 +159,12 @@ const stub = (fx, setName) => {
             }
           });
         }
+        if (a.method === 'workspace.overview') {
+          const id=a.args.repo_id;
+          if (window.__failOverview) throw 'Fixture database unavailable';
+          if (window.__holdOverview && id==='r1') await new Promise(r=>window.__resumeOverview=r);
+          return {repo_id:id,path:`/fixture/${id}/same`,tasks:[{title:`task-${id}`,status:'open'}],agents:[],worktrees:[],resources:[{owner:`agent-${id}`,kind:'kind_cluster',handle:`cluster-${id}`,state:'live'}],pilot:true};
+        }
         const v = fixtures[a.method];
         if (v !== undefined) return JSON.parse(JSON.stringify(v));
         if (/\.(list|tabs|names|proposals|ledger|inbox|threads|playbooks|branches|worktrees|models)$|repos_list/.test(a.method)) return [];
@@ -209,7 +215,7 @@ const clickText = (page, sel, text) => page.evaluate((s, t) => { const el = [...
 
 for (const setName of sets) {
   const fx = SETS[setName];
-  for (const [w, h] of (only.length === 1 && only[0] === 'review' ? [...SIZES,[800,600]] : SIZES)) {
+  for (const [w, h] of (only.length === 1 && ['review','home'].includes(only[0]) ? [...SIZES,[800,600]] : SIZES)) {
     const dir = path.join(out, `${setName}-${w}x${h}`);
     fs.mkdirSync(dir, { recursive: true });
     const shot = async (page, name) => { await page.screenshot({ path: path.join(dir, `${name}.png`) }); console.log("shot", setName, w, name); };
@@ -294,6 +300,20 @@ for (const setName of sets) {
         if (setName === "populated" && !/not found/i.test(t)) problems.push(`${setName} ${w}x${h} ${s}: stale id shows no not-found state`);
       }
       if (s === "home") {
+        if (setName==='populated') {
+          const picker='select[aria-label="Active workspace repository"]';
+          await page.evaluate(()=>window.__holdOverview=true);
+          await page.select(picker,'r1'); await page.waitForFunction(()=>!!window.__resumeOverview);
+          await page.select(picker,'r3'); await page.waitForFunction(()=>document.querySelector('.checkout-home')?.innerText.includes('cluster-r3'));
+          await page.evaluate(()=>window.__resumeOverview()); await sleep(80);
+          const info=await page.$eval('.checkout-home',el=>el.innerText);
+          if (info.includes('cluster-r1') || !info.includes('task-r3') || !info.includes('not a live Docker')) problems.push(`home ${w}: checkout scope or resource attribution`);
+          await page.evaluate(()=>window.__failOverview=true); await clickText(page,'button','Refresh');
+          await page.waitForSelector('[role="alert"]');
+          if (await page.$('.checkout-home')) problems.push(`home ${w}: stale records after error`);
+          await page.evaluate(()=>window.__failOverview=false); await clickText(page,'button','Refresh'); await page.waitForSelector('.checkout-home');
+          await shot(page,'selected-checkout'); await page.select(picker,'');
+        }
         if (await clickText(page, "button", "Improve Philium")) { await sleep(400); await shot(page, "modal-improve"); }
         await page.keyboard.press("Escape");
         await page.keyboard.down("Meta"); await page.keyboard.press("k"); await page.keyboard.up("Meta");

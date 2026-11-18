@@ -12,7 +12,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import { Page, Button, Segmented, Empty } from "../ui/kit.jsx";
 import { rpc, useEvent } from "../lib/rpc.js";
-import { useStore, activeRepoId } from "../lib/store.js";
+import { activeRepoId } from "../lib/store.js";
 import "../styles/terminals.css";
 const decode = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
 const encode = (s) =>
@@ -151,13 +151,10 @@ export default function Terminals() {
   useEvent("terminals:data", (p) => {
     if (!items().some((t) => t.id === p.id)) reload();
   });
-  const store = useStore();
   const scopedItems = createMemo(() => {
     const rid = activeRepoId();
     if (!rid) return items();
-    const repo = (store.repos() ?? []).find((r) => r.id === rid);
-    if (!repo?.path) return items();
-    return items().filter((t) => t.cwd?.startsWith(repo.path));
+    return items().filter((t) => t.workspace_id === rid);
   });
   const visible = createMemo(() => {
     const list = scopedItems(),
@@ -170,8 +167,7 @@ export default function Terminals() {
   const open = async () => {
     try {
       const rid = activeRepoId();
-      const repo = rid ? (store.repos() ?? []).find((r) => r.id === rid) : null;
-      const id = await rpc("terminals.open", repo?.path ? { cwd: repo.path } : {});
+      const id = await rpc("terminals.open", rid ? {repo_id:rid} : {});
       await reload();
       setSelected(id);
     } catch (e) {

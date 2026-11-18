@@ -69,7 +69,7 @@ CREATE TABLE IF NOT EXISTS resources (
   meta TEXT, state TEXT NOT NULL DEFAULT 'live', created_at INTEGER NOT NULL,
   released_at INTEGER);
 CREATE TABLE IF NOT EXISTS terminals (
-  id TEXT PRIMARY KEY, agent_id TEXT, title TEXT NOT NULL, command TEXT NOT NULL,
+  id TEXT PRIMARY KEY, agent_id TEXT, repo_id TEXT REFERENCES repos(id) ON DELETE SET NULL, title TEXT NOT NULL, command TEXT NOT NULL,
   cwd TEXT NOT NULL, pid INTEGER, exit_code INTEGER, state TEXT NOT NULL DEFAULT 'running',
   created_at INTEGER NOT NULL, ended_at INTEGER);
 CREATE TABLE IF NOT EXISTS requests (
@@ -105,6 +105,9 @@ impl Db {
         c.busy_timeout(std::time::Duration::from_secs(5)).map_err(|e| e.to_string())?;
         c.execute_batch("PRAGMA synchronous=NORMAL;").map_err(|e| e.to_string())?;
         c.execute_batch(SCHEMA).map_err(|e| e.to_string())?;
+        if !c.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('terminals') WHERE name='repo_id')", [], |r| r.get::<_, bool>(0)).map_err(|e| e.to_string())? {
+            c.execute_batch("ALTER TABLE terminals ADD COLUMN repo_id TEXT REFERENCES repos(id) ON DELETE SET NULL").map_err(|e|e.to_string())?;
+        }
         Ok(Db(Mutex::new(c)))
     }
 
@@ -159,6 +162,18 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn old_terminal_history_is_preserved_unassigned() {
+        let path = std::env::temp_dir().join(format!("philium-migration-{}.db",new_id()));
+        let old = Connection::open(&path).unwrap();
+        old.execute_batch("CREATE TABLE terminals(id TEXT PRIMARY KEY,cwd TEXT); INSERT INTO terminals VALUES('old','/same');").unwrap();
+        drop(old);
+        for _ in 0..2 {
+            let db = Db::open(&path).unwrap();
+            assert_eq!(db.query("SELECT cwd,repo_id FROM terminals WHERE id='old'",[]).unwrap()[0],serde_json::json!({"cwd":"/same","repo_id":null}));
+        }
+        std::fs::remove_file(&path).unwrap();
+    }
     #[test]
     fn schema_and_query() {
         let db = Db::memory();
