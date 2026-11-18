@@ -7,7 +7,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 // A socket is a discovery hint, not proof of a healthy daemon, a deployment or ownership.
 // Store only profile names, scan status and time. No logs, paths, environment or secrets.
 const PREFLIGHT:&str="CREATE TABLE IF NOT EXISTS check_preflight(repo TEXT PRIMARY KEY REFERENCES repos(id) ON DELETE CASCADE, observed INTEGER NOT NULL, profiles TEXT, CHECK(profiles IS NULL OR length(profiles)<=18000))";
-fn remember(
+pub(crate) fn remember(
     db: &crate::db::Db,
     repo: &str,
     at: i64,

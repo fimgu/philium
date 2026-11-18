@@ -15,6 +15,7 @@ mod agentshell;
 mod board;
 mod checks;
 mod release_intake;
+mod release_sql;
 mod environments;
 #[cfg(unix)] mod managed;
 mod browser;
@@ -291,6 +292,7 @@ fn philium_root() -> std::path::PathBuf {
 }
 
 fn main() {
+    if std::env::args().nth(1).as_deref()==Some("--observe-sql-contract") {std::process::exit(if release_sql::worker().is_some(){0}else{2});}
     let config = tauri::generate_context!();
     let checking = std::env::args().nth(1).as_deref() == Some("--pilot-check");
     if checking && config.config().identifier != pilot::ID {

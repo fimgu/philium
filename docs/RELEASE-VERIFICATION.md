@@ -94,6 +94,18 @@ Output: **Child PR/change | User workflow | SHA/environment | Result | Evidence 
 
 ## Acceptance scenario for the first usable implementation
 
+### Implemented local lane: SQLite views and data contracts
+
+Register the product checkout and a separately trusted verifier checkout in Philium. In the verifier checkout, commit `philium/sql-contracts.json`, for example:
+
+```json
+{"schema":"db/schema.sql","cases":[{"id":"record-101","seed":"INSERT INTO items(id) VALUES(101)","query":"SELECT id FROM visible_items WHERE id=101","expect":[[101]]}]}
+```
+
+In **Review → Release PR revisions → Configure local SQL verification**, choose and pin the verifier once. A new PR capture then runs these contracts locally, provided the pinned Git objects are available. Historical generations may be rerun explicitly. Updating the verifier requires an explicit new pin. Use synthetic, nonsecret fixture inputs. The enrolled driver is stored locally. Each case uses fresh in-memory SQLite databases. Only supported table/index/view SQL, integer/text/null result cells and bounded result sets are eligible. Unsupported setup, query errors, timeouts or inconsistent repetitions are incomplete, not a regression finding. This lane is not an application, CLI, hosted database or staging test.
+
+Receipts identify the target, common ancestor, candidate, tested merge parents, driver pin, contract digest, engine version and repeated observation hashes. A failure new to a two-parent merge with both parents passing can be attributed to the composed head, not to either PR by name. A matching failure on the target is reported separately. A lane pass cannot substitute for other required workflows or deployment provenance. The full acceptance scenario below is still required.
+
 Use a disposable release repository with two child PRs, one shared grandchild, one squash and one direct integration commit. Give the independent verifier a trusted pagination driver that checks record 101. Introduce one known base defect, one defect only in the composed head, and a staging deployment still at the base. This is a test recipe, not a report about a live PR.
 
 1. Paste only the parent PR. Expect one matrix, the grandchild shown once with both inclusion paths, the integration commit visible, and every net change accounted for. No PR description supplies the answers.

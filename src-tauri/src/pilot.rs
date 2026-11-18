@@ -116,6 +116,12 @@ pub async fn check() -> Result<(), String> {
             if phase == "seed" {
                 fs::create_dir_all(&path).map_err(|e| e.to_string())?;
                 workspace::git(&path, &["init", "-b", "main"])?;
+                if name=="alpha" {fs::write(path.join("schema.sql"),sql_fixture(false)).map_err(|e|e.to_string())?;}else{
+                    fs::create_dir(path.join("philium")).map_err(|e|e.to_string())?;
+                    let seed="WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<101) INSERT INTO items SELECT i FROM n";
+                    let cases=json!([{"id":"page-101","seed":seed,"query":"SELECT id FROM page ORDER BY id LIMIT 1 OFFSET 100","expect":[[101]]},{"id":"legacy-101","seed":seed,"query":"SELECT id FROM legacy WHERE id=101","expect":[[101]]},{"id":"missing-view","seed":seed,"query":"SELECT * FROM absent","expect":[]}]);
+                    fs::write(path.join("philium/sql-contracts.json"),json!({"schema":"schema.sql","cases":cases}).to_string()).map_err(|e|e.to_string())?;}
+                workspace::git(&path,&["add","--",if name=="alpha"{"schema.sql"}else{"philium/sql-contracts.json"}])?;
                 workspace::git(
                     &path,
                     &[
@@ -254,14 +260,14 @@ async fn release_graph_fixture(
     call("history", json!({"repo_id":repo})).await?;
     if seed {
         let root = workspace::git(path, &["rev-parse", "HEAD"])?;
-        let node = |name: &str, parents: &[&str]| {
+        let node = |name: &str, parents: &[&str], tree: &str| {
             let mut args = vec![
                 "-c",
                 "user.name=Fixture",
                 "-c",
                 "user.email=fixture@example.invalid",
                 "commit-tree",
-                "HEAD^{tree}",
+                tree,
                 "-m",
                 name,
             ];
@@ -270,10 +276,18 @@ async fn release_graph_fixture(
             }
             workspace::git(path, &args)
         };
-        let target = node("target only", &[&root])?;
-        let direct = node("direct", &[&root])?;
-        let child = node("child", &[&root])?;
-        let merged = node("integration", &[&direct, &child])?;
+        let good = "HEAD^{tree}";
+        let target = node("target only", &[&root], good)?;
+        let direct = node("direct", &[&root], good)?;
+        let child = node("child", &[&root], good)?;
+        fs::write(path.join("schema.sql"), sql_fixture(true)).map_err(|e| e.to_string())?;
+        workspace::git(path, &["add", "--", "schema.sql"])?;
+        let bad = workspace::git(path, &["write-tree"])?;
+        workspace::git(
+            path,
+            &["restore", "--staged", "--worktree", "--", "schema.sql"],
+        )?;
+        let merged = node("integration", &[&direct, &child], &bad)?;
         let url = "https://github.com/philium-fixture/offline/pull/1";
         for h in [&direct, &merged] {
             crate::release_intake::record(
@@ -296,7 +310,13 @@ async fn release_graph_fixture(
     }
     let oid =
         |name: &str| workspace::git(path, &["rev-parse", &format!("refs/heads/fixture-{name}")]);
-    let rows = call("history", json!({"repo_id":repo})).await?;
+    let all = call("history", json!({"repo_id":repo})).await?;
+    let rows = json!(all
+        .as_array()
+        .ok_or("Invalid history")?
+        .iter()
+        .filter(|r| r["pr"] == 1)
+        .collect::<Vec<_>>());
     if rows.as_array().map(Vec::len) != Some(2) {
         return Err("Missing fixture generations".into());
     }
@@ -339,6 +359,79 @@ async fn release_graph_fixture(
     {
         return Err("Follow-up lost the last reviewed head or missed a commit".into());
     }
+    if seed {
+        call("sql_enroll", json!({"repo_id":repo,"driver":peer})).await?;
+        let fixed = workspace::git(
+            path,
+            &[
+                "-c",
+                "user.name=Pilot",
+                "-c",
+                "user.email=pilot@example.invalid",
+                "commit-tree",
+                "HEAD^{tree}",
+                "-p",
+                &oid("merged")?,
+                "-m",
+                "restore page",
+            ],
+        )?;
+        workspace::git(path, &["branch", "fixture-fixed", &fixed])?;
+        for h in [oid("merged")?, fixed] {
+            let gen = crate::release_intake::record(
+                &app.ctx.db,
+                repo,
+                "philium-fixture/offline",
+                2,
+                &json!({"number":2,"url":"https://github.com/philium-fixture/offline/pull/2","baseRefOid":oid("target")?,"headRefOid":h}),
+            )?;
+            let args = json!({"repo_id":repo,"generation":gen["generation"]});
+            if !call("sql_receipt", args.clone()).await?.is_null() {
+                return Err("New head inherited evidence".into());
+            }
+            call("sql_compare", args).await?;
+        }
+    }
+    let all = call("history", json!({"repo_id":repo})).await?;
+    let found: Vec<_> = all
+        .as_array()
+        .ok_or("Invalid history")?
+        .iter()
+        .filter(|r| r["pr"] == 2)
+        .collect();
+    if found.len() != 2 {
+        return Err("Missing SQL generations".into());
+    }
+    for (index, r) in found.iter().enumerate() {
+        let receipt = call("sql_receipt", json!({"repo_id":repo,"generation":r["seq"]})).await?;
+        let expected = if index == 0 {
+            "candidate_pass"
+        } else {
+            "composed_head_regression"
+        };
+        if receipt["head"] != r["head"]
+            || receipt["cases"][0]["state"] != expected
+            || receipt["cases"][1]["state"] != "same_failure_on_target"
+            || receipt["cases"][2]["state"] != "incomplete"
+            || receipt["staging"] != "not_verified"
+            || receipt["release_decision"] != "incomplete"
+        {
+            return Err(format!(
+                "SQL acceptance failed: expected {expected}, got {}",
+                receipt["cases"]
+            ));
+        }
+        if call("sql_receipt", json!({"repo_id":peer,"generation":r["seq"]}))
+            .await
+            .is_ok()
+        {
+            return Err("Peer could read private receipt".into());
+        }
+    }
+    println!("SQL: record 101 absent only on merged head, restored on new head; legacy failure present on target; missing view and staging not credited. Both private generation receipts isolated.");
     println!("Release graph: divergent target excluded, merge parents preserved, peer denied. Follow-up covers both commits since the reviewed revision (fixture origin metadata).");
     Ok(())
+}
+fn sql_fixture(broken: bool) -> String {
+    format!("CREATE TABLE items(id INTEGER PRIMARY KEY); CREATE VIEW page AS SELECT id FROM items {}; CREATE VIEW legacy AS SELECT id FROM items WHERE id<101;",if broken{"WHERE id<101"}else{""})
 }

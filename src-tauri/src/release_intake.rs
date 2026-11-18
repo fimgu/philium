@@ -77,7 +77,7 @@ fn sha(s: &str) -> bool {
 }
 
 // Only object IDs leave this reader. No subjects, patch contents, hooks or origin requests.
-async fn local_git(path: &Path, args: &[&str]) -> Result<String, String> {
+pub(crate) async fn local_git(path: &Path, args: &[&str]) -> Result<String, String> {
     use tokio::io::AsyncReadExt;
     let mut child = tokio::process::Command::new("/usr/bin/git")
         .current_dir(path)
@@ -122,7 +122,12 @@ async fn local_git(path: &Path, args: &[&str]) -> Result<String, String> {
     .await
     .map_err(|_| "Local history inspection timed out")?
 }
-async fn graph(path: &Path, expected: &str, base: &str, head: &str) -> Result<Value, String> {
+pub(crate) async fn graph(
+    path: &Path,
+    expected: &str,
+    base: &str,
+    head: &str,
+) -> Result<Value, String> {
     if !sha(base) || !sha(head) || !path.join(".git").exists() {
         return Err("Pinned checkout unavailable".into());
     }
@@ -176,6 +181,17 @@ pub async fn call(ctx: &Ctx, method: &str, a: Value) -> Result<Value, String> {
     )?;
     ctx.db.with(|c| c.execute_batch(SCHEMA))?;
     ctx.db.with(|c| c.execute_batch(ANCHORS))?;
+    if method.starts_with("sql_") {
+        return crate::release_sql::call(
+            ctx,
+            method,
+            &a,
+            &repo,
+            &o,
+            Path::new(r[0]["path"].as_str().ok_or("Missing checkout")?),
+        )
+        .await;
+    }
     match method{
  "checkpoint"|"followup"=>{
     let seq=a["generation"].as_i64().ok_or("Select a recorded generation")?;
