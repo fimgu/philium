@@ -21,6 +21,7 @@ const SCREENS = [
   { id: "agents", label: "Agents", icon: "agents", group: "work", load: () => import("./screens/agents.jsx") },
   { id: "board", label: "Board", icon: "board", group: "work", load: () => import("./screens/board.jsx") },
   { id: "review", label: "Review", icon: "repo", group: "work", load: () => import("./screens/review.jsx") },
+  { id: "environments", label: "Environments", icon: "graph", group: "work", load: () => import("./screens/environments.jsx") },
   { id: "chat", label: "Chat", icon: "chat", group: "work", load: () => import("./screens/chat.jsx") },
   { id: "terminals", label: "Terminals", icon: "terminal", group: "tools", load: () => import("./screens/terminals.jsx") },
   { id: "browser", label: "Browser", icon: "globe", group: "tools", load: () => import("./screens/browser.jsx") },

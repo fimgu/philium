@@ -13,6 +13,13 @@ pub fn active() -> bool {
     BASE.get().is_some()
 }
 
+// Only the human-operated Environments explorer uses this fixed host directory.
+// Do not restore the real HOME to children or expose an arbitrary host path.
+pub(crate) fn colima_dir() -> Option<PathBuf> {
+    BASE.get().and_then(|base| base.parent().map(|p| p.join(".colima")))
+        .or_else(|| env::var_os("HOME").map(|p| PathBuf::from(p).join(".colima")))
+}
+
 // Refuse links rather than accidentally following a pilot path into live data.
 fn child_dir(parent: &Path, name: &str) -> Result<PathBuf, String> {
     let p = parent.join(name);

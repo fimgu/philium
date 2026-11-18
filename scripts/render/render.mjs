@@ -23,7 +23,7 @@ const only = opt("only", "").split(",").filter(Boolean);
 const sets = opt("sets", "empty,populated,failing,slow,huge").split(",");
 const CHROME = process.env.CHROME ?? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 const SIZES = [[1440, 900], [1280, 800]];
-const SCREENS = ["home", "agents", "board", "review", "chat", "terminals", "browser", "repos", "code", "activity", "stats", "providers", "settings"];
+const SCREENS = ["home", "agents", "board", "review", "environments", "chat", "terminals", "browser", "repos", "code", "activity", "stats", "providers", "settings"];
 
 const mime = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".woff2": "font/woff2", ".png": "image/png", ".svg": "image/svg+xml" };
 const server = http.createServer((req, res) => {
@@ -98,6 +98,9 @@ const stub = (fx, setName) => {
         throw fixtures.__fail[window.__n % fixtures.__fail.length];
       }
       if (cmd === "rpc") {
+        if(a.method==='environments.profiles') return ['alpha','beta'];
+        if(a.method==='environments.containers') return [{id:'a'.repeat(64),name:`${a.args.profile}-node`,cluster:'sandbox',image:'fixture:local',status:'Up'}];
+        if(a.method==='environments.logs') {if(window.__test.holdLogs)await new Promise(resolve=>window.__test.releaseLogs=resolve);return {text:`${a.args.profile} fixture log`,truncated:false};}
         if (a.method === "agents.get_effort") return window.__test.efforts?.[a.args.id] ?? "default";
         if (a.method === "agents.set_effort") {
           if (window.__test.holdEffort) await new Promise((resolve) => { window.__test.releaseEffort = resolve; });
@@ -235,6 +238,18 @@ for (const setName of sets) {
         return out;
       });
       for (const b of bad) problems.push(`${setName} ${w}x${h} ${s}: ${b}`);
+      if(s==='environments' && setName==='populated') {
+        try {
+          await clickText(page,'button','Inspect local machine'); await page.waitForSelector('label select option[value="alpha"]');
+          const sel='label select:has(option[value="alpha"])'; await page.select(sel,'alpha');
+          await page.waitForSelector('[aria-label="Runtime inventory"] summary'); await page.click('[aria-label="Runtime inventory"] summary');
+          await clickText(page,'button','View logs'); await page.waitForFunction(()=>document.querySelector('aside pre')?.textContent==='alpha fixture log');
+          await page.evaluate(()=>window.__test.holdLogs=true);await clickText(page,'button','Refresh logs');await page.waitForFunction(()=>!!window.__test.releaseLogs);
+          await page.select(sel,'beta');await page.evaluate(()=>window.__test.releaseLogs());await page.waitForFunction(()=>document.querySelector('[aria-label="Runtime inventory"]')?.innerText.includes('beta'));
+          if(await page.$('aside[aria-label="Container logs"]'))throw Error('Stale peer logs remained visible');
+          await clickText(page,'button','This checkout');if(await page.$('[aria-label="Runtime inventory"]')) throw Error('Machine inventory leaked into checkout');
+        } catch(e){problems.push(`${w} environments: ${e.message}`);}
+      }
       if (s === 'review' && setName === 'populated') {
         try { await checkReviewPreview(page); } catch (e) { problems.push(`${w} review: ${e.message}`); }
       }
