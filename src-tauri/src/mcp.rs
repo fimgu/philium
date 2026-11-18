@@ -182,11 +182,11 @@ pub fn tool_list() -> Vec<Value> {
           json!({ "job": s }), &["job"]),
         t("skill_list", "Your skills (reusable procedures like review-pr, make-plan, babysit): name and when to use each.", json!({}), &[]),
         t("skill_get", "Load one skill's full instructions and supporting files. Follow them.", json!({ "name": s }), &["name"]),
-        t("memory_search", "Search what Filip has told agents before (preferences, corrections, project facts). Check before asking him again.",
+        t("memory_search", "Search memories saved under this agent's registered repository ID.",
           json!({ "q": s, "limit": i }), &["q"]),
-        t("memory_save", "Remember a durable preference, correction or fact for future agents. Category: fact, preference, correction, entity. project=true scopes it to this repo.",
+        t("memory_save", "Save for this repository only. Global writes are unavailable. Category: fact, preference, correction, entity.",
           json!({ "content": s, "category": s, "project": b }), &["content", "category"]),
-        t("session_search", "Search past Philium agent transcripts and imported Jcode (~/.jcode/sessions) sessions for prior decisions, debugging context, or unfinished work on this or other repos. Omit `q` or pass keywords; set `repo_only: true` to restrict to the current repository.",
+        t("session_search", "Search Philium session metadata (agent, task, branch) bound to this repository ID. Raw conversations and imported histories are not included.",
           json!({ "q": s, "repo_only": b, "limit": i }), &[]),
         t("resource_register", "Declare something you created outside Philium's tools (container, process, temp dir) so it is cleaned up with you. Use kind_cluster for managed clusters.",
           json!({ "kind": s, "handle": s, "note": s }), &["kind", "handle"]),
@@ -413,20 +413,18 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
             if row["strict"].as_i64() == Some(1) {
                 return Err("memory and past sessions are not available to Strict agents".into());
             }
-            let project = crate::agents::repo_path_of(ctx, &row);
+            let repo = row["repo_id"].as_str().filter(|id| !id.is_empty()).ok_or("A registered repository is required for memory and history")?;
+            if ctx.db.query("SELECT id FROM repos WHERE id=?1", [repo])?.is_empty() {
+                return Err("Repository identity is unavailable".into());
+            }
             if name == "memory_search" {
-                crate::library::memory_search(ctx, arg(&a, "q")?, project.as_deref(), a["limit"].as_i64().unwrap_or(10))
+                crate::library::agent_memories(ctx, arg(&a, "q")?, repo, a["limit"].as_i64().unwrap_or(10))
             } else if name == "session_search" {
-                crate::library::session_search(
-                    ctx,
-                    a["q"].as_str().unwrap_or(""),
-                    project.as_deref(),
-                    a["repo_only"].as_bool().unwrap_or(false),
-                    a["limit"].as_u64().unwrap_or(8) as usize,
-                )
+                if a["repo_only"] == false { return Err("Cross-repository history is unavailable".into()); }
+                crate::library::agent_sessions(ctx, a["q"].as_str().unwrap_or(""), repo, a["limit"].as_u64().unwrap_or(8) as usize)
             } else {
-                let scope = if a["project"].as_bool() == Some(true) { project.as_deref() } else { None };
-                crate::library::memory_save(ctx, arg(&a, "content")?, arg(&a, "category")?, scope, &me)
+                if a["project"] == false { return Err("Global memory writes are unavailable".into()); }
+                crate::library::save_agent_memory(ctx, arg(&a, "content")?, arg(&a, "category")?, repo, &me)
             }
         }
         "resource_register" => {
@@ -534,8 +532,13 @@ mod tests {
     #[tokio::test]
     async fn skills_and_memory_tools_respect_strict() {
         let ctx = Ctx::test();
+        ctx.db.kv_set("library.imported_at", "fixture").unwrap();
         crate::library::init(&ctx).unwrap();
+        ctx.db.exec("INSERT INTO repos(id,name,path,added_at) VALUES('ra','same','/one/same',0),('rb','same','/two/same',0)", []).unwrap();
         ctx.db.exec("INSERT INTO agents(id,name,model_ref,strict,created_at,last_active_at) VALUES('t1','owl','p/m',0,0,0),('s1','fox','p/m',1,0,0)", []).unwrap();
+        ctx.db.exec("INSERT INTO tasks(id,title,repo_id,created_at,updated_at) VALUES('a','scoped-marker-A','ra',0,0),('b','scoped-marker-B','rb',0,0)", []).unwrap();
+        ctx.db.exec("UPDATE agents SET repo_id='ra',task_id='a' WHERE id='t1'", []).unwrap();
+        ctx.db.exec("INSERT INTO agents(id,name,repo_id,model_ref,task_id,created_at,last_active_at) VALUES('peer','ibis','rb','p/m','b',0,0),('none','duck',NULL,'p/m',NULL,0,0)", []).unwrap();
         ctx.db.exec("INSERT INTO skills(name,description,body,source,updated_at) VALUES('review-pr','Review','do it','jcode',0)", []).unwrap();
         let call = |agent: &'static str, name: &'static str, args: Value| {
             let ctx = ctx.clone();
@@ -545,6 +548,23 @@ mod tests {
         assert!(text(&call("s1", "skill_get", json!({"name":"review-pr"})).await).contains("do it"));
         let saved = call("t1", "memory_save", json!({"content":"Filip likes terse replies","category":"preference"})).await;
         assert_ne!(saved["result"]["isError"], true, "{saved}");
+        assert!(text(&saved).contains("repo:ra"));
+        crate::library::memory_save(&ctx, "terse legacy-global", "preference", None, "fixture").unwrap();
+        crate::library::save_agent_memory(&ctx, "terse sibling-private", "fact", "rb", "fixture").unwrap();
+        assert_eq!(call("t1", "memory_search", json!({"q":""})).await["result"]["isError"], true);
+        for q in ["terse", "*"] {
+            let hits = text(&call("t1", "memory_search", json!({"q":q,"repo_id":"rb"})).await);
+            assert!(hits.contains("terse replies") && !hits.contains("legacy-global") && !hits.contains("sibling-private"), "fixture query {q:?}: {hits}");
+        }
+        let hits = text(&call("t1", "session_search", json!({"q":"scoped-marker","repo_id":"rb"})).await);
+        assert!(hits.contains("scoped-marker-A") && !hits.contains("scoped-marker-B"));
+        for (agent, tool, args) in [
+            ("none", "session_search", json!({})), ("none", "memory_search", json!({"q":"terse"})),
+            ("none", "memory_save", json!({"category":"fact","content":"blocked"})),
+            ("t1", "session_search", json!({"repo_only":false})),
+            ("t1", "memory_save", json!({"project":false,"category":"fact","content":"blocked"})),
+        ] { assert_eq!(call(agent, tool, args).await["result"]["isError"], true); }
+        assert_eq!(ctx.db.query("SELECT count(*) AS n FROM memories WHERE content='blocked'", []).unwrap()[0]["n"],0);
         assert!(text(&call("t1", "memory_search", json!({"q":"terse"})).await).contains("terse replies"));
         let denied = call("s1", "memory_search", json!({"q":"terse"})).await;
         assert_eq!(denied["result"]["isError"], true);

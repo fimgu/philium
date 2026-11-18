@@ -1961,7 +1961,7 @@ pub fn prompt_map(ctx: &Ctx, repo_id: &str, wt_path: Option<&Path>) -> Option<St
         if !lines.is_empty() {
             landscape_block = format!(
                 "\n## Repo landscape (auto-discovered worktrees & active branches)\n\
-                 Use `repo_context {{}}` for full worktrees/branches/GitHub PRs, `repo_context {{branch}}` or `repo_context {{pr}}` for structural AST diff of any branch/PR, and `session_search {{q}}` to recall past Philium/Jcode/Claude sessions on this repo.\n\
+                 Use `repo_context {{}}` for full worktrees/branches/GitHub PRs, `repo_context {{branch}}` or `repo_context {{pr}}` for structural AST diff of any branch/PR, and `session_search {{q}}` to recall repository-bound Philium sessions.\n\
                  ```\n{}\n```\n",
                 lines.join("\n")
             );

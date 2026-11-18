@@ -227,29 +227,45 @@ pub fn skill_get(ctx: &Ctx, name: &str) -> Result<Value, String> {
 
 /// FTS search over active memories in global scope plus the given project.
 pub fn memory_search(ctx: &Ctx, q: &str, project: Option<&str>, limit: i64) -> Result<Value, String> {
+    search_scope(ctx, q, &project.map(|p| format!("project:{p}")).unwrap_or_default(), true, limit)
+}
+
+pub fn agent_memories(ctx: &Ctx, q: &str, repo_id: &str, limit: i64) -> Result<Value, String> {
+    search_scope(ctx, q, &format!("repo:{repo_id}"), false, limit)
+}
+
+fn search_scope(ctx: &Ctx, q: &str, scope: &str, include_global: bool, limit: i64) -> Result<Value, String> {
     let terms: Vec<String> = q
         .split(|c: char| !c.is_alphanumeric())
         .filter(|t| t.len() > 1)
         .take(12)
         .map(|t| format!("\"{t}\""))
         .collect();
-    let scope = project.map(|p| format!("project:{p}")).unwrap_or_default();
     let limit = limit.clamp(1, 50);
     if terms.is_empty() {
         return Ok(json!(ctx.db.query(
-            "SELECT id,scope,category,content FROM memories WHERE active=1 AND (scope='global' OR scope=?1) ORDER BY created_at DESC LIMIT ?2",
-            params![scope, limit],
+            "SELECT id,scope,category,content FROM memories WHERE active=1 AND ((?3 AND scope='global') OR scope=?1) ORDER BY created_at DESC LIMIT ?2",
+            params![scope, limit, include_global],
         )?));
     }
     Ok(json!(ctx.db.query(
         "SELECT m.id,m.scope,m.category,m.content FROM memories_fts f JOIN memories m ON m.rowid=f.rowid
-         WHERE memories_fts MATCH ?1 AND m.active=1 AND (m.scope='global' OR m.scope=?2)
+         WHERE memories_fts MATCH ?1 AND m.active=1 AND ((?4 AND m.scope='global') OR m.scope=?2)
          ORDER BY (m.category='correction') DESC, bm25(memories_fts) LIMIT ?3",
-        params![terms.join(" OR "), scope, limit],
+        params![terms.join(" OR "), scope, limit, include_global],
     )?))
 }
 
 pub fn memory_save(ctx: &Ctx, content: &str, category: &str, project: Option<&str>, by: &str) -> Result<Value, String> {
+    let scope = project.map(|p| format!("project:{p}")).unwrap_or("global".into());
+    save_scope(ctx, content, category, &scope, by)
+}
+
+pub fn save_agent_memory(ctx: &Ctx, content: &str, category: &str, repo_id: &str, by: &str) -> Result<Value, String> {
+    save_scope(ctx, content, category, &format!("repo:{repo_id}"), by)
+}
+
+fn save_scope(ctx: &Ctx, content: &str, category: &str, scope: &str, by: &str) -> Result<Value, String> {
     let content = content.trim();
     if content.is_empty() || content.len() > 4000 {
         return Err("memory must be 1-4000 characters".into());
@@ -258,7 +274,6 @@ pub fn memory_save(ctx: &Ctx, content: &str, category: &str, project: Option<&st
         return Err("category must be fact, preference, correction or entity".into());
     }
     let id = format!("mem_{}", crate::db::new_id());
-    let scope = project.map(|p| format!("project:{p}")).unwrap_or("global".into());
     ctx.db.exec(
         "INSERT INTO memories(id,scope,category,content,source,created_at) VALUES(?1,?2,?3,?4,?5,datetime('now'))",
         params![id, scope, category, content, format!("agent:{by}")],
@@ -319,14 +334,7 @@ fn matches_repo(working_dir: &str, project: Option<&str>) -> bool {
     let Some(proj) = project.filter(|p| !p.is_empty()) else {
         return false;
     };
-    if working_dir.starts_with(proj) || proj.starts_with(working_dir) {
-        return true;
-    }
-    let proj_name = Path::new(proj).file_name().and_then(|s| s.to_str()).unwrap_or("");
-    !proj_name.is_empty()
-        && (working_dir.ends_with(&format!("/{proj_name}"))
-            || working_dir.contains(&format!("/{proj_name}/"))
-            || working_dir.contains(&format!("/{proj_name}-")))
+    Path::new(proj).is_absolute() && Path::new(working_dir) == Path::new(proj)
 }
 
 pub fn session_search_at(
@@ -337,6 +345,18 @@ pub fn session_search_at(
     repo_only: bool,
     limit: usize,
 ) -> Result<Value, String> {
+    if repo_only && project.filter(|p| !p.is_empty()).is_none() {
+        return Err("A repository is required for scoped history".into());
+    }
+    search_sessions(ctx, Some(home_dir), query, project, repo_only, None, limit)
+}
+
+pub fn agent_sessions(ctx: &Ctx, query: &str, repo_id: &str, limit: usize) -> Result<Value, String> {
+    // Imported histories do not carry a trusted Philium repository ID. Do not open them.
+    search_sessions(ctx, None, query, None, true, Some(repo_id), limit)
+}
+
+fn search_sessions(ctx: &Ctx, home_dir: Option<&Path>, query: &str, project: Option<&str>, repo_only: bool, repo_id: Option<&str>, limit: usize) -> Result<Value, String> {
     let limit = limit.clamp(1, 25);
     let terms: Vec<String> = query
         .to_lowercase()
@@ -350,14 +370,15 @@ pub fn session_search_at(
     let agents = ctx
         .db
         .query(
-            "SELECT a.id, a.name, a.role, a.state, a.task_title, a.branch, a.hal_session_id, a.last_active_at, r.path AS repo_path \
-             FROM agents a LEFT JOIN repos r ON r.id=a.repo_id ORDER BY a.last_active_at DESC LIMIT 60",
-            [],
-        )
-        .unwrap_or_default();
+            "SELECT a.id,a.name,a.role,a.state,t.title AS task_title, \
+             (SELECT w.branch FROM worktrees w WHERE w.agent_id=a.id AND w.repo_id=r.id AND w.state='active' ORDER BY w.created_at DESC LIMIT 1) AS branch, \
+             a.hal_session_id,a.last_active_at,r.path AS repo_path FROM agents a LEFT JOIN repos r ON r.id=a.repo_id \
+             LEFT JOIN tasks t ON t.id=a.task_id AND t.repo_id=r.id WHERE (?1 IS NULL OR r.id=?1) ORDER BY a.last_active_at DESC LIMIT 60",
+            params![repo_id],
+        )?;
     for a in agents {
         let rpath = a["repo_path"].as_str().unwrap_or("");
-        let same_repo = matches_repo(rpath, project);
+        let same_repo = repo_id.is_some() || matches_repo(rpath, project);
         if repo_only && project.is_some() && !same_repo {
             continue;
         }
@@ -376,7 +397,8 @@ pub fn session_search_at(
             }
         }
         let mut excerpts = vec![];
-        if let Some(sid) = a["hal_session_id"].as_str().filter(|s| !s.is_empty()) {
+        // Agent recall provides orientation, not implicit access to raw conversations.
+        if let Some(sid) = a["hal_session_id"].as_str().filter(|s| repo_id.is_none() && !s.is_empty()) {
             let ev_path = ctx.root.join("hal/sessions").join(sid).join("events.jsonl");
             if let Ok(raw) = std::fs::read_to_string(&ev_path) {
                 for line in raw.lines().take(200) {
@@ -423,8 +445,7 @@ pub fn session_search_at(
     }
 
     // 2. Jcode sessions (~/.jcode/sessions/*.json)
-    let jcode_dir = home_dir.join(".jcode/sessions");
-    if let Ok(rd) = std::fs::read_dir(&jcode_dir) {
+    if let Some(rd) = home_dir.and_then(|home| std::fs::read_dir(home.join(".jcode/sessions")).ok()) {
         let mut files: Vec<(std::time::SystemTime, PathBuf)> = rd
             .flatten()
             .filter_map(|e| {
@@ -523,7 +544,10 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
             tokio::task::spawn_blocking(move || import(&c, &home())).await.map_err(|e| e.to_string())?
         }
         "skills" => skill_list(ctx),
-        "memories" => memory_search(ctx, args["q"].as_str().unwrap_or(""), None, args["limit"].as_i64().unwrap_or(50)),
+        "memories" => match args["repo_id"].as_str() {
+            Some(repo) => agent_memories(ctx, args["q"].as_str().unwrap_or(""), repo, args["limit"].as_i64().unwrap_or(50)),
+            None => memory_search(ctx, args["q"].as_str().unwrap_or(""), None, args["limit"].as_i64().unwrap_or(50)),
+        },
         "sessions" => session_search(
             ctx,
             args["q"].as_str().unwrap_or(""),

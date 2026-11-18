@@ -135,12 +135,6 @@ pub fn free_names(ctx: &Ctx, n: usize) -> Vec<String> {
     out
 }
 
-/// The main checkout path of the repo an agent works on, used to scope memory.
-pub fn repo_path_of(ctx: &Ctx, row: &Value) -> Option<String> {
-    let id = row["repo_id"].as_str()?;
-    ctx.db.query("SELECT path FROM repos WHERE id=?1", [id]).ok()?.first()?["path"].as_str().map(str::to_string)
-}
-
 pub fn get_row(ctx: &Ctx, id_or_name: &str) -> Option<Value> {
     ctx.db
         .query("SELECT * FROM agents WHERE id=?1 OR name=?1", [id_or_name])
@@ -242,7 +236,7 @@ fn shared_instructions(strict: bool) -> String {
          - Commands: `shell_run` types into your persistent shell (cd and exports persist). Dev servers and watchers: `shell_run` with `background=true`, then open the URL in your browser. \
          A second interactive session: `shell_open {name}`, then `shell_run` with `shell={name}`. The built-in shell tool is disabled.\n\
          - Code questions: check the `## Codebase map` in your prompt first, then use `code_outline` / `code_map` (file or directory structure with line spans), `code_symbol` (read a symbol's exact AST source + callers/callees in one call), `code_find` (locate a symbol), `code_refs` (bidirectional call graph: callees and callers), and `code_impact` (what your change touches + cross-agent clashes). Use these before grep or reading whole files.\n\
-         - Branches, worktrees, GitHub PRs & past sessions: check `## Repo landscape` in your prompt first, then use `repo_context` (all git worktrees including external checkouts, local/remote branches with ahead/behind, cross-worktree clashes, open/merged GitHub PRs, or pass `branch` / `pr` for a structural AST symbol diff of any branch or PR) and `session_search` (search prior Philium and Jcode `~/.jcode/sessions` transcripts for past architectural decisions or unfinished work).\n\
+         - Branches, worktrees, GitHub PRs & past sessions: check `## Repo landscape` in your prompt first, then use `repo_context` (all git worktrees including external checkouts, local/remote branches with ahead/behind, cross-worktree clashes, open/merged GitHub PRs, or pass `branch` / `pr` for a structural AST symbol diff of any branch or PR) and `session_search` (search Philium session records bound to your repository for prior decisions or unfinished work).\n\
          - Other agents and the human: `board_*` for tasks (claim before working, keep the lease alive), `mail_send` / `mail_read` for messages. `mail_send` to `\"you\"` reaches the human.\n\
          - Jobs like commit, open_pr, review_pr, release: `playbook_get` first and follow it. Finished work lands as a GitHub pull request.\n\
          \n\
@@ -263,7 +257,12 @@ fn shared_instructions(strict: bool) -> String {
     s
 }
 
-/// Per-agent identity tail placed AFTER `CACHE_BREAK_MARKER` so it never invalidates the shared repo KV cache prefix.
+/// Human-configured standing rules are intentional instructions. Never append archived memories here.
+pub(crate) fn prompt_rules(ctx: &Ctx, strict: bool) -> String {
+    format!("{}\n{}", shared_instructions(strict), crate::library::rules(ctx))
+}
+
+/// Per-agent identity tail placed after the shared repo cache prefix.
 fn agent_identity_tail(name: &str, role: &str, parent_name: Option<&str>, worktree: Option<&Path>) -> String {
     let mut s = format!("## Agent Identity & Assignment\n- Your agent name is \"{name}\" (role: `{role}`).\n");
     if let Some(p) = parent_name {
@@ -433,13 +432,8 @@ async fn provision(ctx: &Arc<Ctx>, id: &str, fresh: bool, brief: Option<String>)
         .as_str()
         .and_then(|pid| get_row(ctx, pid))
         .and_then(|pr| pr["name"].as_str().map(str::to_string));
-    let mut extra = shared_instructions(strict);
-    extra.push('\n');
-    extra.push_str(&crate::library::rules(ctx));
-    // Personal memories only reach agents on trusted providers.
-    if !strict {
-        extra.push_str(&crate::library::standing_memories(ctx));
-    }
+    let mut extra = prompt_rules(ctx, strict);
+    // Personal/imported memories are not standing rules. Agents may query ID-bound memory only.
     if let Some(repo_id) = row["repo_id"].as_str() {
         if let Some(cmap) = crate::codeindex::prompt_map(ctx, repo_id, worktree.as_deref()) {
             extra.push_str(&cmap);

@@ -656,13 +656,13 @@ mod e2e {
         println!("real HAL image: forwarded upstream, stored as {sha}, scoped read ok, peer denied");
         h.stop();
 
-        // Standing rules and imported memories: the same prompt.extra agents
-        // get, through a real HAL, must reach the model's system prompt.
+        // Exercise the production rules builder: standing instructions travel, archived memory does not.
+        ctx.db.kv_set("library.imported_at", "fixture").unwrap();
         crate::library::init(&ctx).unwrap();
         crate::library::memory_save(&ctx, "Filip-pref-marker-7731 keep replies short", "preference", None, "test").unwrap();
         let adir = dir.join("agent-hal");
         let mut setup = providers::hal_setup(&ctx, &adir.join("hal"), &providers::ConfigOpts::default());
-        setup.config["prompt"] = json!({ "extra": format!("{}{}", crate::library::rules(&ctx), crate::library::standing_memories(&ctx)) });
+        setup.config["prompt"] = json!({ "extra": crate::agents::prompt_rules(&ctx, false) });
         let ah = Hal::start(Launch { dir: &adir, config: setup.config, cwd: None, env: setup.env, allow_logins: false, wrap: None }).expect("agent-style HAL starts");
         let s = ah.call(reqwest::Method::POST, "/sessions", Some(chat_session_body(&ws, "rules", None))).await.unwrap();
         let sid = s["id"].as_str().or(s["session"]["id"].as_str()).unwrap().to_string();
@@ -670,9 +670,9 @@ mod e2e {
         ah.call(reqwest::Method::POST, &format!("/sessions/{sid}/messages"), Some(json!({"text":"hi"}))).await.unwrap();
         wait_turn(&ah, &sid).await;
         let bodies: Vec<String> = seen.lk()[before..].iter().map(|(_, b)| b.clone()).collect();
-        assert!(bodies.iter().any(|b| b.contains("standing rules") && b.contains("skill_get review-pr") && b.contains("Filip-pref-marker-7731")),
-            "rules/memories missing from model request");
-        println!("real HAL rules: standing rules + saved memory reached the model");
+        assert!(bodies.iter().any(|b| b.contains("standing rules") && b.contains("skill_get review-pr")));
+        assert!(bodies.iter().all(|b| !b.contains("Filip-pref-marker-7731")));
+        println!("real HAL rules reached the recording recipient; archived personal memory did not");
         ah.stop();
         let _ = std::fs::remove_dir_all(&dir);
     }
