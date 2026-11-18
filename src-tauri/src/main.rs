@@ -14,6 +14,7 @@ mod agents;
 mod agentshell;
 mod board;
 mod checks;
+mod release_intake;
 mod environments;
 #[cfg(unix)] mod managed;
 mod browser;
@@ -158,6 +159,7 @@ async fn rpc_inner(app: &App, method: String, args: Option<Value>) -> Result<Val
         "agents" => agents::call(&ctx, m, args).await,
         "board" => board::call(&ctx, m, args).await,
         "checks" => checks::call(&ctx, m, args).await,
+        "release_intake" => release_intake::call(&ctx,m,args).await,
         "environments" => environments::call(m, args).await,
         #[cfg(unix)] "managed" => managed::call(&ctx, m, args).await,
         "browser" => browser::call(&ctx, m, args).await,

@@ -4,6 +4,7 @@ import { Empty, Page } from '../ui/kit.jsx';
 import { githubIdentity, maxPacketBytes, reviewPreview } from '../lib/review-packet.js';
 import { tenantBundle } from '../lib/tenant-bundle.js';
 import { LocalChecks } from './local-checks.jsx';
+import { ReleaseIntake } from './release-intake.jsx';
 
 function Reader(props) {
   const [data, setData] = createSignal(null), [error, setError] = createSignal('');
@@ -47,6 +48,7 @@ export default function Review() {
   // Key by stable values, not the repo row object: background refresh is not a switch.
   const key = () => slug() && JSON.stringify([activeRepoId(), slug()]);
   return <Page title="Review" sub="Saved results">
+    <Show when={key()} keyed>{k=><ReleaseIntake repo={JSON.parse(k)[0]}/>}</Show>
     <Show when={workspace()?.id} keyed>{id => <LocalChecks repo={id}/>}</Show>
     <Show when={workspace()?.id} keyed>{id => <details aria-label="Kubernetes tenant plan">
       <summary>Kubernetes tenant plan · not applied</summary>
