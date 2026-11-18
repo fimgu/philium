@@ -1,5 +1,7 @@
 # Review as a first-class Philium workflow
 
+For the proposed one-input release workflow, see [Verify a release PR](RELEASE-VERIFICATION.md). It defines nested PR discovery, orchestration, independent attribution and the private ship decision.
+
 Proposal, 2026-11-18. Baseline inspected: `018b09e`. No changes to runtime, review gate or disclosure policy are implied by this document. See `DAILY-DRIVER-REVIEW.md` for the host constraints and remote-runner pilot.
 
 ## Start from the review you already do
