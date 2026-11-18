@@ -413,11 +413,11 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
             if crate::workspace::repo(ctx, repo).is_none() { return Err("Workspace unavailable".into()); }
             // Imported instructions and their supporting files belong to the operator.
             // Only ship reviewed product text until a per-recipient grant exists.
-            let skill = json!({"name":"review-pr", "description":"Check a PR against its real workflow", "source":"Philium built-in"});
+            let skill = json!({"name":"review-pr", "description":"Check a PR against its real workflow", "source":"Philium built-in", "policy_sha256":crate::board::review_policy_digest()});
             if name == "skill_list" { return Ok(json!([skill])); }
             if arg(&a,"name")? != "review-pr" { return Err("No attached skill with that name".into()); }
             let mut result = skill;
-            result["body"] = json!(include_str!("../playbooks/review_pr.md"));
+            result["body"] = json!(crate::board::REVIEW_POLICY);
             result["files"] = json!({});
             Ok(result)
         }
@@ -578,6 +578,9 @@ mod tests {
         assert_eq!(call("s1", "skill_get", json!({"name":"review-pr"})).await["result"]["isError"], true);
         let selected = text(&call("t1", "skill_get", json!({"name":"review-pr"})).await);
         assert!(selected.contains("Philium built-in") && !selected.contains("do it"));
+        let delivered:Value=serde_json::from_str(&selected).unwrap();
+        assert_eq!(delivered["policy_sha256"],crate::board::review_policy_digest());
+        assert_eq!(delivered["body"],crate::board::REVIEW_POLICY);
         assert!(crate::library::skill_get(&ctx,"review-pr").unwrap()["body"] == "do it");
         for args in [json!({"task_id":"b"}), json!({"model":"other/m"}), json!({"model":"p/other"})] {
             let mut attempt = args; attempt["brief"] = json!("test");

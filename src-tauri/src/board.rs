@@ -482,12 +482,17 @@ pub fn thread(ctx: &Arc<Ctx>, a: &str, b: &str, limit: i64) -> Result<Value, Str
     Ok(json!(ctx.db.query("SELECT * FROM (SELECT * FROM messages WHERE (from_agent=?1 AND to_target=?2) OR (from_agent=?2 AND to_target=?1) OR (?2='all' AND to_target='all') ORDER BY id DESC LIMIT ?3) ORDER BY id",rusqlite::params![a,b,limit.clamp(1,1000)])?))
 }
 
+pub(crate) const REVIEW_POLICY: &str = include_str!("../playbooks/review_pr.md");
+pub(crate) fn review_policy_digest() -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(REVIEW_POLICY.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
+}
 fn builtin(job: &str) -> Result<&'static str, String> {
     Ok(match job {
         "commit" => include_str!("../playbooks/commit.md"),
         "open_pr" => include_str!("../playbooks/open_pr.md"),
         "test_pr" => include_str!("../playbooks/test_pr.md"),
-        "review_pr" => include_str!("../playbooks/review_pr.md"),
+        "review_pr" => REVIEW_POLICY,
         "docs" => include_str!("../playbooks/docs.md"),
         "release" => include_str!("../playbooks/release.md"),
         "teardown" => include_str!("../playbooks/teardown.md"),
@@ -542,6 +547,11 @@ fn parse(job: &str, body: &str, source: &str) -> Result<Value, String> {
 }
 pub fn playbook(ctx: &Arc<Ctx>, job: &str, repo_path: Option<&Path>) -> Result<Value, String> {
     let default = builtin(job)?;
+    if job == "review_pr" {
+        let mut p = parse(job, default, "builtin")?;
+        p["policy_sha256"] = json!(review_policy_digest());
+        return Ok(p);
+    }
     if let Some(repo) = repo_path {
         let p = repo.join(".philium/playbooks").join(format!("{job}.md"));
         match std::fs::read_to_string(p) {
@@ -707,6 +717,7 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
         "playbook_get" => playbook(ctx, s(&args, "job")?, None),
         "playbook_set" => {
             let job = s(&args, "job")?;
+            if job == "review_pr" { return Err("The bundled review policy cannot be replaced by a playbook override".into()); }
             builtin(job)?;
             let body = s(&args, "body")?;
             let v = parse(job, body, "user")?;
@@ -918,6 +929,12 @@ mod tests {
         assert_eq!(playbook(&c, "commit", None).unwrap()["source"], "user");
         let repo = c.root.join("repo");
         std::fs::create_dir_all(repo.join(".philium/playbooks")).unwrap();
+        let weaker = body.replace("commit", "review_pr");
+        c.db.kv_set("playbook.review_pr", &weaker).unwrap();
+        std::fs::write(repo.join(".philium/playbooks/review_pr.md"), &weaker).unwrap();
+        let rubric = playbook(&c, "review_pr", Some(&repo)).unwrap();
+        assert_eq!(rubric["body"], REVIEW_POLICY);
+        assert_eq!(rubric["policy_sha256"], review_policy_digest());
         std::fs::write(
             repo.join(".philium/playbooks/commit.md"),
             body.replace("Personal", "Repo"),
