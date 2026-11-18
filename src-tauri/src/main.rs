@@ -15,6 +15,7 @@ mod agentshell;
 mod board;
 mod checks;
 mod environments;
+#[cfg(unix)] mod managed;
 mod browser;
 #[cfg(test)]
 mod browser_permission_tests;
@@ -158,6 +159,7 @@ async fn rpc_inner(app: &App, method: String, args: Option<Value>) -> Result<Val
         "board" => board::call(&ctx, m, args).await,
         "checks" => checks::call(&ctx, m, args).await,
         "environments" => environments::call(m, args).await,
+        #[cfg(unix)] "managed" => managed::call(&ctx, m, args).await,
         "browser" => browser::call(&ctx, m, args).await,
         "graph" => graph::call(&ctx, m, args).await,
         "codeindex" => codeindex::call(&ctx, m, args).await,
@@ -370,6 +372,7 @@ fn main() {
                 }
             }
 
+            #[cfg(unix)] managed::start_watcher(&ctx);
             refresh_desk(&ctx);
             app.manage(App { ctx: ctx.clone() });
 

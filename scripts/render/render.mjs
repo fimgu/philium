@@ -98,6 +98,10 @@ const stub = (fx, setName) => {
         throw fixtures.__fail[window.__n % fixtures.__fail.length];
       }
       if (cmd === "rpc") {
+        if(a.method==='managed.list') return {tasks:[{id:'t1',agent:'a1',owner:'lion',title:'Offline check'}],jobs:window.__test.managed?[{...window.__test.managed}]:[]};
+        if(a.method==='managed.launch') {if(a.args.repo_id!=='r1'||a.args.task_id!=='t1'||a.args.agent_id!=='a1'||a.args.profile!=='alpha'||a.args.command!=='echo marker')throw Error('Incorrect preview binding');return window.__test.managed={id:'j1',task_name:'Offline check',agent_name:'lion',profile:'alpha',cid:'b'.repeat(64),expires:Date.now()+60000,state:'active'};}
+        if(a.method==='managed.logs') return {text:'fixture marker',truncated:false};
+        if(a.method==='managed.release') {if(a.args.id!=='j1'||a.args.repo_id!=='r1')throw Error('Wrong release');Object.assign(window.__test.managed,{state:'released',receipt:'removal verified'});return window.__test.managed;}
         if(a.method==='environments.profiles') return ['alpha','beta'];
         if(a.method==='environments.containers') return [{id:'a'.repeat(64),name:`${a.args.profile}-node`,cluster:'sandbox',image:'fixture:local',status:'Up'}];
         if(a.method==='environments.logs') {if(window.__test.holdLogs)await new Promise(resolve=>window.__test.releaseLogs=resolve);return {text:`${a.args.profile} fixture log`,truncated:false};}
@@ -206,7 +210,7 @@ async function open(fx, setName, w, h, route) {
   const page = await browser.newPage();
   await page.setViewport({ width: w, height: h, deviceScaleFactor: 1 });
   await page.evaluateOnNewDocument(`(${stub.toString()})(${JSON.stringify(fx)}, ${JSON.stringify(setName)})`);
-  await page.evaluateOnNewDocument((r) => localStorage.setItem("route", r), route);
+  await page.evaluateOnNewDocument((r) => {localStorage.setItem("route", r);if(r==='environments')localStorage.setItem('philium.activeRepo','r1');}, route);
   page.on("pageerror", (e) => { problems.push(`${setName} ${route} pageerror: ${e.message}`); });
   page.on("console", (m) => { if (m.type() === "error") problems.push(`${setName} ${route} console.error: ${m.text().slice(0, 200)}`); });
   await page.goto(`http://127.0.0.1:${port}/`);
@@ -248,6 +252,9 @@ for (const setName of sets) {
           await page.select(sel,'beta');await page.evaluate(()=>window.__test.releaseLogs());await page.waitForFunction(()=>document.querySelector('[aria-label="Runtime inventory"]')?.innerText.includes('beta'));
           if(await page.$('aside[aria-label="Container logs"]'))throw Error('Stale peer logs remained visible');
           await clickText(page,'button','This checkout');if(await page.$('[aria-label="Runtime inventory"]')) throw Error('Machine inventory leaked into checkout');
+          await clickText(page,'button','New task sandbox');await page.waitForSelector('fieldset select option[value="t1"]');await page.select('fieldset select:has(option[value="t1"])','t1');await page.select('fieldset select:has(option:not([value]))','alpha');await page.type('fieldset textarea','echo marker');
+          await clickText(page,'button','Preview sandbox');await page.waitForFunction(()=>document.body.innerText.includes('Start offline sandbox')&&!window.__test.managed);await clickText(page,'button','Start offline sandbox');await page.waitForSelector('[aria-label="Managed task sandboxes"] summary');await page.click('[aria-label="Managed task sandboxes"] summary');await clickText(page,'button','Sandbox logs');await page.waitForFunction(()=>document.body.innerText.includes('fixture marker'));
+          await clickText(page,'button','Refresh sandboxes');await clickText(page,'button','Release sandbox');await clickText(page,'button','Keep sandbox');if(await page.evaluate(()=>window.__test.managed.state)!=='active')throw Error('Dismissed release removed sandbox');await clickText(page,'button','Release sandbox');await clickText(page,'button','Confirm release');await page.waitForFunction(()=>document.body.innerText.includes('removal verified'));
         } catch(e){problems.push(`${w} environments: ${e.message}`);}
       }
       if (s === 'review' && setName === 'populated') {

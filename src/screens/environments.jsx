@@ -1,6 +1,7 @@
 import { createMemo, createSignal, createResource, For, Show, onCleanup } from 'solid-js';
 import { activeRepoId, useStore } from '../lib/store.js';
 import { Page } from '../ui/kit.jsx';
+import { ManagedJobs } from './managed-jobs.jsx';
 import { rpc } from '../lib/rpc.js';
 const read=(m,args)=>rpc(`environments.${m}`,args,{local:true});
 
@@ -31,5 +32,5 @@ export default function Environments(){const store=useStore(),[scope,setScope]=c
   async function scan(){const n=++epoch;setScope('machine');setProfile('');setNames(null);setErr('');try{const r=await read('profiles');if(n!==epoch)return;setNames(r);if(r.length===1)setProfile(r[0]);}catch(e){if(n===epoch)setErr(String(e));}}
   return <Page title="Environments" sub="Inspect local runtimes without changing clusters or contexts."><div class="row gap-4"><button aria-pressed={scope()==='checkout'} onClick={()=>{++epoch;setScope('checkout');setProfile('');}}>This checkout</button><button aria-pressed={scope()==='machine'} onClick={scan}>Inspect local machine</button></div>
     <Show when={scope()==='checkout'} fallback={<section><h2>Local machine</h2><p>Colima profiles with local Docker sockets. No workload or cluster is started.</p><Show when={err()}><p role="alert">{err()}</p></Show><Show when={names()} fallback={!err()&&<p>Looking for profiles…</p>}><label>Runtime <select value={profile()} onChange={e=>setProfile(e.currentTarget.value)}><option value="">Choose profile</option><For each={names()}>{p=><option value={p}>{p}</option>}</For></select></label><Show when={!names().length}><p>No local Colima Docker socket found.</p></Show></Show><Show when={profile()} keyed>{p=><Inventory profile={p}/>}</Show></section>}>
-    <Show when={activeRepoId()} keyed fallback={<p>Select a checkout or inspect the local machine.</p>}>{id=><Recorded id={id} name={store.repos()?.find(r=>r.id===id)?.name||'Checkout'}/>}</Show></Show></Page>;
+    <Show when={activeRepoId()} keyed fallback={<p>Select a checkout or inspect the local machine.</p>}>{id=><><ManagedJobs id={id}/><Recorded id={id} name={store.repos()?.find(r=>r.id===id)?.name||'Checkout'}/></>}</Show></Show></Page>;
 }
