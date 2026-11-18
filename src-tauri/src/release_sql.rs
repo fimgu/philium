@@ -375,7 +375,13 @@ pub async fn call(
         };
         cases.push(json!({"id":c["id"],"state":state}));
     }
-    let report = json!({"generation":seq,"pr":r["pr"],"observed":now(),"target":base,"head":head,"ancestor":ancestor,"parents":parents,"driver":profile["driver"],"driver_pin":profile["pin"],"contract_digest":digest(raw.as_bytes()),"sqlite":rusqlite::version(),"cases":cases,"observations":obs,"staging":"not_verified","release_decision":"incomplete"});
+    let blocked = cases.iter().any(|c| {
+        matches!(
+            c["state"].as_str(),
+            Some("composed_head_regression" | "release_range_regression")
+        )
+    });
+    let report = json!({"generation":seq,"pr":r["pr"],"observed":now(),"target":base,"head":head,"ancestor":ancestor,"parents":parents,"driver":profile["driver"],"driver_pin":profile["pin"],"contract_digest":digest(raw.as_bytes()),"sqlite":rusqlite::version(),"cases":cases,"observations":obs,"staging":"not_verified","release_decision":if blocked{"not_ready_at_tested_head"}else{"incomplete"}});
     ctx.db.exec(
         "INSERT INTO sql_receipts(repo,seq,report) VALUES(?,?,?)",
         params![repo, seq, report.to_string()],

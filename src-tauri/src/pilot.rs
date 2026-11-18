@@ -414,7 +414,12 @@ async fn release_graph_fixture(
             || receipt["cases"][1]["state"] != "same_failure_on_target"
             || receipt["cases"][2]["state"] != "incomplete"
             || receipt["staging"] != "not_verified"
-            || receipt["release_decision"] != "incomplete"
+            || receipt["release_decision"]
+                != if index == 0 {
+                    "incomplete"
+                } else {
+                    "not_ready_at_tested_head"
+                }
         {
             return Err(format!(
                 "SQL acceptance failed: expected {expected}, got {}",

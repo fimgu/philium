@@ -17,7 +17,7 @@ axum = { version = "0.8", default-features = false, features = ["http1", "json",
 futures-util = "0.3"
 regex = "1"
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
-rusqlite = { version = "0.43.0", features = ["bundled","hooks","limits"] }
+rusqlite = { version = "0.43.0", features = ["bundled", "hooks", "limits"] }
 portable-pty = "0.9.0"
 libc = "0.2"
 base64 = "0.23.1"
