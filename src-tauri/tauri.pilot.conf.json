@@ -1,0 +1,5 @@
+{
+  "productName": "Philium Pilot",
+  "identifier": "dev.gunnarsson.philium.pilot",
+  "app": { "windows": [{ "title": "Philium Pilot · Separate profile", "width": 1200, "height": 800, "minWidth": 800, "minHeight": 500, "dragDropEnabled": false }] }
+}

@@ -33,6 +33,7 @@ mod secrets;
 mod drafts;
 mod capture;
 mod selfdev;
+mod pilot;
 mod stats;
 mod terminals;
 mod workspace;
@@ -134,6 +135,9 @@ async fn rpc_inner(app: &App, method: String, args: Option<Value>) -> Result<Val
     let ctx = app.ctx.clone();
     let args = args.unwrap_or(Value::Null);
     let (module, m) = method.split_once('.').ok_or("method must be module.name")?;
+    if pilot::active() && ((module == "selfdev" && !matches!(m, "status" | "list")) || (module == "reaper" && !matches!(m, "ledger" | "proposals"))) {
+        return Err("Host cleanup and self-update are disabled in the side-by-side pilot".into());
+    }
     match module {
         "app" => app_call(app, m, args).await,
         "activity" => match m {
@@ -278,6 +282,18 @@ fn philium_root() -> std::path::PathBuf {
 }
 
 fn main() {
+    let config = tauri::generate_context!();
+    let checking = std::env::args().nth(1).as_deref() == Some("--pilot-check");
+    if checking && config.config().identifier != pilot::ID {
+        eprintln!("Not a pilot bundle"); std::process::exit(2);
+    }
+    if config.config().identifier == pilot::ID {
+        if let Err(e) = pilot::prepare() { eprintln!("Could not isolate pilot: {e}"); std::process::exit(1); }
+        if checking {
+            if let Err(e) = tauri::async_runtime::block_on(pilot::check()) { eprintln!("Pilot check failed: {e}"); std::process::exit(1); }
+            return;
+        }
+    }
     let tauri_app = tauri::Builder::default()
         .setup(|app| {
             // PHILIUM_DATA_DIR isolates Improve-Philium previews from real data.
@@ -386,7 +402,7 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![hal, rpc, drafts::drafts_load, drafts::drafts_save, drafts::drafts_put_blob, drafts::drafts_blob, capture::capture_screenshot, capture::open_screen_settings, capture::agent_attachment])
-        .build(tauri::generate_context!())
+        .build(config)
         .expect("error while building Philium");
     tauri_app.run(|handle, event| {
         if let RunEvent::Exit = event {

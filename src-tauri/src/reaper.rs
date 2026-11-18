@@ -22,6 +22,8 @@ fn schema(ctx: &Arc<Ctx>) -> Result<(), String> {
 }
 pub fn init(ctx: &Arc<Ctx>) -> Result<(), String> {
     schema(ctx)?;
+    // A second profile must never adopt or sweep the installed app's resources.
+    if crate::pilot::active() { return Ok(()); }
     // Runs before any module starts a process this run, so every live process
     // row belongs to a previous run that did not shut down cleanly.
     let stale = reap_stale_processes(ctx);
@@ -538,6 +540,7 @@ fn process_rows(
     )
 }
 pub fn teardown_agent(ctx: &Arc<Ctx>, agent_id: &str, force: bool) -> Result<Value, String> {
+    if crate::pilot::active() { return Err("Host resource teardown is disabled in the pilot".into()); }
     let _q = REAP_QUEUE.lock().map_err(|e| e.to_string())?;
     // Recover legacy scratch creation into the ledger before teardown.
     if let Some(a) = ctx
@@ -583,6 +586,9 @@ pub fn reap_stale_processes(ctx: &Arc<Ctx>) -> Value {
 }
 /// App lifecycle hook. Stop agent processes, never containers, clusters or worktrees.
 pub fn shutdown(ctx: &Arc<Ctx>) -> Result<Value, String> {
+    // Agents, terminals and desk already stop their own in-memory child handles.
+    // A PID recorded before a restart is not proof of ownership.
+    if crate::pilot::active() { return Ok(json!({"skipped":"pilot"})); }
     let _q = REAP_QUEUE.lock().map_err(|e| e.to_string())?;
     let mut removed = Vec::new();
     let mut errors = Vec::new();

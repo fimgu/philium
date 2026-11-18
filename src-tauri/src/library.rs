@@ -54,7 +54,7 @@ pub const DEFAULT_RULES: &str = "\
 
 pub fn init(ctx: &Arc<Ctx>) -> Result<(), String> {
     ctx.db.with(|c| c.execute_batch(SCHEMA))?;
-    if ctx.db.kv_get("library.imported_at").is_none() {
+    if !crate::pilot::active() && ctx.db.kv_get("library.imported_at").is_none() {
         let c = ctx.clone();
         std::thread::spawn(move || {
             let r = import(&c, &home());
