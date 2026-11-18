@@ -15,6 +15,9 @@ mod agentshell;
 mod board;
 mod checks;
 mod release_intake;
+mod release_verify;
+mod release_http;
+mod release_scope;
 mod release_sql;
 mod release_members;
 mod release_composition;
@@ -164,6 +167,7 @@ async fn rpc_inner(app: &App, method: String, args: Option<Value>) -> Result<Val
         "agents" => agents::call(&ctx, m, args).await,
         "board" => board::call(&ctx, m, args).await,
         "checks" => checks::call(&ctx, m, args).await,
+        "release_intake" if m=="verify_url" => release_verify::run(&ctx,&ctx::arg_str(&args,"repo_id")?,&ctx::arg_str(&args,"url")?).await,
         "release_intake" => release_intake::call(&ctx,m,args).await,
         "environments" => environments::call(m, args).await,
         #[cfg(unix)] "managed" => managed::call(&ctx, m, args).await,
@@ -297,19 +301,24 @@ fn philium_root() -> std::path::PathBuf {
 
 fn main() {
     if std::env::args().nth(1).as_deref()==Some("--observe-sql-contract") {std::process::exit(if release_sql::worker().is_some(){0}else{2});}
-    let config = tauri::generate_context!();
+    let mut config = tauri::generate_context!();
+    let offscreen=std::env::args().nth(1).as_deref()==Some("--pilot-check-review-form");
+    if offscreen {let home=std::env::var_os("HOME").map(std::path::PathBuf::from);if !cfg!(target_os="macos")||config.config().identifier!=pilot::ID||!home.is_some_and(|p|std::fs::read_to_string(p.join(".philium-pilot-fixture")).ok().as_deref()==Some("disposable\n")){eprintln!("Disposable Pilot home required");std::process::exit(2);}for w in &mut config.config_mut().app.windows{w.visible=false;w.focus=false;w.focusable=false;w.skip_taskbar=true;w.incognito=true;}}
     let checking = std::env::args().nth(1).as_deref() == Some("--pilot-check");
     if checking && config.config().identifier != pilot::ID {
         eprintln!("Not a pilot bundle"); std::process::exit(2);
     }
     if config.config().identifier == pilot::ID {
         if let Err(e) = pilot::prepare() { eprintln!("Could not isolate pilot: {e}"); std::process::exit(1); }
+        if matches!(std::env::args().nth(1).as_deref(),Some("--review-url"|"--pin-review-driver")){match tauri::async_runtime::block_on(release_verify::cli()){Ok(v)=>println!("{}",v),Err(e)=>{eprintln!("Philium: {e}");std::process::exit(2);}}return;}
         if checking {
             if let Err(e) = tauri::async_runtime::block_on(pilot::check()) { eprintln!("Pilot check failed: {e}"); std::process::exit(1); }
             return;
         }
     }
-    let tauri_app = tauri::Builder::default()
+    let builder=tauri::Builder::default();
+    #[cfg(target_os="macos")] let builder=if offscreen{builder.activate_ignoring_other_apps(false)}else{builder};
+    let mut tauri_app = builder
         .setup(|app| {
             // PHILIUM_DATA_DIR isolates Improve-Philium previews from real data.
             let data_dir = match std::env::var("PHILIUM_DATA_DIR") {
@@ -420,7 +429,9 @@ fn main() {
         .invoke_handler(tauri::generate_handler![hal, rpc, drafts::drafts_load, drafts::drafts_save, drafts::drafts_put_blob, drafts::drafts_blob, capture::capture_screenshot, capture::open_screen_settings, capture::agent_attachment])
         .build(config)
         .expect("error while building Philium");
-    tauri_app.run(|handle, event| {
+    #[cfg(target_os="macos")] if offscreen{tauri_app.set_activation_policy(tauri::ActivationPolicy::Prohibited);}
+    tauri_app.run(move |handle, event| {
+        if offscreen && matches!(&event,RunEvent::Ready){pilot::review_form(handle.clone());}
         if let RunEvent::Exit = event {
             if let Some(app) = handle.try_state::<App>() {
                 // Drop UI emits first so the shutdown thread can never queue

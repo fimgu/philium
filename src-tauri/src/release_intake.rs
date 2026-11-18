@@ -75,6 +75,32 @@ pub(crate) fn record(
 fn sha(s: &str) -> bool {
     s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
+pub(crate) async fn github_public(path: &str) -> Option<Value> {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(5))
+        .user_agent("Philium-release-review")
+        .build()
+        .ok()?;
+    let mut r = client
+        .get(format!("https://api.github.com/repos/{path}"))
+        .header("Cache-Control", "no-cache")
+        .send()
+        .await
+        .ok()?;
+    if r.status() != 200 || r.headers().get("link").is_some() {
+        return None;
+    }
+    let mut buf = vec![];
+    while let Some(chunk) = r.chunk().await.ok()? {
+        if buf.len() + chunk.len() > 262144 {
+            return None;
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&buf).ok()
+}
 
 // Only object IDs leave this reader. No subjects, patch contents, hooks or origin requests.
 pub(crate) async fn local_git(path: &Path, args: &[&str]) -> Result<String, String> {
@@ -188,6 +214,20 @@ pub async fn call(ctx: &Ctx, method: &str, a: Value) -> Result<Value, String> {
     )?;
     ctx.db.with(|c| c.execute_batch(SCHEMA))?;
     ctx.db.with(|c| c.execute_batch(ANCHORS))?;
+    if method == "decision" {
+        let seq = a["generation"].as_i64().ok_or("Select a generation")?;
+        if ctx
+            .db
+            .query(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='release_decisions'",
+                [],
+            )?
+            .is_empty()
+        {
+            return Ok(Value::Null);
+        }
+        return match ctx.db.query("SELECT d.summary FROM release_decisions d JOIN release_refs r ON r.seq=d.seq WHERE d.repo=? AND r.repo=d.repo AND r.origin=? AND d.seq=?",params![repo,o,seq])?.pop(){Some(v)=>serde_json::from_str(v["summary"].as_str().unwrap_or("")).map_err(|_|"Invalid saved decision".into()),None=>Ok(Value::Null)};
+    }
     if matches!(method, "members" | "discover_members") {
         return crate::release_members::call(
             ctx,
@@ -232,6 +272,7 @@ pub async fn call(ctx: &Ctx, method: &str, a: Value) -> Result<Value, String> {
  "graph"=>{let seq=a["generation"].as_i64().ok_or("Select a recorded generation")?;let rows=ctx.db.query("SELECT base,head FROM release_refs WHERE repo=? AND origin=? AND seq=?",params![repo,o,seq])?;let row=rows.first().ok_or("Generation does not belong to this checkout")?;graph(Path::new(r[0]["path"].as_str().ok_or("Checkout unavailable")?),&o,row["base"].as_str().ok_or("Invalid base")?,row["head"].as_str().ok_or("Invalid head")?).await},
  "history"=>Ok(json!(ctx.db.query("SELECT seq,pr,base,head,observed FROM release_refs WHERE repo=? AND origin=? ORDER BY seq DESC LIMIT 30",params![repo,o])?)),
  "resolve"=>{let n=target(&arg_str(&a,"url")?,&o)?;let _g=FETCH.try_lock().map_err(|_|"Another origin lookup is in progress")?;
+ if let Some(v)=github_public(&format!("{o}/pulls/{n}")).await{if v["base"]["repo"]["full_name"].as_str().is_some_and(|s|s.eq_ignore_ascii_case(&o)){return record(&ctx.db,&repo,&o,n,&json!({"number":v["number"],"url":v["html_url"],"baseRefOid":v["base"]["sha"],"headRefOid":v["head"]["sha"]}));}}
  let exe=["/opt/homebrew/bin/gh","/usr/local/bin/gh","/usr/bin/gh"].into_iter().find(|p|Path::new(p).is_file()).ok_or("GitHub CLI unavailable")?;
  let mut cmd=tokio::process::Command::new(exe);cmd.current_dir("/").args(["pr","view",&format!("https://github.com/{o}/pull/{n}"),"--json","number,url,baseRefOid,headRefOid"]).env("GH_PROMPT_DISABLED","1").env("GH_HOST","github.com").stdin(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true);
  let out=tokio::time::timeout(Duration::from_secs(12),cmd.output()).await.map_err(|_|"Origin lookup timed out")?.map_err(|_|"Could not start GitHub CLI")?;if !out.status.success()||out.stdout.len()>16384{return Err("Origin lookup failed. Check read access for this repository.".into())}let refs=serde_json::from_slice(&out.stdout).map_err(|_|"Invalid origin response")?;record(&ctx.db,&repo,&o,n,&refs)},_=>Err("Unknown intake action".into())}

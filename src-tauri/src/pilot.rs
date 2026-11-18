@@ -549,3 +549,21 @@ async fn deployment_fixture() -> Result<(), String> {
 fn sql_fixture(broken: bool) -> String {
     format!("CREATE TABLE items(id INTEGER PRIMARY KEY); CREATE VIEW page AS SELECT id FROM items {}; CREATE VIEW legacy AS SELECT id FROM items WHERE id<101;",if broken{"WHERE id<101"}else{""})
 }
+
+// No keystrokes, window APIs or URL supplied by repository content. Only a
+// marked disposable Pilot with one known public checkout can reach this test.
+pub fn review_form(app: tauri::AppHandle) {
+    use tauri::Manager;
+    tauri::async_runtime::spawn(async move {
+        let result=async{let w=app.get_webview_window("main").ok_or("No webview")?;if w.is_visible().unwrap_or(true){return Err("Refusing visible window");}
+ let ctx=&app.state::<crate::App>().ctx;let rows=ctx.db.query("SELECT id FROM repos WHERE lower(remote_url)='https://github.com/typicode/demo.git'",[]).map_err(|_|"No disposable checkout")?;if rows.len()!=1{return Err("Expected one public fixture checkout");}let id=serde_json::to_string(&rows[0]["id"]).map_err(|_|"Invalid checkout")?;
+ let script=include_str!("pilot_review_form.js").replace("__REPO__",&id);
+ for _ in 0..180{let(tx,mut rx)=tokio::sync::mpsc::channel(1);w.eval_with_callback(&script,move|s|{let _=tx.try_send(s);}).map_err(|_|"Cannot inspect form")?;let s=match tokio::time::timeout(std::time::Duration::from_secs(4),rx.recv()).await{Ok(Some(s))=>s,_=>{tokio::time::sleep(std::time::Duration::from_millis(350)).await;continue;}};if let Ok(v)=serde_json::from_str::<serde_json::Value>(&s){if let Some(label)=v["decision"].as_str(){println!("{}",json!({"native_review":label,"head":v["head"],"live_case":v["live_case"]}));return Ok(());}}tokio::time::sleep(std::time::Duration::from_millis(350)).await;}Err("Review form did not render a decision")}.await;
+        if let Err(e) = result {
+            eprintln!("{e}");
+            app.exit(2);
+        } else {
+            app.exit(0);
+        }
+    });
+}

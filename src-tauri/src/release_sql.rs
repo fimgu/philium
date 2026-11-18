@@ -71,6 +71,29 @@ fn spec(raw: &str) -> Result<Value, String> {
             return Err("Invalid or duplicate SQL contract".into());
         }
     }
+    if let Some(live) = v.get("live_cases") {
+        let xs = live
+            .as_array()
+            .filter(|xs| (1..=4).contains(&xs.len()))
+            .ok_or("Choose 1 to 4 live contracts")?;
+        for c in xs {
+            let id = c["id"].as_str().unwrap_or("");
+            if id.is_empty()
+                || id.len() > 64
+                || !id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+                || !seen.insert(id)
+                || !c["path"]
+                    .as_str()
+                    .is_some_and(crate::release_http::valid_path)
+                || !c["pointer"].is_string()
+                || c.get("expect").is_none()
+            {
+                return Err("Invalid or duplicate live contract".into());
+            }
+        }
+    }
     Ok(v)
 }
 fn observe(schema: &str, c: &Value) -> Option<String> {
@@ -387,9 +410,111 @@ pub async fn call(
         .pop()
         .ok_or("Enroll a trusted driver first")?;
     let raw = profile["blob"].as_str().ok_or("Missing enrolled driver")?;
-    let v = spec(raw)?;
+    let mut v = spec(raw)?;
     let base = r["base"].as_str().ok_or("Missing base")?;
     let head = r["head"].as_str().ok_or("Missing head")?;
+    let mut record_pin = Value::Null;
+    let mut verified_evidence = json!({});
+    if v["release_records"] == true {
+        v["artifacts"] = json!({});
+        v["release_review"] = Value::Null;
+        let load = async {
+            let row = ctx
+                .db
+                .query(
+                    "SELECT path FROM repos WHERE id=?",
+                    [profile["driver"].as_str()?],
+                )
+                .ok()?
+                .pop()?;
+            let dp = Path::new(row["path"].as_str()?);
+            let args = ["rev-parse", "--path-format=absolute", "--git-common-dir"];
+            let d = std::fs::canonicalize(local_git(dp, &args).await.ok()?).ok()?;
+            let p = std::fs::canonicalize(local_git(path, &args).await.ok()?).ok()?;
+            if d == p {
+                return None;
+            }
+            let rev = local_git(dp, &["rev-parse", "--verify", "HEAD^{commit}"])
+                .await
+                .ok()?;
+            let pin = profile["pin"].as_str()?;
+            if local_git(dp, &["merge-base", "--all", &rev, pin])
+                .await
+                .ok()?
+                != pin
+            {
+                return None;
+            }
+            let bytes = crate::release_intake::local_git_output(
+                dp,
+                &[
+                    "cat-file",
+                    "blob",
+                    &format!("{rev}:philium/releases/{head}.json"),
+                ],
+                true,
+            )
+            .await
+            .ok()?;
+            if bytes.len() > 32768 {
+                return None;
+            }
+            let att = crate::release_document::strict_value(&bytes)?;
+            if att["driver_pin"] != pin
+                || att["origin"] != o
+                || att["pr"] != r["pr"]
+                || att["base"] != base
+                || att["head"] != head
+            {
+                return None;
+            }
+            let mut evidence = json!({});
+            if let Some(rows) = att["evidence"].as_object().filter(|m| m.len() <= 12) {
+                for (id, r) in rows {
+                    let Some(p) = r["path"]
+                        .as_str()
+                        .filter(|p| p.starts_with("philium/evidence/") && safe_path(p, ".json"))
+                    else {
+                        continue;
+                    };
+                    let Some(bytes) = crate::release_intake::local_git_output(
+                        dp,
+                        &["cat-file", "blob", &format!("{rev}:{p}")],
+                        true,
+                    )
+                    .await
+                    .ok() else {
+                        continue;
+                    };
+                    if bytes.len() > 32768 {
+                        continue;
+                    }
+                    let hash = digest(bytes.as_bytes());
+                    let Some(e) = crate::release_document::strict_value(&bytes) else {
+                        continue;
+                    };
+                    if r["sha256"] == hash
+                        && e["case"] == id.as_str()
+                        && e["head"] == head
+                        && e["status"] == "pass"
+                        && e["observation"]
+                            .as_str()
+                            .is_some_and(|s| !s.trim().is_empty())
+                    {
+                        evidence[id] = json!(hash);
+                    }
+                }
+            }
+            Some((rev, att, evidence))
+        }
+        .await;
+        if let Some((pin, att, evidence)) = load {
+            verified_evidence = evidence;
+            record_pin = json!(pin);
+            v["artifacts"][head] = att["artifact"].clone();
+            v["release_review"] = att;
+        }
+    }
     let g = graph(path, o, base, head).await?;
     let ancestor = g["merge_base"].as_str().ok_or("Missing common ancestor")?;
     let parents: Vec<&str> = g["commits"]
@@ -474,7 +599,52 @@ pub async fn call(
         .and_then(|n| u16::try_from(n).ok())
         .filter(|n| *n >= 1024);
     let provenance = stage_probe(port, head, v["artifacts"][head].as_str().unwrap_or("")).await;
-    let report = json!({"generation":seq,"pr":r["pr"],"observed":now(),"target":base,"head":head,"ancestor":ancestor,"parents":parents,"driver":profile["driver"],"driver_pin":profile["pin"],"contract_digest":digest(raw.as_bytes()),"sqlite":rusqlite::version(),"cases":cases,"observations":obs,"staging":"not_verified","deployment_identity":provenance,"release_decision":if blocked{"not_ready_at_tested_head"}else{"incomplete"}});
+    let mut live = vec![];
+    for c in v["live_cases"].as_array().into_iter().flatten() {
+        let mut observations = vec![];
+        if let (Some(port), Some(hash), Some(endpoint)) = (
+            port,
+            v["artifacts"][head]
+                .as_str()
+                .and_then(|s| s.strip_prefix("sha256:")),
+            c["path"].as_str(),
+        ) {
+            if provenance["state"] == "match" {
+                for _ in 0..2 {
+                    observations.push(
+                        crate::release_http::sample(port, endpoint, head, hash)
+                            .await
+                            .and_then(|body| crate::release_document::observe(&body, c)),
+                    );
+                }
+            }
+        }
+        let s = match observations.as_slice() {
+            [Some(a), Some(b)] if a == b => {
+                if a.starts_with("pass:") {
+                    "pass"
+                } else {
+                    "mismatch"
+                }
+            }
+            _ => "unknown",
+        };
+        live.push(json!({"id":c["id"],"state":s,"observations":observations}));
+    }
+    let after = if live.is_empty() {
+        Value::Null
+    } else {
+        stage_probe(port, head, v["artifacts"][head].as_str().unwrap_or("")).await
+    };
+    let report = json!({"generation":seq,"pr":r["pr"],"observed":now(),"target":base,"head":head,"ancestor":ancestor,"parents":parents,"driver":profile["driver"],"driver_pin":profile["pin"],"contract_digest":digest(raw.as_bytes()),"sqlite":rusqlite::version(),"cases":cases,"observations":obs,"staging":"not_verified","deployment_identity":provenance,"deployment_after":after,"live_cases":live,"release_decision":if blocked{"not_ready_at_tested_head"}else{"incomplete"}});
+    let mut report = report;
+    report["release_record_pin"] = record_pin;
+    report["verified_evidence"] = verified_evidence;
+    report["review_scope_verified"] = json!(crate::release_verify::reviewed(
+        &v["release_review"],
+        &json!({"pr":r["pr"],"base":base,"head":head}),
+        &report
+    ));
     ctx.db.exec(
         "INSERT INTO sql_receipts(repo,seq,report) VALUES(?,?,?)",
         params![repo, seq, report.to_string()],

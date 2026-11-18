@@ -171,8 +171,37 @@ pub async fn call(
         if start.elapsed() > Duration::from_secs(30) {
             break;
         }
-        let Ok(part) = lookup(o, chunk).await else {
-            break;
+        let part = match lookup(o, chunk).await {
+            Ok(v) => v,
+            Err(_) => {
+                let mut found = json!({});
+                for item in chunk {
+                    if start.elapsed() > Duration::from_secs(30) {
+                        break;
+                    }
+                    let Some(oid) = item["oid"].as_str() else {
+                        continue;
+                    };
+                    let Some(v) = crate::release_intake::github_public(&format!(
+                        "{o}/commits/{oid}/pulls?per_page=32"
+                    ))
+                    .await
+                    else {
+                        break;
+                    };
+                    let Some(rows) = v.as_array() else { break };
+                    if rows.iter().all(|r| {
+                        r["base"]["repo"]["full_name"]
+                            .as_str()
+                            .is_some_and(|n| n.eq_ignore_ascii_case(o))
+                            && r.get("merged_at").is_some()
+                            && r["number"].as_i64().is_some_and(|n| n > 0)
+                    }) {
+                        found[oid]=json!(rows.iter().filter(|r|r["merged_at"].is_string()).map(|r|json!({"merged":true,"merge":r["merge_commit_sha"],"number":r["number"]})).collect::<Vec<_>>());
+                    }
+                }
+                found
+            }
         };
         associations
             .as_object_mut()
