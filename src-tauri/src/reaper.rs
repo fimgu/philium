@@ -540,7 +540,6 @@ fn process_rows(
     )
 }
 pub fn teardown_agent(ctx: &Arc<Ctx>, agent_id: &str, force: bool) -> Result<Value, String> {
-    if crate::pilot::active() { return Err("Host resource teardown is disabled in the pilot".into()); }
     let _q = REAP_QUEUE.lock().map_err(|e| e.to_string())?;
     // Recover legacy scratch creation into the ledger before teardown.
     if let Some(a) = ctx
@@ -559,15 +558,40 @@ pub fn teardown_agent(ctx: &Arc<Ctx>, agent_id: &str, force: bool) -> Result<Val
             }
         }
     }
-    process_rows(
-        ctx,
-        rows(ctx, Some(agent_id), None)?
-            .into_iter()
-            .filter(|r| r["state"] != "released")
-            .collect(),
-        true,
-        force,
-    )
+    let mut list: Vec<Value> = rows(ctx, Some(agent_id), None)?
+        .into_iter()
+        .filter(|r| r["state"] != "released")
+        .collect();
+    if crate::pilot::active() {
+        // The Pilot removes only what lives inside its own profile: the agent's worktree,
+        // scratch and port block. It never signals a recorded PID and never touches a
+        // container, cluster or VM; those block the removal with a plain reason instead.
+        let mut own = vec![];
+        for r in list {
+            let handle = r["handle"].as_str().unwrap_or("");
+            match r["kind"].as_str() {
+                Some("worktree" | "scratch_dir" | "tmpdir" | "port" | "port_block") => own.push(r),
+                Some("process" | "terminal") => {
+                    #[cfg(unix)]
+                    let running = handle.parse::<i32>().is_ok_and(|pid| pid > 1 && unsafe { libc::kill(pid, 0) } == 0);
+                    #[cfg(not(unix))]
+                    let running = true;
+                    if running {
+                        return Err("A command recorded for this agent is still running. Stop it, then remove the agent.".into());
+                    }
+                    if let Some(id) = r["id"].as_str() {
+                        release(ctx, id);
+                    }
+                }
+                Some(kind) => {
+                    return Err(format!("This agent recorded a {kind} ({handle}). The Pilot does not remove host resources. Release it yourself, then remove the agent."));
+                }
+                None => {}
+            }
+        }
+        list = own;
+    }
+    process_rows(ctx, list, true, force)
 }
 /// Startup hook: stop processes a crashed previous run left behind. Identity
 /// checks in `stop_process` make a reused PID safe (it is never signalled).

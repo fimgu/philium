@@ -7,10 +7,19 @@ import { playSound } from "./sound.js";
 const [activeRepoId, setActiveRepoIdRaw] = createSignal(localStorage.getItem("philium.activeRepo") || "");
 export { activeRepoId };
 
+// The profile remembers the selected checkout too, so a reopen restores it even where the
+// web store is not kept. A choice made before that answer arrives wins.
+let chosen = false;
+rpc("app.settings_get").then((s) => {
+  if (!chosen && typeof s?.active_repo === "string") setActiveRepoIdRaw(s.active_repo);
+}).catch(() => {});
+
 export function setActiveRepoId(id) {
   const next = id || "";
+  chosen = true;
   setActiveRepoIdRaw(next);
   localStorage.setItem("philium.activeRepo", next);
+  rpc("app.settings_set", { key: "active_repo", value: next }, { local: true }).catch(() => {});
 }
 
 // In-memory event cache per agent id so switching agents never flashes empty/loading.

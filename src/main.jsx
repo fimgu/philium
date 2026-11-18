@@ -80,6 +80,11 @@ function App() {
     const r = route();
     setVisited((prev) => (prev.includes(r) ? prev : [...prev, r]));
   });
+  // A checkout that was unregistered must not stay selected and silently empty every screen.
+  createEffect(() => {
+    const list = store.repos();
+    if (store.repos.state === "ready" && activeRepoId() && !(list ?? []).some((r) => r.id === activeRepoId())) setActiveRepoId("");
+  });
   const failing = () => Object.entries(failures()).filter(([k]) => !k.startsWith("browser.") && k !== "app.status");
   const retry = () => { clearFailures(); refresh(); setVisited([route()]); setAttempt((n) => n + 1); };
   onMount(() => {

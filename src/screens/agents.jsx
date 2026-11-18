@@ -271,6 +271,8 @@ function Changes(props) {
       <Impact id={props.id} />
       <Show when={diff()?.error}><div class="err small">{diff().error}</div></Show>
       <Show when={diff() && !diff().error && !(diff().patch || diff().stat)}><Empty title="No changes yet" /></Show>
+      <Show when={(diff()?.untracked || []).length}><p class="small" aria-label="New files not added yet">{diff().untracked.length} new file(s) not added yet: {diff().untracked.slice(0, 12).join(", ")}{diff().untracked.length > 12 ? " …" : ""}</p></Show>
+      <Show when={diff()?.truncated}><p class="small dim">Some changes are too large to show here. Open the worktree to inspect everything.</p></Show>
       <Show when={diff()?.stat}><pre class="conv-pre">{diff().stat}</pre></Show>
       <Show when={diff()?.patch}><pre class="conv-pre diff">{diff().patch}</pre></Show>
     </div>
@@ -428,7 +430,8 @@ function AgentView(props) {
   };
   const store = useStore();
   const [events, setEvents] = createSignal([]);
-  const [info, { refetch }] = createResource(() => props.id, (id) => rpc("agents.get", { id }));
+  // An agent that was just removed must not take the whole screen down with a failed read.
+  const [info, { refetch }] = createResource(() => props.id, (id) => rpc("agents.get", { id }, { local: true }).catch(() => null));
   const models = store.models;
   const providers = store.providers;
   const [historyLoading, setHistoryLoading] = createSignal(false);

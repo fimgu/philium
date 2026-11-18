@@ -58,6 +58,8 @@ fn changed(ctx: &Arc<Ctx>) {
     ctx.notify("board");
 }
 fn event(ctx: &Arc<Ctx>, id: &str, actor: &str, kind: &str, body: &Value) -> Result<(), String> {
+    // History names the agent, never its internal id.
+    let actor = identity(ctx, actor).map(|x| x.0).unwrap_or_else(|_| actor.to_owned());
     ctx.db.exec(
         "INSERT INTO task_events(task_id,actor,kind,body,created_at) VALUES(?1,?2,?3,?4,?5)",
         rusqlite::params![id, actor, kind, body.to_string(), now()],
@@ -508,7 +510,20 @@ pub fn send(ctx: &Arc<Ctx>, from: &str, to: &str, body: &str) -> Result<Value, S
         .remove(0);
     ctx.emit("mail:new", v.clone());
     ctx.notify("mail");
+    // A report or a redirect reaches an idle agent's conversation without anyone polling.
+    if let Some(agent) = ctx.db.query("SELECT agent_id FROM agent_mail_delivery WHERE message_id=?1", [msg])?.pop() {
+        if let Some(id) = agent["agent_id"].as_str() {
+            crate::agents::deliver_mail(ctx, id);
+        }
+    }
     Ok(v)
+}
+/// Unread mail an idle agent is told about on its own: from the person, from its lead, or
+/// from a helper it started. Mail between unrelated agents stays in the inbox. Marks it read.
+pub fn take_deliverable(ctx: &Arc<Ctx>, id: &str, name: &str) -> Result<Vec<Value>, String> {
+    let rows = ctx.db.query("SELECT m.id,m.from_agent,m.body FROM agent_mail_delivery d JOIN agents a ON a.id=d.agent_id AND a.repo_id=d.repo_id AND a.model_ref=d.model_ref JOIN messages m ON m.id=d.message_id LEFT JOIN mail_reads r ON r.message_id=m.id AND r.agent=a.name LEFT JOIN agents s ON s.name=m.from_agent WHERE a.id=?1 AND r.read_at IS NULL AND (m.from_agent='you' OR s.id=a.parent_id OR s.parent_id=a.id) ORDER BY m.id LIMIT 20", [id])?;
+    finish_inbox(ctx, name, rows.clone(), true)?;
+    Ok(rows)
 }
 pub fn inbox(
     ctx: &Arc<Ctx>,

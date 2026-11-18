@@ -697,8 +697,32 @@ fn dispatch(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, String> 
                 path,
                 &["diff", "--no-ext-diff", "--no-textconv", base, "--"],
             )?);
+            // New files the agent has not added yet are part of its result. They are listed, and
+            // small text files are shown in full, so "no changes" never hides fresh work.
+            let listed = git(path, &["ls-files", "--others", "--exclude-standard", "--"]).unwrap_or_default();
+            let untracked: Vec<&str> = listed.lines().filter(|l| !l.is_empty()).take(200).collect();
+            let (mut stat, mut patch, mut cut) = (stat, patch, s || p || listed.lines().count() > 200);
+            for name in &untracked {
+                let file = path.join(name);
+                let shown = std::fs::symlink_metadata(&file).ok().filter(|m| m.is_file() && m.len() <= 16384)
+                    .and_then(|_| std::fs::read(&file).ok())
+                    .filter(|b| !b.contains(&0))
+                    .and_then(|b| String::from_utf8(b).ok());
+                stat.push_str(&format!("{}{name} (new, not added)\n", if stat.is_empty() || stat.ends_with('\n') { " " } else { "\n " }));
+                match shown {
+                    Some(text) if patch.len() + text.len() < 200_000 => {
+                        patch.push_str(&format!("{}diff --git a/{name} b/{name}\nnew file (not added)\n--- /dev/null\n+++ b/{name}\n", if patch.is_empty() || patch.ends_with('\n') { "" } else { "\n" }));
+                        for line in text.lines() {
+                            patch.push('+');
+                            patch.push_str(line);
+                            patch.push('\n');
+                        }
+                    }
+                    _ => cut = true,
+                }
+            }
             Ok(
-                json!({"stat":stat,"patch":patch,"truncated":s||p,"note":"Untracked files are listed in status, not included in the patch"}),
+                json!({"stat":stat,"patch":patch,"truncated":cut,"untracked":untracked,"note":"New files that are not added yet are listed. Small text files are shown in full."}),
             )
         }
         "log" => {

@@ -602,6 +602,9 @@ async fn provision(ctx: &Arc<Ctx>, id: &str, fresh: bool, brief: Option<String>)
 
     if let Some(b) = brief.filter(|b| !b.trim().is_empty()) {
         send(ctx, id, &b).await?;
+    } else {
+        // A resumed agent picks up what arrived while it was stopped.
+        deliver_mail(ctx, id);
     }
     Ok(())
 }
@@ -726,6 +729,9 @@ fn apply_event(ctx: &Arc<Ctx>, id: &str, ev: &Value) {
     let ty = ev["type"].as_str().unwrap_or("");
     let current = get_row(ctx, id).and_then(|r| r["state"].as_str().map(str::to_string)).unwrap_or_default();
     if let Some(s) = next_state(&current, ty) {
+        if s == "idle" {
+            deliver_mail(ctx, id);
+        }
         if s != current {
             set_state(ctx, id, s);
         }
@@ -765,6 +771,40 @@ pub async fn send_with_images(_ctx: &Arc<Ctx>, id: &str, text: &str, images: Val
     r.hal
         .call(reqwest::Method::POST, &format!("/sessions/{}/messages", r.session), Some(message_body(text, images)))
         .await
+}
+
+/// Hand an idle agent the mail it should act on: from the person, its lead or its helpers.
+/// Called when mail arrives, when a turn ends and after a start. A busy agent gets it when
+/// its turn ends. At most 30 automatic deliveries an hour per agent, so two agents cannot
+/// keep each other busy; beyond that the mail waits in the inbox.
+pub fn deliver_mail(ctx: &Arc<Ctx>, id: &str) {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else { return };
+    let (ctx, id) = (ctx.clone(), id.to_owned());
+    handle.spawn(async move {
+        // Let the turn that just ended settle before starting another.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let Some(row) = get_row(&ctx, &id) else { return };
+        if row["state"] != "idle" || runtime(&id).is_none() {
+            return;
+        }
+        let key = format!("agent.mailwake.{id}");
+        let (start, count) = ctx.db.kv_get(&key).and_then(|v| v.split_once(':').and_then(|(a, b)| Some((a.parse::<i64>().ok()?, b.parse::<u32>().ok()?)))).unwrap_or((0, 0));
+        let (start, count) = if now() - start > 3_600_000 { (now(), 0) } else { (start, count) };
+        if count >= 30 {
+            return;
+        }
+        let name = row["name"].as_str().unwrap_or_default().to_owned();
+        let mail = match crate::board::take_deliverable(&ctx, &id, &name) {
+            Ok(m) if !m.is_empty() => m,
+            _ => return,
+        };
+        let _ = ctx.db.kv_set(&key, &format!("{start}:{}", count + 1));
+        let lines: Vec<String> = mail.iter().map(|m| format!("From {}: {}", m["from_agent"].as_str().unwrap_or("?"), m["body"].as_str().unwrap_or(""))).collect();
+        let text = format!("Mail delivered by Philium while you were idle:\n{}\n\nAct on it. Reply with mail_send only when there is something to report or ask, not to acknowledge.", lines.join("\n"));
+        if let Err(e) = send(&ctx, &id, &text).await {
+            ctx.log_event("agent_mail_undelivered", Some(&id), &json!({ "error": e }));
+        }
+    });
 }
 
 /// Stop the HAL and everything that runs on the agent's behalf. Keeps the
@@ -1001,7 +1041,10 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
                 "SELECT * FROM resources WHERE agent_id=?1 AND state!='released' ORDER BY created_at",
                 [&id]
             )?);
-            row["children"] = json!(ctx.db.query("SELECT id,name,state FROM agents WHERE parent_id=?1", [&id])?);
+            row["children"] = json!(ctx.db.query("SELECT id,name,state,role FROM agents WHERE parent_id=?1", [&id])?);
+            if let Some(parent) = row["parent_id"].as_str().and_then(|p| get_row(ctx, p)) {
+                row["parent_name"] = parent["name"].clone();
+            }
             Ok(row)
         }
         "spawn" => spawn(
