@@ -116,10 +116,10 @@ pub async fn check() -> Result<(), String> {
             if phase == "seed" {
                 fs::create_dir_all(&path).map_err(|e| e.to_string())?;
                 workspace::git(&path, &["init", "-b", "main"])?;
-                if name=="alpha" {fs::write(path.join("schema.sql"),sql_fixture(false)).map_err(|e|e.to_string())?;}else{
+                if name=="alpha" {fs::write(path.join("display.json"),r#"{"columns":["name","status"]}"#).map_err(|e|e.to_string())?;workspace::git(&path,&["add","--","display.json"])?;fs::write(path.join("schema.sql"),sql_fixture(false)).map_err(|e|e.to_string())?;}else{
                     fs::create_dir(path.join("philium")).map_err(|e|e.to_string())?;
                     let seed="WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<101) INSERT INTO items SELECT i FROM n";
-                    let cases=json!([{"id":"page-101","seed":seed,"query":"SELECT id FROM page ORDER BY id LIMIT 1 OFFSET 100","expect":[[101]]},{"id":"legacy-101","seed":seed,"query":"SELECT id FROM legacy WHERE id=101","expect":[[101]]},{"id":"missing-view","seed":seed,"query":"SELECT * FROM absent","expect":[]}]);
+                    let cases=json!([{"id":"page-101","seed":seed,"query":"SELECT id FROM page ORDER BY id LIMIT 1 OFFSET 100","expect":[[101]]},{"id":"legacy-101","seed":seed,"query":"SELECT id FROM legacy WHERE id=101","expect":[[101]]},{"id":"missing-view","seed":seed,"query":"SELECT * FROM absent","expect":[]},{"id":"second-column","document":"display.json","pointer":"/columns/1","expect":"status"}]);
                     fs::write(path.join("philium/sql-contracts.json"),json!({"schema":"schema.sql","cases":cases}).to_string()).map_err(|e|e.to_string())?;}
                 workspace::git(&path,&["add","--",if name=="alpha"{"schema.sql"}else{"philium/sql-contracts.json"}])?;
                 workspace::git(
@@ -281,11 +281,20 @@ async fn release_graph_fixture(
         let direct = node("direct", &[&root], good)?;
         let child = node("child", &[&root], good)?;
         fs::write(path.join("schema.sql"), sql_fixture(true)).map_err(|e| e.to_string())?;
-        workspace::git(path, &["add", "--", "schema.sql"])?;
+        fs::write(path.join("display.json"), r#"{"columns":["name"]}"#)
+            .map_err(|e| e.to_string())?;
+        workspace::git(path, &["add", "--", "schema.sql", "display.json"])?;
         let bad = workspace::git(path, &["write-tree"])?;
         workspace::git(
             path,
-            &["restore", "--staged", "--worktree", "--", "schema.sql"],
+            &[
+                "restore",
+                "--staged",
+                "--worktree",
+                "--",
+                "schema.sql",
+                "display.json",
+            ],
         )?;
         let merged = node("integration", &[&direct, &child], &bad)?;
         let url = "https://github.com/philium-fixture/offline/pull/1";
@@ -389,6 +398,30 @@ async fn release_graph_fixture(
             if !call("sql_receipt", args.clone()).await?.is_null() {
                 return Err("New head inherited evidence".into());
             }
+            if !call("members", args.clone()).await?.is_null() {
+                return Err("New head inherited PR associations".into());
+            }
+            let graph = call("graph", args.clone()).await?;
+            let outer = oid("merged")?;
+            let inner = graph["commits"]
+                .as_array()
+                .and_then(|cs| cs.iter().find(|c| c["oid"] == outer))
+                .and_then(|c| c["parents"][1].as_str())
+                .ok_or("Missing fixture child")?;
+            let mut fixture = json!({});
+            for (pr, pin) in [(30, outer.as_str()), (31, inner)] {
+                fixture[pin] = json!([{"merged":true,"merge":pin,"number":pr}]);
+            }
+            let m = crate::release_members::save(
+                &app.ctx,
+                &json!({"pr":2,"head":h}),
+                gen["generation"].as_i64().ok_or("Missing generation")?,
+                &graph["commits"],
+                &fixture,
+            )?;
+            if m["edges"] != json!([{"outer":30,"inner":31}]) {
+                return Err("Nested fixture membership not established".into());
+            }
             call("sql_compare", args).await?;
         }
     }
@@ -404,6 +437,24 @@ async fn release_graph_fixture(
     }
     for (index, r) in found.iter().enumerate() {
         let receipt = call("sql_receipt", json!({"repo_id":repo,"generation":r["seq"]})).await?;
+        let evidence = receipt["cases"][3]["landed_evidence"]
+            .as_array()
+            .ok_or("Missing landed document evidence")?;
+        if !evidence
+            .iter()
+            .any(|c| c["pr"] == 31 && c["result"] == "pass")
+            || !evidence.iter().any(|c| {
+                c["pr"] == 30
+                    && c["result"]
+                        == if index == 0 {
+                            "different_failure"
+                        } else {
+                            "same_failure_as_candidate"
+                        }
+            })
+        {
+            return Err("Landed commit evidence incorrect".into());
+        }
         let expected = if index == 0 {
             "candidate_pass"
         } else {
@@ -413,6 +464,8 @@ async fn release_graph_fixture(
             || receipt["cases"][0]["state"] != expected
             || receipt["cases"][1]["state"] != "same_failure_on_target"
             || receipt["cases"][2]["state"] != "incomplete"
+            || receipt["cases"][3]["state"] != expected
+            || receipt["deployment_identity"]["state"] != "absent"
             || receipt["staging"] != "not_verified"
             || receipt["release_decision"]
                 != if index == 0 {
@@ -433,8 +486,64 @@ async fn release_graph_fixture(
             return Err("Peer could read private receipt".into());
         }
     }
-    println!("SQL: record 101 absent only on merged head, restored on new head; legacy failure present on target; missing view and staging not credited. Both private generation receipts isolated.");
+    if !seed {
+        let args = json!({"repo_id":repo,"generation":found[0]["seq"]});
+        let prev = call("sql_receipt", args.clone()).await?;
+        let fresh = call("sql_compare", args).await?;
+        if fresh["head"] != prev["head"]
+            || fresh["observed"].as_i64() <= prev["observed"].as_i64()
+            || fresh["release_decision"] != "incomplete"
+        {
+            return Err("Restart did not produce a fresh incomplete decision".into());
+        }
+    }
+    deployment_fixture().await?;
+    println!("SQL and JSON: merged head regresses, fixed revision restores both. Nested fixture PRs differ. Historical and fresh receipts isolated. Observer: mixed, stale and match distinguished; no staging workflow credit.");
     println!("Release graph: divergent target excluded, merge parents preserved, peer denied. Follow-up covers both commits since the reviewed revision (fixture origin metadata).");
+    Ok(())
+}
+async fn deployment_fixture() -> Result<(), String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let head = "a".repeat(40);
+    let digest = format!("sha256:{}", "b".repeat(64));
+    for expected in ["mixed", "unknown", "match"] {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .map_err(|_| "Fixture listener unavailable")?;
+        let port = listener.local_addr().map_err(|_| "No port")?.port();
+        let replica = json!({"revision":head,"digest":digest,"ready":true});
+        let mut peer = replica.clone();
+        if expected == "mixed" {
+            peer["revision"] = json!("c".repeat(40));
+        }
+        let body=json!({"observed_ms":crate::db::now()-if expected=="unknown"{180000}else{0},"complete":true,"replicas":[replica,peer]}).to_string();
+        let serve = async move {
+            let (mut tcp, _) = listener.accept().await.ok()?;
+            let mut buf = [0; 1024];
+            let n = tcp.read(&mut buf).await.ok()?;
+            if !buf[..n].starts_with(b"GET /.well-known/philium/deployment HTTP/1.1\r\n") {
+                return None;
+            }
+            tcp.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .ok()
+        };
+        let (served, state) = tokio::join!(
+            tokio::time::timeout(std::time::Duration::from_secs(4), serve),
+            crate::release_sql::stage_probe(Some(port), &head, &digest)
+        );
+        if !matches!(served, Ok(Some(()))) || state["state"] != expected {
+            return Err(format!(
+                "Deployment fixture expected {expected}, got {state}"
+            ));
+        }
+    }
     Ok(())
 }
 fn sql_fixture(broken: bool) -> String {

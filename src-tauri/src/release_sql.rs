@@ -27,18 +27,19 @@ fn digest(b: &[u8]) -> String {
         .map(|x| format!("{x:02x}"))
         .collect()
 }
-fn spec(raw: &str) -> Result<Value, String> {
-    let v: Value = serde_json::from_str(raw).map_err(|_| "Invalid driver JSON")?;
-    let path = v["schema"].as_str().ok_or("Missing schema path")?;
-    if path.len() > 200
-        || !path.ends_with(".sql")
-        || !path.split('/').all(|p| {
-            !p.is_empty()
-                && !p.starts_with('.')
-                && p.bytes()
+fn safe_path(p: &str, ext: &str) -> bool {
+    p.len() <= 200
+        && p.ends_with(ext)
+        && p.split('/').all(|s| {
+            !s.is_empty()
+                && !s.starts_with('.')
+                && s.bytes()
                     .all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))
         })
-    {
+}
+fn spec(raw: &str) -> Result<Value, String> {
+    let v = crate::release_document::strict_value(raw).ok_or("Invalid or ambiguous driver JSON")?;
+    if !v["schema"].is_null() && !v["schema"].as_str().is_some_and(|p| safe_path(p, ".sql")) {
         return Err("Invalid SQL schema path".into());
     }
     let cs = v["cases"]
@@ -54,9 +55,18 @@ fn spec(raw: &str) -> Result<Value, String> {
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
             || !seen.insert(id)
-            || !c["query"].is_string()
-            || !c["seed"].is_string()
-            || !c["expect"].is_array()
+            || !(if c.get("document").is_some() {
+                c["document"]
+                    .as_str()
+                    .is_some_and(|p| safe_path(p, ".json"))
+                    && c["pointer"].is_string()
+                    && c.get("expect").is_some()
+            } else {
+                v["schema"].is_string()
+                    && c["query"].is_string()
+                    && c["seed"].is_string()
+                    && c["expect"].is_array()
+            })
         {
             return Err("Invalid or duplicate SQL contract".into());
         }
@@ -174,6 +184,42 @@ pub fn worker() -> Option<()> {
     Some(())
 }
 async fn run_one(path: &Path, oid: &str, v: &Value) -> Option<Value> {
+    let cases = v["cases"].as_array()?;
+    let sql: Vec<_> = cases
+        .iter()
+        .filter(|c| c.get("document").is_none())
+        .collect();
+    let rows = if sql.is_empty() {
+        Value::Null
+    } else {
+        run_sql(path, oid, &json!({"schema":v["schema"],"cases":sql}))
+            .await
+            .unwrap_or(Value::Null)
+    };
+    let mut i = 0;
+    let mut out = vec![];
+    for c in cases {
+        if let Some(p) = c["document"].as_str() {
+            let mut attempts = vec![];
+            for _ in 0..2 {
+                let s = crate::release_intake::local_git_output(
+                    path,
+                    &["cat-file", "blob", &format!("{oid}:{p}")],
+                    true,
+                )
+                .await
+                .ok();
+                attempts.push(s.and_then(|d| crate::release_document::observe(&d, c)));
+            }
+            out.push(json!(attempts));
+        } else {
+            out.push(rows[i].clone());
+            i += 1;
+        }
+    }
+    Some(json!(out))
+}
+async fn run_sql(path: &Path, oid: &str, v: &Value) -> Option<Value> {
     let schema = local_git(
         path,
         &[
@@ -229,6 +275,7 @@ pub async fn call(
     path: &Path,
 ) -> Result<Value, String> {
     ctx.db.with(|c| c.execute_batch(DB))?;
+    ctx.db.with(|c|c.execute_batch("CREATE TABLE IF NOT EXISTS release_stage_ports(repo TEXT PRIMARY KEY REFERENCES repos(id) ON DELETE CASCADE,port INTEGER NOT NULL)"))?;
     if method == "sql_drivers" {
         return Ok(json!(ctx.db.query(
             "SELECT id,name FROM repos WHERE id!=? ORDER BY name,id LIMIT 200",
@@ -283,10 +330,26 @@ pub async fn call(
         if snapshot.len() > 32768 {
             return Err("Driver exceeds 32 KiB".into());
         }
-        ctx.db.exec(
-            "INSERT OR REPLACE INTO sql_profiles(repo,driver,pin,blob) VALUES(?,?,?,?)",
-            params![repo, driver, pin, snapshot],
-        )?;
+        let port = if a["stage_port"].is_null() {
+            0
+        } else {
+            a["stage_port"]
+                .as_u64()
+                .filter(|p| (1024..=65535).contains(p))
+                .ok_or("Choose an explicit unprivileged local observer port")?
+        };
+        ctx.db.with(|c| {
+            let tx = c.unchecked_transaction()?;
+            tx.execute(
+                "INSERT OR REPLACE INTO sql_profiles(repo,driver,pin,blob) VALUES(?,?,?,?)",
+                params![repo, driver, pin, snapshot],
+            )?;
+            tx.execute(
+                "INSERT OR REPLACE INTO release_stage_ports(repo,port) VALUES(?,?)",
+                params![repo, port as i64],
+            )?;
+            tx.commit()
+        })?;
         return Ok(json!({"pin":pin,"cases":v["cases"].as_array().unwrap().len()}));
     }
     let seq = a["generation"].as_i64().ok_or("Select a generation")?;
@@ -347,12 +410,33 @@ pub async fn call(
         crate::environments::call("profiles", json!({})).await,
     )?;
     let mut obs = BTreeMap::new();
+    let membership = crate::release_members::call(ctx, repo, o, path, seq, false).await?;
+    let children = membership["landed"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|r| Some((r["pr"].as_i64()?, r["oid"].as_str()?)))
+        .filter(|(_, oid)| {
+            g["commits"]
+                .as_array()
+                .is_some_and(|cs| cs.iter().any(|c| c["oid"] == *oid))
+        })
+        .collect::<Vec<_>>();
     let mut pins = BTreeSet::from([head, base, ancestor]);
     if parents.len() == 2 {
         pins.extend(parents.iter().copied());
     }
     for pin in pins {
         obs.insert(pin, run_one(path, pin, &v).await.unwrap_or(Value::Null));
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
+    for (_, pin) in children.iter().take(8) {
+        if !obs.contains_key(pin) {
+            let Ok(value) = tokio::time::timeout_at(deadline, run_one(path, pin, &v)).await else {
+                break;
+            };
+            obs.insert(*pin, value.unwrap_or(Value::Null));
+        }
     }
     let mut cases = vec![];
     for (i, c) in v["cases"].as_array().unwrap().iter().enumerate() {
@@ -373,7 +457,8 @@ pub async fn call(
             (Some(_), Some(_)) => "failure_unattributed",
             _ => "incomplete",
         };
-        cases.push(json!({"id":c["id"],"state":state}));
+        let landed_evidence=children.iter().map(|(pr,oid)|{let child=s(oid);json!({"pr":pr,"oid":oid,"result":if child.is_none(){"untested"}else if pass(child){"pass"}else if child==h{"same_failure_as_candidate"}else{"different_failure"}})}).collect::<Vec<_>>();
+        cases.push(json!({"id":c["id"],"state":state,"landed_evidence":landed_evidence}));
     }
     let blocked = cases.iter().any(|c| {
         matches!(
@@ -381,10 +466,58 @@ pub async fn call(
             Some("composed_head_regression" | "release_range_regression")
         )
     });
-    let report = json!({"generation":seq,"pr":r["pr"],"observed":now(),"target":base,"head":head,"ancestor":ancestor,"parents":parents,"driver":profile["driver"],"driver_pin":profile["pin"],"contract_digest":digest(raw.as_bytes()),"sqlite":rusqlite::version(),"cases":cases,"observations":obs,"staging":"not_verified","release_decision":if blocked{"not_ready_at_tested_head"}else{"incomplete"}});
+    let port = ctx
+        .db
+        .query("SELECT port FROM release_stage_ports WHERE repo=?", [repo])?
+        .pop()
+        .and_then(|r| r["port"].as_u64())
+        .and_then(|n| u16::try_from(n).ok())
+        .filter(|n| *n >= 1024);
+    let provenance = stage_probe(port, head, v["artifacts"][head].as_str().unwrap_or("")).await;
+    let report = json!({"generation":seq,"pr":r["pr"],"observed":now(),"target":base,"head":head,"ancestor":ancestor,"parents":parents,"driver":profile["driver"],"driver_pin":profile["pin"],"contract_digest":digest(raw.as_bytes()),"sqlite":rusqlite::version(),"cases":cases,"observations":obs,"staging":"not_verified","deployment_identity":provenance,"release_decision":if blocked{"not_ready_at_tested_head"}else{"incomplete"}});
     ctx.db.exec(
         "INSERT INTO sql_receipts(repo,seq,report) VALUES(?,?,?)",
         params![repo, seq, report.to_string()],
     )?;
     Ok(report)
+}
+
+pub(crate) async fn stage_probe(port: Option<u16>, head: &str, digest: &str) -> Value {
+    let observed = async {
+        let port = port?;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .ok()?;
+        let mut res = client
+            .get(format!(
+                "http://127.0.0.1:{port}/.well-known/philium/deployment"
+            ))
+            .send()
+            .await
+            .ok()?;
+        if res.status() != reqwest::StatusCode::OK {
+            return None;
+        }
+        let mut buf = vec![];
+        while let Some(chunk) = res.chunk().await.ok()? {
+            if buf.len() + chunk.len() > 32768 {
+                return None;
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        crate::release_document::strict_value(std::str::from_utf8(&buf).ok()?)
+            .filter(Value::is_object)
+    }
+    .await
+    .unwrap_or_else(|| {
+        if port.is_some() {
+            json!({})
+        } else {
+            Value::Null
+        }
+    });
+    crate::release_stage::assess(head, digest, &observed, now())
 }

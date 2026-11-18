@@ -78,6 +78,13 @@ fn sha(s: &str) -> bool {
 
 // Only object IDs leave this reader. No subjects, patch contents, hooks or origin requests.
 pub(crate) async fn local_git(path: &Path, args: &[&str]) -> Result<String, String> {
+    local_git_output(path, args, false).await
+}
+pub(crate) async fn local_git_output(
+    path: &Path,
+    args: &[&str],
+    exact: bool,
+) -> Result<String, String> {
     use tokio::io::AsyncReadExt;
     let mut child = tokio::process::Command::new("/usr/bin/git")
         .current_dir(path)
@@ -116,7 +123,7 @@ pub(crate) async fn local_git(path: &Path, args: &[&str]) -> Result<String, Stri
             return Err("Pinned history unavailable locally. No fetch was attempted.".into());
         }
         String::from_utf8(buf)
-            .map(|s| s.trim_end().to_owned())
+            .map(|s| if exact { s } else { s.trim_end().to_owned() })
             .map_err(|_| "Invalid Git response".into())
     })
     .await
@@ -181,6 +188,17 @@ pub async fn call(ctx: &Ctx, method: &str, a: Value) -> Result<Value, String> {
     )?;
     ctx.db.with(|c| c.execute_batch(SCHEMA))?;
     ctx.db.with(|c| c.execute_batch(ANCHORS))?;
+    if matches!(method, "members" | "discover_members") {
+        return crate::release_members::call(
+            ctx,
+            &repo,
+            &o,
+            Path::new(r[0]["path"].as_str().ok_or("Missing checkout")?),
+            a["generation"].as_i64().ok_or("Select generation")?,
+            method == "discover_members",
+        )
+        .await;
+    }
     if method.starts_with("sql_") {
         return crate::release_sql::call(
             ctx,
