@@ -63,6 +63,36 @@ fn child_dir(parent: &Path, name: &str) -> Result<PathBuf, String> {
     Ok(p)
 }
 
+/// PATH as the person's login shell sets it. Bounded: a slow or chatty profile is ignored.
+fn login_path(home: &Path) -> Option<std::ffi::OsString> {
+    use std::io::Read;
+    let shell = env::var_os("SHELL").map(PathBuf::from).filter(|s| s.is_absolute() && s.is_file()).or_else(|| Some(PathBuf::from("/bin/zsh")).filter(|s| s.is_file()))?;
+    let mut child = std::process::Command::new(shell)
+        .args(["-l", "-c", "printf '\\n__PHILIUM_PATH__%s\\n' \"$PATH\""])
+        .env("HOME", home)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(25)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let mut out = String::new();
+    child.stdout.take()?.take(65536).read_to_string(&mut out).ok()?;
+    let path = out.lines().rev().find_map(|l| l.strip_prefix("__PHILIUM_PATH__"))?.trim();
+    (!path.is_empty() && path.len() < 16384 && path.contains('/')).then(|| path.into())
+}
+
 pub fn prepare() -> Result<(), String> {
     let home = PathBuf::from(env::var_os("HOME").ok_or("HOME missing")?)
         .canonicalize()
@@ -88,12 +118,19 @@ pub fn prepare() -> Result<(), String> {
     for k in foreign {
         env::remove_var(k);
     }
-    if let Some(path) = env::var_os("PATH") {
-        let other = home.join(".jcode");
-        let kept: Vec<_> = env::split_paths(&path)
-            .filter(|p| !p.starts_with(&other))
-            .collect();
-        if let Ok(joined) = env::join_paths(kept) {
+    // A window opened from the Dock gets the system's bare PATH, so agents and checks would not
+    // find the toolchains a terminal has. Ask the person's login shell for theirs, once, while
+    // HOME still names their own home. Entries of another agent harness are left out.
+    let mut entries: Vec<PathBuf> = login_path(&home).map(|p| env::split_paths(&p).collect()).unwrap_or_default();
+    for p in env::var_os("PATH").map(|p| env::split_paths(&p).collect::<Vec<_>>()).unwrap_or_default() {
+        if !entries.contains(&p) {
+            entries.push(p);
+        }
+    }
+    let other = home.join(".jcode");
+    entries.retain(|p| p.is_absolute() && !p.starts_with(&other));
+    if let Ok(joined) = env::join_paths(entries) {
+        if !joined.is_empty() {
             env::set_var("PATH", joined);
         }
     }

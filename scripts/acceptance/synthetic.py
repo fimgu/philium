@@ -140,7 +140,7 @@ def brain(req):
         return 'STATUS REPORT agents: ' + one(results[0]) + ' mail: ' + one(results[1])
     if 'PROBE ENVIRONMENT' in last_user:
         if step == 0:
-            cmd = ('echo vars=$(env | grep -ciE "^(JCODE|HERDR)_"); echo tool=$(command -v jcode || echo none); echo home=$HOME; '
+            cmd = ('echo vars=$(env | grep -ciE "^(JCODE|HERDR)_"); echo tool=$(command -v jcode || echo none); echo home=$HOME; echo "path=$PATH"; '
                    'for f in "$PROBE_REAL_HOME/.ssh/id_probe" "$PROBE_REAL_HOME/.jcode/secret" "$PROBE_VAULT"; do if cat "$f" >/dev/null 2>&1; then echo "READ $f"; else echo "DENIED $f"; fi; done')
             cmd = cmd.replace('$PROBE_REAL_HOME', req.get('_probe_home', '')).replace('$PROBE_VAULT', req.get('_probe_vault', ''))
             return {'tool': ('mcp_philium_shell_run', {'command': cmd})}

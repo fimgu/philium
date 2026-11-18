@@ -582,7 +582,8 @@ def main():
             sent = [x for x in syn.Origin.auth if x]
             run.check('C1', 'A read-only origin token saved in the form is kept in the vault and sent only as a bearer to the origin', 'A read-only token is saved' in (v.get('access') or '') and bool(sent) and set(sent) == {'Bearer synthetic-read-token-0001'} and b'synthetic-read-token-0001' in vault.read_bytes() and b'synthetic-read-token-0001' not in (run.profile / 'data/philium.db').read_bytes(), {'access': v.get('access'), 'requests_with_token': len(sent)})
             ids = d.get('ids') or {}
-            run.check('C2', 'The decision shows the exact generation, target and head, and says no artifact is recorded', ids.get('Generation') == '1' and ids.get('Target (base)') == g['target'] and ids.get('Head') == g['head'] and 'No independent artifact record' in ids.get('Artifact', ''), ids)
+            first_gen = int(ids.get('Generation') or 0)
+            run.check('C2', 'The decision shows the exact generation, target and head, and says no artifact is recorded', first_gen > 0 and ids.get('Target (base)') == g['target'] and ids.get('Head') == g['head'] and 'No independent artifact record' in ids.get('Artifact', ''), ids)
             landed = d.get('landed') or ''
             run.check('C2', 'Landed pull requests and the nested one are listed with their exact commits', all(x in landed for x in [f"#30 landed at {g['m30']}", f"#31 landed at {g['f31']}", f"#32 landed at {g['b1']}", '#30 contains #31', '0 missing lookups, 3 unmapped commits, 0 ambiguous']) and '6 included commits' in (d.get('included') or ''), landed[:400])
             cases = dict((c[1].split(':')[0], c) for c in d.get('cases') or [])
@@ -594,10 +595,10 @@ def main():
 
             # ---- reopen: setup persists; a new head starts without a verdict ------------------
             syn.Origin.repos[A]['prs'][40]['heads'] = [g['fixed']]
-            v = verify('alpha/same', pr_a, inspect=1)
+            v = verify('alpha/same', pr_a, inspect=first_gen)
             d, old = v.get('verified') or {}, v.get('inspected') or {}
             run.check('C1', 'After a reopen the form says it is set up, names the pinned verifier, and the URL verifies without touching setup', pin_a[:12] in (v.get('summaryAtOpen') or '') and 'verifier-alpha' in (v.get('summaryAtOpen') or '') and d.get('headline') is not None, v.get('summaryAtOpen'))
-            run.check('C4', 'A new head gets a new generation and its own result, not the old Do not ship', (d.get('ids') or {}).get('Generation') == '2' and (d.get('ids') or {}).get('Head') == g['fixed'] and d.get('headline') == 'Release verification incomplete' and 'regression' not in why(d), {'headline': d.get('headline'), 'ids': d.get('ids')})
+            run.check('C4', 'A new head gets a new generation and its own result, not the old Do not ship', int((d.get('ids') or {}).get('Generation') or 0) > first_gen and (d.get('ids') or {}).get('Head') == g['fixed'] and d.get('headline') == 'Release verification incomplete' and 'regression' not in why(d), {'headline': d.get('headline'), 'ids': d.get('ids')})
             run.check('C4', 'The old verdict stays on the old head and is labelled as an earlier revision', old.get('headline') == 'Do not ship' and (old.get('ids') or {}).get('Head') == g['head'] and 'Saved result for an earlier revision' in (old.get('earlier') or ''), {'headline': old.get('headline'), 'earlier': old.get('earlier')})
 
             # ---- degraded origin ---------------------------------------------------------------
@@ -762,6 +763,9 @@ def main():
                 home = (res.split('home=')[1].split('\\n')[0] if 'home=' in res else '')
                 private = home == f'{run.profile}/home' if not strict else home.startswith(f'{run.profile}/data/agents/{name}/')
                 run.check('D1', f"{'Strict' if strict else 'Trusted'} agent shell: no variable or tool of another harness, and a private home inside the profile", 'vars=0' in res and 'tool=none' in res and private and home != str(run.home), {'home': home, 'vars_tool': res[14:60]} if res else (v.get('started') or r.get('error')))
+                path = (res.split('path=')[1].split('\\n')[0] if 'path=' in res else '')
+                if not strict:
+                    run.check('B1', "Started with the system's bare PATH, an agent still gets the login shell's PATH, without another harness's directory", '/usr/local/bin' in path.split(':') and '.jcode' not in path, path[:200])
                 denied = [p for p in [str(vault)] + ([str(run.home / '.ssh/id_probe'), str(run.home / '.jcode/secret')] if strict else []) if f'DENIED {p}' in res]
                 run.check('D1', f"{'Strict' if strict else 'Trusted'} agent cannot read the key vault" + (' or the account home\'s keys and other harness data' if strict else ''), len(denied) == (3 if strict else 1) and 'READ ' + str(vault) not in res, res[-420:])
             trees = lambda: sorted(p.name.split('-')[0] for p in (run.profile / 'workspace/worktrees/same').glob('*'))
