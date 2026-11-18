@@ -140,11 +140,11 @@ def brain(req):
         return 'STATUS REPORT agents: ' + one(results[0]) + ' mail: ' + one(results[1])
     if 'PROBE ENVIRONMENT' in last_user:
         if step == 0:
-            cmd = ('echo vars=$(env | grep -ciE "^(JCODE|HERDR)_"); echo tool=$(command -v jcode || echo none); echo home=$HOME; echo "path=$PATH"; '
-                   'for f in "$PROBE_REAL_HOME/.ssh/id_probe" "$PROBE_REAL_HOME/.jcode/secret" "$PROBE_VAULT"; do if cat "$f" >/dev/null 2>&1; then echo "READ $f"; else echo "DENIED $f"; fi; done')
+            cmd = ('echo vars=$(env | grep -ciE "^(JCODE|HERDR)_"); echo tool=$(command -v jcode || echo none); echo home=$HOME; '
+                   'for f in "$PROBE_REAL_HOME/.ssh/id_probe" "$PROBE_REAL_HOME/.jcode/secret" "$PROBE_VAULT"; do if cat "$f" >/dev/null 2>&1; then echo "READ $f"; else echo "DENIED $f"; fi; done; echo "path=$PATH"')
             cmd = cmd.replace('$PROBE_REAL_HOME', req.get('_probe_home', '')).replace('$PROBE_VAULT', req.get('_probe_vault', ''))
             return {'tool': ('mcp_philium_shell_run', {'command': cmd})}
-        return 'PROBE RESULT ' + results[0][:900]
+        return 'PROBE RESULT ' + results[0][:3000]
     m = re.search(r'WORKER TASK ([0-9a-f]+): (SLOW (\d+))?', last_user)
     if m:
         tid = m.group(1)

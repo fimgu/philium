@@ -349,7 +349,7 @@ const picked = txt(m.querySelector('button[aria-label="Choose model"]'));
 await click('Start Agent', m);
 const started = await until(() => (!modal() ? 'started' : (all('.err', m).map(txt)[0] || null)), 'spawn result', 45000);
 if (started !== 'started') return { started, picked };
-const result = await until(() => { const t = convo(); const i = t.lastIndexOf('PROBE RESULT'); return i >= 0 ? t.slice(i, i + 900) : null; }, 'probe result', 60000).catch((e) => String(e) + ' :: ' + convo().slice(-500));
+const result = await until(() => { const t = convo(); const i = t.lastIndexOf('PROBE RESULT'); return i >= 0 ? t.slice(i, i + 3200) : null; }, 'probe result', 60000).catch((e) => String(e) + ' :: ' + convo().slice(-500));
 return { started, picked, head: head(), result };
 '''
 
@@ -763,7 +763,7 @@ def main():
                 home = (res.split('home=')[1].split('\\n')[0] if 'home=' in res else '')
                 private = home == f'{run.profile}/home' if not strict else home.startswith(f'{run.profile}/data/agents/{name}/')
                 run.check('D1', f"{'Strict' if strict else 'Trusted'} agent shell: no variable or tool of another harness, and a private home inside the profile", 'vars=0' in res and 'tool=none' in res and private and home != str(run.home), {'home': home, 'vars_tool': res[14:60]} if res else (v.get('started') or r.get('error')))
-                path = (res.split('path=')[1].split('\\n')[0] if 'path=' in res else '')
+                path = (res.split('path=')[1].split('\\n')[0].split('"')[0] if 'path=' in res else '')
                 if not strict:
                     run.check('B1', "Started with the system's bare PATH, an agent still gets the login shell's PATH, without another harness's directory", '/usr/local/bin' in path.split(':') and '.jcode' not in path, path[:200])
                 denied = [p for p in [str(vault)] + ([str(run.home / '.ssh/id_probe'), str(run.home / '.jcode/secret')] if strict else []) if f'DENIED {p}' in res]
