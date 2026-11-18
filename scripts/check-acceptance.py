@@ -349,8 +349,8 @@ const picked = txt(m.querySelector('button[aria-label="Choose model"]'));
 await click('Start Agent', m);
 const started = await until(() => (!modal() ? 'started' : (all('.err', m).map(txt)[0] || null)), 'spawn result', 45000);
 if (started !== 'started') return { started, picked };
-const result = await until(() => { const t = convo(); const i = t.lastIndexOf('PROBE RESULT'); return i >= 0 ? t.slice(i, i + 3200) : null; }, 'probe result', 60000).catch((e) => String(e) + ' :: ' + convo().slice(-500));
-return { started, picked, head: head(), result };
+const result = await until(() => { const t = convo(); const i = t.lastIndexOf('PROBE RESULT'); return i >= 0 ? t.slice(i, i + 3200) : null; }, 'probe result', 60000).catch((e) => String(e) + ' :: ' + convo().slice(-300));
+return { started, picked, head: head(), result, problem: all('.shield.danger', document.querySelector('.agent-view')).map(txt).concat(toasts()).join(' | ') };
 '''
 
 REMOVE = AGENT + r'''
@@ -760,6 +760,8 @@ def main():
                 res = v.get('result') or ''
                 if provider:
                     run.check('B1', 'The model list opens in the New agent dialog and another provider can be chosen', provider in (v.get('picked') or '') and v.get('started') == 'started', v.get('picked') or r.get('error'))
+                if 'PROBE RESULT' not in res:
+                    print('  probe diagnostics:', run.redact({'head': v.get('head'), 'problem': v.get('problem')}), flush=True)
                 home = (res.split('home=')[1].split('\\n')[0] if 'home=' in res else '')
                 private = home == f'{run.profile}/home' if not strict else home.startswith(f'{run.profile}/data/agents/{name}/')
                 run.check('D1', f"{'Strict' if strict else 'Trusted'} agent shell: no variable or tool of another harness, and a private home inside the profile", 'vars=0' in res and 'tool=none' in res and private and home != str(run.home), {'home': home, 'vars_tool': res[14:60]} if res else (v.get('started') or r.get('error')))
