@@ -2,6 +2,8 @@ import { createSignal, For, Show, onCleanup } from 'solid-js';
 import { activeRepoId, useStore } from '../lib/store.js';
 import { Empty, Page } from '../ui/kit.jsx';
 import { githubIdentity, maxPacketBytes, reviewPreview } from '../lib/review-packet.js';
+import { tenantBundle } from '../lib/tenant-bundle.js';
+import { LocalChecks } from './local-checks.jsx';
 
 function Reader(props) {
   const [data, setData] = createSignal(null), [error, setError] = createSignal('');
@@ -45,6 +47,13 @@ export default function Review() {
   // Key by stable values, not the repo row object: background refresh is not a switch.
   const key = () => slug() && JSON.stringify([activeRepoId(), slug()]);
   return <Page title="Review" sub="Saved results">
+    <Show when={workspace()?.id} keyed>{id => <LocalChecks repo={id}/>}</Show>
+    <Show when={workspace()?.id} keyed>{id => <details aria-label="Kubernetes tenant plan">
+      <summary>Kubernetes tenant plan · not applied</summary>
+      <p>Offline policy preview for this checkout. No cluster is contacted. The observer can read job and pod status, not logs or secrets. Workloads get no API role. No jobs are deployed.</p>
+      <p>Before running workloads, an administrator must verify Pod Security Admission, effective RBAC and network-policy enforcement on an approved disposable cluster. This is not isolation for hostile code or privileged installers.</p>
+      <pre style={{overflow:'auto'}}>{JSON.stringify(tenantBundle(id), null, 2)}</pre>
+    </details>}</Show>
     <Show when={workspace()?.id} keyed>{id => <details aria-label="Workspace context">
       <summary>Context: who can see this?</summary>
       <p><strong>Saved review: only you, on this device.</strong> Opening a packet does not send it to a worker, model, runner or GitHub.</p>

@@ -290,6 +290,12 @@ details.msg summary { cursor: pointer; display: flex; align-items: center; gap: 
 .fleet-mini-btn:hover { color: var(--text); border-color: var(--accent); }
 
 /* Clean Provider-Scoped ModelPicker */
+.model-picker-pop { position:fixed; z-index:1000; max-height:calc(100vh - 24px); display:flex; flex-direction:column; overflow:auto; border:1px solid var(--line); border-radius:10px; background:var(--surface,#141720); box-shadow:0 12px 32px #0006; }
+.model-picker-group-head, .model-picker-btn { display:flex; align-items:center; gap:6px; background:transparent; color:var(--text); border:1px solid var(--line); border-radius:6px; padding:5px 8px; cursor:pointer; }
+.model-picker-group-head { width:100%; flex-wrap:wrap; text-align:left; }
+.model-picker-group-head[aria-expanded=true], .model-picker-item[aria-pressed=true] { background:var(--surface-raised,#242936); }
+.model-trust-tag, .model-kv-tag, .model-picker-foot { font-size:var(--fs-xs); color:var(--text-dim); }
+.model-picker-foot { padding:6px 10px; }
 .model-picker { position: relative; display: inline-flex; min-width: 220px; }
 .model-picker.compact { min-width: 190px; max-width: 310px; }
 .model-picker-trigger {
@@ -402,6 +408,5 @@ details.msg summary { cursor: pointer; display: flex; align-items: center; gap: 
   padding: 6px 10px; border-bottom: 1px solid var(--line);
   background: rgba(120, 160, 255, 0.08); color: var(--text); flex-wrap: wrap;
 }
-
 
 

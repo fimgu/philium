@@ -13,6 +13,7 @@
 mod agents;
 mod agentshell;
 mod board;
+mod checks;
 mod browser;
 #[cfg(test)]
 mod browser_permission_tests;
@@ -154,6 +155,7 @@ async fn rpc_inner(app: &App, method: String, args: Option<Value>) -> Result<Val
         "workspace" => workspace::call(&ctx, m, args).await,
         "agents" => agents::call(&ctx, m, args).await,
         "board" => board::call(&ctx, m, args).await,
+        "checks" => checks::call(&ctx, m, args).await,
         "browser" => browser::call(&ctx, m, args).await,
         "graph" => graph::call(&ctx, m, args).await,
         "codeindex" => codeindex::call(&ctx, m, args).await,
