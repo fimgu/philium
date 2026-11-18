@@ -11,10 +11,11 @@ import { checkAgentMessaging, checkChatMessaging } from "./robustness.mjs";
 import { checkStoppedHistory } from "./stopped-history.mjs";
 import { checkEffortProgress } from "./effort-progress.mjs";
 import { checkCodeGraph } from "./code-review.mjs";
+import { checkReviewPreview } from "./review-preview.mjs";
 const SETS = { empty: EMPTY, populated: POPULATED, failing: FAILING, slow: SLOW, huge: HUGE };
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const dist = path.resolve(here, "../../dist");
+const dist = process.env.PHILIUM_RENDER_DIST ?? path.resolve(here, "../../dist");
 const args = process.argv.slice(2);
 const out = path.resolve(args.find((a) => !a.startsWith("--")) ?? path.join(here, "out"));
 const opt = (k, d) => (args.find((a) => a.startsWith(`--${k}=`)) ?? `--${k}=${d}`).split("=")[1];
@@ -22,7 +23,7 @@ const only = opt("only", "").split(",").filter(Boolean);
 const sets = opt("sets", "empty,populated,failing,slow,huge").split(",");
 const CHROME = process.env.CHROME ?? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 const SIZES = [[1440, 900], [1280, 800]];
-const SCREENS = ["home", "agents", "board", "chat", "terminals", "browser", "repos", "code", "activity", "stats", "providers", "settings"];
+const SCREENS = ["home", "agents", "board", "review", "chat", "terminals", "browser", "repos", "code", "activity", "stats", "providers", "settings"];
 
 const mime = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".woff2": "font/woff2", ".png": "image/png", ".svg": "image/svg+xml" };
 const server = http.createServer((req, res) => {
@@ -227,6 +228,9 @@ for (const setName of sets) {
         return out;
       });
       for (const b of bad) problems.push(`${setName} ${w}x${h} ${s}: ${b}`);
+      if (s === 'review' && setName === 'populated') {
+        try { await checkReviewPreview(page); } catch (e) { problems.push(`${w} review: ${e.message}`); }
+      }
       if (s === "agents") {
         if (setName === "populated") await page.evaluate(() => { window.__test.holdShell = true; });
         if (await clickText(page, ".list-item", "lion")) {

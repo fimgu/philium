@@ -81,7 +81,7 @@ const models = [
 ];
 const repos = [
   { id: "r1", name: "philium", path: "/Users/demo/Developer/philium", default_branch: "main", integration_branch: null, branch: "main", dirty: false, worktree_count: 2, remote_url: "git@github.com:demo/philium.git" },
-  { id: "r2", name: "hal", path: "/Users/demo/Developer/hal", default_branch: "main", branch: "main", dirty: true, worktree_count: 0 },
+  { id: "r2", name: "hal", path: "/Users/demo/Developer/hal", default_branch: "main", branch: "main", dirty: true, worktree_count: 0, remote_url: "https://github.com/demo/hal.git" },
 ];
 const worktrees = [
   { id: "w1", repo_id: "r1", agent_id: "a1", branch: "agent/lion", path: "/Users/demo/Philium/worktrees/lion", agent_name: "lion", created_at: now - 3600000, status: { unsaved: true, dirty_files: ["src/a.jsx", "src/b.css"], ahead: 2, behind: 0, unpushed_commits: 2, unmerged_commits: 2 } },
