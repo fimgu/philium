@@ -308,7 +308,7 @@ pub async fn call(
     if method == "sql_profile" {
         return Ok(ctx
             .db
-            .query("SELECT driver,pin FROM sql_profiles WHERE repo=?", [repo])?
+            .query("SELECT p.driver,p.pin,d.name AS driver_name,d.path AS driver_path,(SELECT port FROM release_stage_ports s WHERE s.repo=p.repo) AS observer_port FROM sql_profiles p LEFT JOIN repos d ON d.id=p.driver WHERE p.repo=?", [repo])?
             .pop()
             .unwrap_or(Value::Null));
     }
@@ -415,6 +415,8 @@ pub async fn call(
     let head = r["head"].as_str().ok_or("Missing head")?;
     let mut record_pin = Value::Null;
     let mut verified_evidence = json!({});
+    let mut evidence_status = json!({});
+    let records = v["release_records"] == true;
     if v["release_records"] == true {
         v["artifacts"] = json!({});
         v["release_review"] = Value::Null;
@@ -469,12 +471,15 @@ pub async fn call(
                 return None;
             }
             let mut evidence = json!({});
+            // Why each named evidence file did or did not count, so the operator sees the cause.
+            let mut status = json!({});
             if let Some(rows) = att["evidence"].as_object().filter(|m| m.len() <= 12) {
                 for (id, r) in rows {
                     let Some(p) = r["path"]
                         .as_str()
                         .filter(|p| p.starts_with("philium/evidence/") && safe_path(p, ".json"))
                     else {
+                        status[id] = json!("invalid");
                         continue;
                     };
                     let Some(bytes) = crate::release_intake::local_git_output(
@@ -484,17 +489,23 @@ pub async fn call(
                     )
                     .await
                     .ok() else {
+                        status[id] = json!("missing");
                         continue;
                     };
                     if bytes.len() > 32768 {
+                        status[id] = json!("invalid");
                         continue;
                     }
                     let hash = digest(bytes.as_bytes());
+                    if r["sha256"] != hash {
+                        status[id] = json!("altered");
+                        continue;
+                    }
                     let Some(e) = crate::release_document::strict_value(&bytes) else {
+                        status[id] = json!("invalid");
                         continue;
                     };
-                    if r["sha256"] == hash
-                        && e["case"] == id.as_str()
+                    if e["case"] == id.as_str()
                         && e["head"] == head
                         && e["status"] == "pass"
                         && e["observation"]
@@ -502,13 +513,17 @@ pub async fn call(
                             .is_some_and(|s| !s.trim().is_empty())
                     {
                         evidence[id] = json!(hash);
+                        status[id] = json!("verified");
+                    } else {
+                        status[id] = json!("not_for_this_head");
                     }
                 }
             }
-            Some((rev, att, evidence))
+            Some((rev, att, evidence, status))
         }
         .await;
-        if let Some((pin, att, evidence)) = load {
+        if let Some((pin, att, evidence, status)) = load {
+            evidence_status = status;
             verified_evidence = evidence;
             record_pin = json!(pin);
             v["artifacts"][head] = att["artifact"].clone();
@@ -638,6 +653,18 @@ pub async fn call(
     };
     let report = json!({"generation":seq,"pr":r["pr"],"observed":now(),"target":base,"head":head,"ancestor":ancestor,"parents":parents,"driver":profile["driver"],"driver_pin":profile["pin"],"contract_digest":digest(raw.as_bytes()),"sqlite":rusqlite::version(),"cases":cases,"observations":obs,"staging":"not_verified","deployment_identity":provenance,"deployment_after":after,"live_cases":live,"release_decision":if blocked{"not_ready_at_tested_head"}else{"incomplete"}});
     let mut report = report;
+    report["base"] = json!(base);
+    // The independently recorded artifact for exactly this head, or null when there is none.
+    report["artifact"] = v["artifacts"][head].clone();
+    report["release_records"] = json!(records);
+    report["observer_configured"] = json!(port.is_some());
+    let att = &v["release_review"];
+    report["review_attestation"] = if att.is_object() {
+        json!({"recorded":true,"all_changes_accounted_for":att["all_changes_accounted_for"]==true,"code_review_complete":att["code_review_complete"]==true,"cleanup_verified":att["cleanup_verified"]==true,"unresolved_findings":att["unresolved_findings"].as_array().map(Vec::len),"required_cases":att["required_cases"]})
+    } else {
+        json!({"recorded":false})
+    };
+    report["evidence_status"] = evidence_status;
     report["release_record_pin"] = record_pin;
     report["verified_evidence"] = verified_evidence;
     report["review_scope_verified"] = json!(crate::release_verify::reviewed(

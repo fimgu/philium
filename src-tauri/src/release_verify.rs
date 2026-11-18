@@ -71,13 +71,150 @@ fn finish(
         }
         _ => "incomplete",
     };
-    let v = json!({"pr":first["pr"],"generation":first["generation"],"head":first["head"],"base":first["base"],"checked_ms":crate::db::now(),"origin_current":current,"decision":decision,"contract_decision":outcome,"membership":members,"receipt":receipt,"reason":reason});
+    let why = explain(current, last.as_ref(), m, &receipt, reason.as_deref());
+    let v = json!({"pr":first["pr"],"generation":first["generation"],"head":first["head"],"base":first["base"],"artifact":receipt["artifact"],"checked_ms":crate::db::now(),"origin_current":current,"decision":decision,"contract_decision":outcome,"membership":members,"receipt":receipt,"reason":reason,"why":why});
     ctx.db.with(|c|c.execute_batch("CREATE TABLE IF NOT EXISTS release_decisions(repo TEXT NOT NULL REFERENCES repos(id) ON DELETE CASCADE,seq INTEGER NOT NULL REFERENCES release_refs(seq),summary TEXT NOT NULL,PRIMARY KEY(repo,seq))"))?;
     ctx.db.exec(
         "INSERT OR REPLACE INTO release_decisions(repo,seq,summary) VALUES(?,?,?)",
         rusqlite::params![repo, first["generation"].as_i64(), v.to_string()],
     )?;
     Ok(v)
+}
+/// Every cause that keeps this from being a ship decision, in the operator's words. One line
+/// per cause, so a moved head, missing or altered evidence, a wrong or absent deployment and an
+/// unreachable origin never look alike. Empty only when nothing stands in the way.
+fn explain(
+    current: Option<bool>,
+    last: Option<&Value>,
+    m: &Value,
+    receipt: &Value,
+    reason: Option<&str>,
+) -> Vec<String> {
+    let mut why = vec![];
+    match current {
+        None => why.push("Origin could not be reconfirmed after the checks. There is no verdict for the current head.".to_owned()),
+        Some(false) => why.push(format!(
+            "The head or target moved during verification (origin now reports head {}). This result belongs to the earlier revision only.",
+            last.and_then(|v| v["head"].as_str()).unwrap_or("unknown")
+        )),
+        Some(true) => {}
+    }
+    if let Some(r) = reason {
+        why.push(r.to_owned());
+    }
+    if m.is_null() {
+        why.push("Landed pull requests were not established: the origin lookup did not complete.".to_owned());
+    } else {
+        if m["missing"].as_u64().unwrap_or(0) > 0 {
+            why.push(format!("{} included commits have no completed pull request lookup. The origin did not answer for them.", m["missing"]));
+        }
+        if m["ambiguous"].as_u64().unwrap_or(0) > 0 {
+            why.push(format!("{} included commits map to more than one pull request.", m["ambiguous"]));
+        }
+    }
+    if receipt.is_null() {
+        return why;
+    }
+    for c in receipt["cases"].as_array().into_iter().flatten() {
+        let id = c["id"].as_str().unwrap_or("?");
+        let children: Vec<String> = c["landed_evidence"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|e| e["result"] == "same_failure_as_candidate")
+            .map(|e| format!("#{}", e["pr"]))
+            .collect();
+        let child = if children.is_empty() {
+            String::new()
+        } else {
+            format!(" Landed {} fails the same way on its own.", children.join(", "))
+        };
+        match c["state"].as_str() {
+            Some("composed_head_regression") => why.push(format!("{id}: merge-only regression. The target and both merged sides pass; the merged head fails.{child}")),
+            Some("release_range_regression") => why.push(format!("{id}: regression inside this release. The target passes and the head fails.{child}")),
+            Some("same_failure_on_target") => why.push(format!("{id}: already failing on the target in the same way. Not introduced by this release.")),
+            Some("failure_unattributed") => why.push(format!("{id}: fails on the head; the comparison does not establish where it started.{child}")),
+            Some("incomplete") => why.push(format!("{id}: missing evidence. The check could not be observed on the pinned revisions.")),
+            _ => {}
+        }
+    }
+    let (before, after) = (
+        receipt["deployment_identity"]["state"].as_str().unwrap_or(""),
+        receipt["deployment_after"]["state"].as_str().unwrap_or(""),
+    );
+    let live = receipt["live_cases"].as_array().map_or(0, Vec::len);
+    let deployment = |state: &str, when: &str| match state {
+        "match" => None,
+        "absent" => Some("No deployment observer is configured for this checkout, so the running product was not observed.".to_owned()),
+        "mismatch" => Some(format!("Wrong deployment {when}: the running replicas report a different revision or artifact than this head.")),
+        "mixed" => Some(format!("Mixed deployment {when}: replicas report different revisions or artifacts.")),
+        "not_ready" => Some(format!("Deployment {when}: the matching replicas are not ready.")),
+        _ if receipt["artifact"].is_null() => Some("No independent artifact record exists for this exact head, so the deployment cannot be matched to it.".to_owned()),
+        _ => Some(format!("Deployment unavailable {when}: the observer did not answer, or its report was stale or incomplete.")),
+    };
+    if let Some(line) = deployment(before, "before the checks") {
+        why.push(line);
+    } else if live > 0 {
+        if let Some(line) = deployment(after, "after the checks") {
+            why.push(line);
+        }
+    }
+    for c in receipt["live_cases"].as_array().into_iter().flatten() {
+        let id = c["id"].as_str().unwrap_or("?");
+        match c["state"].as_str() {
+            Some("mismatch") => why.push(format!("{id}: the running product returned a different value than the contract expects.")),
+            Some("unknown") if before == "match" => why.push(format!("{id}: the running product could not be observed twice with the pinned revision and artifact.")),
+            _ => {}
+        }
+    }
+    if live == 0 && receipt["release_records"] == true {
+        why.push("The verifier declares no running-product checks, so product behavior was not exercised.".to_owned());
+    }
+    let att = &receipt["review_attestation"];
+    if receipt["release_records"] != true {
+        why.push("The verifier does not record reviews, so review coverage cannot be established.".to_owned());
+    } else if att["recorded"] != true {
+        why.push("No independent release record exists for this exact base, head and verifier pin. An earlier head's record does not carry over.".to_owned());
+    } else {
+        for (flag, text) in [
+            ("all_changes_accounted_for", "not every change is accounted for"),
+            ("code_review_complete", "code review is not recorded as complete"),
+            ("cleanup_verified", "cleanup is not recorded as verified"),
+        ] {
+            if att[flag] != true {
+                why.push(format!("Review record: {text}."));
+            }
+        }
+        match att["unresolved_findings"].as_u64() {
+            Some(0) => {}
+            Some(n) => why.push(format!("Review record: {n} unresolved findings.")),
+            None => why.push("Review record: unresolved findings are not listed.".to_owned()),
+        }
+        let mut gaps = vec![];
+        for c in receipt["cases"].as_array().into_iter().flatten().chain(receipt["live_cases"].as_array().into_iter().flatten()) {
+            let Some(id) = c["id"].as_str() else { continue };
+            if receipt["verified_evidence"][id].is_string() {
+                continue;
+            }
+            gaps.push(format!(
+                "{id} ({})",
+                match receipt["evidence_status"][id].as_str() {
+                    Some("altered") => "altered: the file no longer matches its recorded hash",
+                    Some("missing") => "missing: the recorded file is not in the verifier",
+                    Some("not_for_this_head") => "not a passing observation of this head",
+                    Some("invalid") => "unreadable",
+                    _ => "not recorded",
+                }
+            ));
+        }
+        if !gaps.is_empty() {
+            why.push(format!("Evidence not accepted for {}.", gaps.join("; ")));
+        }
+        if receipt["review_scope_verified"] != true && att["required_cases"].is_array() && gaps.is_empty() && !why.iter().any(|w| w.starts_with("Review record")) {
+            why.push("Review record: the required case list does not match the cases that ran.".to_owned());
+        }
+    }
+    why
 }
 pub(crate) fn reviewed(scope: &Value, refs: &Value, receipt: &Value) -> bool {
     use std::collections::BTreeSet;
@@ -128,6 +265,7 @@ pub async fn cli() -> Result<Value, String> {
         return Err("Usage: --review-url CHECKOUT PR_URL | --pin-review-driver CHECKOUT DRIVER [OBSERVER_PORT]".into());
     }
     let dir = PathBuf::from(std::env::var_os("PHILIUM_DATA_DIR").ok_or("Missing Pilot profile")?);
+    crate::secrets::init(&dir);
     let ctx = Ctx::new(
         Db::open(&dir.join("philium.db"))?,
         dir,

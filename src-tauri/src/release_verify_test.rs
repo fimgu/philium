@@ -38,7 +38,7 @@ fn commit(p: &Path) -> String {
 }
 #[tokio::test]
 async fn reviewed_disposable_change() {
-    let tmp = std::env::var_os("JCODE_SCRATCH_DIR")
+    let tmp = std::env::var_os("PHILIUM_SCRATCH_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
         .join(format!("review-{}", hal::random_token()));
@@ -208,4 +208,62 @@ async fn reviewed_disposable_change() {
     assert!(tokio::net::TcpStream::connect(("127.0.0.1", port))
         .await
         .is_err());
+}
+
+#[test]
+fn every_cause_gets_its_own_sentence() {
+    let digest = format!("sha256:{}", "b".repeat(64));
+    let attested = json!({"recorded":true,"all_changes_accounted_for":true,"code_review_complete":true,"cleanup_verified":true,"unresolved_findings":0,"required_cases":["child"]});
+    let receipt = json!({"artifact":digest,"release_records":true,
+        "cases":[
+            {"id":"child","state":"release_range_regression","landed_evidence":[{"pr":31,"oid":"x","result":"same_failure_as_candidate"},{"pr":32,"oid":"y","result":"pass"}]},
+            {"id":"merge","state":"composed_head_regression","landed_evidence":[{"pr":31,"oid":"x","result":"pass"}]},
+            {"id":"old","state":"same_failure_on_target"},
+            {"id":"gone","state":"incomplete"}],
+        "live_cases":[{"id":"view","state":"unknown"}],
+        "deployment_identity":{"state":"mismatch"},"deployment_after":{"state":"mismatch"},
+        "review_attestation":attested,"verified_evidence":{"child":"h"},
+        "evidence_status":{"merge":"altered","old":"missing"},"review_scope_verified":false});
+    let moved = json!({"head":"c".repeat(40)});
+    let why = explain(Some(false), Some(&moved), &json!({"missing":2,"ambiguous":0}), &receipt, None).join("\n");
+    for needle in [
+        "moved during verification",
+        "2 included commits have no completed pull request lookup",
+        "child: regression inside this release",
+        "Landed #31 fails the same way on its own",
+        "merge: merge-only regression",
+        "old: already failing on the target",
+        "gone: missing evidence",
+        "Wrong deployment before the checks",
+        "merge (altered",
+        "old (missing",
+        "gone (not recorded",
+    ] {
+        assert!(why.contains(needle), "{needle}\n{why}");
+    }
+    // The merge-only case names no child: every landed change passes on its own.
+    assert!(!why.lines().any(|l| l.starts_with("merge:") && l.contains("#31")), "{why}");
+    let clean = json!({"artifact":digest,"release_records":true,
+        "cases":[{"id":"child","state":"candidate_pass"}],"live_cases":[{"id":"view","state":"pass"}],
+        "deployment_identity":{"state":"match"},"deployment_after":{"state":"match"},
+        "review_attestation":{"recorded":true,"all_changes_accounted_for":true,"code_review_complete":true,"cleanup_verified":true,"unresolved_findings":0,"required_cases":["child","view"]},
+        "verified_evidence":{"child":"h","view":"h"},"evidence_status":{"child":"verified","view":"verified"},"review_scope_verified":true});
+    let members = json!({"missing":0,"ambiguous":0});
+    assert_eq!(explain(Some(true), None, &members, &clean, None), Vec::<String>::new());
+    // The same passing checks on a newer head: no record for that head, so nothing carries over.
+    let mut fresh = clean.clone();
+    fresh["review_attestation"] = json!({"recorded":false});
+    fresh["artifact"] = Value::Null;
+    fresh["deployment_identity"] = json!({"state":"unknown"});
+    let why = explain(Some(true), None, &members, &fresh, None).join("\n");
+    assert!(why.contains("An earlier head's record does not carry over") && why.contains("No independent artifact record exists for this exact head"), "{why}");
+    // No observer, an observer that is down, and an origin that cannot be reached all read differently.
+    let mut absent = clean.clone();
+    absent["deployment_identity"] = json!({"state":"absent"});
+    let mut down = clean.clone();
+    down["deployment_identity"] = json!({"state":"unknown"});
+    let a = explain(Some(true), None, &members, &absent, None).join("\n");
+    let d = explain(Some(true), None, &members, &down, None).join("\n");
+    let o = explain(None, None, &Value::Null, &Value::Null, Some("Membership discovery: Origin unavailable")).join("\n");
+    assert!(a.contains("No deployment observer is configured") && d.contains("Deployment unavailable before the checks") && o.contains("Origin could not be reconfirmed") && o.contains("Landed pull requests were not established"), "{a}\n{d}\n{o}");
 }

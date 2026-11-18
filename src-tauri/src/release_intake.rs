@@ -72,8 +72,23 @@ pub(crate) fn record(
     let sampled = now();
     db.with(|c|{let tx=c.unchecked_transaction()?;tx.execute("INSERT INTO release_refs(repo,origin,pr,base,head,observed) SELECT ?1,?2,?3,?4,?5,?6 WHERE NOT EXISTS(SELECT 1 FROM (SELECT base,head FROM release_refs WHERE repo=?1 AND origin=?2 AND pr=?3 ORDER BY seq DESC LIMIT 1) WHERE base=?4 AND head=?5)",params![repo,origin,pr,base,head,sampled])?;let generation:i64=tx.query_row("SELECT MAX(seq) FROM release_refs WHERE repo=? AND origin=? AND pr=?",params![repo,origin,pr],|r|r.get(0))?;tx.commit()?;Ok(json!({"generation":generation,"pr":pr,"base":base,"head":head,"checked":sampled}))})
 }
+const ORIGIN_TOKEN: &str = "origin:github";
 fn sha(s: &str) -> bool {
     s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+/// A harness-made disposable profile may point origin lookups at a loopback stand-in, so the
+/// form can be taken through a moved head or an outage. A person's profile never has the marker,
+/// and with the stand-in active the real origin and its CLI are not contacted at all.
+pub(crate) fn fixture_origin() -> Option<String> {
+    if !crate::pilot::disposable() {
+        return None;
+    }
+    let port = std::env::var("PHILIUM_FIXTURE_ORIGIN_PORT")
+        .ok()?
+        .parse::<u16>()
+        .ok()
+        .filter(|p| *p >= 1024)?;
+    Some(format!("http://127.0.0.1:{port}"))
 }
 pub(crate) async fn github_public(path: &str) -> Option<Value> {
     let client = reqwest::Client::builder()
@@ -83,12 +98,18 @@ pub(crate) async fn github_public(path: &str) -> Option<Value> {
         .user_agent("Philium-release-review")
         .build()
         .ok()?;
-    let mut r = client
-        .get(format!("https://api.github.com/repos/{path}"))
-        .header("Cache-Control", "no-cache")
-        .send()
-        .await
-        .ok()?;
+    let mut request = client
+        .get(format!(
+            "{}/repos/{path}",
+            fixture_origin().as_deref().unwrap_or("https://api.github.com")
+        ))
+        .header("Cache-Control", "no-cache");
+    // A read-only token the person saved for private repositories. It lives in the vault,
+    // which agents cannot read, and is only ever sent to this one origin.
+    if let Some(token) = crate::secrets::get(ORIGIN_TOKEN) {
+        request = request.bearer_auth(token);
+    }
+    let mut r = request.send().await.ok()?;
     if r.status() != 200 || r.headers().get("link").is_some() {
         return None;
     }
@@ -214,6 +235,27 @@ pub async fn call(ctx: &Ctx, method: &str, a: Value) -> Result<Value, String> {
     )?;
     ctx.db.with(|c| c.execute_batch(SCHEMA))?;
     ctx.db.with(|c| c.execute_batch(ANCHORS))?;
+    match method {
+        "origin_access" => {
+            return Ok(json!({"token_saved":crate::secrets::get(ORIGIN_TOKEN).is_some()}));
+        }
+        "origin_token_set" => {
+            let token = arg_str(&a, "token")?;
+            let token = token.trim();
+            if token.is_empty() || token.len() > 255 || !token.bytes().all(|b| b.is_ascii_graphic()) {
+                return Err("Enter one GitHub token without spaces".into());
+            }
+            crate::secrets::set(ORIGIN_TOKEN, token)?;
+            ctx.log_event("origin_token_saved", None, &json!({"origin":"github.com"}));
+            return Ok(json!({"token_saved":true}));
+        }
+        "origin_token_clear" => {
+            crate::secrets::delete(ORIGIN_TOKEN);
+            ctx.log_event("origin_token_removed", None, &json!({"origin":"github.com"}));
+            return Ok(json!({"token_saved":false}));
+        }
+        _ => {}
+    }
     if method == "decision" {
         let seq = a["generation"].as_i64().ok_or("Select a generation")?;
         if ctx
@@ -273,9 +315,10 @@ pub async fn call(ctx: &Ctx, method: &str, a: Value) -> Result<Value, String> {
  "history"=>Ok(json!(ctx.db.query("SELECT seq,pr,base,head,observed FROM release_refs WHERE repo=? AND origin=? ORDER BY seq DESC LIMIT 30",params![repo,o])?)),
  "resolve"=>{let n=target(&arg_str(&a,"url")?,&o)?;let _g=FETCH.try_lock().map_err(|_|"Another origin lookup is in progress")?;
  if let Some(v)=github_public(&format!("{o}/pulls/{n}")).await{if v["base"]["repo"]["full_name"].as_str().is_some_and(|s|s.eq_ignore_ascii_case(&o)){return record(&ctx.db,&repo,&o,n,&json!({"number":v["number"],"url":v["html_url"],"baseRefOid":v["base"]["sha"],"headRefOid":v["head"]["sha"]}));}}
- let exe=["/opt/homebrew/bin/gh","/usr/local/bin/gh","/usr/bin/gh"].into_iter().find(|p|Path::new(p).is_file()).ok_or("GitHub CLI unavailable")?;
+ if fixture_origin().is_some(){return Err("Origin lookup failed. The origin did not answer.".into());}
+ let exe=["/opt/homebrew/bin/gh","/usr/local/bin/gh","/usr/bin/gh"].into_iter().find(|p|Path::new(p).is_file()).ok_or("Origin lookup failed. Public metadata was not readable and the GitHub CLI is not installed for private read access.")?;
  let mut cmd=tokio::process::Command::new(exe);cmd.current_dir("/").args(["pr","view",&format!("https://github.com/{o}/pull/{n}"),"--json","number,url,baseRefOid,headRefOid"]).env("GH_PROMPT_DISABLED","1").env("GH_HOST","github.com").stdin(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true);
- let out=tokio::time::timeout(Duration::from_secs(12),cmd.output()).await.map_err(|_|"Origin lookup timed out")?.map_err(|_|"Could not start GitHub CLI")?;if !out.status.success()||out.stdout.len()>16384{return Err("Origin lookup failed. Check read access for this repository.".into())}let refs=serde_json::from_slice(&out.stdout).map_err(|_|"Invalid origin response")?;record(&ctx.db,&repo,&o,n,&refs)},_=>Err("Unknown intake action".into())}
+ let out=tokio::time::timeout(Duration::from_secs(12),cmd.output()).await.map_err(|_|"Origin lookup timed out")?.map_err(|_|"Could not start GitHub CLI")?;if !out.status.success()||out.stdout.len()>16384{return Err("Origin lookup failed. Check the network and GitHub read access for this repository.".into())}let refs=serde_json::from_slice(&out.stdout).map_err(|_|"Invalid origin response")?;record(&ctx.db,&repo,&o,n,&refs)},_=>Err("Unknown intake action".into())}
 }
 
 #[cfg(test)]

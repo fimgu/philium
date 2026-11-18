@@ -7,6 +7,9 @@ const SCHEMA:&str="CREATE TABLE IF NOT EXISTS release_membership(seq INTEGER PRI
 static BUSY: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 async fn lookup(o: &str, ids: &[&Value]) -> Result<Value, String> {
     let (owner, name) = o.split_once('/').ok_or("Missing repository identity")?;
+    if crate::release_intake::fixture_origin().is_some() {
+        return Err("Stand-in origin has no graph reader".into());
+    }
     let mut body = String::new();
     for (i, row) in ids.iter().enumerate() {
         let id = row["oid"]
