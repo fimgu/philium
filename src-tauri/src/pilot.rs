@@ -567,3 +567,63 @@ pub fn review_form(app: tauri::AppHandle) {
         }
     });
 }
+
+// Operates the packaged window the way a person would: the harness-supplied script may
+// click and type in the rendered page and read what it shows. It may not reach the
+// backend bridge, so it cannot perform a step the interface lacks. main() only starts
+// this hidden, non-focusable window for a marked disposable Pilot home.
+pub fn ui_script(app: tauri::AppHandle, path: String) {
+    use tauri::Manager;
+    tauri::async_runtime::spawn(async move {
+        let result = async {
+            let w = app.get_webview_window("main").ok_or("No webview")?;
+            if w.is_visible().unwrap_or(true) {
+                return Err("Refusing visible window".to_owned());
+            }
+            let script = fs::read_to_string(&path).map_err(|_| "Cannot read UI script")?;
+            if script.len() > 262_144
+                || ["__TAURI", "invoke(", "ipc.localhost", "ipc:"]
+                    .iter()
+                    .any(|s| script.contains(s))
+            {
+                return Err("A UI script may only use the rendered page".into());
+            }
+            let limit = env::args()
+                .nth(3)
+                .and_then(|s| s.parse::<u64>().ok())
+                .filter(|n| (1..=900).contains(n))
+                .unwrap_or(120);
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(limit);
+            let mut last = String::new();
+            while tokio::time::Instant::now() < deadline {
+                let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+                w.eval_with_callback(&script, move |s| {
+                    let _ = tx.try_send(s);
+                })
+                .map_err(|_| "Cannot evaluate UI script")?;
+                if let Ok(Some(s)) =
+                    tokio::time::timeout(std::time::Duration::from_secs(4), rx.recv()).await
+                {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                        if v["done"] == true {
+                            println!("{}", json!({"ui_result":v}));
+                            return Ok(());
+                        }
+                        if !v.is_null() {
+                            last = v.to_string();
+                        }
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            Err(format!("UI script did not finish: {last}"))
+        }
+        .await;
+        if let Err(e) = result {
+            eprintln!("{e}");
+            app.exit(2);
+        } else {
+            app.exit(0);
+        }
+    });
+}

@@ -302,7 +302,11 @@ fn philium_root() -> std::path::PathBuf {
 fn main() {
     if std::env::args().nth(1).as_deref()==Some("--observe-sql-contract") {std::process::exit(if release_sql::worker().is_some(){0}else{2});}
     let mut config = tauri::generate_context!();
-    let offscreen=std::env::args().nth(1).as_deref()==Some("--pilot-check-review-form");
+    let first_arg=std::env::args().nth(1);
+    let scripted=first_arg.as_deref()==Some("--pilot-ui-script");
+    let ui_script=if scripted{std::env::args().nth(2)}else{None};
+    if scripted&&ui_script.is_none(){eprintln!("Usage: --pilot-ui-script SCRIPT [SECONDS]");std::process::exit(2);}
+    let offscreen=scripted||first_arg.as_deref()==Some("--pilot-check-review-form");
     if offscreen {let home=std::env::var_os("HOME").map(std::path::PathBuf::from);if !cfg!(target_os="macos")||config.config().identifier!=pilot::ID||!home.is_some_and(|p|std::fs::read_to_string(p.join(".philium-pilot-fixture")).ok().as_deref()==Some("disposable\n")){eprintln!("Disposable Pilot home required");std::process::exit(2);}for w in &mut config.config_mut().app.windows{w.visible=false;w.focus=false;w.focusable=false;w.skip_taskbar=true;w.incognito=true;}}
     let checking = std::env::args().nth(1).as_deref() == Some("--pilot-check");
     if checking && config.config().identifier != pilot::ID {
@@ -431,7 +435,7 @@ fn main() {
         .expect("error while building Philium");
     #[cfg(target_os="macos")] if offscreen{tauri_app.set_activation_policy(tauri::ActivationPolicy::Prohibited);}
     tauri_app.run(move |handle, event| {
-        if offscreen && matches!(&event,RunEvent::Ready){pilot::review_form(handle.clone());}
+        if offscreen && matches!(&event,RunEvent::Ready){match &ui_script{Some(path)=>pilot::ui_script(handle.clone(),path.clone()),None=>pilot::review_form(handle.clone())}}
         if let RunEvent::Exit = event {
             if let Some(app) = handle.try_state::<App>() {
                 // Drop UI emits first so the shutdown thread can never queue
