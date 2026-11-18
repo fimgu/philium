@@ -677,6 +677,55 @@ mod e2e {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn helper_keeps_workspace_and_session_across_resume() {
+        struct Scratch(std::path::PathBuf);
+        impl Scratch { fn path(&self) -> &std::path::Path { &self.0 } }
+        impl Drop for Scratch { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+        let dir = Scratch(std::env::temp_dir().join(format!("philium-helper-{}", hal::random_token())));
+        std::fs::create_dir(&dir.0).unwrap();
+        let (url, seen) = upstream(dir.path().join("marker")).await;
+        let gw = Gateway::new(hal::random_token(), None);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("http://{}", listener.local_addr().unwrap());
+        let router = gw.router();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let ctx = Ctx::new(db::Db::memory(), dir.path().join("data"), dir.path().join("root"), gw.clone(), addr);
+        ctx.db.kv_set("library.imported_at", "fixture").unwrap();
+        library::init(&ctx).unwrap(); codeindex::init(&ctx).unwrap();
+        let p = Provider { id:"record".into(), name:"Loopback".into(), kind:Kind::OpenaiChat, base_url:url, trusted:true, guard:GuardMode::Redact, enabled:true, default_model:Some("up-model".into()) };
+        providers::upsert(&ctx, &p).unwrap();
+        gw.set_routes(vec![Route { provider:p, api_key:Some("fixture".into()) }]);
+        for (id, symbol) in [("r-a", "visible_workspace_fn"), ("r-b", "sibling_private_fn")] {
+            let path = dir.path().join(id).join("same"); std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join("lib.rs"),format!("pub fn {symbol}() {{}}\n")).unwrap();
+            for args in [&["init","-b","main"][..], &["add","lib.rs"], &["-c","user.name=Test","-c","user.email=fixture@example.invalid","commit","-m","fixture"]] { workspace::git(&path,args).unwrap(); }
+            ctx.db.exec("INSERT INTO repos(id,name,path,default_branch,added_at) VALUES(?1,'same',?2,'main',0)", [id,path.to_str().unwrap()]).unwrap();
+        }
+        ctx.db.exec("INSERT INTO agents(id,name,model_ref,repo_id,created_at,last_active_at) VALUES('parent-fixture','parent-fixture','record/up-model','r-a',0,0)", []).unwrap();
+        let child = mcp::call_tool(&ctx,"parent-fixture","agent_spawn",json!({"name":"scoped-fixture","brief":"Reply OK"})).await.unwrap();
+        let id = child["id"].as_str().unwrap();
+        let ready = || async {
+            for _ in 0..200 {
+                if let Some(rt) = agents::runtime(id) { return rt; }
+                if let Some(reason) = ctx.db.kv_get(&format!("agent_error.{id}")).filter(|e| !e.is_empty()) { panic!("helper failed: {reason}"); }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            panic!("helper did not start");
+        };
+        let rt = ready().await;
+        wait_turn(&rt.hal, &rt.session).await;
+        let sid = rt.session.clone();
+        assert!(seen.lk().iter().any(|(_,b)| b.contains("visible_workspace_fn")));
+        assert!(seen.lk().iter().all(|(_,b)| !b.contains("sibling_private_fn")));
+        agents::stop(&ctx,id,"stopped");
+        agents::call(&ctx,"resume",json!({"id":id})).await.unwrap();
+        let resumed = ready().await;
+        assert_eq!(resumed.session,sid);
+        assert_eq!(resumed.cwd,rt.cwd);
+        agents::stop(&ctx,id,"stopped"); server.abort();
+    }
+
     /// Anthropic provider through the real HAL: HAL validates its config, speaks
     /// chat.completions, the gateway translates to Messages and back, and a tool
     /// call round-trips (denied in Chat, result returned to the model).

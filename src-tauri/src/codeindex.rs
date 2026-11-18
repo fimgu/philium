@@ -1253,9 +1253,10 @@ pub fn render_symbol(v: &View, root: &Path, sym: &str, path_filter: Option<&str>
         if !callees.is_empty() {
             out.line(format!("  calls: {}", callees.into_iter().take(12).collect::<Vec<_>>().join(", ")));
         }
-        if let Ok(src) = std::fs::read_to_string(root.join(&d.path)) {
+        if let Some(src) = inspect::checked(root, &d.path).ok().and_then(|p| stamp_of(&p).and_then(|_| std::fs::read_to_string(p).ok())) {
             let lines: Vec<&str> = src.lines().collect();
             let mut start = d.line.saturating_sub(1) as usize;
+            if start >= lines.len() { continue; }
             while start > 0 && start + 4 >= d.line as usize {
                 let prev = lines.get(start - 1).map(|l| l.trim()).unwrap_or("");
                 if prev.starts_with("//") || prev.starts_with('#') || prev.starts_with("#[") || prev.starts_with('@') || prev.starts_with("/*") || prev.starts_with('*') {
@@ -1516,10 +1517,21 @@ pub fn resolve(ctx: &Ctx, args: &Value) -> Result<Target, String> {
 pub fn resolve_agent(ctx: &Ctx, agent: &str) -> Result<Target, String> {
     let a = ctx.db.query("SELECT id,repo_id FROM agents WHERE id=?1 OR name=?1", [agent])?.into_iter().next().ok_or("unknown agent")?;
     let aid = a["id"].as_str().unwrap_or("");
-    if let Some(w) = ctx.db.query("SELECT * FROM worktrees WHERE agent_id=?1 AND state='active' ORDER BY created_at DESC LIMIT 1", [aid])?.into_iter().next() {
-        return target_for_repo(ctx, w["repo_id"].as_str().unwrap_or(""), Some(wt_row(ctx, &w)));
-    }
     let repo = a["repo_id"].as_str().ok_or("agent has no repo")?;
+    if let Some(w) = ctx.db.query("SELECT * FROM worktrees WHERE agent_id=?1 AND state='active' ORDER BY created_at DESC LIMIT 1", [aid])?.into_iter().next() {
+        if w["repo_id"] != repo { return Err("Worktree does not belong to the agent's repository".into()); }
+        let t = target_for_repo(ctx, repo, Some(wt_row(ctx, &w)))?;
+        let wt = &t.wt.as_ref().unwrap().path;
+        let common = |p: &Path| -> Result<PathBuf,String> {
+            let dir = git(p, &["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
+            Path::new(dir.trim()).canonicalize().map_err(|_| "Git identity unavailable".into())
+        };
+        let top = git(wt, &["rev-parse", "--show-toplevel"])?;
+        if common(&t.repo_path)? != common(wt)? || Path::new(top.trim()).canonicalize().ok() != wt.canonicalize().ok() {
+            return Err("Worktree checkout identity mismatch".into());
+        }
+        return Ok(t);
+    }
     target_for_repo(ctx, repo, None)
 }
 
@@ -1904,13 +1916,14 @@ pub fn prompt_map(ctx: &Ctx, repo_id: &str, wt_path: Option<&Path>) -> Option<St
     let wt_row = wt_path.and_then(|p| {
         let ps = p.to_string_lossy().to_string();
         ctx.db
-            .query("SELECT id FROM worktrees WHERE path=?1 AND state='active' LIMIT 1", [ps])
+            .query("SELECT id FROM worktrees WHERE path=?1 AND repo_id=?2 AND state='active' LIMIT 1", [ps.as_str(),repo_id])
             .ok()
             .and_then(|r| r.into_iter().next())
             .and_then(|r| r["id"].as_str().map(str::to_string))
     });
     let wt_arg = match (&wt_row, wt_path) {
         (Some(id), Some(p)) => Some((id.as_str(), p)),
+        (None, Some(_)) => return None,
         _ => None,
     };
     let (view, _) = index_target(ctx, &t.repo_id, &t.repo_path, &t.branch, wt_arg, false).ok()?;

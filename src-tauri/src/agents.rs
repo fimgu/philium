@@ -306,6 +306,9 @@ pub struct SpawnReq {
 
 /// Create the agent row and start provisioning in the background.
 pub fn spawn(ctx: &Arc<Ctx>, req: SpawnReq) -> Result<Value, String> {
+    if let Some(parent) = req.parent_id.as_deref() {
+        helper_scope(ctx, parent, req.repo_id.as_deref(), req.model.as_deref(), req.task_id.as_deref(), req.strict)?;
+    }
     let (provider, model) = providers::resolve(ctx, req.model.as_deref())?;
     let model_ref = format!("{}/{}", provider.id, model);
     let strict = req.strict || !provider.trusted;
@@ -366,11 +369,28 @@ pub fn spawn(ctx: &Arc<Ctx>, req: SpawnReq) -> Result<Value, String> {
 }
 
 /// Bring up the agent's HAL (fresh or resume) and its event pump.
+fn helper_scope(ctx: &Ctx, parent: &str, repo: Option<&str>, model: Option<&str>, task: Option<&str>, strict: bool) -> Result<(), String> {
+    let p = ctx.db.query("SELECT a.model_ref,a.strict,r.id AS repo FROM agents a JOIN repos r ON r.id=a.repo_id WHERE a.id=?1", [parent])?
+        .into_iter().next().ok_or("Helper needs a parent with a registered workspace")?;
+    if repo != p["repo"].as_str() || model.is_none() || model != p["model_ref"].as_str() || (p["strict"] == 1 && !strict) {
+        return Err("Helpers must keep the parent's workspace, model recipient and restrictions".into());
+    }
+    if let Some(task) = task {
+        if ctx.db.query("SELECT id FROM tasks WHERE id=?1 AND repo_id=?2", rusqlite::params![task,repo])?.is_empty() {
+            return Err("Helper task is outside the parent's workspace".into());
+        }
+    }
+    Ok(())
+}
+
 async fn provision(ctx: &Arc<Ctx>, id: &str, fresh: bool, brief: Option<String>) -> Result<(), String> {
     let row = get_row(ctx, id).ok_or("agent vanished")?;
     let name = row["name"].as_str().unwrap_or_default().to_string();
     let model_ref = row["model_ref"].as_str().unwrap_or_default().to_string();
     let strict = row["strict"].as_i64() == Some(1);
+    if let Some(parent) = row["parent_id"].as_str() {
+        helper_scope(ctx, parent, row["repo_id"].as_str(), Some(&model_ref), row["task_id"].as_str(), strict)?;
+    }
     let port = row["port_base"].as_i64().unwrap_or(42000);
     let (provider, _) = providers::resolve(ctx, Some(&model_ref))?;
     if strict {
@@ -399,7 +419,7 @@ async fn provision(ctx: &Arc<Ctx>, id: &str, fresh: bool, brief: Option<String>)
                     "The agent's worktree folder {p} is missing (deleted or moved). Remove the agent, or restore the folder and press Resume."
                 ));
             }
-            Some(p) => Some(PathBuf::from(p)),
+            Some(_) => Some(crate::codeindex::resolve_agent(ctx, id)?.wt.ok_or("Worktree unavailable")?.path),
             None => {
                 let (c, repo, n, aid) = (ctx.clone(), repo.to_string(), name.clone(), id.to_string());
                 let wt = tokio::task::spawn_blocking(move || {
@@ -414,7 +434,7 @@ async fn provision(ctx: &Arc<Ctx>, id: &str, fresh: bool, brief: Option<String>)
     let cwd = worktree.clone().unwrap_or_else(|| scratch.clone());
 
     // Tokens: gateway (model traffic, attribution) and MCP (agent tools).
-    let only = if strict { Some(vec![provider.id.clone()]) } else { None };
+    let only = if strict || row["parent_id"].is_string() { Some(vec![provider.id.clone()]) } else { None };
     let gw_token = ctx.gateway.issue_token(&name, only.clone());
     let mcp_token = crate::mcp::issue_token(id);
 
@@ -1007,6 +1027,9 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
         }
         "remove" => {
             let id = id()?;
+            if !ctx.db.query("SELECT id FROM agents WHERE parent_id=?1 LIMIT 1", [&id])?.is_empty() {
+                return Err("Remove this agent's helpers first".into());
+            }
             let force = args["force"].as_bool().unwrap_or(false);
             stop(ctx, &id, "tearing_down");
             let (c, i) = (ctx.clone(), id.clone());
@@ -1223,6 +1246,9 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
                 return Err("switching to an untrusted provider needs a new Strict agent".into());
             }
             let r = format!("{}/{}", p.id, m);
+            if r != row["model_ref"] && (row["parent_id"].is_string() || !ctx.db.query("SELECT id FROM agents WHERE parent_id=?1 LIMIT 1", [&id])?.is_empty()) {
+                return Err("Start a separate agent to change the recipient of a helper family".into());
+            }
             let cur_eff = ctx.db.kv_get(&format!("agent.effort.{id}")).unwrap_or_else(|| "default".into());
             let next_eff = providers::validate_effort_for_ref(ctx, Some(&r), &cur_eff).unwrap_or_else(|_| "default".into());
             if next_eff != cur_eff {

@@ -45,6 +45,16 @@ export default function Review() {
   // Key by stable values, not the repo row object: background refresh is not a switch.
   const key = () => slug() && JSON.stringify([activeRepoId(), slug()]);
   return <Page title="Review" sub="Saved results">
+    <Show when={workspace()?.id} keyed>{id => <details aria-label="Workspace context">
+      <summary>Context: who can see this?</summary>
+      <p><strong>Saved review: only you, on this device.</strong> Opening a packet does not send it to a worker, model, runner or GitHub.</p>
+      <h3>Agents in this workspace</h3>
+      <p>These are configured agents, not recipients of the saved review. Starting a separate agent session can send its prompt, code map and requested code to its configured provider.</p>
+      <ul><For each={(store.agents() || []).filter(a => a.repo_id === id)} fallback={<li>No agents listed for this workspace.</li>}>{a => <li>
+        <strong>{a.name}</strong> · {a.model_ref || a.model || 'Unknown recipient'} · {a.strict ? 'No memory or history access' : 'May request this repository’s memory and session metadata'}
+      </li>}</For></ul>
+      <p>Helpers inherit the parent’s workspace and configured model. The skills tool serves the built-in review procedure, not imported personal skills or their files.</p>
+    </details>}</Show>
     <Show when={key()} keyed fallback={<Empty title="Select a GitHub workspace" body="Use the workspace picker to view a saved PR review for one repository." />}>
       {_identity => <Reader workspace={workspace} slug={slug()} />}
     </Show>

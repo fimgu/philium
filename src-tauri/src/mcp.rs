@@ -387,11 +387,10 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
             crate::browser::mcp_call(ctx, agent, &me, row["strict"].as_i64() == Some(1), n, a).await
         }
         "graph_query" => {
-            let path = crate::agents::runtime(agent)
-                .map(|r| r.cwd.clone())
-                .or_else(|| crate::codeindex::resolve_agent(ctx, agent).ok().map(|t| t.wt.map(|w| w.path).unwrap_or(t.repo_path)))
-                .ok_or("agent not running")?;
-            let g = crate::graph::call(ctx, "get", json!({ "repo_path": path })).await?;
+            let target = crate::codeindex::resolve_agent(ctx, agent)?;
+            let path = target.wt.map(|w| w.path).unwrap_or(target.repo_path);
+            // No path-keyed desktop cache or external graph processor on the model route.
+            let g = tokio::task::spawn_blocking(move || crate::graph::build_fallback(&path)).await.map_err(|e| e.to_string())?;
             Ok(match a["path"].as_str() {
                 Some(p) => focus(&g, p),
                 None => g,
@@ -406,8 +405,19 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
             let repo = crate::agents::runtime(agent).map(|r| r.cwd.clone());
             crate::board::playbook(ctx, arg(&a, "job")?, repo.as_deref())
         }
-        "skill_list" => crate::library::skill_list(ctx),
-        "skill_get" => crate::library::skill_get(ctx, arg(&a, "name")?),
+        "skill_list" | "skill_get" => {
+            let repo = row["repo_id"].as_str().ok_or("Skills require a registered workspace")?;
+            if crate::workspace::repo(ctx, repo).is_none() { return Err("Workspace unavailable".into()); }
+            // Imported instructions and their supporting files belong to the operator.
+            // Only ship reviewed product text until a per-recipient grant exists.
+            let skill = json!({"name":"review-pr", "description":"Check a PR against its real workflow", "source":"Philium built-in"});
+            if name == "skill_list" { return Ok(json!([skill])); }
+            if arg(&a,"name")? != "review-pr" { return Err("No attached skill with that name".into()); }
+            let mut result = skill;
+            result["body"] = json!(include_str!("../playbooks/review_pr.md"));
+            result["files"] = json!({});
+            Ok(result)
+        }
         "memory_search" | "memory_save" | "session_search" => {
             // Personal memory and past sessions never go to agents on untrusted (Strict) providers.
             if row["strict"].as_i64() == Some(1) {
@@ -545,7 +555,16 @@ mod tests {
             async move { dispatch(&ctx, agent, json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":name,"arguments":args}})).await.unwrap() }
         };
         let text = |r: &Value| r["result"]["content"][0]["text"].as_str().unwrap_or("").to_string();
-        assert!(text(&call("s1", "skill_get", json!({"name":"review-pr"})).await).contains("do it"));
+        assert_eq!(call("s1", "skill_get", json!({"name":"review-pr"})).await["result"]["isError"], true);
+        let selected = text(&call("t1", "skill_get", json!({"name":"review-pr"})).await);
+        assert!(selected.contains("Philium built-in") && !selected.contains("do it"));
+        assert!(crate::library::skill_get(&ctx,"review-pr").unwrap()["body"] == "do it");
+        for args in [json!({"task_id":"b"}), json!({"model":"other/m"}), json!({"model":"p/other"})] {
+            let mut attempt = args; attempt["brief"] = json!("test");
+            let denied = call("t1", "agent_spawn", attempt).await;
+            assert_eq!(denied["result"]["isError"], true);
+            assert!(text(&denied).to_lowercase().contains("helper"));
+        }
         let saved = call("t1", "memory_save", json!({"content":"Filip likes terse replies","category":"preference"})).await;
         assert_ne!(saved["result"]["isError"], true, "{saved}");
         assert!(text(&saved).contains("repo:ra"));

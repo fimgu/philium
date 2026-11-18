@@ -85,9 +85,7 @@ pub struct Gateway {
     routes: RwLock<HashMap<String, Route>>,
     /// Extra tokens (one per agent) -> agent name, for attribution and
     /// per-agent revocation. The desk token is `token`.
-    agent_tokens: RwLock<HashMap<String, String>>,
-    /// Agents restricted to a provider set (Strict agents on untrusted ones).
-    agent_providers: RwLock<HashMap<String, Vec<String>>>,
+    agent_tokens: RwLock<HashMap<String, (String, Option<Vec<String>>)>>,
     /// Dynamic reasoning effort per agent (and desk chat under key `""`), applied at the gateway
     /// so custom provider effort values and token budgets work regardless of HAL's internal enum.
     efforts: RwLock<HashMap<String, String>>,
@@ -150,7 +148,6 @@ impl Gateway {
                 .unwrap_or_default(),
             routes: RwLock::new(HashMap::new()),
             agent_tokens: RwLock::new(HashMap::new()),
-            agent_providers: RwLock::new(HashMap::new()),
             efforts: RwLock::new(HashMap::new()),
             learned_efforts_cb: RwLock::new(None),
             log: Mutex::new(VecDeque::new()),
@@ -207,18 +204,15 @@ impl Gateway {
 
     /// Issue a gateway token for an agent. Optional provider allowlist.
     pub fn issue_token(&self, agent: &str, providers: Option<Vec<String>>) -> String {
-        self.revoke_agent(agent);
         let t = crate::hal::random_token();
-        self.agent_tokens.wr().insert(t.clone(), agent.to_string());
-        if let Some(p) = providers {
-            self.agent_providers.wr().insert(agent.to_string(), p);
-        }
+        let mut tokens = self.agent_tokens.wr();
+        tokens.retain(|_, (a, _)| a != agent);
+        tokens.insert(t.clone(), (agent.to_string(), providers));
         t
     }
 
     pub fn revoke_agent(&self, agent: &str) {
-        self.agent_tokens.wr().retain(|_, a| a != agent);
-        self.agent_providers.wr().remove(agent);
+        self.agent_tokens.wr().retain(|_, (a, _)| a != agent);
     }
 
     pub fn router(self: &Arc<Self>) -> Router {
@@ -358,7 +352,7 @@ impl Gateway {
     }
 
     /// `Some(None)` = desk token, `Some(Some(agent))` = agent token.
-    fn who(&self, headers: &HeaderMap) -> Option<Option<String>> {
+    fn who(&self, headers: &HeaderMap) -> Option<Option<(String, Option<Vec<String>>)>> {
         let presented = headers
             .get("authorization")
             .and_then(|v| v.to_str().ok())
@@ -518,16 +512,15 @@ async fn proxy(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let Some(agent) = gw.who(&headers) else {
+    let Some(credential) = gw.who(&headers) else {
         return error_response(StatusCode::UNAUTHORIZED, "philium_auth", "invalid gateway token".into());
     };
-    if let Some(a) = &agent {
-        if let Some(allowed) = gw.agent_providers.rd().get(a) {
+    if let Some((a, Some(allowed))) = &credential {
             if !allowed.contains(&provider) {
                 return error_response(StatusCode::FORBIDDEN, "philium_route", format!("agent {a} may not use provider {provider}"));
             }
-        }
     }
+    let agent = credential.map(|(name, _)| name);
     let Some(route) = gw.routes.rd().get(&provider).cloned() else {
         return error_response(StatusCode::NOT_FOUND, "philium_route", format!("unknown provider {provider}"));
     };
