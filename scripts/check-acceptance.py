@@ -459,6 +459,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('app'); ap.add_argument('--out'); ap.add_argument('--only', default='')
     ap.add_argument('--keep', action='store_true', help='keep the scratch folder for inspection')
+    ap.add_argument('--public', nargs=5, metavar=('CHECKOUT', 'PR_URL', 'HEAD', 'LANDED', 'NESTED'),
+                    help='also verify one public pull request against the real origin: a local clone that holds its history, its URL, and the expected head, landed and nested counts. Reads public GitHub metadata only.')
     args = ap.parse_args()
     scratch = Path(tempfile.mkdtemp(prefix='philium-acceptance-', dir=os.environ.get('PHILIUM_SCRATCH_DIR') or None)).resolve()
     run = Run(args.app, scratch, args.out)
@@ -485,15 +487,26 @@ def main():
             (bin_dir / name).write_text(body); (bin_dir / name).chmod(0o755)
         url = f'http://127.0.0.1:{model.server_port}/v1'
 
-        r = run.ui(SETUP, {'repos': [str(alpha), str(beta), str(ver_a), str(gamma), str(ver_g), str(delta), str(ver_d)], 'model_url': url, 'key': KEY}, 240)
+        repos = [str(alpha), str(beta), str(ver_a), str(gamma), str(ver_g), str(delta), str(ver_d)] + ([str(Path(args.public[0]).resolve())] if args.public else [])
+        r = run.ui(SETUP, {'repos': repos, 'model_url': url, 'key': KEY}, 240)
         v = run.value(r)
-        run.check('B6', 'Two same-named checkouts register from the Repos screen with distinct labels', sorted(v.get('labels') or []) == sorted(['All Workspaces', 'alpha/same', 'beta/same', 'gamma', 'verifier-alpha', 'verifier-gamma', 'delta', 'verifier-delta']), v.get('labels') or r.get('error'))
+        labels = ['All Workspaces', 'alpha/same', 'beta/same', 'gamma', 'verifier-alpha', 'verifier-gamma', 'delta', 'verifier-delta'] + ([Path(args.public[0]).resolve().name] if args.public else [])
+        run.check('B6', 'Two same-named checkouts register from the Repos screen with distinct labels', sorted(v.get('labels') or []) == sorted(labels), v.get('labels') or r.get('error'))
         run.check('B1', 'A provider with an API key can be saved', v.get('keyed') == 'saved', v.get('keyed') or r.get('error'))
         vault = run.profile / 'data/secrets/vault.json'
         mode = stat.S_IMODE(vault.stat().st_mode) if vault.exists() else None
         db = (run.profile / 'data/philium.db').read_bytes() if (run.profile / 'data/philium.db').exists() else b''
         run.check('B1', 'The key is in the profile vault with owner-only access and not in the database', mode == 0o600 and KEY.encode() in vault.read_bytes() and KEY.encode() not in db, f'mode={oct(mode) if mode else None}')
         syn.Model.probe = {'home': str(run.home), 'vault': str(vault)}
+
+        if args.public and want('public'):
+            # The real origin, read without credentials. No stand-in is configured for this phase.
+            checkout, pr, head, n_landed, n_nested = args.public
+            d = (run.value(run.ui(REVIEW, {'checkout': Path(checkout).resolve().name, 'url': pr}, 260)).get('verified')) or {}
+            landed = d.get('landed') or ''
+            found = (landed.count(' landed at '), landed.count(' contains #'))
+            run.check('C2', 'A public parent pull request, read from the real origin by the form: exact head, landed and nested pull requests', (d.get('ids') or {}).get('Head') == head and found == (int(n_landed), int(n_nested)) and ' 0 missing lookups' in landed and '0 ambiguous' in landed, {'head': (d.get('ids') or {}).get('Head'), 'base': (d.get('ids') or {}).get('Target (base)'), 'landed': found[0], 'nested': found[1], 'tail': landed[-70:], 'status': d.get('status')})
+            run.check('C7', 'With no verifier pinned, a public pull request is resolved but never called ready', d.get('headline') == 'Release verification incomplete' and 'No independent driver enrolled' in ' '.join(d.get('reasons') or []), {'headline': d.get('headline'), 'why': ' | '.join(d.get('reasons') or [])[:200]})
 
         if want('coord'):
             r = run.ui(COORDINATE, {'checkout': 'alpha/same', 'lead': 'lead', 'worker': 'wren', 'task': 'Add status column'}, 220)
