@@ -5,9 +5,9 @@ import {rpc} from '../lib/rpc.js';
 // Mounted with a stable checkout key; switching checkout destroys the inspector and draft.
 export function ManagedJobs(props){
   const [view,setView]=createStore({data:null}),data=()=>view.data,[error,setError]=createSignal(''),[busy,setBusy]=createSignal(false);
-  const [profiles,setProfiles]=createSignal([]),[profile,setProfile]=createSignal(''),[task,setTask]=createSignal(''),[cmd,setCmd]=createSignal(''),[minutes,setMinutes]=createSignal(10),[form,setForm]=createSignal(false),[plan,setPlan]=createSignal(null);
+  const [profiles,setProfiles]=createSignal([]),[profile,setProfile]=createSignal(''),[task,setTask]=createSignal(props.taskId||''),[cmd,setCmd]=createSignal(''),[minutes,setMinutes]=createSignal(10),[form,setForm]=createSignal(false),[plan,setPlan]=createSignal(null);
   const [tail,setTail]=createSignal(null),[release,setRelease]=createSignal('');let live=true,seq=0,lseq=0,timer;
-  const invoke=(method,args={})=>rpc('managed.'+method,{repo_id:props.id,...args},{local:true});
+  const invoke=(method,args={})=>rpc('managed.'+method,{repo_id:props.id,...args,...(props.taskId?{task_id:props.taskId}:{})},{local:true});
   async function refresh(){const n=++seq;clearTimeout(timer);try{const r=await invoke('list');if(!live||seq!==n)return;setView('data',reconcile(r));if(r.jobs.some(j=>j.state!=='released'))timer=setTimeout(refresh,5000);}catch(e){if(live&&seq===n)setError(String(e));}}
   onMount(refresh);onCleanup(()=>{live=false;seq++;lseq++;clearTimeout(timer);});
   async function act(fn){if(busy())return;setError('');setBusy(true);try{await fn();}catch(e){if(live)setError(String(e));}finally{if(live)setBusy(false);}}
@@ -18,7 +18,7 @@ export function ManagedJobs(props){
     <button disabled={busy()} onClick={()=>act(openForm)}>New task sandbox</button> <button disabled={busy()} onClick={()=>act(refresh)}>Refresh sandboxes</button>
     <Show when={error()}><p role="alert">{error()}</p></Show>
     <Show when={form()}><fieldset disabled={busy()||!!plan()}><legend>Run a local command</legend>
-      <label>Claimed task <select value={task()} onChange={e=>setTask(e.currentTarget.value)}><option value="">Choose task and agent</option><For each={data()?.tasks||[]}>{t=><option value={t.id}>{t.title} · {t.owner}</option>}</For></select></label>
+      <label>Claimed task <select disabled={!!props.taskId} value={task()} onChange={e=>setTask(e.currentTarget.value)}><option value="">Choose task and agent</option><For each={data()?.tasks||[]}>{t=><option selected={task()===t.id} value={t.id}>{t.title} · {t.owner}</option>}</For></select></label>
       <Show when={!data()?.tasks.length}><p>Claim a task with an agent in this checkout first.</p></Show>
       <label>Colima profile <select value={profile()} onChange={e=>setProfile(e.currentTarget.value)}><option value="">Choose runtime</option><For each={profiles()}>{p=><option>{p}</option>}</For></select></label>
       <label>Maximum minutes <input type="number" min="1" max="60" value={minutes()} onInput={e=>setMinutes(e.currentTarget.valueAsNumber)}/></label>

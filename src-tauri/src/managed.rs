@@ -308,17 +308,34 @@ pub fn start_watcher(ctx: &Arc<Ctx>) {
 pub async fn call(ctx: &Arc<Ctx>, method: &str, a: Value) -> Result<Value, String> {
     init(ctx)?;
     let repo = arg_str(&a, "repo_id")?;
+    let selected_job = || -> Result<Value, String> {
+        let j = row(ctx, &repo, key(&a, "id")?)?;
+        if a.get("task_id").is_some() && key(&a, "task_id")? != key(&j, "task")? {
+            return Err("Sandbox does not belong to the selected task".into());
+        }
+        Ok(j)
+    };
     match method {
-        "list" => Ok(
-            json!({"tasks":candidates(ctx,&repo)?,"jobs":ctx.db.query("SELECT j.*,t.title AS task_name,a.name AS agent_name FROM managed_jobs j LEFT JOIN tasks t ON t.id=j.task LEFT JOIN agents a ON a.id=j.agent WHERE j.repo=? ORDER BY (j.state!='released') DESC,j.created DESC LIMIT 80",[repo])?}),
-        ),
+        "list" => {
+            let task = if a.get("task_id").is_some() {
+                Some(key(&a, "task_id")?)
+            } else {
+                None
+            };
+            let tasks: Vec<_> = candidates(ctx, &repo)?
+                .into_iter()
+                .filter(|t| task.is_none() || task == t["id"].as_str())
+                .collect();
+            let jobs=ctx.db.query("SELECT j.*,t.title AS task_name,a.name AS agent_name FROM managed_jobs j LEFT JOIN tasks t ON t.id=j.task LEFT JOIN agents a ON a.id=j.agent WHERE j.repo=?1 AND (?2 IS NULL OR j.task=?2) ORDER BY (j.state!='released') DESC,j.created DESC LIMIT 80",params![repo,task])?;
+            Ok(json!({"tasks":tasks,"jobs":jobs}))
+        }
         "launch" => {
             let _g = OPS.lock().await;
             launch(ctx, &a).await
         }
         "release" => {
             let _g = OPS.lock().await;
-            let j = row(ctx, &repo, key(&a, "id")?)?;
+            let j = selected_job()?;
             if j["state"] == "released" {
                 return Ok(j);
             }
@@ -333,7 +350,7 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, a: Value) -> Result<Value, Strin
             row(ctx, &repo, key(&j, "id")?)
         }
         "logs" => {
-            let j = row(ctx, &repo, key(&a, "id")?)?;
+            let j = selected_job()?;
             if j["state"] != "active" {
                 return Err("Sandbox no longer active".into());
             }

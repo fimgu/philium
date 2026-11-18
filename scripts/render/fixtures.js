@@ -36,7 +36,7 @@ const agents = [
 const task = (id, title, status, extra = {}) => ({ id, title, status, priority: 2, owner: null, depends_on: [], detail: "Details for " + title, ...extra });
 const tasks = [
   task("t1", "Add retry to gateway streaming", "open", { priority: 1 }),
-  task("t2", "Refactor worktree cleanup", "claimed", { owner: "lion" }),
+  task("t2", "Refactor worktree cleanup", "claimed", { owner: "lion", owner_agent_id:"a1", repo_id:"r1" }),
   task("t3", "Fix sidebar overflow", "review", { owner: "otter" }),
   task("t4", "Write onboarding copy", "done", { owner: "crane" }),
   task("t5", "Index ignore rules", "open", { blocked: true, depends_on: ["t2"] }),

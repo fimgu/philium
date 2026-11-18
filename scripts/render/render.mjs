@@ -98,6 +98,8 @@ const stub = (fx, setName) => {
         throw fixtures.__fail[window.__n % fixtures.__fail.length];
       }
       if (cmd === "rpc") {
+        if(a.method==='managed.list' && a.args.task_id==='t2' && a.args.repo_id==='r1')return {tasks:[{id:'t2',agent:'a1',owner:'lion',title:'Refactor worktree cleanup'}],jobs:[{id:'board-job',task:'t2',agent:'a1',cid:'c'.repeat(64),state:'active',expires:Date.now()+60000}]};
+        if(a.method==='managed.logs' && a.args.id==='board-job') {if(a.args.task_id!=='t2'||a.args.repo_id!=='r1')throw Error('Unscoped task logs');return {text:'board task fixture output'};}
         if(a.method==='managed.list') return {tasks:[{id:'t1',agent:'a1',owner:'lion',title:'Offline check'}],jobs:window.__test.managed?[{...window.__test.managed}]:[]};
         if(a.method==='managed.launch') {if(a.args.repo_id!=='r1'||a.args.task_id!=='t1'||a.args.agent_id!=='a1'||a.args.profile!=='alpha'||a.args.command!=='echo marker')throw Error('Incorrect preview binding');return window.__test.managed={id:'j1',task_name:'Offline check',agent_name:'lion',profile:'alpha',cid:'b'.repeat(64),expires:Date.now()+60000,state:'active'};}
         if(a.method==='managed.logs') return {text:'fixture marker',truncated:false};
@@ -210,7 +212,7 @@ async function open(fx, setName, w, h, route) {
   const page = await browser.newPage();
   await page.setViewport({ width: w, height: h, deviceScaleFactor: 1 });
   await page.evaluateOnNewDocument(`(${stub.toString()})(${JSON.stringify(fx)}, ${JSON.stringify(setName)})`);
-  await page.evaluateOnNewDocument((r) => {localStorage.setItem("route", r);if(r==='environments')localStorage.setItem('philium.activeRepo','r1');}, route);
+  await page.evaluateOnNewDocument((r) => {localStorage.setItem("route", r);if(r==='board')localStorage.setItem('agents.viewMode','grid');if(r==='environments')localStorage.setItem('philium.activeRepo','r1');}, route);
   page.on("pageerror", (e) => { problems.push(`${setName} ${route} pageerror: ${e.message}`); });
   page.on("console", (m) => { if (m.type() === "error") problems.push(`${setName} ${route} console.error: ${m.text().slice(0, 200)}`); });
   await page.goto(`http://127.0.0.1:${port}/`);
@@ -313,7 +315,7 @@ for (const setName of sets) {
         }
       }
       if (s === "board" && setName === "populated") {
-        if (await clickText(page, "[class*=card], article", "Refactor worktree")) { await sleep(400); await shot(page, "board-detail"); }
+        try {await clickText(page,'.board-task-title','Refactor worktree');await page.waitForSelector('.board-drawer details summary');await page.click('.board-drawer summary');await clickText(page,'.board-drawer button','Sandbox logs');await page.waitForFunction(()=>document.querySelector('.board-drawer pre')?.textContent==='board task fixture output');await shot(page,'board-detail');await clickText(page,'.board-drawer button','Open agent');await page.waitForFunction(()=>!document.querySelector('.board-drawer')&&document.querySelector('.agent-head .agent-chip')?.textContent==='lion'&&localStorage.getItem('agents.viewMode')==='grid',{timeout:4000});}catch(e){problems.push(`${w} board inspection: ${e.message} ${await page.evaluate(()=>[localStorage.getItem('route'),document.querySelector('.main')?.innerText.slice(0,420),document.querySelector('.toast')?.textContent].join(' '))}`);}
       }
       if (s === "agents" || s === "chat") {
         await page.evaluate((s) => window.__philiumGo(s, s === "agents" ? { id: "deleted-id" } : { session: "deleted-id" }), s);

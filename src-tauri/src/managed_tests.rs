@@ -89,6 +89,27 @@ async fn runtime_phase() {
         let a = rpc("list", json!({"repo_id":"alpha"})).await.unwrap()["jobs"][0].clone();
         let b = rpc("list", json!({"repo_id":"beta"})).await.unwrap()["jobs"][0].clone();
         assert_ne!(a["cid"], b["cid"]);
+        assert_eq!(
+            rpc("list", json!({"repo_id":"alpha","task_id":a["task"]}))
+                .await
+                .unwrap()["jobs"][0]["id"],
+            a["id"]
+        );
+        assert_eq!(
+            rpc("list", json!({"repo_id":"alpha","task_id":b["task"]}))
+                .await
+                .unwrap()["jobs"],
+            json!([])
+        );
+        for m in ["logs", "release"] {
+            assert!(rpc(
+                m,
+                json!({"repo_id":"alpha","task_id":b["task"],"id":a["id"]})
+            )
+            .await
+            .unwrap_err()
+            .contains("selected task"));
+        }
         // Mutate only copies of fixture records. Never switch the shared engine.
         for (field, value, reason) in [
             ("engine", json!("changed"), "identity changed"),

@@ -916,6 +916,11 @@ export default function Agents() {
   const [search, setSearch] = createSignal("");
   const [viewMode, setViewModeRaw] = createSignal(localStorage.getItem("agents.viewMode") || "split");
   const setViewMode = (m) => { setViewModeRaw(m); localStorage.setItem("agents.viewMode", m); };
+  createEffect(() => {
+    if (params().focusOwner && params().id) {
+      setFilter('all'); setSearch(''); setViewModeRaw('split');
+    }
+  });
 
   registerCommands([
     { id: "agent.new", label: "New agent / orchestrator", run: () => setSpawn({}) },
