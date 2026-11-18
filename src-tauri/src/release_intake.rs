@@ -132,6 +132,14 @@ pub(crate) async fn local_git_output(
     args: &[&str],
     exact: bool,
 ) -> Result<String, String> {
+    local_git_limited(path, args, exact, 131072).await
+}
+pub(crate) async fn local_git_limited(
+    path: &Path,
+    args: &[&str],
+    exact: bool,
+    max: u64,
+) -> Result<String, String> {
     use tokio::io::AsyncReadExt;
     let mut child = tokio::process::Command::new("/usr/bin/git")
         .current_dir(path)
@@ -159,11 +167,11 @@ pub(crate) async fn local_git_output(
             .stdout
             .take()
             .ok_or("No Git output")?
-            .take(131073)
+            .take(max + 1)
             .read_to_end(&mut buf)
             .await
             .map_err(|_| "Cannot read history")?;
-        if buf.len() > 131072 {
+        if buf.len() as u64 > max {
             return Err("History exceeds the inspection limit".into());
         }
         if !child.wait().await.is_ok_and(|s| s.success()) {

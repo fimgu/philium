@@ -142,6 +142,8 @@ fn observe(schema: &str, c: &Value) -> Option<String> {
                 | A::Delete { .. }
                 | A::Transaction { .. }
                 | A::Recursive => true,
+                // SQLite asks for this once for every index it creates, to fill it.
+                A::Reindex { .. } => true,
                 A::Function { function_name: f } => matches!(
                     f,
                     "count"
@@ -242,10 +244,12 @@ async fn run_one(path: &Path, oid: &str, v: &Value) -> Option<Value> {
         if let Some(p) = c["document"].as_str() {
             let mut attempts = vec![];
             for _ in 0..2 {
-                let s = crate::release_intake::local_git_output(
+                // Committed documents may be as large as the document reader accepts.
+                let s = crate::release_intake::local_git_limited(
                     path,
                     &["cat-file", "blob", &format!("{oid}:{p}")],
                     true,
+                    1_048_576,
                 )
                 .await
                 .ok();
@@ -819,4 +823,22 @@ pub(crate) async fn stage_probe(port: Option<u16>, head: &str, digest: &str) -> 
         }
     });
     crate::release_stage::assess(head, digest, &observed, now())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn schema_with_explicit_indexes_is_observed() {
+        let schema = "-- comment\nCREATE TABLE IF NOT EXISTS m (w text NOT NULL, g bigint NOT NULL, u text NOT NULL, at timestamptz, PRIMARY KEY (w, g));\nCREATE UNIQUE INDEX IF NOT EXISTS one_user ON m(w, u);\nCREATE INDEX IF NOT EXISTS by_user ON m(u);";
+        let case = |seed: &str, query: &str, expect: Value| json!({"id":"x","seed":seed,"query":query,"expect":expect});
+        let kept = observe(schema, &case("INSERT INTO m(w,g,u) VALUES('w1',100,'u1'); INSERT OR IGNORE INTO m(w,g,u) VALUES('w1',200,'u1')", "SELECT g FROM m WHERE u='u1'", json!([[100]])));
+        assert!(kept.as_deref().is_some_and(|r| r.starts_with("pass:")), "{kept:?}");
+        let wrong = observe(schema, &case("INSERT INTO m(w,g,u) VALUES('w1',100,'u1')", "SELECT count(*) FROM m", json!([[2]])));
+        assert!(wrong.as_deref().is_some_and(|r| r.starts_with("mismatch:")), "{wrong:?}");
+        // Still refused: anything that is not a table, index or view, and writes in the query.
+        assert_eq!(observe("CREATE TABLE t(a); CREATE TRIGGER x AFTER INSERT ON t BEGIN SELECT 1; END;", &case("SELECT 1", "SELECT 1", json!([[1]]))), None);
+        assert_eq!(observe("CREATE TABLE t(a);", &case("SELECT 1", "DELETE FROM t", json!([]))), None);
+        assert_eq!(observe("ATTACH DATABASE ':memory:' AS other;", &case("SELECT 1", "SELECT 1", json!([[1]]))), None);
+    }
 }
