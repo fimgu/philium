@@ -22,6 +22,18 @@ pub async fn run(ctx: &Ctx, repo: &str, url: &str) -> Result<Value, String> {
         }
     };
     let last = release_intake::call(ctx, "resolve", req).await.ok();
+    finish(ctx, repo, first, last, members, receipt, reason)
+}
+
+fn finish(
+    ctx: &Ctx,
+    repo: &str,
+    first: Value,
+    last: Option<Value>,
+    members: Option<Value>,
+    receipt: Value,
+    reason: Option<String>,
+) -> Result<Value, String> {
     let current = last.as_ref().map(|v| {
         v["generation"] == first["generation"]
             && v["head"] == first["head"]
@@ -98,6 +110,10 @@ pub(crate) fn reviewed(scope: &Value, refs: &Value, receipt: &Value) -> bool {
             .collect::<BTreeSet<_>>()
             == ids
 }
+#[cfg(test)]
+#[path = "release_verify_test.rs"]
+mod tests;
+
 pub async fn cli() -> Result<Value, String> {
     let argv: Vec<_> = std::env::args().skip(1).collect();
     let verify = argv.first().is_some_and(|s| s == "--review-url");
