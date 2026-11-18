@@ -16,7 +16,8 @@ pub fn active() -> bool {
 // Only the human-operated Environments explorer uses this fixed host directory.
 // Do not restore the real HOME to children or expose an arbitrary host path.
 pub(crate) fn colima_dir() -> Option<PathBuf> {
-    BASE.get().and_then(|base| base.parent().map(|p| p.join(".colima")))
+    BASE.get()
+        .and_then(|base| base.parent().map(|p| p.join(".colima")))
         .or_else(|| env::var_os("HOME").map(|p| PathBuf::from(p).join(".colima")))
 }
 
@@ -128,6 +129,7 @@ pub async fn check() -> Result<(), String> {
                         name,
                     ],
                 )?;
+                workspace::git(&path,&["config","remote.origin.url","https://github.com/philium-fixture/offline.git"])?;
                 let r = crate::rpc_inner(
                     &app,
                     "workspace.repo_add".into(),
@@ -228,6 +230,7 @@ pub async fn check() -> Result<(), String> {
         {
             return Err("Pilot startup or shutdown isolation failed".into());
         }
+        release_graph_fixture(&app, &base.join("alpha/same"), &alpha, &beta, phase=="seed").await?;
         Ok(())
     }
     .await;
@@ -235,5 +238,107 @@ pub async fn check() -> Result<(), String> {
     desk.stop();
     result?;
     println!("Pilot {phase}: selected workspace tasks isolated, both IDs preserved, bundled HAL session recovered.");
+    Ok(())
+}
+
+// Only reached from the packaged check with its explicit disposable-home guard.
+async fn release_graph_fixture(
+    app: &crate::App,
+    path: &Path,
+    repo: &str,
+    peer: &str,
+    seed: bool,
+) -> Result<(), String> {
+    let call =
+        |method: &str, args| crate::rpc_inner(app, format!("release_intake.{method}"), Some(args));
+    call("history", json!({"repo_id":repo})).await?;
+    if seed {
+        let root = workspace::git(path, &["rev-parse", "HEAD"])?;
+        let node = |name: &str, parents: &[&str]| {
+            let mut args = vec![
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit-tree",
+                "HEAD^{tree}",
+                "-m",
+                name,
+            ];
+            for p in parents {
+                args.extend(["-p", *p]);
+            }
+            workspace::git(path, &args)
+        };
+        let target = node("target only", &[&root])?;
+        let direct = node("direct", &[&root])?;
+        let child = node("child", &[&root])?;
+        let merged = node("integration", &[&direct, &child])?;
+        let url = "https://github.com/philium-fixture/offline/pull/1";
+        for h in [&direct, &merged] {
+            crate::release_intake::record(
+                &app.ctx.db,
+                repo,
+                "philium-fixture/offline",
+                1,
+                &json!({"number":1,"url":url,"baseRefOid":target,"headRefOid":h}),
+            )?;
+        }
+        for (k, v) in [
+            ("root", root),
+            ("target", target),
+            ("direct", direct),
+            ("child", child),
+            ("merged", merged),
+        ] {
+            workspace::git(path, &["branch", &format!("fixture-{k}"), &v])?;
+        }
+    }
+    let oid =
+        |name: &str| workspace::git(path, &["rev-parse", &format!("refs/heads/fixture-{name}")]);
+    let rows = call("history", json!({"repo_id":repo})).await?;
+    if rows.as_array().map(Vec::len) != Some(2) {
+        return Err("Missing fixture generations".into());
+    }
+    for (i, n) in [(0, 3), (1, 1)] {
+        let id = &rows[i]["seq"];
+        let graph = call("graph", json!({"repo_id":repo,"generation":id})).await?;
+        let commits = graph["commits"].as_array().ok_or("Missing graph")?;
+        if graph["merge_base"] != oid("root")?
+            || graph["target"] != oid("target")?
+            || commits.len() != n
+            || graph["head"] != oid(if i == 0 { "merged" } else { "direct" })?
+        {
+            return Err("Wrong commit range or comparator".into());
+        }
+        if i == 0
+            && (commits[0]["parents"] != json!([oid("direct")?, oid("child")?])
+                || !commits.iter().any(|v| v["oid"] == commits[0]["parents"][1]))
+        {
+            return Err("Wrong merge edges".into());
+        }
+        if !matches!(call("graph",json!({"repo_id":peer,"generation":id})).await,Err(e) if e=="Generation does not belong to this checkout")
+        {
+            return Err("Peer generation not isolated".into());
+        }
+    }
+    let first = json!({"repo_id":repo,"generation":rows[1]["seq"]});
+    let latest = json!({"repo_id":repo,"generation":rows[0]["seq"]});
+    if seed {
+        if call("followup", latest.clone()).await?["mode"] != "full" {
+            return Err("Captured head became a review checkpoint".into());
+        }
+        call("checkpoint", first.clone()).await?;
+    }
+    let next = call("followup", latest).await?;
+    if call("followup", first).await?["mode"] != "checkpoint"
+        || next["mode"] != "followup"
+        || next["from"] != oid("direct")?
+        || next["to"] != oid("merged")?
+        || next["commits"].as_array().map(Vec::len) != Some(2)
+    {
+        return Err("Follow-up lost the last reviewed head or missed a commit".into());
+    }
+    println!("Release graph: divergent target excluded, merge parents preserved, peer denied. Follow-up covers both commits since the reviewed revision (fixture origin metadata).");
     Ok(())
 }

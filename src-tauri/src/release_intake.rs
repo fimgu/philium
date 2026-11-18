@@ -7,6 +7,7 @@ use rusqlite::params;
 use serde_json::{json, Value};
 use std::{path::Path, process::Stdio, time::Duration};
 static FETCH: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+const ANCHORS:&str="CREATE TABLE IF NOT EXISTS release_review_checkpoints(seq INTEGER PRIMARY KEY REFERENCES release_refs(seq), marked INTEGER NOT NULL)";
 const SCHEMA:&str="CREATE TABLE IF NOT EXISTS release_refs(seq INTEGER PRIMARY KEY,repo TEXT NOT NULL,origin TEXT NOT NULL,pr INTEGER NOT NULL,base TEXT NOT NULL,head TEXT NOT NULL,observed INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS release_lookup ON release_refs(repo,origin,pr,seq)";
 fn slug(s: &str) -> Result<String, String> {
     let parts: Vec<_> = s.split('/').collect();
@@ -51,7 +52,13 @@ fn target(url: &str, expected: &str) -> Result<i64, String> {
         .filter(|v| *v > 0)
         .ok_or("Invalid PR number".into())
 }
-fn record(db: &Db, repo: &str, origin: &str, pr: i64, v: &Value) -> Result<Value, String> {
+pub(crate) fn record(
+    db: &Db,
+    repo: &str,
+    origin: &str,
+    pr: i64,
+    v: &Value,
+) -> Result<Value, String> {
     if v["number"].as_i64() != Some(pr) || target(v["url"].as_str().unwrap_or(""), origin)? != pr {
         return Err("Origin returned a different PR".into());
     }
@@ -65,18 +72,130 @@ fn record(db: &Db, repo: &str, origin: &str, pr: i64, v: &Value) -> Result<Value
     let sampled = now();
     db.with(|c|{let tx=c.unchecked_transaction()?;tx.execute("INSERT INTO release_refs(repo,origin,pr,base,head,observed) SELECT ?1,?2,?3,?4,?5,?6 WHERE NOT EXISTS(SELECT 1 FROM (SELECT base,head FROM release_refs WHERE repo=?1 AND origin=?2 AND pr=?3 ORDER BY seq DESC LIMIT 1) WHERE base=?4 AND head=?5)",params![repo,origin,pr,base,head,sampled])?;let generation:i64=tx.query_row("SELECT MAX(seq) FROM release_refs WHERE repo=? AND origin=? AND pr=?",params![repo,origin,pr],|r|r.get(0))?;tx.commit()?;Ok(json!({"generation":generation,"pr":pr,"base":base,"head":head,"checked":sampled}))})
 }
+fn sha(s: &str) -> bool {
+    s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+// Only object IDs leave this reader. No subjects, patch contents, hooks or origin requests.
+async fn local_git(path: &Path, args: &[&str]) -> Result<String, String> {
+    use tokio::io::AsyncReadExt;
+    let mut child = tokio::process::Command::new("/usr/bin/git")
+        .current_dir(path)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", "/var/empty")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_ALLOW_PROTOCOL", "")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env("GIT_GRAFT_FILE", "/dev/null")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .args(["--no-pager", "-c", "core.commitGraph=false"])
+        .args(args)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .stdout(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|_| "Local Git unavailable")?;
+    tokio::time::timeout(Duration::from_secs(8), async {
+        let mut buf = Vec::new();
+        child
+            .stdout
+            .take()
+            .ok_or("No Git output")?
+            .take(131073)
+            .read_to_end(&mut buf)
+            .await
+            .map_err(|_| "Cannot read history")?;
+        if buf.len() > 131072 {
+            return Err("History exceeds the inspection limit".into());
+        }
+        if !child.wait().await.is_ok_and(|s| s.success()) {
+            return Err("Pinned history unavailable locally. No fetch was attempted.".into());
+        }
+        String::from_utf8(buf)
+            .map(|s| s.trim_end().to_owned())
+            .map_err(|_| "Invalid Git response".into())
+    })
+    .await
+    .map_err(|_| "Local history inspection timed out")?
+}
+async fn graph(path: &Path, expected: &str, base: &str, head: &str) -> Result<Value, String> {
+    if !sha(base) || !sha(head) || !path.join(".git").exists() {
+        return Err("Pinned checkout unavailable".into());
+    }
+    if origin(&local_git(path, &["config", "--local", "--get", "remote.origin.url"]).await?)?
+        != expected
+    {
+        return Err("Checkout origin changed".into());
+    }
+    if local_git(path, &["rev-parse", "--is-shallow-repository"]).await? != "false" {
+        return Err("A shallow checkout cannot establish complete ancestry".into());
+    }
+    let ancestor = local_git(path, &["merge-base", "--all", base, head]).await?;
+    if !sha(&ancestor) {
+        return Err("No unique merge base for this generation".into());
+    }
+    let range = format!("{base}..{head}");
+    let lines = local_git(
+        path,
+        &[
+            "rev-list",
+            "--parents",
+            "--topo-order",
+            "--max-count=513",
+            &range,
+            "--",
+        ],
+    )
+    .await?;
+    let mut commits = Vec::new();
+    for line in lines.lines() {
+        let ids: Vec<_> = line.split_ascii_whitespace().collect();
+        if ids.is_empty() || !ids.iter().all(|id| sha(id)) {
+            return Err("Invalid ancestry response".into());
+        }
+        if commits.len() == 512 {
+            return Err("Over 512 included commits. No partial graph reported.".into());
+        }
+        commits.push(json!({"oid":ids[0],"parents":&ids[1..]}));
+    }
+    Ok(json!({"merge_base":ancestor,"target":base,"head":head,"commits":commits}))
+}
 pub async fn call(ctx: &Ctx, method: &str, a: Value) -> Result<Value, String> {
     let repo = arg_str(&a, "repo_id")?;
     let r = ctx
         .db
-        .query("SELECT remote_url FROM repos WHERE id=?", [&repo])?;
+        .query("SELECT remote_url,path FROM repos WHERE id=?", [&repo])?;
     let o = origin(
         r.first()
             .and_then(|v| v["remote_url"].as_str())
             .unwrap_or(""),
     )?;
     ctx.db.with(|c| c.execute_batch(SCHEMA))?;
+    ctx.db.with(|c| c.execute_batch(ANCHORS))?;
     match method{
+ "checkpoint"|"followup"=>{
+    let seq=a["generation"].as_i64().ok_or("Select a recorded generation")?;
+    let rows=ctx.db.query("SELECT base,head,pr FROM release_refs WHERE repo=? AND origin=? AND seq=?",params![repo,o,seq])?;
+    let row=rows.first().ok_or("Generation does not belong to this checkout")?;
+    if method=="checkpoint"{ctx.db.exec("INSERT OR IGNORE INTO release_review_checkpoints(seq,marked) VALUES(?,?)",params![seq,now()])?;return Ok(json!({"recorded":seq}));}
+    let anchors=ctx.db.query("SELECT r.seq,r.base,r.head FROM release_refs r JOIN release_review_checkpoints c ON c.seq=r.seq WHERE repo=? AND origin=? AND pr=? AND r.seq<=? ORDER BY r.seq DESC LIMIT 1",params![repo,o,row["pr"].as_i64(),seq])?;
+    let Some(anchor)=anchors.first() else{return Ok(json!({"mode":"full","reason":"No completed code-review checkpoint"}));};
+    if anchor["seq"]==seq{return Ok(json!({"mode":"checkpoint","reason":"Code review recorded. This is not a workflow pass or approval."}));}
+    if anchor["base"]!=row["base"]{return Ok(json!({"mode":"full","reason":"The target revision changed"}));}
+    let old=anchor["head"].as_str().ok_or("Invalid checkpoint")?;let head=row["head"].as_str().ok_or("Invalid head")?;let path=Path::new(r[0]["path"].as_str().ok_or("Missing checkout")?);
+    let full=|reason:&str|json!({"mode":"full","reason":reason});
+    let delta=match graph(path,&o,old,head).await{Ok(g) if g["merge_base"]==old=>g,Ok(_)=>return Ok(full("History was rewritten")),Err(e)=>return Ok(full(&e))};
+    // A merge from the target may advance the merge base even if the target tip did not move.
+    let base=row["base"].as_str().ok_or("Invalid target")?;
+    let previous=local_git(path,&["merge-base","--all",base,old]).await;
+    let current=local_git(path,&["merge-base","--all",base,head]).await;
+    if !matches!((previous,current),(Ok(a),Ok(b)) if sha(&a)&&a==b){return Ok(full("Merge base changed or cannot be verified"));}
+    Ok(json!({"mode":"followup","from":old,"to":head,"commits":delta["commits"],"reason":"Review the cumulative change and prior findings. Broaden to full review if scope changed. Required workflows still need current-head evidence."}))},
+ "graph"=>{let seq=a["generation"].as_i64().ok_or("Select a recorded generation")?;let rows=ctx.db.query("SELECT base,head FROM release_refs WHERE repo=? AND origin=? AND seq=?",params![repo,o,seq])?;let row=rows.first().ok_or("Generation does not belong to this checkout")?;graph(Path::new(r[0]["path"].as_str().ok_or("Checkout unavailable")?),&o,row["base"].as_str().ok_or("Invalid base")?,row["head"].as_str().ok_or("Invalid head")?).await},
  "history"=>Ok(json!(ctx.db.query("SELECT seq,pr,base,head,observed FROM release_refs WHERE repo=? AND origin=? ORDER BY seq DESC LIMIT 30",params![repo,o])?)),
  "resolve"=>{let n=target(&arg_str(&a,"url")?,&o)?;let _g=FETCH.try_lock().map_err(|_|"Another origin lookup is in progress")?;
  let exe=["/opt/homebrew/bin/gh","/usr/local/bin/gh","/usr/bin/gh"].into_iter().find(|p|Path::new(p).is_file()).ok_or("GitHub CLI unavailable")?;
