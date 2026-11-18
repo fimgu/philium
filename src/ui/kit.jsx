@@ -300,7 +300,8 @@ export function Menu(props) {
     const r = btn.getBoundingClientRect();
     setPos({ top: Math.min(r.bottom + 4, window.innerHeight - 40 - (props.items?.length ?? 0) * 30), right: Math.max(8, window.innerWidth - r.right) });
   };
-  const onDoc = () => close();
+  // The opening click is delegated to the document and reaches this listener too: ignore it.
+  const onDoc = (e) => { if (e?.type !== "click" || !btn?.contains(e.target)) close(); };
   onMount(() => { document.addEventListener("click", onDoc); window.addEventListener("resize", onDoc); });
   onCleanup(() => { document.removeEventListener("click", onDoc); window.removeEventListener("resize", onDoc); });
   return (
@@ -434,12 +435,15 @@ export function ModelPicker(props) {
   };
 
   const close = (restoreFocus = false) => { setOpen(false); if (restoreFocus === true) btn?.focus(); };
+  // Clicks are delegated to the document, so the click that opens the list, and every click
+  // inside it, also reaches this listener. Only a click elsewhere closes the list.
+  const outside = (e) => { if (!btn?.contains(e.target) && !e.target?.closest?.(".model-picker-pop")) close(); };
   onMount(() => {
-    document.addEventListener("click", close);
+    document.addEventListener("click", outside);
     window.addEventListener("resize", close);
   });
   onCleanup(() => {
-    document.removeEventListener("click", close);
+    document.removeEventListener("click", outside);
     window.removeEventListener("resize", close);
   });
 
