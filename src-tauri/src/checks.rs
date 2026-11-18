@@ -4,15 +4,54 @@ use serde_json::{json, Value};
 use std::{process::Stdio, sync::Arc};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
+// A socket is a discovery hint, not proof of a healthy daemon, a deployment or ownership.
+// Store only profile names, scan status and time. No logs, paths, environment or secrets.
+const PREFLIGHT:&str="CREATE TABLE IF NOT EXISTS check_preflight(repo TEXT PRIMARY KEY REFERENCES repos(id) ON DELETE CASCADE, observed INTEGER NOT NULL, profiles TEXT, CHECK(profiles IS NULL OR length(profiles)<=18000))";
+fn remember(
+    db: &crate::db::Db,
+    repo: &str,
+    at: i64,
+    scan: Result<Value, String>,
+) -> Result<(), String> {
+    let names = scan.ok().map(|v| v.to_string());
+    db.with(|c| c.execute_batch(PREFLIGHT))?;
+    db.exec("INSERT INTO check_preflight(repo,observed,profiles) VALUES(?,?,?) ON CONFLICT(repo) DO UPDATE SET observed=excluded.observed,profiles=excluded.profiles WHERE excluded.observed>=check_preflight.observed",rusqlite::params![repo,at,names])?;
+    Ok(())
+}
+fn recalled(db: &crate::db::Db, repo: &str) -> Result<Value, String> {
+    db.with(|c| c.execute_batch(PREFLIGHT))?;
+    let Some(row) = db
+        .query(
+            "SELECT observed,profiles FROM check_preflight WHERE repo=?",
+            [repo],
+        )?
+        .pop()
+    else {
+        return Ok(Value::Null);
+    };
+    let profiles: Value = match row["profiles"].as_str() {
+        Some(s) => serde_json::from_str(s).map_err(|_| "Invalid saved inventory")?,
+        None => Value::Null,
+    };
+    let observed = row["observed"].as_i64().ok_or("Invalid observation time")?;
+    Ok(json!({"observed":observed,"expires":observed.saturating_add(300_000),"profiles":profiles}))
+}
+
 pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, String> {
     if !cfg!(target_os = "macos") {
         return Err("Local Make checks require the macOS offline runner".into());
     }
-    if !matches!(method, "list" | "preview" | "start" | "cancel") {
+    if !matches!(
+        method,
+        "list" | "preview" | "start" | "cancel" | "remembered"
+    ) {
         return Err("Unknown local check method".into());
     }
     let id = arg_str(&args, "repo_id")?;
     let repo = crate::workspace::repo(ctx, &id).ok_or("Unknown checkout")?;
+    if method == "remembered" {
+        return recalled(&ctx.db, &id);
+    }
     let mut payload = json!({"repo_id":id,"path":repo["path"]});
     match method {
         "start" => {
@@ -32,6 +71,11 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
         }
         "cancel" => payload["id"] = json!(arg_str(&args, "id")?),
         _ => {}
+    }
+    if matches!(method, "preview" | "start") {
+        let at = crate::db::now();
+        let scan = crate::environments::call("profiles", json!({})).await;
+        remember(&ctx.db, &id, at, scan)?;
     }
     let mut child = tokio::process::Command::new("/usr/bin/python3")
         .args(["-I", "-B", "-c", include_str!("check_worker.py")])
@@ -60,4 +104,57 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
         return Err(e.into());
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{new_id, Db};
+    #[test]
+    fn preflight_recovers_only_last_observation_per_checkout() {
+        let dir = std::env::temp_dir().join(format!("preflight-{}", new_id()));
+        std::fs::create_dir(&dir).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let cleanup = Cleanup(dir.clone());
+        let path = dir.join("fixture.sqlite");
+        {
+            let db = Db::open(&path).unwrap();
+            for repo in ["a", "b"] {
+                db.exec(
+                    "INSERT INTO repos(id,name,path,added_at) VALUES(?1,'same',?1,1)",
+                    [repo],
+                )
+                .unwrap();
+            }
+            remember(&db, "a", 20, Ok(json!(["shared"]))).unwrap();
+            remember(&db, "a", 10, Ok(json!(["obsolete"]))).unwrap();
+            assert!(recalled(&db, "b").unwrap().is_null());
+        }
+        {
+            let db = Db::open(&path).unwrap();
+            assert_eq!(
+                recalled(&db, "a").unwrap(),
+                json!({"observed":20,"expires":300020,"profiles":["shared"]})
+            );
+            remember(&db, "a", 30, Err("private runtime detail".into())).unwrap();
+            assert_eq!(
+                recalled(&db, "a").unwrap(),
+                json!({"observed":30,"expires":300030,"profiles":null})
+            );
+            remember(&db, "b", 31, Ok(json!([]))).unwrap();
+            assert_eq!(recalled(&db, "b").unwrap()["profiles"], json!([]));
+            assert_eq!(
+                db.query("SELECT count(*) AS n FROM check_preflight", [])
+                    .unwrap()[0]["n"],
+                2
+            );
+        }
+        drop(cleanup);
+        assert!(!dir.exists());
+    }
 }

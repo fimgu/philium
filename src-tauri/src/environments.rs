@@ -89,11 +89,33 @@ async fn inspect(root: &Path, method: &str, args: Value) -> Result<Value, String
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(json!([])),
             Err(_) => return Err("Cannot read Colima profile directory".into()),
         };
-        let mut names: Vec<String> = entries
-            .flatten()
-            .filter_map(|e| e.file_name().into_string().ok())
-            .filter(|p| socket(root, p).is_ok())
-            .collect();
+        let mut names = Vec::new();
+        for (i, entry) in entries.enumerate() {
+            if i >= 256 {
+                return Err("Profile directory exceeds inspection limit".into());
+            }
+            let e = entry.map_err(|_| "Incomplete profile directory scan")?;
+            if let Ok(p) = e.file_name().into_string() {
+                use std::os::unix::fs::FileTypeExt;
+                if !valid_profile(&p)
+                    || !e
+                        .file_type()
+                        .map_err(|_| "Incomplete profile directory scan")?
+                        .is_dir()
+                {
+                    continue;
+                }
+                match std::fs::symlink_metadata(e.path().join("docker.sock")) {
+                    Ok(m) if m.file_type().is_socket() => {
+                        socket(root, &p)?;
+                        names.push(p);
+                    }
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(_) => return Err("Incomplete profile directory scan".into()),
+                }
+            }
+        }
         names.sort();
         return Ok(json!(names));
     }
