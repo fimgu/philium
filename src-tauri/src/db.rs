@@ -54,6 +54,10 @@ CREATE TABLE IF NOT EXISTS task_deps (
   task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
   depends_on TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
   PRIMARY KEY (task_id, depends_on));
+CREATE TABLE IF NOT EXISTS agent_mail_delivery (
+  message_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+  agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  repo_id TEXT NOT NULL, model_ref TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS messages (
   id INTEGER PRIMARY KEY AUTOINCREMENT, from_agent TEXT NOT NULL, to_target TEXT NOT NULL,
   body TEXT NOT NULL, guard_findings TEXT, read_at INTEGER, created_at INTEGER NOT NULL);

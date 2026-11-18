@@ -433,7 +433,13 @@ pub fn send(ctx: &Arc<Ctx>, from: &str, to: &str, body: &str) -> Result<Value, S
     let mut text = body.to_owned();
     let mut findings = crate::guard::Findings::default();
     crate::guard::scan_text(&mut text, true, &mut findings);
-    let msg=ctx.db.with(|c|{c.execute("INSERT INTO messages(from_agent,to_target,body,guard_findings,created_at) VALUES(?1,?2,?3,?4,?5)",rusqlite::params![from,to,text,json!(findings).to_string(),now()])?;Ok(c.last_insert_rowid())})?;
+    let msg=ctx.db.with(|c|{
+        let tx = c.unchecked_transaction()?;
+        tx.execute("INSERT INTO messages(from_agent,to_target,body,guard_findings,created_at) VALUES(?1,?2,?3,?4,?5)",rusqlite::params![from,to,text,json!(findings).to_string(),now()])?;
+        let id = tx.last_insert_rowid();
+        tx.execute("INSERT INTO agent_mail_delivery SELECT ?1,a.id,a.repo_id,a.model_ref FROM agents a JOIN repos r ON r.id=a.repo_id WHERE a.name=?2 AND ?2 NOT IN ('all','you') AND (?3='you' OR EXISTS(SELECT 1 FROM agents s WHERE s.name=?3 AND s.repo_id=a.repo_id AND s.model_ref=a.model_ref AND s.strict=a.strict))",rusqlite::params![id,to,from])?;
+        tx.commit()?; Ok(id)
+    })?;
     let v = ctx
         .db
         .query("SELECT * FROM messages WHERE id=?1", [msg])?
@@ -449,6 +455,15 @@ pub fn inbox(
     mark_read: bool,
 ) -> Result<Value, String> {
     let rows=ctx.db.query("SELECT m.*,r.read_at AS recipient_read_at FROM messages m LEFT JOIN mail_reads r ON r.message_id=m.id AND r.agent=?1 WHERE (m.to_target=?1 OR m.to_target='all') AND (?2=0 OR r.read_at IS NULL) ORDER BY m.id DESC",rusqlite::params![agent,unread_only])?;
+    finish_inbox(ctx, agent, rows, mark_read)
+}
+
+pub fn agent_inbox(ctx: &Arc<Ctx>, id: &str, name: &str, unread: bool) -> Result<Value,String> {
+    let rows = ctx.db.query("SELECT m.*,r.read_at AS recipient_read_at FROM agent_mail_delivery d JOIN agents a ON a.id=d.agent_id AND a.repo_id=d.repo_id AND a.model_ref=d.model_ref JOIN messages m ON m.id=d.message_id LEFT JOIN mail_reads r ON r.message_id=m.id AND r.agent=a.name WHERE a.id=?1 AND (?2=0 OR r.read_at IS NULL) ORDER BY m.id DESC LIMIT 100", rusqlite::params![id,unread])?;
+    finish_inbox(ctx,name,rows,true)
+}
+
+fn finish_inbox(ctx: &Arc<Ctx>,agent: &str,rows: Vec<Value>,mark_read: bool) -> Result<Value,String> {
     if mark_read {
         ctx.db.with(|c| {
             let tx = c.unchecked_transaction()?;

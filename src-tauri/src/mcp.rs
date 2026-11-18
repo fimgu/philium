@@ -149,9 +149,9 @@ pub fn tool_list() -> Vec<Value> {
     let i = json!({ "type": "integer" });
     let b = json!({ "type": "boolean" });
     vec![
-        t("board_list", "List tasks on the shared master board. Filter by status (open, claimed, in_review, done, cancelled), owner (agent name) or q (text).",
+        t("board_list", "List tasks in your registered workspace. Filter by status, owner name or q (text).",
           json!({ "status": s, "owner": s, "q": s }), &[]),
-        t("board_get", "Full task: description, dependencies, playbook progress, history.", json!({ "id": s }), &["id"]),
+        t("board_get", "Read one workspace task's description, owner, status and playbook step.", json!({ "id": s }), &["id"]),
         t("board_create", "Add a task to the master board.",
           json!({ "title": s, "detail": s, "priority": { "type": "string", "enum": ["low", "normal", "high", "urgent"] },
                   "depends_on": { "type": "array", "items": s }, "playbook": s }), &["title"]),
@@ -161,12 +161,12 @@ pub fn tool_list() -> Vec<Value> {
           json!({ "id": s, "status": s, "note": s, "step": s, "pr_url": s, "detail": s }), &["id"]),
         t("board_submit", "Submit a claimed task for review with a summary and the PR URL. Playbook checks run.",
           json!({ "id": s, "summary": s, "pr_url": s }), &["id", "summary"]),
-        t("mail_send", "Message another agent by name, \"all\" for every agent, or \"you\" for the human.",
+        t("mail_send", "Message a named agent in your workspace with the same model and trust level, or \"you\" for the human. No broadcasts.",
           json!({ "to": s, "body": s }), &["to", "body"]),
         t("mail_read", "Read your inbox (marks messages read).", json!({ "unread_only": b }), &[]),
         t("agent_spawn", "Start a helper agent. It gets its own worktree of the same repo and its own session.",
           json!({ "name": s, "brief": s, "model": s, "role": s, "task_id": s }), &["brief"]),
-        t("agent_status", "Status of agents: everyone, or one by name.", json!({ "name": s }), &[]),
+        t("agent_status", "Status of workspace agents, or one by name.", json!({ "name": s }), &[]),
         t("agent_stop", "Stop a helper agent you spawned.", json!({ "name": s }), &["name"]),
         t("shell_run", "Run a command in your persistent interactive shell (bash), visible live to the human. State carries over (cd, exports, venvs). Waits at most 30 seconds, or timeout_secs if shorter, then returns terminal, running, finished, output and exit_code. A running response is NOT failure: do not retry the command. Poll shell_read with the terminal id until finished, and check exit_code. Pass shell to use another shell. Use background=true for builds, test suites, dev servers and watchers to return a terminal id immediately.",
           json!({ "command": s, "cwd": s, "timeout_secs": i, "background": b, "title": s, "shell": s }), &["command"]),
@@ -181,7 +181,7 @@ pub fn tool_list() -> Vec<Value> {
         t("playbook_get", "The standard steps and checks for a job: commit, open_pr, test_pr, review_pr, docs, release, teardown.",
           json!({ "job": s }), &["job"]),
         t("skill_list", "Your skills (reusable procedures like review-pr, make-plan, babysit): name and when to use each.", json!({}), &[]),
-        t("skill_get", "Load one skill's full instructions and supporting files. Follow them.", json!({ "name": s }), &["name"]),
+        t("skill_get", "Read a listed built-in skill. Imported instructions and supporting files are not attached.", json!({ "name": s }), &["name"]),
         t("memory_search", "Search memories saved under this agent's registered repository ID.",
           json!({ "q": s, "limit": i }), &["q"]),
         t("memory_save", "Save for this repository only. Global writes are unavailable. Category: fact, preference, correction, entity.",
@@ -241,53 +241,56 @@ fn inside(base: &PathBuf, rel: Option<&str>) -> Result<PathBuf, String> {
 pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Result<Value, String> {
     let row = agent_row(ctx, agent)?;
     let me = row["name"].as_str().unwrap_or("agent").to_string();
+    let repo = || row["repo_id"].as_str().filter(|id| crate::workspace::repo(ctx,id).is_some()).ok_or("Registered workspace required");
+    let task_here = |id: &str| -> Result<(),String> {
+        if ctx.db.query("SELECT id FROM tasks WHERE repo_id=?1 AND id=?2", [repo()?,id])?.is_empty() {return Err("Task unavailable in this workspace".into());}
+        Ok(())
+    };
+    if matches!(name,"board_get"|"board_claim"|"board_update"|"board_submit") { task_here(arg(&a,"id")?)?; }
     match name {
         "board_list" => {
-            let mut f = a.clone();
-            if let Some(o) = a["owner"].as_str() {
-                f["owner"] = json!(crate::agents::get_row(ctx, o).and_then(|r| r["id"].as_str().map(str::to_string)).unwrap_or_default());
-            }
-            crate::board::list(ctx, &f)
+            Ok(json!(ctx.db.query("SELECT id,title,detail,status,priority,owner FROM tasks WHERE repo_id=?1 AND (?2 IS NULL OR status=?2) AND (?3 IS NULL OR owner=?3) AND instr(lower(title||' '||detail),lower(?4))>0 ORDER BY created_at DESC LIMIT 100", rusqlite::params![repo()?,a["status"].as_str(),a["owner"].as_str(),a["q"].as_str().unwrap_or("")])?))
         }
-        "board_get" => crate::board::get(ctx, arg(&a, "id")?),
+        "board_get" => Ok(ctx.db.query("SELECT id,title,detail,status,priority,owner,playbook,step FROM tasks WHERE repo_id=?1 AND id=?2",[repo()?,arg(&a,"id")?])?.into_iter().next().ok_or("Task unavailable")?),
         "board_create" => {
             let deps: Vec<String> = a["depends_on"]
                 .as_array()
                 .map(|v| v.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
                 .unwrap_or_default();
+            for dep in &deps { task_here(dep)?; }
             crate::board::create(
                 ctx,
                 &me,
                 arg(&a, "title")?,
                 a["detail"].as_str().unwrap_or(""),
                 a["priority"].as_str(),
-                row["repo_id"].as_str(),
+                Some(repo()?),
                 &deps,
                 a["playbook"].as_str(),
-            )
+            ).map(|r| json!({"id":r["id"],"status":r["status"]}))
         }
         "board_claim" => {
             let r = crate::board::claim(ctx, agent, arg(&a, "id")?, a["lease_secs"].as_i64().unwrap_or(900).clamp(60, 7200))?;
             let _ = ctx.db.exec("UPDATE agents SET task_id=?2 WHERE id=?1", rusqlite::params![agent, arg(&a, "id")?]);
             ctx.emit("agents:changed", json!({ "id": agent }));
-            Ok(r)
+            Ok(json!({"id":r["id"],"status":r["status"]}))
         }
         "board_update" => {
             let mut patch = a.clone();
             if let Some(o) = patch.as_object_mut() {
                 o.remove("id");
             }
-            crate::board::update(ctx, agent, arg(&a, "id")?, &patch)
+            crate::board::update(ctx, agent, arg(&a, "id")?, &patch).map(|r| json!({"id":r["id"],"status":r["status"]}))
         }
-        "board_submit" => crate::board::submit(ctx, agent, arg(&a, "id")?, arg(&a, "summary")?, a["pr_url"].as_str()),
+        "board_submit" => crate::board::submit(ctx, agent, arg(&a, "id")?, arg(&a, "summary")?, a["pr_url"].as_str()).map(|r| json!({"id":r["id"],"status":r["status"]})),
         "mail_send" => {
             let to = arg(&a, "to")?;
-            if !matches!(to, "all" | "you") && crate::agents::get_row(ctx, to).is_none() {
-                return Err(format!("no agent named {to}"));
+            if to != "you" && (to == "all" || ctx.db.query("SELECT id FROM agents WHERE name=?1 AND repo_id=?2 AND model_ref=?3 AND strict=?4",rusqlite::params![to,repo()?,row["model_ref"].as_str(),row["strict"].as_i64()])?.is_empty()) {
+                return Err("Choose a direct recipient in the same workspace and model scope".into());
             }
             crate::board::send(ctx, &me, to, arg(&a, "body")?)
         }
-        "mail_read" => crate::board::inbox(ctx, &me, a["unread_only"].as_bool().unwrap_or(true), true),
+        "mail_read" => crate::board::agent_inbox(ctx,agent,&me,a["unread_only"].as_bool().unwrap_or(true)),
         "agent_spawn" => {
             let strict = row["strict"].as_i64() == Some(1);
             let model = a["model"].as_str().map(str::to_string).or_else(|| row["model_ref"].as_str().map(str::to_string));
@@ -314,20 +317,15 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
             Ok(json!({ "name": r["name"], "id": r["id"], "state": r["state"] }))
         }
         "agent_status" => {
-            let all = crate::agents::list(ctx)?;
+            let all = json!(ctx.db.query("SELECT a.name,a.state,a.role,a.model_ref,t.title AS task_title,w.branch FROM agents a LEFT JOIN tasks t ON t.id=a.task_id AND t.repo_id=a.repo_id LEFT JOIN worktrees w ON w.agent_id=a.id AND w.repo_id=a.repo_id AND w.state='active' WHERE a.repo_id=?1 ORDER BY a.name",[repo()?])?);
             let pick = |r: &Value| {
                 json!({
                     "name": r["name"],
                     "state": r["state"],
                     "role": r["role"],
                     "model": r["model_ref"],
-                    "parent": r["parent_name"],
-                    "cluster": r["cluster_name"],
-                    "children_count": r["children_count"],
                     "task": r["task_title"],
                     "branch": r["branch"],
-                    "warnings": r["warnings"],
-                    "kv_cache_hit_pct": r["kv"]["cache_hit_pct"],
                 })
             };
             match a["name"].as_str() {
@@ -398,6 +396,11 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
         }
         // --- codeindex tools ---
         "code_map" | "code_outline" | "code_symbol" | "code_find" | "code_refs" | "code_impact" | "repo_context" => {
+            let mut a = a;
+            if name == "repo_context" {
+                if a.get("pr").is_some() || a["include_prs"] == true { return Err("Remote PR context requires separate permission".into()); }
+                a["include_prs"] = json!(false);
+            }
             crate::codeindex::mcp_call(ctx, agent, name, a).await
         }
         // --- end codeindex tools ---
@@ -555,6 +558,23 @@ mod tests {
             async move { dispatch(&ctx, agent, json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":name,"arguments":args}})).await.unwrap() }
         };
         let text = |r: &Value| r["result"]["content"][0]["text"].as_str().unwrap_or("").to_string();
+        crate::board::init(&ctx).unwrap();
+        let tasks = text(&call("t1","board_list",json!({"repo_id":"rb"})).await);
+        assert!(tasks.contains("scoped-marker-A") && !tasks.contains("scoped-marker-B"));
+        assert!(text(&call("t1","board_get",json!({"id":"a"})).await).contains("scoped-marker-A"));
+        for tool in ["board_get","board_claim","board_update","board_submit"] {
+            assert_eq!(call("t1",tool,json!({"id":"b"})).await["result"]["isError"],true);
+        }
+        let roster = text(&call("t1","agent_status",json!({})).await);
+        assert!(roster.contains("owl") && !roster.contains("ibis"));
+        for to in ["all","ibis"] { assert_eq!(call("t1","mail_send",json!({"to":to,"body":"denied"})).await["result"]["isError"],true); }
+        crate::board::send(&ctx,"you","all","legacy-broadcast").unwrap();
+        crate::board::send(&ctx,"you","owl","direct-marker").unwrap();
+        let mail = text(&call("t1","mail_read",json!({})).await);
+        assert!(mail.contains("direct-marker") && !mail.contains("legacy-broadcast"));
+        ctx.db.exec("UPDATE agents SET model_ref='q/m' WHERE id='t1'",[]).unwrap();
+        assert!(!text(&call("t1","mail_read",json!({"unread_only":false})).await).contains("direct-marker"));
+        ctx.db.exec("UPDATE agents SET model_ref='p/m' WHERE id='t1'",[]).unwrap();
         assert_eq!(call("s1", "skill_get", json!({"name":"review-pr"})).await["result"]["isError"], true);
         let selected = text(&call("t1", "skill_get", json!({"name":"review-pr"})).await);
         assert!(selected.contains("Philium built-in") && !selected.contains("do it"));
