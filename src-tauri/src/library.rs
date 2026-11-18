@@ -243,8 +243,8 @@ pub fn memory_search(ctx: &Ctx, q: &str, project: Option<&str>, limit: i64) -> R
     }
     Ok(json!(ctx.db.query(
         "SELECT m.id,m.scope,m.category,m.content FROM memories_fts f JOIN memories m ON m.rowid=f.rowid
-         WHERE memories_fts MATCH ?1 AND m.active=1
-         ORDER BY (m.scope='global' OR m.scope=?2) DESC, (m.category='correction') DESC, bm25(memories_fts) LIMIT ?3",
+         WHERE memories_fts MATCH ?1 AND m.active=1 AND (m.scope='global' OR m.scope=?2)
+         ORDER BY (m.category='correction') DESC, bm25(memories_fts) LIMIT ?3",
         params![terms.join(" OR "), scope, limit],
     )?))
 }
@@ -585,6 +585,21 @@ mod tests {
         println!("import {r}\nscopes {}\nskills {}", json!(scopes), names.join(" "));
         println!("search 'coauthor' -> {}", memory_search(&ctx, "co-authored trailers", None, 2).unwrap());
         println!("standing bytes {}", standing_memories(&ctx).len() + rules(&ctx).len());
+    }
+
+    #[test]
+    fn keyword_memory_search_excludes_other_projects_before_ranking() {
+        let ctx = Ctx::test();
+        ctx.db.with(|c| c.execute_batch(SCHEMA)).unwrap();
+        for scope in [None, Some("/fixture/a"), Some("/fixture/b")] {
+            memory_save(&ctx, "marker common", "fact", scope, "fixture").unwrap();
+        }
+        for (scope, want) in [(Some("/fixture/a"), 2), (None, 1)] {
+            let hits = memory_search(&ctx, "marker", scope, 10).unwrap();
+            let rows = hits.as_array().unwrap();
+            assert_eq!(rows.len(), want);
+            assert!(rows.iter().all(|r| r["scope"] == "global" || (scope.is_some() && r["scope"] == "project:/fixture/a")));
+        }
     }
 
     #[test]
