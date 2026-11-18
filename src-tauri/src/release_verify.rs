@@ -6,9 +6,9 @@ pub async fn run(ctx: &Ctx, repo: &str, url: &str) -> Result<Value, String> {
     let req = json!({"repo_id":repo,"url":url});
     let first = release_intake::call(ctx, "resolve", req.clone()).await?;
     let a = json!({"repo_id":repo,"generation":first["generation"]});
-    let members = release_intake::call(ctx, "discover_members", a.clone())
-        .await
-        .ok();
+    let membership = release_intake::call(ctx, "discover_members", a.clone()).await;
+    let membership_error = membership.as_ref().err().cloned();
+    let members = membership.ok();
     let profile = release_intake::call(ctx, "sql_profile", a.clone()).await?;
     let (receipt, reason) = if profile.is_null() {
         (
@@ -22,6 +22,13 @@ pub async fn run(ctx: &Ctx, repo: &str, url: &str) -> Result<Value, String> {
         }
     };
     let last = release_intake::call(ctx, "resolve", req).await.ok();
+    let reason = match (reason, membership_error) {
+        (existing, Some(error)) => Some(format!(
+            "{}Membership discovery: {error}",
+            existing.map(|r| format!("{r}. ")).unwrap_or_default()
+        )),
+        (existing, None) => existing,
+    };
     finish(ctx, repo, first, last, members, receipt, reason)
 }
 
