@@ -1,5 +1,6 @@
 // Code: structural index of a repo (symbols, references, graph) with per-worktree overlays.
 import { For, Show, createResource, createSignal, createMemo, createEffect, onCleanup, on } from "solid-js";
+import { repoLabels } from "../lib/repo-labels.js";
 import { Page, Button, Badge, Select, Input, Segmented, Toggle, Empty, VirtualList } from "../ui/kit.jsx";
 import Graph from "../ui/graph.jsx";
 import CodeInspector from "../ui/code-inspector.jsx";
@@ -188,6 +189,7 @@ function RefList(props) {
 
 export default function Code() {
   const [repos] = createResource(() => rpc("workspace.repos_list").catch(() => []));
+  const labels = createMemo(() => repoLabels(repos() ?? []));
   const [repoId, setRepoId] = createSignal(params()?.repo_id ?? "");
   const repo = () => repoId() || repos()?.[0]?.id || "";
   const [wts] = createResource(repo, (r) => (r ? rpc("workspace.worktrees", { repo_id: r }).catch(() => []) : []));
@@ -257,7 +259,7 @@ export default function Code() {
     <Page title="Code" sub="Symbols and references, indexed locally" flush>
       <div class="code-wrap">
         <div class="code-bar" style={repo() ? undefined : { display: "none" }}>
-          <Select value={repo()} onValue={setRepoId} options={(repos() ?? []).map((r) => ({ value: r.id, label: r.name }))} />
+          <Select value={repo()} onValue={setRepoId} options={(repos() ?? []).map((r) => ({ value: r.id, label: labels().get(r.id) }))} />
           <Select value={viewId()} onValue={(v) => { setViewId(v); setSel(null); }}
             options={[{ value: "main", label: "Indexed base commit" }, { value: "local", label: "Local checkout" }, ...(wts() ?? []).filter((w) => w.state === "active").map((w) => ({ value: w.id, label: `${agentName(w)} (worktree)` }))]} />
           <Show when={viewId() !== "main" && viewId() !== "local"}><AgentChip name={agentName((wts() ?? []).find((w) => w.id === viewId()) ?? {})} /></Show>

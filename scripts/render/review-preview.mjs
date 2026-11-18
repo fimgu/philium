@@ -16,6 +16,9 @@ export async function checkReviewPreview(page) {
   await page.waitForFunction(()=>document.querySelector('article')?.innerText.includes('Not run by Philium'));
   await page.click('article details summary');
   const text=await page.$eval('article',n=>n.innerText);
+  assert.deepEqual(await page.$$eval(`${select} option`,opts => ['r1','r3','r2'].map(id=>opts.find(o=>o.value===id)?.text)), ['Developer/philium','pilot/philium','hal']);
+  await page.select(select,'r3'); await page.waitForSelector(input); assert.equal(await page.$('article'),null);
+  await page.click(`${context} summary`); assert.doesNotMatch(await page.$eval(context,n=>n.innerText), /\blion\b/);
   for(const expected of [sha,'Check the fixture marker','untested','Included: #1, #2, #3, #4, #5, #6, #7','Moved elsewhere: #8, #9']) assert.ok(text.includes(expected),expected);
   await page.select(select,'r2'); assert.equal(await page.$('article'),null);
   await page.click(`${context} summary`);

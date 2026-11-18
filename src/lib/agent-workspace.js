@@ -2,11 +2,21 @@
 export function workspaceAgents(agents, repoId, repos = []) {
   if (!repoId) return agents;
   const repo = repos.find(item => item.id === repoId);
-  const path = repo?.path?.replace(/\/+$/, "");
+  const uniqueName = repo?.name && repos.filter(r => r.name === repo.name).length === 1;
   return agents.filter(agent => {
     if (agent.repo_id) return agent.repo_id === repoId;
-    return Boolean((repo?.name && agent.repo_name === repo.name)
-      || (path && (agent.cwd === path || agent.cwd?.startsWith(`${path}/`))));
+    if (agent.cwd) {
+      // A nested registered checkout wins over its enclosing checkout.
+      let owner, longest = 0;
+      for (const r of repos) {
+        const p = r.path?.replace(/\/+$/, "");
+        if (!p || !(agent.cwd === p || agent.cwd.startsWith(`${p}/`))) continue;
+        if (p.length === longest) owner = undefined;
+        if (p.length > longest) { longest = p.length; owner = r.id; }
+      }
+      return owner === repoId;
+    }
+    return Boolean(uniqueName && agent.repo_name === repo.name);
   });
 }
 

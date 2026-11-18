@@ -4,6 +4,16 @@ import { readFileSync } from "node:fs";
 import vm from "node:vm";
 import { createRoot, createSignal, createMemo } from "solid-js/dist/solid.js";
 import { workspaceAgents, selectedAgentId, spawnRepoDefault } from "./agent-workspace.js";
+import { repoLabels } from './repo-labels.js';
+
+test('same-name checkouts remain identifiable without long paths for unrelated repos', () => {
+  const rows = [{id:'a',name:'app',path:'/a/src/app'}, {id:'b',name:'app',path:'/b/src/app'}, {id:'c',name:'solo',path:'/a/solo'}];
+  assert.deepEqual([...repoLabels(rows).values()], ['a/src/app','b/src/app','solo']);
+  const agents = [{id:'old',repo_name:'app'}, {id:'known',repo_name:'app',cwd:'/b/src/app/lib'}];
+  assert.deepEqual(workspaceAgents(agents,'a',rows), []);
+  assert.deepEqual(workspaceAgents(agents,'b',rows), [agents[1]]);
+  assert.deepEqual(workspaceAgents(agents,'',rows), agents);
+});
 
 const repos = [{ id: "pcb", name: "watch-pcb", path: "/fixture/watch-pcb" }, { id: "phi", name: "Philium", path: "/fixture/philium" }];
 const agents = [

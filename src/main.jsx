@@ -8,6 +8,7 @@ import { ToastHost, ConfirmHost, Guard, toast, cleanError } from "./ui/kit.jsx";
 import { ImproveHost } from "./ui/improve.jsx";
 import { Icon } from "./ui/icons.jsx";
 import { rpc, failures, clearFailures } from "./lib/rpc.js";
+import { repoLabels } from "./lib/repo-labels.js";
 import { route, go, commands, improve } from "./lib/nav.js";
 import { useStore, activeRepoId, setActiveRepoId } from "./lib/store.js";
 import { soundEnabled, setSoundEnabled, playSound } from "./lib/sound.js";
@@ -67,6 +68,7 @@ function Palette(props) {
 
 function App() {
   const store = useStore();
+  const labels = createMemo(() => repoLabels(store.repos() ?? []));
   const [palette, setPalette] = createSignal(false);
   const [status, setStatus] = createSignal(null);
   const refresh = () => rpc("app.status").then(setStatus).catch(() => setStatus((s) => ({ ...(s ?? {}), desk: { ok: false, error: "Backend not responding" } })));
@@ -108,7 +110,7 @@ function App() {
           >
             <option value="" selected={!activeRepoId()}>All Workspaces</option>
             <For each={store.repos() ?? []}>
-              {(r) => <option value={r.id} selected={activeRepoId() === r.id}>{r.name}</option>}
+              {(r) => <option value={r.id} title={r.path} selected={activeRepoId() === r.id}>{labels().get(r.id)}</option>}
             </For>
           </select>
         </div>

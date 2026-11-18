@@ -309,6 +309,7 @@ pub fn spawn(ctx: &Arc<Ctx>, req: SpawnReq) -> Result<Value, String> {
     if let Some(parent) = req.parent_id.as_deref() {
         helper_scope(ctx, parent, req.repo_id.as_deref(), req.model.as_deref(), req.task_id.as_deref(), req.strict)?;
     }
+    task_scope(ctx, req.repo_id.as_deref(), req.task_id.as_deref())?;
     let (provider, model) = providers::resolve(ctx, req.model.as_deref())?;
     let model_ref = format!("{}/{}", provider.id, model);
     let strict = req.strict || !provider.trusted;
@@ -368,7 +369,16 @@ pub fn spawn(ctx: &Arc<Ctx>, req: SpawnReq) -> Result<Value, String> {
     Ok(get_row(ctx, &id).unwrap_or(Value::Null))
 }
 
-/// Bring up the agent's HAL (fresh or resume) and its event pump.
+// NULL denotes the scratch workspace, not permission to link any repo's task.
+fn task_scope(ctx: &Ctx, repo: Option<&str>, task: Option<&str>) -> Result<(), String> {
+    if let Some(id) = task {
+        if ctx.db.query("SELECT id FROM tasks WHERE id=?1 AND repo_id IS ?2", rusqlite::params![id,repo])?.is_empty() {
+            return Err("Choose a task from the agent's workspace".into());
+        }
+    }
+    Ok(())
+}
+
 fn helper_scope(ctx: &Ctx, parent: &str, repo: Option<&str>, model: Option<&str>, task: Option<&str>, strict: bool) -> Result<(), String> {
     let p = ctx.db.query("SELECT a.model_ref,a.strict,r.id AS repo FROM agents a JOIN repos r ON r.id=a.repo_id WHERE a.id=?1", [parent])?
         .into_iter().next().ok_or("Helper needs a parent with a registered workspace")?;
@@ -388,6 +398,7 @@ async fn provision(ctx: &Arc<Ctx>, id: &str, fresh: bool, brief: Option<String>)
     let name = row["name"].as_str().unwrap_or_default().to_string();
     let model_ref = row["model_ref"].as_str().unwrap_or_default().to_string();
     let strict = row["strict"].as_i64() == Some(1);
+    task_scope(ctx, row["repo_id"].as_str(), row["task_id"].as_str())?;
     if let Some(parent) = row["parent_id"].as_str() {
         helper_scope(ctx, parent, row["repo_id"].as_str(), Some(&model_ref), row["task_id"].as_str(), strict)?;
     }

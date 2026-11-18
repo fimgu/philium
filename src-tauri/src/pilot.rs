@@ -156,6 +156,12 @@ pub async fn check() -> Result<(), String> {
                 return Err("Lost task or peer task visible".into());
             }
         }
+        let alpha = ctx.db.kv_get("fixture.alpha").ok_or("Missing alpha checkout")?;
+        let beta = ctx.db.kv_get("fixture.beta").ok_or("Missing beta checkout")?;
+        let tasks = crate::rpc_inner(&app,"board.list".into(),Some(json!({"repo_id":alpha}))).await?;
+        let task = tasks[0]["id"].as_str().ok_or("Missing alpha task")?;
+        let denied = crate::rpc_inner(&app,"agents.spawn".into(),Some(json!({"repo_id":beta,"task_id":task}))).await;
+        if !matches!(denied, Err(ref msg) if msg.contains("Choose a task from the agent's workspace")) { return Err("Sibling task was not rejected before provisioning".into()); }
         if phase == "seed" {
             let session = desk
                 .call(

@@ -1,4 +1,5 @@
 import { createSignal, createMemo, createEffect, on, onMount, Show, For } from "solid-js";
+import { repoLabels } from "../lib/repo-labels.js";
 import { Page, Empty, Button, Input, Field, Badge, Modal, Select, Segmented, VirtualList, Menu, confirm, toast } from "../ui/kit.jsx";
 import { Icon } from "../ui/icons.jsx";
 import { rpc, useEvent, fmt } from "../lib/rpc.js";
@@ -105,6 +106,7 @@ function Branches(props) {
 
 export default function Repos() {
   const [repos, setRepos] = createSignal([]), [selected, setSelected] = createSignal(null);
+  const labels = createMemo(() => repoLabels(repos()));
   const [trees, setTrees] = createSignal([]), [branches, setBranches] = createSignal([]);
   const [error, setError] = createSignal(""), [busy, setBusy] = createSignal(false), [loading, setLoading] = createSignal(true);
   const [dialog, setDialog] = createSignal(null), [path, setPath] = createSignal(""), [name, setName] = createSignal("");
@@ -144,7 +146,7 @@ export default function Repos() {
       <Show when={repos().length} fallback={<Empty icon={<Icon name="repo" size={28} />} title="Give agents a repository" action={<Button variant="primary" onClick={() => add("local")}>Add your first repository</Button>}>Add an existing local Git repository without moving it, or clone one into your Philium folder.</Empty>}>
         <div class="ws-layout">
           <aside class="ws-repos"><VirtualList items={repos()} rowHeight={84}>{r => <button class={`ws-repo ${selected() === r.id ? "selected" : ""}`} onClick={() => choose(r.id)}>
-            <strong class="ellipsis">{r.name}</strong>
+            <strong class="ellipsis" title={r.path}>{labels().get(r.id)}</strong>
             <span class="ws-mono xs faint"><Icon name="branch" size={11} /> {r.branch || "Detached HEAD"}</span>
             <span class="rp-line"><Pill tone={r.error ? "bad" : r.dirty ? "warn" : "ok"}>{r.error ? "Unavailable" : r.dirty ? "Dirty" : "Clean"}</Pill><span class="xs faint">{r.worktree_count ?? 0} worktree{r.worktree_count === 1 ? "" : "s"}</span></span>
           </button>}</VirtualList></aside>

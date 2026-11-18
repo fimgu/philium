@@ -31,7 +31,8 @@ const server = http.createServer((req, res) => {
   if (!fs.existsSync(p) || fs.statSync(p).isDirectory()) p = path.join(dist, "index.html");
   res.setHeader("content-type", mime[path.extname(p)] ?? "application/octet-stream");
   fs.createReadStream(p).pipe(res);
-}).listen(0);
+});
+await new Promise((resolve,reject) => server.once('error',reject).listen(0, '127.0.0.1', resolve));
 const port = server.address().port;
 
 const stub = (fx, setName) => {
@@ -199,7 +200,7 @@ async function open(fx, setName, w, h, route) {
   await page.evaluateOnNewDocument((r) => localStorage.setItem("route", r), route);
   page.on("pageerror", (e) => { problems.push(`${setName} ${route} pageerror: ${e.message}`); });
   page.on("console", (m) => { if (m.type() === "error") problems.push(`${setName} ${route} console.error: ${m.text().slice(0, 200)}`); });
-  await page.goto(`http://localhost:${port}/`);
+  await page.goto(`http://127.0.0.1:${port}/`);
   await page.waitForSelector(".sidebar");
   await sleep(fx.__delay ? 700 : 500);
   return page;
@@ -208,7 +209,7 @@ const clickText = (page, sel, text) => page.evaluate((s, t) => { const el = [...
 
 for (const setName of sets) {
   const fx = SETS[setName];
-  for (const [w, h] of SIZES) {
+  for (const [w, h] of (only.length === 1 && only[0] === 'review' ? [...SIZES,[800,600]] : SIZES)) {
     const dir = path.join(out, `${setName}-${w}x${h}`);
     fs.mkdirSync(dir, { recursive: true });
     const shot = async (page, name) => { await page.screenshot({ path: path.join(dir, `${name}.png`) }); console.log("shot", setName, w, name); };

@@ -2,6 +2,7 @@
 // changes. Supports Human -> Orchestrator -> Worker/Reviewer hierarchies,
 // shared-prefix KV cache telemetry, AST clash/health warnings, and Fleet Command Grid.
 import { workspaceAgents, selectedAgentId, spawnRepoDefault } from "../lib/agent-workspace.js";
+import { repoLabels } from "../lib/repo-labels.js";
 import { kindResources } from "../lib/kind-resources.js";
 import { For, Show, createSignal, createResource, createMemo, createEffect, on, onCleanup, Suspense } from "solid-js";
 import { NotFound, Page, Button, Badge, Dot, Empty, Modal, Field, Input, TextArea, Select, Toggle, Segmented, ModelPicker, confirm, toast } from "../ui/kit.jsx";
@@ -97,6 +98,7 @@ export function SpawnModal(props) {
   const models = store.models;
   const providers = store.providers;
   const repos = store.repos;
+  const labels = createMemo(() => repoLabels(repos() ?? []));
   const [tasks] = createResource(() => rpc("board.list", { status: "open" }).catch(() => []));
   const def = store.defaultModel;
   const [name, setName] = createSignal(props.preset?.name ?? "");
@@ -174,10 +176,10 @@ export function SpawnModal(props) {
           />
         </Field>
         <Field label="Repo" hint="The agent gets its own worktree and branch">
-          <Select value={repo()} onValue={setRepo} options={[{ value: "", label: "No repo (scratch only)" }, ...(repos() ?? []).map((r) => ({ value: r.id, label: r.name }))]} />
+          <Select value={repo()} onValue={id => { setTask(""); setRepo(id); }} options={[{ value: "", label: "No repo (scratch only)" }, ...(repos() ?? []).map((r) => ({ value: r.id, label: labels().get(r.id) }))]} />
         </Field>
         <Field label="Task" hint="Optional: link a board task">
-          <Select value={task()} onValue={setTask} options={[{ value: "", label: "None" }, ...(tasks() ?? []).map((t) => ({ value: t.id, label: t.title }))]} />
+          <Select value={task()} onValue={setTask} options={[{ value: "", label: "None" }, ...(tasks() ?? []).filter(t => (t.repo_id ?? "") === repo()).map((t) => ({ value: t.id, label: t.title }))]} />
         </Field>
       </div>
       <Field label="Mission Brief" hint="The first instruction. Orchestrators will automatically plan, spawn workers on disjoint files, and synthesize results.">
@@ -844,7 +846,9 @@ function FleetHeatmapTile(props) {
 /** Quick Mission Dispatch Bar: 1-line launch for an Orchestrator cluster or Worker. */
 function MissionDispatchBar(props) {
   const [repos] = createResource(() => rpc("workspace.repos_list").catch(() => []));
-  const [repoId, setRepoId] = createSignal("");
+  const labels = createMemo(() => repoLabels(repos() ?? []));
+  const [repoId, setRepoId] = createSignal(activeRepoId());
+  createEffect(on(activeRepoId, id => setRepoId(id), { defer: true }));
   const [role, setRole] = createSignal("orchestrator");
   const [brief, setBrief] = createSignal("");
   const [busy, setBusy] = createSignal(false);
@@ -880,7 +884,7 @@ function MissionDispatchBar(props) {
       </select>
       <select class="select mission-select" value={repoId()} onChange={(e) => setRepoId(e.currentTarget.value)} aria-label="Target repository">
         <option value="">Any / Scratch Repo</option>
-        <For each={repos() ?? []}>{(r) => <option value={r.id}>{r.name}</option>}</For>
+        <For each={repos() ?? []}>{(r) => <option value={r.id} selected={repoId() === r.id}>{labels().get(r.id)}</option>}</For>
       </select>
       <input
         type="text"
