@@ -108,10 +108,17 @@ fn open_in_repo(ctx: &Arc<Ctx>, o: Opts, repo_id: Option<&str>) -> Result<String
     cmd.args(&command[1..]);
     cmd.cwd(&o.cwd);
     cmd.env_clear();
+    // A terminal the person opens is their own login shell: it gets the account home back so
+    // their profile, toolchain and cluster settings load. Agent shells keep the private home.
+    let own_home = if o.agent_id.is_none() { crate::pilot::real_home() } else { None };
     for (k, v) in std::env::vars().chain(o.env) {
-        if !crate::hal::is_credential_var(&k) {
-            cmd.env(k, v);
+        if crate::hal::is_credential_var(&k) || (own_home.is_some() && crate::pilot::PRIVATE_ENV.contains(&k.as_str())) {
+            continue;
         }
+        cmd.env(k, v);
+    }
+    if let Some(home) = &own_home {
+        cmd.env("HOME", home);
     }
     cmd.env("TERM", "xterm-256color");
     let mut child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;

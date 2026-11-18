@@ -7,7 +7,7 @@ def run(app):
     subprocess.run(['codesign','--verify','--deep','--strict',app],check=True)
     exe=app/'Contents/MacOS'/info['CFBundleExecutable']; url='https://github.com/typicode/demo/pull/1090'
     head='610dcdf4f371d2e47f15c4edcad6837b4b8c862b'; base='f0b44972443d306e32eed093910687d26cd9f3f1'
-    with tempfile.TemporaryDirectory(prefix='public-review-',dir=os.environ['JCODE_SCRATCH_DIR']) as tmp:
+    with tempfile.TemporaryDirectory(prefix='public-review-',dir=os.environ.get('PHILIUM_SCRATCH_DIR') or None) as tmp:
         root=Path(tmp); home=root/'home';home.mkdir();(home/'.philium-pilot-fixture').write_text('disposable\n'); (root/'tmp').mkdir()
         env=dict(HOME=str(home),TMPDIR=str(root/'tmp'),PATH='/usr/bin:/bin:/usr/sbin:/sbin',GIT_CONFIG_NOSYSTEM='1',GIT_CONFIG_GLOBAL='/dev/null',GIT_TERMINAL_PROMPT='0')
         def cmd(args,cwd=root):

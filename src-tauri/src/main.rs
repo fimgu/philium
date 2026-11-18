@@ -48,6 +48,7 @@ mod selfdev;
 mod pilot;
 mod stats;
 mod terminals;
+mod workday;
 mod workspace;
 
 use std::sync::Arc;
@@ -133,14 +134,18 @@ async fn rpc(app: State<'_, App>, method: String, args: Option<Value>) -> Result
     // A bug in one handler must not take the IPC call (or app) down with it:
     // turn panics into an error the UI can show.
     let label = method.clone();
-    match std::panic::AssertUnwindSafe(rpc_inner(&app, method, args)).catch_unwind().await {
+    let scope = workday::scope(args.as_ref());
+    let result = match std::panic::AssertUnwindSafe(rpc_inner(&app, method, args)).catch_unwind().await {
         Ok(r) => r,
         Err(p) => {
             let msg = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_default();
             app.ctx.log_event("rpc_panic", None, &json!({ "method": label, "panic": msg }));
             Err(format!("Internal error in {label}: {msg}"))
         }
-    }
+    };
+    // The person's own actions, by name and outcome only, for the workday ledger.
+    workday::record(&app.ctx, &label, &scope, result.is_ok());
+    result
 }
 
 async fn rpc_inner(app: &App, method: String, args: Option<Value>) -> Result<Value, String> {
@@ -180,6 +185,7 @@ async fn rpc_inner(app: &App, method: String, args: Option<Value>) -> Result<Val
         "library" => library::call(&ctx, m, args).await,
         "selfdev" => selfdev::call(&ctx, m, args).await,
         "mcp" => mcp::call(&ctx, m, args).await,
+        "workday" => workday::call(&ctx, m, args).await,
         _ => Err(format!("unknown module {module}")),
     }
 }
@@ -370,7 +376,8 @@ fn main() {
             });
 
             // Module init. Failures are logged, never fatal: the UI shows them.
-            let inits: [(&str, fn(&Arc<Ctx>) -> Result<(), String>); 14] = [
+            let inits: [(&str, fn(&Arc<Ctx>) -> Result<(), String>); 15] = [
+                ("workday", workday::init),
                 ("library", library::init),
                 ("providers", providers::init),
                 ("sandbox", sandbox::init),

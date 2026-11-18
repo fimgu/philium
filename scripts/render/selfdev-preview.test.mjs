@@ -28,7 +28,7 @@ test('each terminal has its own output action and preview failure retains exit c
 });
 
 test('real Rust preview helpers pass isolated filesystem and exit-101 regression tests without cargo', () => {
-  const dir = mkdtempSync(join(process.env.JCODE_SCRATCH_DIR || tmpdir(), 'selfdev-focused-'));
+  const dir = mkdtempSync(join(process.env.PHILIUM_SCRATCH_DIR || tmpdir(), 'selfdev-focused-'));
   try {
     // Compile actual helper source against the already-built libc dependency.
     const helpers = rust.slice(rust.indexOf('fn preview_state('), rust.indexOf('fn prepare_worktree('));

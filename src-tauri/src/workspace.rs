@@ -389,14 +389,18 @@ pub fn remove_worktree(ctx: &Arc<Ctx>, id: &str, force: bool) -> Result<(), Stri
             );
         }
         let registered = git(repo_path, &["worktree", "list", "--porcelain"])?;
-        if registered
+        // Git lists the real path. A root reached through a symlink (macOS /var) must still match.
+        let real = path
+            .parent()
+            .and_then(|p| std::fs::canonicalize(p).ok())
+            .zip(path.file_name())
+            .map(|(p, n)| p.join(n));
+        let listed = registered
             .lines()
-            .any(|l| l == format!("worktree {}", path.display()))
-        {
-            git(
-                repo_path,
-                &["worktree", "remove", "--force", text(&w, "path")?],
-            )?;
+            .filter_map(|l| l.strip_prefix("worktree "))
+            .find(|l| Path::new(l) == path || real.as_deref() == Some(Path::new(l)));
+        if let Some(listed) = listed {
+            git(repo_path, &["worktree", "remove", "--force", listed])?;
         }
     }
     let branch = text(&w, "branch")?;
@@ -544,8 +548,8 @@ fn dispatch(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, String> 
             let id = arg_str(&args, "repo_id")?;
             let r = repo(ctx, &id).ok_or("Unknown repository")?;
             // IDs only. No host scan, kubeconfig access, Git invocation, or legacy name inference.
-            let tasks = ctx.db.query("SELECT id,title,status FROM tasks WHERE repo_id=?1 AND status!='done' ORDER BY updated_at DESC,id LIMIT 21", [&id])?;
-            let agents = ctx.db.query("SELECT id,name,state FROM agents WHERE repo_id=?1 ORDER BY CASE state WHEN 'waiting' THEN 0 WHEN 'failed' THEN 1 ELSE 2 END,last_active_at DESC,id LIMIT 21", [&id])?;
+            let tasks = ctx.db.query("SELECT id,title,status,owner,assigned FROM tasks WHERE repo_id=?1 AND status NOT IN ('done','cancelled') ORDER BY updated_at DESC,id LIMIT 21", [&id])?;
+            let agents = ctx.db.query("SELECT id,name,state,role FROM agents WHERE repo_id=?1 ORDER BY CASE state WHEN 'waiting' THEN 0 WHEN 'failed' THEN 1 ELSE 2 END,last_active_at DESC,id LIMIT 21", [&id])?;
             let worktrees = ctx.db.query("SELECT id,branch,path,state FROM worktrees WHERE repo_id=?1 ORDER BY created_at DESC,id LIMIT 21", [&id])?;
             let resources = ctx.db.query("SELECT r.kind,r.handle,r.state,a.name AS owner FROM resources r JOIN agents a ON a.id=r.agent_id WHERE a.repo_id=?1 AND r.state!='released' ORDER BY CASE r.state WHEN 'leaked' THEN 0 ELSE 1 END,r.created_at DESC,r.id LIMIT 21", [&id])?;
             Ok(json!({"repo_id":id,"path":r["path"],"tasks":tasks,"agents":agents,"worktrees":worktrees,"resources":resources,"pilot":crate::pilot::active()}))

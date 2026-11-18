@@ -3,7 +3,7 @@ import json, os, subprocess as sp, sys, tempfile, time
 from pathlib import Path
 
 worker=Path(__file__).resolve().parents[1]/'src-tauri/src/check_worker.py'
-with tempfile.TemporaryDirectory(dir=os.environ.get('JCODE_SCRATCH_DIR')) as tmp:
+with tempfile.TemporaryDirectory(dir=os.environ.get('PHILIUM_SCRATCH_DIR')) as tmp:
     root=Path(tmp); src=root/'repo'; src.mkdir(); data=root/'profile'
     def git(*a): return sp.check_output(['/usr/bin/git','-c','user.name=Fixture','-c','user.email=f@example.invalid','-c','core.hooksPath=/dev/null',*a],cwd=src,text=True).strip()
     git('init','-q'); (src/'Makefile').write_text('pass:\n\t@echo marker; echo error-marker >&2\nfail:\n\t@false\nbig:\n\t@yes x | head -c 50000\nslow:\n\t@sleep 20\nmissing:\n\t@/not-a-real-command\n')

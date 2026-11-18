@@ -29,6 +29,7 @@ const SCREENS = [
   { id: "code", label: "Code", icon: "graph", group: "tools", load: () => import("./screens/code.jsx") },
   { id: "activity", label: "Activity", icon: "activity", group: "watch", load: () => import("./screens/activity.jsx") },
   { id: "stats", label: "Stats", icon: "stats", group: "watch", load: () => import("./screens/stats.jsx") },
+  { id: "workday", label: "Workday", icon: "activity", group: "watch", load: () => import("./screens/workday.jsx") },
   { id: "providers", label: "Providers", icon: "key", group: "setup", load: () => import("./screens/providers.jsx") },
   { id: "settings", label: "Settings", icon: "settings", group: "setup", load: () => import("./screens/settings.jsx") },
 ];

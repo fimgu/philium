@@ -26,6 +26,9 @@ pub fn init(ctx: &Arc<Ctx>) -> Result<(), String> {
         "ALTER TABLE tasks ADD COLUMN owner TEXT",
         "ALTER TABLE tasks ADD COLUMN step INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE tasks ADD COLUMN check_results TEXT NOT NULL DEFAULT '[]'",
+        // Who the work was handed to. Unlike the lease, this survives a stop, a quit and a crash.
+        "ALTER TABLE tasks ADD COLUMN assigned TEXT",
+        "ALTER TABLE tasks ADD COLUMN assigned_agent_id TEXT",
     ] {
         if let Err(e) = ctx.db.exec(sql, []) {
             if !e.contains("duplicate column") {
@@ -34,6 +37,13 @@ pub fn init(ctx: &Arc<Ctx>) -> Result<(), String> {
         }
     }
     ctx.db.with(|c| c.execute_batch("CREATE TABLE IF NOT EXISTS task_events(id INTEGER PRIMARY KEY AUTOINCREMENT,task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,actor TEXT NOT NULL,kind TEXT NOT NULL,body TEXT NOT NULL,created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS mail_reads(message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,agent TEXT NOT NULL,read_at INTEGER NOT NULL,PRIMARY KEY(message_id,agent)); UPDATE tasks SET status='open' WHERE status='todo';"))?;
+    // No agent process survives a restart. Their claims reopen now instead of looking owned
+    // until a lease runs out; the assignment stays, so the board still shows whose work it was.
+    for t in ctx.db.query("SELECT id,owner FROM tasks WHERE status='claimed' AND owner_agent_id IS NOT NULL", [])? {
+        if let Some(id) = t["id"].as_str() {
+            reopen(ctx, id, t["owner"].as_str().unwrap_or("system"), "agent_interrupted")?;
+        }
+    }
     let weak = Arc::downgrade(ctx);
     std::thread::spawn(move || loop {
         std::thread::sleep(std::time::Duration::from_secs(15));
@@ -89,16 +99,62 @@ fn deps(ctx: &Arc<Ctx>, id: &str) -> Result<Vec<Value>, String> {
 }
 fn expire(ctx: &Arc<Ctx>) -> Result<(), String> {
     let rows = ctx.db.query(
-        "SELECT id FROM tasks WHERE status='claimed' AND lease_expires_at<=?1",
+        "SELECT id,owner_agent_id FROM tasks WHERE status='claimed' AND lease_expires_at<=?1",
         [now()],
     )?;
+    let mut reopened = false;
     for t in &rows {
-        reopen(ctx, t["id"].as_str().unwrap(), "system", "lease_expired")?;
+        let id = t["id"].as_str().unwrap();
+        // A running agent keeps its task without having to remember a heartbeat.
+        if t["owner_agent_id"].as_str().is_some_and(|a| crate::agents::runtime(a).is_some()) {
+            let end = now() + 900_000;
+            ctx.db.exec("UPDATE tasks SET lease_expires_at=?2 WHERE id=?1", rusqlite::params![id, end])?;
+            ctx.db.exec("UPDATE leases SET expires_at=?2 WHERE kind='task' AND key=?1", rusqlite::params![id, end])?;
+            continue;
+        }
+        reopen(ctx, id, "system", "lease_expired")?;
+        reopened = true;
     }
-    if !rows.is_empty() {
+    if reopened {
         changed(ctx);
     }
     Ok(())
+}
+/// Record who a task was handed to. Does not start work and does not need a running agent.
+pub fn assign(ctx: &Arc<Ctx>, by: &str, task_id: &str, agent: &str) -> Result<Value, String> {
+    let _lock = WRITE.lk();
+    assign_inner(ctx, by, task_id, agent)?;
+    changed(ctx);
+    get(ctx, task_id)
+}
+fn assign_inner(ctx: &Arc<Ctx>, by: &str, task_id: &str, agent: &str) -> Result<(), String> {
+    let (name, aid) = identity(ctx, agent)?;
+    let aid = aid.ok_or("Choose an agent")?;
+    let t = raw(ctx, task_id)?;
+    let home = ctx.db.query("SELECT repo_id FROM agents WHERE id=?1", [&aid])?;
+    if home.first().map(|r| &r["repo_id"]) != Some(&t["repo_id"]) || t["repo_id"].is_null() {
+        return Err("Choose an agent from the task's checkout".into());
+    }
+    if matches!(t["status"].as_str(), Some("done" | "cancelled")) {
+        return Err("This task is closed".into());
+    }
+    if t["status"] == "claimed" && t["owner"] != name {
+        return Err(format!("{} holds this task. Release it first.", t["owner"].as_str().unwrap_or("Another owner")));
+    }
+    if t["assigned_agent_id"] == aid {
+        return Ok(());
+    }
+    ctx.db.exec("UPDATE tasks SET assigned=?2,assigned_agent_id=?3,updated_at=?4 WHERE id=?1", rusqlite::params![task_id, name, aid, now()])?;
+    event(ctx, task_id, by, "assigned", &json!({"to":name}))
+}
+/// A started or resumed agent takes back the open work that was handed to it.
+pub fn reclaim_assigned(ctx: &Arc<Ctx>, agent_id: &str) {
+    let rows = ctx.db.query("SELECT id FROM tasks WHERE assigned_agent_id=?1 AND status='open'", [agent_id]).unwrap_or_default();
+    for t in rows {
+        if let Some(id) = t["id"].as_str() {
+            let _ = claim(ctx, agent_id, id, 900);
+        }
+    }
 }
 fn reopen(ctx: &Arc<Ctx>, id: &str, actor: &str, reason: &str) -> Result<(), String> {
     ctx.db.exec("UPDATE tasks SET status='open',owner=NULL,owner_agent_id=NULL,lease_expires_at=NULL,updated_at=?2 WHERE id=?1",rusqlite::params![id,now()])?;
@@ -117,6 +173,10 @@ fn decorate(ctx: &Arc<Ctx>, mut t: Value, history: bool) -> Result<Value, String
     if let Some(job) = t["playbook"].as_str() {
         let path = repo_path(ctx, t["repo_id"].as_str())?;
         t["playbook_progress"] = playbook(ctx, job, path.as_deref())?;
+    }
+    if let Some(agent) = t["assigned_agent_id"].as_str() {
+        let state = ctx.db.query("SELECT state FROM agents WHERE id=?1", [agent])?.pop();
+        t["assigned_state"] = state.map(|r| r["state"].clone()).unwrap_or(json!("removed"));
     }
     if history {
         t["history"] = json!(ctx.db.query(
@@ -240,7 +300,7 @@ pub fn claim(
     }
     let end = now() + lease_secs * 1000;
     ctx.db.with(|c|{let tx=c.unchecked_transaction()?;
-        tx.execute("UPDATE tasks SET status='claimed',owner=?2,owner_agent_id=?3,lease_expires_at=?4,updated_at=?5 WHERE id=?1",rusqlite::params![task_id,name,aid,end,now()])?;
+        tx.execute("UPDATE tasks SET status='claimed',owner=?2,owner_agent_id=?3,lease_expires_at=?4,updated_at=?5,assigned=CASE WHEN ?3 IS NULL THEN assigned ELSE ?2 END,assigned_agent_id=COALESCE(?3,assigned_agent_id) WHERE id=?1",rusqlite::params![task_id,name,aid,end,now()])?;
         tx.execute("INSERT INTO leases(id,agent_id,kind,key,expires_at) VALUES(?1,?2,'task',?3,?4) ON CONFLICT(kind,key) DO UPDATE SET agent_id=excluded.agent_id,expires_at=excluded.expires_at",rusqlite::params![new_id(),aid.as_deref().unwrap_or(&name),task_id,end])?;tx.commit()})?;
     event(
         ctx,
@@ -314,6 +374,8 @@ fn update_inner(ctx: &Arc<Ctx>, actor: &str, id: &str, patch: &Value) -> Result<
     ctx.db.exec("UPDATE tasks SET title=?2,detail=?3,priority=?4,status=?5,pr_url=?6,step=?7,updated_at=?8 WHERE id=?1",rusqlite::params![id,patch["title"].as_str().or(t["title"].as_str()),patch["detail"].as_str().or(t["detail"].as_str()),patch["priority"].as_str().or(t["priority"].as_str()),next,patch["pr_url"].as_str().or(t["pr_url"].as_str()),patch["step"].as_i64().or(t["step"].as_i64()),now()])?;
     if next == "open" && old != "open" {
         reopen(ctx, id, actor, "released")?;
+        // An explicit release hands the work back. An interruption does not.
+        ctx.db.exec("UPDATE tasks SET assigned=NULL,assigned_agent_id=NULL WHERE id=?1", [id])?;
     } else if next == "claimed" && old == "in_review" {
         let end = now() + 300_000;
         ctx.db.exec(
@@ -676,6 +738,15 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
             args["pr_url"].as_str(),
         ),
         "release" => update(ctx, "you", s(&args, "task_id")?, &json!({"status":"open"})),
+        "assign" => {
+            let (task, agent) = (s(&args, "task_id")?, s(&args, "agent")?);
+            let r = assign(ctx, "you", task, agent)?;
+            // A running agent holds the task at once. A stopped one takes it back on Resume.
+            if crate::agents::runtime(r["assigned_agent_id"].as_str().unwrap_or("")).is_some() && r["status"] == "open" {
+                return claim(ctx, agent, task, 900);
+            }
+            Ok(r)
+        }
         "delete" => {
             let _lock = WRITE.lk();
             let id = s(&args, "task_id")?;
@@ -753,6 +824,46 @@ mod tests {
             .as_str()
             .unwrap()
             .into()
+    }
+    #[test]
+    fn handover_survives_stop_and_restart() {
+        let c = ctx();
+        for (id, path) in [("r1", "/fixture/a"), ("r2", "/fixture/b")] {
+            c.db.exec("INSERT INTO repos(id,name,path,default_branch,added_at) VALUES(?1,'same',?2,'main',0)", [id, path]).unwrap();
+        }
+        c.db.exec("UPDATE agents SET repo_id='r1' WHERE id='a1'", []).unwrap();
+        c.db.exec("UPDATE agents SET repo_id='r2' WHERE id='a2'", []).unwrap();
+        let id = create(&c, "you", "Handed", "", None, Some("r1"), &[], None).unwrap()["id"].as_str().unwrap().to_owned();
+        // An agent from the peer checkout cannot be given this task.
+        assert!(assign(&c, "you", &id, "a2").is_err());
+        let t = assign(&c, "lead", &id, "a1").unwrap();
+        assert_eq!((t["assigned"].as_str(), t["status"].as_str(), t["owner"].is_null()), (Some("alice"), Some("open"), true));
+        // Once it runs, the agent holds the task without the model asking.
+        reclaim_assigned(&c, "a1");
+        assert_eq!(get(&c, &id).unwrap()["owner"], "alice");
+        assert!(assign(&c, "you", &id, "a2").is_err());
+        // Stop: the lease goes, the handover stays visible.
+        release_agent(&c, "a1");
+        let t = get(&c, &id).unwrap();
+        assert_eq!((t["status"].as_str(), t["owner"].is_null(), t["assigned"].as_str(), t["assigned_state"].as_str()), (Some("open"), true, Some("alice"), Some("idle")));
+        // Crash with the claim still on disk: reopened at the next start, still handed to alice.
+        claim(&c, "a1", &id, 900).unwrap();
+        init(&c).unwrap();
+        let t = get(&c, &id).unwrap();
+        assert_eq!((t["status"].as_str(), t["owner"].is_null(), t["assigned"].as_str()), (Some("open"), true, Some("alice")));
+        let kinds: Vec<_> = t["history"].as_array().unwrap().iter().map(|e| (e["actor"].as_str().unwrap().to_owned(), e["kind"].as_str().unwrap().to_owned())).collect();
+        assert!(kinds.contains(&("lead".into(), "assigned".into())) && kinds.contains(&("alice".into(), "agent_interrupted".into())), "{kinds:?}");
+        // Resume takes it back. An explicit release hands it back for good.
+        reclaim_assigned(&c, "a1");
+        assert_eq!(get(&c, &id).unwrap()["owner"], "alice");
+        let t = update(&c, "you", &id, &json!({"status":"open"})).unwrap();
+        assert!(t["assigned"].is_null() && t["owner"].is_null());
+        reclaim_assigned(&c, "a1");
+        assert!(get(&c, &id).unwrap()["owner"].is_null());
+        // A removed agent is shown as such, never as an owner.
+        assign(&c, "you", &id, "a1").unwrap();
+        c.db.exec("DELETE FROM agents WHERE id='a1'", []).unwrap();
+        assert_eq!(get(&c, &id).unwrap()["assigned_state"], "removed");
     }
     #[test]
     fn lifecycle_and_owner_enforcement() {

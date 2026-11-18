@@ -5,8 +5,8 @@
 set -eu
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 BINARY="${1:?pass the already-compiled absolute Rust test executable}"
-: "${JCODE_SCRATCH_DIR:?set JCODE_SCRATCH_DIR to a disposable scratch parent}"
-TASK="$(mktemp -d "$JCODE_SCRATCH_DIR/selfdev-backend-XXXXXX")"
+: "${PHILIUM_SCRATCH_DIR:?set PHILIUM_SCRATCH_DIR to a disposable scratch parent}"
+TASK="$(mktemp -d "$PHILIUM_SCRATCH_DIR/selfdev-backend-XXXXXX")"
 cleanup() {
   if [ -d "$TASK/source/.git" ]; then
     git -C "$TASK/source" worktree remove --force "$TASK/worktree" >/dev/null 2>&1 || true

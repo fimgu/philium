@@ -2,7 +2,7 @@
 import os, pathlib, subprocess, sys, tempfile
 
 def main(profile, interrupted=False):
-    base=pathlib.Path(tempfile.mkdtemp(prefix='managed-check-',dir=os.environ['JCODE_SCRATCH_DIR']))
+    base=pathlib.Path(tempfile.mkdtemp(prefix='managed-check-',dir=os.environ['PHILIUM_SCRATCH_DIR']))
     (base/'disposable').write_text('fixture\n')
     env=dict(os.environ,PHILIUM_MANAGED_FIXTURE=str(base),PHILIUM_TEST_PROFILE=profile)
     cargo=pathlib.Path(__file__).resolve().parents[1]/'src-tauri'

@@ -18,7 +18,7 @@ def main():
     exe = app / 'Contents/MacOS' / info['CFBundleExecutable']
     if not (exe.parent / 'hal-desktop-server').is_file():
         raise SystemExit('Missing bundled HAL')
-    with tempfile.TemporaryDirectory(prefix='pilot-check-', dir=os.environ['JCODE_SCRATCH_DIR']) as scratch:
+    with tempfile.TemporaryDirectory(prefix='pilot-check-', dir=os.environ.get('PHILIUM_SCRATCH_DIR') or None) as scratch:
         root = Path(scratch).resolve()
         home = root / 'home'; home.mkdir()
         temp = root / 'tmp'; temp.mkdir()

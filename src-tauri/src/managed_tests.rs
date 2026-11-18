@@ -21,7 +21,7 @@ async fn runtime_phase() {
     let root = std::path::PathBuf::from(std::env::var("PHILIUM_MANAGED_FIXTURE").unwrap())
         .canonicalize()
         .unwrap();
-    let scratch = std::path::PathBuf::from(std::env::var("JCODE_SCRATCH_DIR").unwrap())
+    let scratch = std::path::PathBuf::from(std::env::var("PHILIUM_SCRATCH_DIR").unwrap())
         .canonicalize()
         .unwrap();
     assert_eq!(root.parent(), Some(scratch.as_path()));

@@ -352,6 +352,15 @@ pub fn spawn(ctx: &Arc<Ctx>, req: SpawnReq) -> Result<Value, String> {
             t
         ],
     )?;
+    // Handing over a task is recorded by Philium at once. It does not depend on the model
+    // remembering to claim it, and it survives a stop, a quit and a crash.
+    if let Some(task) = req.task_id.as_deref() {
+        let by = req.parent_id.as_deref().and_then(|p| get_row(ctx, p)).and_then(|r| r["name"].as_str().map(str::to_string)).unwrap_or_else(|| "you".into());
+        if let Err(e) = crate::board::assign(ctx, &by, task, &id) {
+            let _ = ctx.db.exec("DELETE FROM agents WHERE id=?1", [&id]);
+            return Err(e);
+        }
+    }
     ctx.log_event("agent_spawned", Some(&id), &json!({ "name": name, "model": model_ref, "strict": strict }));
     ctx.emit("agents:changed", json!({ "id": id }));
     let c = ctx.clone();
@@ -588,6 +597,8 @@ async fn provision(ctx: &Arc<Ctx>, id: &str, fresh: bool, brief: Option<String>)
     }
     let _ = ctx.db.kv_set(&format!("agent_error.{id}"), "");
     set_state(ctx, id, "idle");
+    // Now that it runs, the agent holds the open work that was handed to it (first start and Resume).
+    crate::board::reclaim_assigned(ctx, id);
 
     if let Some(b) = brief.filter(|b| !b.trim().is_empty()) {
         send(ctx, id, &b).await?;
@@ -1047,9 +1058,12 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
             let force = args["force"].as_bool().unwrap_or(false);
             stop(ctx, &id, "tearing_down");
             let (c, i) = (ctx.clone(), id.clone());
-            let report = tokio::task::spawn_blocking(move || crate::reaper::teardown_agent(&c, &i, force))
-                .await
-                .map_err(|e| e.to_string())??;
+            let report = match tokio::task::spawn_blocking(move || crate::reaper::teardown_agent(&c, &i, force)).await {
+                Ok(Ok(report)) => report,
+                // A refused or failed teardown must not leave the agent looking half removed.
+                Ok(Err(e)) => { set_state(ctx, &id, "stopped"); return Err(e); }
+                Err(e) => { set_state(ctx, &id, "stopped"); return Err(e.to_string()); }
+            };
             if report["needs_confirmation"].as_bool() == Some(true) {
                 set_state(ctx, &id, "stopped");
                 return Ok(report);

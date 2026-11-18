@@ -132,6 +132,7 @@ export function SpawnModal(props) {
   }));
 
   const submit = async () => {
+    if (role() === "orchestrator" && !repo()) { setErr("Choose a repo. A coordinator without a checkout cannot create tasks or start helpers."); return; }
     setBusy(true); setErr("");
     try {
       const a = await rpc("agents.spawn", {

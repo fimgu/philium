@@ -1,4 +1,5 @@
-import { For, Show, createResource, onCleanup } from 'solid-js';
+import { For, Show, createResource, createSignal, onCleanup } from 'solid-js';
+import { SpawnModal } from './agents.jsx';
 import { Page, Button } from '../ui/kit.jsx';
 import { go } from '../lib/nav.js';
 import { rpc, useEvent } from '../lib/rpc.js';
@@ -24,14 +25,21 @@ export default function CheckoutHome(props) {
   const refreshSoon = () => { if (!timer) timer = setTimeout(() => { timer = null; refetch(); }, 300); };
   for (const topic of ['agents:changed','board:changed','workspace:changed','reaper:changed']) useEvent(topic,refreshSoon);
   onCleanup(() => clearTimeout(timer));
+  const [starting, setStarting] = createSignal(false);
+  const coordinators = () => (result()?.data?.agents || []).filter(a => a.role === 'orchestrator' || a.role === 'coordinator');
   const link = (label, route, params) => <Button size="sm" variant="ghost" onClick={() => go(route,params)}>{label}</Button>;
   return <Page title="Workspace" sub="Selected checkout" actions={<Button onClick={() => refetch()} disabled={result.loading}>Refresh</Button>}>
     <Show when={result()?.error}><p role="alert">Could not load this checkout: {result().error}</p></Show>
     <Show when={result()?.data} fallback={!result()?.error && <p role="status">Loading checkout…</p>}>{d => <div aria-label="Checkout overview" class="checkout-home">
       <code class="ws-path">{d().path}</code>
       <div class="row">{link('Open terminals','terminals')}{link('Review changes','code',{repo_id:props.id})}{link('Review evidence','review')}</div>
+      <section class="home-sec" aria-label="Coordinator"><div class="row"><h2 class="grow">Coordinator</h2><Show when={!coordinators().length}><Button variant="primary" onClick={() => setStarting(true)}>Start coordinator</Button></Show></div>
+        <For each={coordinators()} fallback={<p class="small faint">No coordinator for this checkout yet. Start one, tell it what you want, and it creates tasks and hands them to helpers here.</p>}>
+          {a => <div class="checkout-row"><span><strong>{a.name}</strong> coordinates this checkout</span><small>{a.state}</small><Button size="sm" onClick={() => go('agents',{id:a.id})}>Open coordinator</Button></div>}
+        </For>
+      </section>
       <Records title="Unfinished tasks" rows={d().tasks} empty="No unfinished tasks for this checkout." action={link('Open board','board')}>
-        {t => <div class="checkout-row"><span>{t.title}</span><small>{t.status}</small></div>}
+        {t => <div class="checkout-row"><span>{t.title}</span><small>{t.status}{t.owner ? ` · ${t.owner}` : t.assigned ? ` · handed to ${t.assigned}` : ''}</small></div>}
       </Records>
       <Records title="Agents" rows={d().agents} empty="No agents assigned." action={link('Open agents','agents')}>
         {a => <div class="checkout-row">{link(a.name,'agents',{id:a.id})}<small>{a.state}</small></div>}
@@ -44,5 +52,6 @@ export default function CheckoutHome(props) {
       </Records>
       <p class="small faint">Recorded by Philium, not a live Docker or Kubernetes scan. Released resources and resources without a matching agent are not shown.{d().pilot && ' Host cleanup and kind cluster changes are disabled in this pilot.'}</p>
     </div>}</Show>
+    <Show when={starting()}><SpawnModal preset={{ role: 'orchestrator', repo_id: props.id }} onClose={(a) => { setStarting(false); if (a) go('agents', { id: a.id }); }} /></Show>
   </Page>;
 }

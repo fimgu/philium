@@ -12,6 +12,28 @@ static BASE: OnceLock<PathBuf> = OnceLock::new();
 pub fn active() -> bool {
     BASE.get().is_some()
 }
+/// The account home the Pilot was started from. Model-driven children get the private home.
+pub(crate) fn real_home() -> Option<PathBuf> {
+    BASE.get().and_then(|b| b.parent().map(Path::to_path_buf))
+}
+pub(crate) fn data_dir() -> Option<PathBuf> {
+    BASE.get().map(|b| b.join("data"))
+}
+/// Only a harness-made home carries this marker. It never exists in a person's profile.
+pub(crate) fn disposable() -> bool {
+    real_home().is_some_and(|h| {
+        fs::read_to_string(h.join(".philium-pilot-fixture")).ok().as_deref() == Some("disposable\n")
+    })
+}
+/// Variables prepare() points at the private home. A shell the person opens gets its own back.
+pub(crate) const PRIVATE_ENV: [&str; 6] = [
+    "HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
+    "CODEX_HOME",
+    "CLAUDE_CONFIG_DIR",
+];
 
 // Only the human-operated Environments explorer uses this fixed host directory.
 // Do not restore the real HOME to children or expose an arbitrary host path.
@@ -52,7 +74,29 @@ pub fn prepare() -> Result<(), String> {
     // Before the desktop/runtime threads start. Never inherit preview overrides from a parent app.
     env::set_var("PHILIUM_DATA_DIR", data);
     env::set_var("PHILIUM_ROOT", root);
-    env::set_var("PHILIUM_PREVIEW", "1");
+    // The Pilot keeps its own key vault and composer drafts inside its profile, so a daily
+    // session can add a provider and keep talking. Drop an inherited preview flag.
+    env::remove_var("PHILIUM_PREVIEW");
+    // Another agent harness must not steer the Pilot or its children through the environment.
+    let foreign: Vec<_> = env::vars_os()
+        .map(|(k, _)| k)
+        .filter(|k| {
+            let k = k.to_string_lossy().to_ascii_uppercase();
+            k.starts_with("JCODE_") || k.starts_with("HERDR_")
+        })
+        .collect();
+    for k in foreign {
+        env::remove_var(k);
+    }
+    if let Some(path) = env::var_os("PATH") {
+        let other = home.join(".jcode");
+        let kept: Vec<_> = env::split_paths(&path)
+            .filter(|p| !p.starts_with(&other))
+            .collect();
+        if let Ok(joined) = env::join_paths(kept) {
+            env::set_var("PATH", joined);
+        }
+    }
     env::set_var("HOME", &private_home);
     for (key, dir) in [
         ("XDG_CONFIG_HOME", "config"),

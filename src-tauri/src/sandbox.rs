@@ -140,6 +140,20 @@ fn home() -> PathBuf {
     std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/var/empty"))
 }
 
+/// Every home whose private folders an agent must not see: the process HOME and, in the
+/// Pilot, the account home it was started from (with its /private/var style real path).
+fn private_homes() -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for root in std::iter::once(home()).chain(crate::pilot::real_home()) {
+        for v in variants(&root) {
+            if !out.contains(&v) {
+                out.push(v);
+            }
+        }
+    }
+    out
+}
+
 fn esc(p: &Path) -> String {
     p.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"")
 }
@@ -216,9 +230,19 @@ pub fn profile(p: &Policy) -> String {
     s.push_str("(allow file-write* (literal \"/dev/null\") (literal \"/dev/dtracehelper\"))\n");
     // Shared temp and the per-user temp/cache folders (xcrun, clang, kicad).
     s.push_str("(allow file-read* file-write* (subpath \"/private/tmp\") (subpath \"/private/var/folders\"))\n");
-    // Private: never readable or writable.
-    for d in PRIVATE {
-        s.push_str(&format!("(deny file-read* file-write* (subpath \"{}\"))\n", esc(&h.join(d))));
+    // Private: never readable or writable. The Pilot points HOME at a private folder, so the
+    // account home it started from is listed too; otherwise its keys and logins stay readable.
+    let homes = private_homes();
+    for root in &homes {
+        for d in PRIVATE {
+            s.push_str(&format!("(deny file-read* file-write* (subpath \"{}\"))\n", esc(&root.join(d))));
+        }
+    }
+    // The Pilot's database, logs and other agents' sessions. Own work areas are re-allowed below.
+    if let Some(store) = crate::pilot::data_dir() {
+        for v in variants(&store) {
+            s.push_str(&format!("(deny file-read* file-write* (subpath \"{}\"))\n", esc(&v)));
+        }
     }
     s.push_str("(deny file-read* file-write* (subpath \"/Library/Keychains\"))\n(deny file-read* file-write* (subpath \"/private/var/db/dslocal\"))\n");
     // Package caches and tool state (read/write).
@@ -233,7 +257,9 @@ pub fn profile(p: &Policy) -> String {
     // Own work areas, last so nothing above can take them away.
     s.push_str(&subpaths("file-read* file-write*", &[p.workdir.clone(), p.scratch.clone(), p.hal_dir.clone()]));
     // .env files under home stay private even inside grants and the worktree.
-    s.push_str(&format!("(deny file-read* file-write* (regex #\"^{}/.*/\\.env(\\.[^/]*)?$\"))\n", regex_esc(&h)));
+    for root in &homes {
+        s.push_str(&format!("(deny file-read* file-write* (regex #\"^{}/.*/\\.env(\\.[^/]*)?$\"))\n", regex_esc(root)));
+    }
     // Network: loopback only (gateway, egress proxy, MCP).
     s.push_str("(allow network-outbound (remote ip \"localhost:*\"))\n");
     s.push_str("(allow network-bind (local ip \"localhost:*\"))\n(allow network-inbound (local ip \"localhost:*\"))\n");
@@ -243,8 +269,13 @@ pub fn profile(p: &Policy) -> String {
 
 /// Seatbelt rule hiding Philium's secret vault folder (`secrets.rs`).
 fn deny_secrets() -> String {
+    // Both spellings: the sandbox matches the real path, and the folder may be reached
+    // through a symlink (macOS /var, a home on another volume).
     match crate::secrets::dir() {
-        Some(d) => format!("(deny file-read* file-write* (subpath \"{}\"))\n", esc(d)),
+        Some(d) => variants(d)
+            .iter()
+            .map(|v| format!("(deny file-read* file-write* (subpath \"{}\"))\n", esc(v)))
+            .collect(),
         None => String::new(),
     }
 }
