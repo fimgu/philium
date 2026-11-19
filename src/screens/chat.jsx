@@ -146,7 +146,11 @@ export default function Chat() {
           allowUntrusted={true}
           currentProvider={(chosen() || "").split("/")[0]}
           openRequest={pickModel()}
-          onDismiss={() => document.querySelector(".screen-pane:not(.hidden) textarea.composer-input")?.focus()}
+          onDismiss={() => {
+            const focus = () => document.querySelector(".screen-pane:not(.hidden) textarea.composer-input:not(:disabled)")?.focus();
+            focus();
+            for (const ms of [150, 500, 1200]) setTimeout(() => { const el = document.activeElement; if (!el || el === document.body) focus(); }, ms);
+          }}
         />
         <Button variant="primary" onClick={newChat}><Icon name="plus" size={12} /> New chat</Button>
       </>}>

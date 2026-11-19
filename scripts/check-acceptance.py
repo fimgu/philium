@@ -298,7 +298,7 @@ const focused = txt(document.activeElement);
 document.activeElement.click(); note('choose the focused model');
 const closed = await until(() => !all('.model-picker-pop').length, 'the list closed', 8000).then(() => true, () => false);
 const modelAfter = await until(() => (shownModel() !== modelBefore ? shownModel() : null), 'the model shown in the header changed', 10000).catch(() => shownModel());
-await sleep(300);
+await sleep(1600);
 const composerFocused = document.activeElement === composer();
 const reply = await say('Still there after the switch?', 'SYNTHETIC REPLY from').catch((e) => String(e));
 return { opened: true, modelBefore, first, other, everything, searched, focused, closed, modelAfter, composerFocused, reply, toasts: toasts() };
@@ -614,7 +614,7 @@ def main():
             run.check('B1', 'Typing /model opens the model list with the search ready, instead of printing a line', v.get('opened') is True and first.get('searchFocused') is True, {'opened': v.get('opened'), 'focus': first.get('searchFocused'), 'started': v.get('started'), 'toasts': v.get('toasts')} if v else r.get('error'))
             run.check('B1', 'The list has one switch per provider this agent may use and leaves out the untrusted one', first.get('chips') == ['Synthetic (on)', 'Second'] and 'hidden' in (first.get('foot') or ''), {'chips': first.get('chips'), 'foot': first.get('foot')})
             run.check('B1', 'A provider shows the newest model of each family first and keeps the older ones behind one button', other.get('items') == ['nova-3-2', 'nova-mini-3', 'spark-2-1'] and other.get('more') == 'Show 5 older models' and len(every.get('items') or []) == 8, {'latest': other.get('items'), 'more': other.get('more'), 'all': every.get('items')})
-            run.check('B1', 'Search looks across every provider at once', found.get('items') == ['synthetic-1'] and found.get('chips') == 0, found)
+            run.check('B1', 'Search looks across every provider at once', [i.replace(' ✓', '') for i in found.get('items') or []] == ['synthetic-1'] and found.get('chips') == 0, found)
             run.check('B1', 'An arrow key reaches the first model; choosing it switches the agent, returns to the message box, and the agent answers on the new model', (v.get('focused') or '').startswith('nova-3-2') and v.get('closed') is True and 'nova-3-2' in (v.get('modelAfter') or '') and v.get('composerFocused') is True and 'SYNTHETIC REPLY from solo' in (v.get('reply') or ''), {'focused': v.get('focused'), 'after': v.get('modelAfter'), 'composer': v.get('composerFocused'), 'reply': (v.get('reply') or '')[:60], 'toasts': v.get('toasts')})
 
         if want('review'):

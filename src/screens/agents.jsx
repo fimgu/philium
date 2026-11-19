@@ -546,6 +546,13 @@ function AgentView(props) {
   };
 
   const [pickModel, setPickModel] = createSignal(0);
+  // After /model the cursor belongs back in the message box. A model change can redraw or
+  // briefly disable that box, so try again while nothing else has taken the focus.
+  const backToComposer = () => {
+    const focus = () => agentMain?.querySelector("textarea.composer-input:not(:disabled)")?.focus();
+    focus();
+    for (const ms of [150, 500, 1200]) setTimeout(() => { const el = document.activeElement; if (!el || el === document.body) focus(); }, ms);
+  };
   const handleSlashModel = async (query) => {
     if (!query) {
       // Bare /model opens the picker; /model <name> still switches straight away.
@@ -618,7 +625,7 @@ function AgentView(props) {
           strict={!!a()?.strict}
           currentProvider={(a()?.model_ref || "").split("/")[0]}
           openRequest={pickModel()}
-          onDismiss={() => agentMain?.querySelector("textarea.composer-input")?.focus()}
+          onDismiss={backToComposer}
         />
         <Show when={a()?.strict}><Badge tone="strict"><Icon name="shield" size={11} /> Strict</Badge></Show>
         <Show when={a()?.parent_id}>
