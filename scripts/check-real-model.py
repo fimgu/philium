@@ -33,8 +33,8 @@ spec = importlib.util.spec_from_file_location('acceptance', HERE / 'check-accept
 acc = importlib.util.module_from_spec(spec); spec.loader.exec_module(acc)
 syn = acc.syn
 
-CHROME = 'Requests a reasoning effort level. Support varies by provider and model, and speed, cost and quality are not guaranteed.Auto None Low Medium High Max'
-said = lambda t: (t or '').replace(CHROME, '').replace('Copy reply', '').strip()
+# The effort menu's text ends the conversation pane, and its levels differ by model.
+said = lambda t: re.sub(r'Requests a reasoning effort level[\s\S]*$', '', t or '').replace('Copy reply', '').strip()
 
 TURN = r'''
 const STATES = /\b(Idle|Stopped|Needs you|Failed)\b/;
