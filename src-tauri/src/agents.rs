@@ -12,7 +12,7 @@
 //! rpc:
 //!   list {}                                   -> [agent]
 //!   get {id}                                  -> agent + live info
-//!   spawn {name?, role?, model?, repo_id?, task_id?, brief?, parent_id?, strict?} -> agent
+//!   spawn {name?, role?, model?, repo_id?, task_id?, brief?, parent_id?, strict?, base?} -> agent
 //!   send {id, text}                           -> HAL turn ids
 //!   cancel {id}                               -> stop current turn
 //!   stop {id}                                 -> stop HAL, keep agent + worktree
@@ -302,6 +302,9 @@ pub struct SpawnReq {
     pub brief: Option<String>,
     pub parent_id: Option<String>,
     pub strict: bool,
+    /// The commit or branch the worktree starts from. None: the parent's, else the checkout's
+    /// integration or default branch.
+    pub base: Option<String>,
 }
 
 /// Create the agent row and start provisioning in the background.
@@ -334,11 +337,19 @@ pub fn spawn(ctx: &Arc<Ctx>, req: SpawnReq) -> Result<Value, String> {
             return Err("unknown repo".into());
         }
     }
+    let base = match req.base.as_deref().map(str::trim).filter(|b| !b.is_empty()) {
+        Some(b) if b.starts_with('-') || b.len() > 200 || b.chars().any(char::is_whitespace) => return Err("Invalid starting point".into()),
+        Some(b) => Some(b.to_string()),
+        None => req.parent_id.as_deref().and_then(|p| get_row(ctx, p)).and_then(|r| r["base_ref"].as_str().map(str::to_string)),
+    };
+    if base.is_some() && req.repo_id.is_none() {
+        return Err("A starting point needs a checkout".into());
+    }
     let id = new_id();
     let t = now();
     ctx.db.exec(
-        "INSERT INTO agents(id,name,role,model_ref,state,parent_id,repo_id,task_id,strict,port_base,created_at,last_active_at)
-         VALUES(?1,?2,?3,?4,'provisioning',?5,?6,?7,?8,?9,?10,?10)",
+        "INSERT INTO agents(id,name,role,model_ref,state,parent_id,repo_id,task_id,strict,port_base,created_at,last_active_at,base_ref)
+         VALUES(?1,?2,?3,?4,'provisioning',?5,?6,?7,?8,?9,?10,?10,?11)",
         rusqlite::params![
             id,
             name,
@@ -349,7 +360,8 @@ pub fn spawn(ctx: &Arc<Ctx>, req: SpawnReq) -> Result<Value, String> {
             req.task_id,
             strict as i64,
             port_base(ctx),
-            t
+            t,
+            base
         ],
     )?;
     // Handing over a task is recorded by Philium at once. It does not depend on the model
@@ -442,8 +454,9 @@ async fn provision(ctx: &Arc<Ctx>, id: &str, fresh: bool, brief: Option<String>)
             Some(_) => Some(crate::codeindex::resolve_agent(ctx, id)?.wt.ok_or("Worktree unavailable")?.path),
             None => {
                 let (c, repo, n, aid) = (ctx.clone(), repo.to_string(), name.clone(), id.to_string());
+                let base = row["base_ref"].as_str().map(str::to_string);
                 let wt = tokio::task::spawn_blocking(move || {
-                    crate::workspace::create_worktree(&c, &repo, Some(&aid), &n, None)
+                    crate::workspace::create_worktree(&c, &repo, Some(&aid), &n, base.as_deref())
                 })
                 .await
                 .map_err(|e| e.to_string())??;
@@ -1058,6 +1071,7 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
                 brief: ctx::arg_opt_str(&args, "brief"),
                 parent_id: ctx::arg_opt_str(&args, "parent_id"),
                 strict: args["strict"].as_bool().unwrap_or(false),
+                base: ctx::arg_opt_str(&args, "base").filter(|s| !s.is_empty()),
             },
         ),
         "send" => send_with_images(ctx, &id()?, &ctx::arg_str(&args, "text")?, args.get("images").cloned().unwrap_or(json!([]))).await,
@@ -1642,7 +1656,7 @@ mod tests {
         // No providers configured: resolve fails, nothing is created.
         assert!(spawn(&ctx, SpawnReq {
             name: Some("lion".into()), role: None, model: Some("nope/x".into()), repo_id: None,
-            task_id: None, brief: None, parent_id: None, strict: false
+            task_id: None, brief: None, parent_id: None, strict: false, base: None
         })
         .is_err());
         assert!(ctx.db.query("SELECT * FROM agents", []).unwrap().is_empty());

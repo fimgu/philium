@@ -227,6 +227,7 @@ fn request(ctx: &Arc<Ctx>, text: &str, context: &Value, model: Option<String>) -
             brief: Some(brief),
             parent_id: None,
             strict: false,
+            base: None,
         },
     )?;
     let id = new_id();

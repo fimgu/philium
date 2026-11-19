@@ -38,7 +38,7 @@ CREATE TABLE IF NOT EXISTS agents (
   repo_id TEXT REFERENCES repos(id) ON DELETE SET NULL,
   task_id TEXT, strict INTEGER NOT NULL DEFAULT 0,
   hal_session_id TEXT, token_hash TEXT, port_base INTEGER,
-  created_at INTEGER NOT NULL, last_active_at INTEGER NOT NULL);
+  created_at INTEGER NOT NULL, last_active_at INTEGER NOT NULL, base_ref TEXT);
 CREATE TABLE IF NOT EXISTS worktrees (
   id TEXT PRIMARY KEY, repo_id TEXT NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
   agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
@@ -107,6 +107,11 @@ impl Db {
         c.execute_batch(SCHEMA).map_err(|e| e.to_string())?;
         if !c.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('terminals') WHERE name='repo_id')", [], |r| r.get::<_, bool>(0)).map_err(|e| e.to_string())? {
             c.execute_batch("ALTER TABLE terminals ADD COLUMN repo_id TEXT REFERENCES repos(id) ON DELETE SET NULL").map_err(|e|e.to_string())?;
+        }
+        // Where an agent's worktree starts when it is not the checkout's usual branch: a release
+        // review starts on the pull request's head, and its helpers with it.
+        if !c.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('agents') WHERE name='base_ref')", [], |r| r.get::<_, bool>(0)).map_err(|e| e.to_string())? {
+            c.execute_batch("ALTER TABLE agents ADD COLUMN base_ref TEXT").map_err(|e|e.to_string())?;
         }
         Ok(Db(Mutex::new(c)))
     }

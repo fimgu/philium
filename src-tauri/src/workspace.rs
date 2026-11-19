@@ -177,6 +177,24 @@ fn add_repo(ctx: &Arc<Ctx>, path: &str) -> Result<Value, String> {
     changed(ctx);
     repo(ctx, &id).ok_or_else(|| "Repository registration failed".into())
 }
+/// The commit a new worktree starts from, and the name that led to it. `base` is a commit, a
+/// local branch, or a branch this checkout has only from its origin: a checkout that was cloned
+/// and then worked on another branch never has its default branch locally.
+pub(crate) fn start_point(repo: &Path, base: &str) -> Result<(String, String), String> {
+    if base.is_empty() || base.starts_with('-') {
+        return Err("Invalid base reference".into());
+    }
+    for name in [base.to_string(), format!("origin/{base}")] {
+        if let Ok(commit) = git(repo, &["rev-parse", "--verify", "--quiet", &format!("{name}^{{commit}}")]) {
+            if !commit.is_empty() {
+                return Ok((commit, name));
+            }
+        }
+    }
+    Err(format!(
+        "Agents here start from {base}, and this checkout has no such branch or commit, locally or from origin. Fetch it in the checkout (git fetch origin {base}), or choose another starting branch for this checkout under Repos."
+    ))
+}
 pub fn create_worktree(
     ctx: &Arc<Ctx>,
     repo_id: &str,
@@ -201,13 +219,7 @@ pub fn create_worktree(
     let base = base
         .or(r["integration_branch"].as_str())
         .unwrap_or(text(&r, "default_branch")?);
-    if base.starts_with('-') {
-        return Err("Invalid base reference".into());
-    }
-    let base_commit = git(
-        repo_path,
-        &["rev-parse", "--verify", &format!("{base}^{{commit}}")],
-    )?;
+    let (base_commit, _) = start_point(repo_path, base)?;
     let id = new_id();
     let short = &id[..8];
     let branch = format!("philium/{agent_name}/{short}");
@@ -642,10 +654,7 @@ fn dispatch(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, String> 
                             Path::new(text(&r, "path")?),
                             &["check-ref-format", "--branch", name],
                         )?;
-                        git(
-                            Path::new(text(&r, "path")?),
-                            &["rev-parse", "--verify", &format!("{name}^{{commit}}")],
-                        )?;
+                        start_point(Path::new(text(&r, "path")?), name)?;
                     }
                     ctx.db.exec(
                         &format!("UPDATE repos SET {key}=?1 WHERE id=?2"),
@@ -1108,6 +1117,33 @@ mod tests {
         let r = dispatch(&ctx, "relocate", json!({"repo_id":id,"path":new})).unwrap();
         assert_eq!(r["path"], json!(std::fs::canonicalize(&new).unwrap()));
         assert!(create_worktree(&ctx, &id, None, "lion", None).is_ok());
+        std::fs::remove_dir_all(ctx.root.parent().unwrap()).unwrap();
+    }
+    #[test]
+    fn a_default_branch_that_exists_only_on_the_origin_still_starts_agents() {
+        let (ctx, id) = setup();
+        let p = ctx.root.join("fixture");
+        // The checkout as a person leaves it: on a work branch, the default branch known only
+        // from the origin.
+        let tip = git(&p, &["rev-parse", "HEAD"]).unwrap();
+        git(&p, &["update-ref", "refs/remotes/origin/release/v1", &tip]).unwrap();
+        git(&p, &["checkout", "-q", "-b", "dev"]).unwrap();
+        std::fs::write(p.join("file"), "two\n").unwrap();
+        git(&p, &["commit", "-qam", "work"]).unwrap();
+        git(&p, &["branch", "-D", "main"]).unwrap();
+        dispatch(&ctx, "repo_set", json!({"id":id,"default_branch":"release/v1"})).unwrap();
+        let w = create_worktree(&ctx, &id, None, "lion", None).unwrap();
+        assert_eq!(w.base_commit, tip);
+        assert_eq!(start_point(&p, "release/v1").unwrap(), (tip.clone(), "origin/release/v1".into()));
+        // An explicit commit is taken as it is.
+        let head = git(&p, &["rev-parse", "HEAD"]).unwrap();
+        assert_eq!(create_worktree(&ctx, &id, None, "otter", Some(&head)).unwrap().base_commit, head);
+        // What exists nowhere is refused in words a person can act on.
+        assert!(dispatch(&ctx, "repo_set", json!({"id":id,"default_branch":"release/v2"})).is_err());
+        ctx.db.exec("UPDATE repos SET default_branch='release/v2' WHERE id=?1", [&id]).unwrap();
+        let e = create_worktree(&ctx, &id, None, "finch", None).unwrap_err();
+        assert!(e.contains("start from release/v2") && e.contains("git fetch origin release/v2"), "{e}");
+        assert!(start_point(&p, "--upload-pack=x").is_err());
         std::fs::remove_dir_all(ctx.root.parent().unwrap()).unwrap();
     }
     #[test]

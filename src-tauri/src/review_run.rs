@@ -19,6 +19,20 @@ pub const TIERS: [(&str, &str); 6] = [
     ("P5", "polish: listed, not verified"),
 ];
 const RESULTS: [&str; 3] = ["pass", "fail", "blocked"];
+/// Where a failure comes from, decided by running the same check on the target as well.
+const ORIGINS: [&str; 3] = ["introduced", "pre_existing", "unverified"];
+const ORIGIN_RULE: &str = "introduced (fails on the head, passes on the target), pre_existing (fails the same way on the target) or unverified (the target could not be checked, or fails differently)";
+
+/// A finding's origin in the words an agent may use for it.
+fn origin_of(raw: &str) -> Option<&'static str> {
+    let w = raw.trim().to_ascii_lowercase().replace(['-', ' '], "_");
+    match w.as_str() {
+        "introduced" => Some("introduced"),
+        "pre_existing" | "preexisting" => Some("pre_existing"),
+        "unverified" | "origin_unverified" => Some("unverified"),
+        _ => None,
+    }
+}
 
 fn run_key(repo: &str) -> String {
     format!("review.run.{repo}")
@@ -75,12 +89,19 @@ pub fn plan(ctx: &Arc<Ctx>, me: &str, row: &Value, items: &Value) -> Result<Valu
 
 /// One item's outcome, with what was run and seen. Recorded by the agent that did the item or by
 /// the review's orchestrator.
-pub fn result(ctx: &Arc<Ctx>, agent_id: &str, me: &str, row: &Value, task_id: &str, outcome: &str, evidence: &str) -> Result<Value, String> {
+pub fn result(ctx: &Arc<Ctx>, agent_id: &str, me: &str, row: &Value, task_id: &str, outcome: &str, origin: Option<&str>, evidence: &str) -> Result<Value, String> {
     let repo = repo_of(row)?;
     let outcome = outcome.trim().to_ascii_lowercase();
     if !RESULTS.contains(&outcome.as_str()) {
         return Err("result is pass, fail or blocked".into());
     }
+    // Every finding says whether this release caused it. Only a failure is a finding.
+    let origin = match (outcome.as_str(), origin.filter(|o| !o.trim().is_empty())) {
+        ("fail", None) => return Err(format!("A failure needs its origin. Run the same check on the target too, then send origin: {ORIGIN_RULE}.")),
+        ("fail", Some(o)) => Some(origin_of(o).ok_or_else(|| format!("origin is {ORIGIN_RULE}"))?),
+        _ => None,
+    };
+    debug_assert!(origin.map_or(true, |o| ORIGINS.contains(&o)));
     let evidence = evidence.trim();
     if evidence.len() < 20 || evidence.len() > 6000 {
         return Err("evidence says what you ran and what it showed, on which commit: 20 to 6000 characters".into());
@@ -90,11 +111,11 @@ pub fn result(ctx: &Arc<Ctx>, agent_id: &str, me: &str, row: &Value, task_id: &s
     if !holds && row["role"].as_str() != Some("orchestrator") {
         return Err("Record the outcome of the item you were given, or let the orchestrator record it".into());
     }
-    ctx.db.exec("UPDATE tasks SET review_result=?1, review_evidence=?2, updated_at=?3 WHERE id=?4", params![outcome, format!("{me}: {evidence}"), now(), task_id])?;
+    ctx.db.exec("UPDATE tasks SET review_result=?1, review_evidence=?2, review_origin=?3, updated_at=?4 WHERE id=?5", params![outcome, format!("{me}: {evidence}"), origin, now(), task_id])?;
     // Hand the item in when this agent holds it, so the board shows it done by its owner.
     let handed_in = board::submit(ctx, agent_id, task_id, &format!("{}: {evidence}", outcome.to_uppercase()), None).is_ok();
     ctx.emit("release:review", json!({ "repo_id": repo }));
-    Ok(json!({"recorded": outcome, "handed_in": handed_in}))
+    Ok(json!({"recorded": outcome, "origin": origin, "handed_in": handed_in}))
 }
 
 /// The orchestrator's written report for the review in progress.
@@ -112,12 +133,14 @@ pub fn report(ctx: &Ctx, me: &str, row: &Value, text: &str) -> Result<Value, Str
 }
 
 /// The verdict the items add up to. Failing or unchecked P0 and P1 items decide it; the lower
-/// tiers inform.
+/// tiers inform. A failure the release introduced, or one whose origin is unverified, means do
+/// not ship; one that fails the same way on the target is not this release's doing, so it leaves
+/// the release not ready for the person to judge.
 pub fn headline(items: &[Value]) -> &'static str {
     let key: Vec<&Value> = items.iter().filter(|i| i["tier"].as_i64().unwrap_or(9) <= 1).collect();
     if items.is_empty() {
         "none"
-    } else if key.iter().any(|i| i["result"] == "fail") {
+    } else if key.iter().any(|i| i["result"] == "fail" && i["origin"] != "pre_existing") {
         "do_not_ship"
     } else if key.is_empty() || key.iter().any(|i| i["result"] != "pass") {
         "not_ready"
@@ -130,7 +153,7 @@ pub fn headline(items: &[Value]) -> &'static str {
 /// they add up to and the report, if any. A new head is a new revision and starts empty.
 pub fn items(ctx: &Ctx, repo: &str, pr: i64, gen: i64) -> Result<Value, String> {
     let rows = ctx.db.query(
-        "SELECT t.id,t.title,t.status,t.review_tier AS tier,t.review_result AS result,t.review_evidence AS evidence,COALESCE(a.name,t.assigned,t.owner) AS owner \
+        "SELECT t.id,t.title,t.status,t.review_tier AS tier,t.review_result AS result,t.review_origin AS origin,t.review_evidence AS evidence,COALESCE(a.name,t.assigned,t.owner) AS owner \
          FROM tasks t LEFT JOIN agents a ON a.id=COALESCE(t.owner_agent_id,t.assigned_agent_id) \
          WHERE t.repo_id=?1 AND t.review_gen=?2 AND t.status!='cancelled' ORDER BY t.review_tier, t.created_at",
         params![repo, gen],
@@ -153,8 +176,9 @@ pub fn brief(pr: i64, base: &str, head: &str, facts: &str) -> String {
          \x20  Give each landed pull request at least one P1 item for its main behaviour. Add release-wide items: migrations apply in order on an empty database, conflicts with the target, deployment files. Each item's detail says what to verify and how: the test or command to run, or what to read.\n\
          2. Delegate. For each item call `agent_spawn` with its task_id and a brief that repeats the item, these rules, and step 3. P0 first. At most two helpers at a time; start the next when one reports.\n\
          3. Each helper must actually do the check, then call `review_result` with the item's task_id, a result of pass, fail or blocked, and evidence: the exact commands it ran and what they showed, on which commit. Blocked means it could not check; the evidence then says what it needs. A guess is not a pass.\n\
+         \x20  A fail is a finding, and every finding says whether this release caused it. Run the same check on the target too (`git checkout --detach {base}`, run it, then `git checkout --detach {head}`), and send origin: introduced if it fails on the head and passes on the target, pre_existing if it fails the same way on the target, unverified if the target could not be checked or fails differently. The evidence shows both runs. A conflict with the target is always introduced. For an introduced finding, start the evidence with the landed pull request that brings it in, for example \"Introduced by #1234:\", when `git log {base}..{head} -- <file>` shows it; otherwise say it is not attributed.\n\
          4. Small items you may do yourself and record with `review_result`.\n\
-         5. Finish. When every item has a result, call `review_report` with a thorough report in Markdown: the verdict first (do not ship if any P0 or P1 failed; not ready if any P0 or P1 is blocked or unchecked; otherwise ready for the person's sign-off), then a table of the items with tier, result and one line of evidence, then what failed and why, what could not be checked and what it needs, and risks you noticed that no item covers. Then tell the person the verdict in two sentences."
+         5. Finish. When every item has a result, call `review_report` with a thorough report in Markdown: the verdict first (do not ship if any P0 or P1 failure is introduced or origin unverified; not ready if any P0 or P1 failure is pre-existing, or any P0 or P1 is blocked or unchecked; otherwise ready for the person's sign-off), then a table of the items with tier, result, origin and one line of evidence, then what failed and why, what could not be checked and what it needs, and risks you noticed that no item covers. Label every finding in the report, risks included: introduced, pre-existing or origin unverified. Then tell the person the verdict in two sentences."
     )
 }
 
@@ -163,11 +187,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_failure_is_recorded_only_with_its_origin() {
+        let ctx = Ctx::test();
+        board::init(&ctx).unwrap();
+        ctx.db.exec("INSERT INTO repos(id,name,path,default_branch,added_at) VALUES('r','r','/nonexistent','main',0)", []).unwrap();
+        start(&ctx, "r", 7, 1).unwrap();
+        let lead = json!({"repo_id": "r", "role": "orchestrator"});
+        let p = plan(&ctx, "lead", &lead, &json!([{"title": "Migrations", "tier": 1, "detail": "Run them on an empty database."}])).unwrap();
+        let id = p["items"][0]["id"].as_str().unwrap();
+        let ran = "Ran make migrate on the head and on the target: both fail at step 61 with the same error.";
+        let e = result(&ctx, "x", "lead", &lead, id, "fail", None, ran).unwrap_err();
+        assert!(e.contains("needs its origin") && e.contains("pre_existing"), "{e}");
+        assert!(result(&ctx, "x", "lead", &lead, id, "fail", Some("maybe"), ran).is_err());
+        assert_eq!(result(&ctx, "x", "lead", &lead, id, "fail", Some("Pre-existing"), ran).unwrap()["origin"], "pre_existing");
+        let v = items(&ctx, "r", 7, 1).unwrap();
+        assert_eq!((v["items"][0]["origin"].as_str(), v["headline"].as_str()), (Some("pre_existing"), Some("not_ready")));
+        // A pass carries no origin, whatever is sent.
+        assert_eq!(result(&ctx, "x", "lead", &lead, id, "pass", Some("introduced"), ran).unwrap()["origin"], Value::Null);
+    }
+
+    #[test]
     fn failing_or_unchecked_p0_and_p1_items_decide_the_verdict() {
         let item = |tier: i64, result: Value| json!({"tier": tier, "result": result});
         assert_eq!(headline(&[]), "none");
         assert_eq!(headline(&[item(0, json!("pass")), item(1, json!("pass")), item(3, json!("fail"))]), "passed");
         assert_eq!(headline(&[item(0, json!("pass")), item(1, json!("fail"))]), "do_not_ship");
+        let found = |tier: i64, origin: &str| json!({"tier": tier, "result": "fail", "origin": origin});
+        assert_eq!(headline(&[item(0, json!("pass")), found(1, "introduced")]), "do_not_ship");
+        assert_eq!(headline(&[item(0, json!("pass")), found(1, "unverified")]), "do_not_ship");
+        assert_eq!(headline(&[item(0, json!("pass")), found(1, "pre_existing")]), "not_ready");
+        assert_eq!(headline(&[item(0, json!("pass")), item(1, json!("pass")), found(2, "introduced")]), "passed");
         assert_eq!(headline(&[item(0, json!("pass")), item(1, json!("blocked"))]), "not_ready");
         assert_eq!(headline(&[item(0, json!("pass")), item(1, Value::Null)]), "not_ready");
         // A plan with nothing in P0 or P1 has verified nothing that matters.
@@ -177,7 +226,8 @@ mod tests {
     #[test]
     fn the_brief_names_the_release_the_tiers_and_the_three_tools() {
         let b = brief(5542, "aaaa", "bbbb", "5 pull requests landed in it: #1, #2.");
-        for needle in ["#5542", "target aaaa, head bbbb", "P0: can lose data", "P5: polish", "review_plan", "review_result", "review_report", "At most two helpers", "read-only review"] {
+        for needle in ["#5542", "target aaaa, head bbbb", "P0: can lose data", "P5: polish", "review_plan", "review_result", "review_report", "At most two helpers", "read-only review",
+            "git checkout --detach aaaa", "Introduced by #1234", "introduced if it fails on the head and passes on the target", "pre_existing if it fails the same way", "Label every finding"] {
             assert!(b.contains(needle), "{needle}");
         }
     }

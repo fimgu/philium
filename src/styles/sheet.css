@@ -109,3 +109,9 @@
 .sheet .report p, .sheet .report li, .sheet .report td { max-width: none; }
 
 .sheet button.primary:not(.btn) { background: var(--accent); border-color: var(--accent); color: #0b0c0e; font-weight: 600; }
+
+/* A finding's origin: did this release cause it? */
+.sheet .origin { display: inline-block; margin-right: 6px; padding: 0 6px; border-radius: 8px; font-size: 10px; font-weight: 600; vertical-align: 1px; border: 1px solid currentColor; white-space: nowrap; }
+.sheet .origin.introduced { color: var(--danger); }
+.sheet .origin.unverified { color: var(--strict); }
+.sheet .origin.pre_existing { color: var(--text-faint); }

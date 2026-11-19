@@ -15,6 +15,7 @@ What this harness does and does not do
 Nothing outside the scratch folder is created. No LaunchServices, no keystrokes, no network
 beyond loopback (the `--public` phase, off by default, reads public GitHub metadata).
 """
+import sqlite3
 import argparse, json, os, plistlib, shutil, signal, stat, subprocess, sys, tempfile, threading, time
 from pathlib import Path
 
@@ -362,7 +363,7 @@ const planned = rows().map((tr) => [tr.dataset.tier, txt(tr.querySelector('th'))
 await until(() => rows().filter((tr) => tr.dataset.result).length >= 3 && all('details[aria-label="Review report"]', box).length, 'results and report', 180000).catch(() => null);
 const now = all('section[aria-label="Agent review"]', box)[0];
 return { started, planned, headline: txt(now.querySelector('h3')), progress: txt(now.querySelector('.verdict p')),
-  items: rows().map((tr) => [tr.dataset.tier, tr.dataset.result, txt(tr.querySelector('td:last-child')).slice(0, 150)]),
+  items: rows().map((tr) => [tr.dataset.tier, tr.dataset.result, txt(tr.querySelector('td:last-child')).slice(0, 220), tr.dataset.origin]),
   report: (now.querySelector('details[aria-label="Review report"] [data-report]')?.dataset.report || '').slice(0, 160), reportBy: txt(now.querySelector('details[aria-label="Review report"] summary')),
   facts: txt(all('section[aria-label="Release decision"] h3', box)[0]) };
 '''
@@ -586,6 +587,10 @@ def main():
         gamma = syn.new_repo(scratch / 'gamma', 'philium-fixture/gamma')
         syn.write(gamma, {'view.json': '{"column":"name"}'}); g_base = syn.commit_all(gamma, 'base')
         syn.write(gamma, {'view.json': '{"column":"status"}'}); g_head = syn.commit_all(gamma, 'show status')
+        # Like a clone someone works in: its default branch is known only from the origin, and
+        # another branch is checked out. Agents must still start here.
+        syn.git(gamma, 'update-ref', 'refs/remotes/origin/main', g_base); syn.git(gamma, 'symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/main')
+        syn.git(gamma, 'checkout', '-q', '-b', 'dev'); syn.git(gamma, 'branch', '-D', 'main')
         ver_g = syn.new_repo(scratch / 'verifier-gamma')
         syn.write(ver_g, {'philium/sql-contracts.json': {'release_records': True, 'cases': [{'id': 'source', 'document': 'view.json', 'pointer': '/column', 'expect': 'status'}], 'live_cases': [{'id': 'view', 'path': '/view', 'pointer': '/column', 'expect': 'status'}]}})
         pin_g = syn.commit_all(ver_g)
@@ -868,7 +873,13 @@ def main():
             v = run.value(r)
             items = v.get('items') or []
             run.check('C2', 'One action reviews a release: the facts are checked and an orchestrator writes a plan in tiers P0 to P5', 'is organising the review of #7' in (v.get('started') or '') and [t for t, _ in v.get('planned') or []] == ['0', '1', '4'] and bool(v.get('facts')), {'started': v.get('started'), 'planned': v.get('planned'), 'facts': v.get('facts'), 'error': r.get('error')})
-            run.check('C2', 'Each item is done by an agent and recorded as pass, fail or blocked with what it ran', [x[1] for x in items] == ['pass', 'pass', 'blocked'] and 'finch: Read view.json on the head commit' in ' '.join(x[2] for x in items) and 'Needs the previous notes' in ' '.join(x[2] for x in items), items)
+            run.check('C2', 'Each item is done by an agent and recorded as pass, fail or blocked with what it ran', [x[1] for x in items] == ['pass', 'pass', 'fail'] and 'finch: Read view.json on the head commit' in ' '.join(x[2] for x in items), items)
+            last = items[2] if len(items) == 3 else ['', '', '', '']
+            run.check('C2', 'Every finding is labelled introduced, pre-existing or origin unverified; an unlabelled failure is refused', last[3] == 'pre_existing' and last[2].startswith('pre-existing') and 'Unlabelled first try refused.' in last[2] and [x[3] for x in items[:2]] == ['', ''], last)
+            con = sqlite3.connect(f"file:{run.profile / 'data/philium.db'}?mode=ro", uri=True)
+            starts = con.execute("SELECT a.role, w.base_commit FROM worktrees w JOIN agents a ON a.id=w.agent_id JOIN repos r ON r.id=w.repo_id WHERE r.name='gamma'").fetchall(); con.close()
+            under_review = syn.Origin.repos[G]['prs'][7]['heads'][-1]
+            run.check('C2', 'In a checkout whose default branch is only on its origin, the orchestrator and its helpers start on the head under review', {r for r, _ in starts} >= {'orchestrator', 'helper'} and all(b == under_review for _, b in starts), {'starts': starts, 'head': under_review})
             run.check('C2', 'The items add up to a verdict in which P0 and P1 decide, and the orchestrator leaves a written report', 'passed' in (v.get('headline') or '') and '3 of 3 items have a result' in (v.get('progress') or '') and 'Verdict: ready for your sign-off' in (v.get('report') or '') and 'Report by' in (v.get('reportBy') or ''), {'headline': v.get('headline'), 'progress': v.get('progress'), 'report': v.get('report'), 'by': v.get('reportBy')})
             origin.shutdown(); observer.shutdown()
 

@@ -366,6 +366,19 @@ pub(crate) async fn mergeable(path: &Path, base: &str, head: &str) -> Value {
 fn touched(changed: &[&str], read: &[String]) -> Vec<String> {
     read.iter().filter(|f| changed.contains(&f.as_str())).cloned().collect()
 }
+fn lead_key(kind: &str, repo: &str) -> String {
+    format!("release.lead.{kind}.{repo}")
+}
+/// The agent Review started for a job ("review" or "draft") and how it is doing, so a start that
+/// failed is shown in Review instead of a screen that waits for nothing.
+pub(crate) fn lead(ctx: &Ctx, kind: &str, repo: &str) -> Value {
+    let Some(r) = ctx.db.kv_get(&lead_key(kind, repo)).filter(|s| !s.is_empty()).and_then(|id| crate::agents::get_row(ctx, &id)) else {
+        return Value::Null;
+    };
+    let error = r["id"].as_str().and_then(|id| ctx.db.kv_get(&format!("agent_error.{id}"))).filter(|e| !e.is_empty());
+    json!({"id": r["id"], "name": r["name"], "state": r["state"], "error": error, "started": r["hal_session_id"].is_string()})
+}
+
 pub async fn call(ctx: &Ctx, method: &str, a: Value) -> Result<Value, String> {
     let repo = arg_str(&a, "repo_id")?;
     let r = ctx
@@ -379,6 +392,21 @@ pub async fn call(ctx: &Ctx, method: &str, a: Value) -> Result<Value, String> {
     ctx.db.with(|c| c.execute_batch(SCHEMA))?;
     ctx.db.with(|c| c.execute_batch(ANCHORS))?;
     match method {
+        // Review names the agent it just started for this checkout's review or draft.
+        "lead" => {
+            let kind = arg_str(&a, "kind")?;
+            if kind != "review" && kind != "draft" {
+                return Err("kind is review or draft".into());
+            }
+            let row = crate::agents::get_row(ctx, &arg_str(&a, "agent")?).ok_or("Unknown agent")?;
+            if row["repo_id"].as_str() != Some(repo.as_str()) {
+                return Err("That agent works in another checkout".into());
+            }
+            ctx.db.kv_set(&lead_key(&kind, &repo), row["id"].as_str().unwrap_or_default())?;
+            ctx.emit("release:review", json!({ "repo_id": repo }));
+            return Ok(lead(ctx, &kind, &repo));
+        }
+        "drafter" => return Ok(lead(ctx, "draft", &repo)),
         "origin_access" => {
             return Ok(json!({"token_saved":crate::secrets::get(ORIGIN_TOKEN).is_some()}));
         }
@@ -462,7 +490,7 @@ pub async fn call(ctx: &Ctx, method: &str, a: Value) -> Result<Value, String> {
     let rows=ctx.db.query("SELECT pr,base,head FROM release_refs WHERE repo=? AND origin=? AND seq=?",params![repo,o,seq])?;
     let row=rows.first().ok_or("Generation does not belong to this checkout")?;
     let pr=row["pr"].as_i64().ok_or("Invalid pull request")?;
-    if method=="review_items"{return crate::review_run::items(ctx,&repo,pr,seq);}
+    if method=="review_items"{let mut v=crate::review_run::items(ctx,&repo,pr,seq)?;v["lead"]=lead(ctx,"review",&repo);return Ok(v);}
     let (base,head)=(row["base"].as_str().ok_or("Invalid base")?,row["head"].as_str().ok_or("Invalid head")?);
     let mut facts:Vec<String>=Vec::new();
     if let Ok(m)=Box::pin(call(ctx,"members",a.clone())).await{
@@ -477,8 +505,11 @@ pub async fn call(ctx: &Ctx, method: &str, a: Value) -> Result<Value, String> {
         Some("clean")=>facts.push("It merges onto the target without conflicts.".into()),
         _=>{}
     }
+    // A new run gets a new lead. The one before is returned so Review can tidy up one that never started.
+    let previous=lead(ctx,"review",&repo);
+    ctx.db.kv_set(&lead_key("review",&repo),"")?;
     crate::review_run::start(ctx,&repo,pr,seq)?;
-    Ok(json!({"pr":pr,"brief":crate::review_run::brief(pr,base,head,&facts.join(" "))}))
+    Ok(json!({"pr":pr,"head":head,"previous_lead":previous,"brief":crate::review_run::brief(pr,base,head,&facts.join(" "))}))
  },
  // Which landed pull requests change a file that a pinned check reads. It informs: a pull
  // request no check touches is named, and the verdict is not changed by it.

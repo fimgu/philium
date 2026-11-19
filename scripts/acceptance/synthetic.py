@@ -147,10 +147,14 @@ def brain(req):
             return {'tool': ('mcp_philium_agent_spawn', {'name': 'finch', 'role': 'helper', 'task_id': ids[1], 'brief': f'REVIEW ITEM {ids[1]}: read view.json on the head and record the result with review_result.'})}
         if step == 2:
             return {'tool': ('mcp_philium_review_result', {'task_id': ids[0], 'result': 'pass', 'evidence': 'Ran the migration test on the head commit against an empty database: 3 passed, 0 failed.'})}
+        ran = 'Read the README on the head and on the target: neither mentions any column. Same on the target.'
         if step == 3:
-            return {'tool': ('mcp_philium_review_result', {'task_id': ids[2], 'result': 'blocked', 'evidence': 'The README could not be compared: there are no earlier release notes. Needs the previous notes.'})}
+            return {'tool': ('mcp_philium_review_result', {'task_id': ids[2], 'result': 'fail', 'evidence': ran})}
         if step == 4:
-            return {'tool': ('mcp_philium_review_report', {'markdown': '# Review of the release\n\nVerdict: ready for your sign-off. P0 and P1 passed.\n\n| Tier | Item | Result |\n|---|---|---|\n| P0 | Migrations | pass |\n| P1 | Status column | pass |\n| P4 | Notes | blocked |\n\nNot checked: the notes, for lack of earlier release notes.'})}
+            refused = 'needs its origin' in results[3]
+            return {'tool': ('mcp_philium_review_result', {'task_id': ids[2], 'result': 'fail', 'origin': 'pre_existing', 'evidence': ran + (' Unlabelled first try refused.' if refused else ' Unlabelled first try accepted.')})}
+        if step == 5:
+            return {'tool': ('mcp_philium_review_report', {'markdown': '# Review of the release\n\nVerdict: ready for your sign-off. P0 and P1 passed.\n\n| Tier | Item | Result | Origin |\n|---|---|---|---|\n| P0 | Migrations | pass | |\n| P1 | Status column | pass | |\n| P4 | Notes | fail | pre-existing |\n\nFindings: the notes never mention columns (pre-existing).'})}
         return 'REVIEW ORGANISED ' + one(results[-1])
     m = re.search(r'REVIEW ITEM ([0-9a-f]+):', last_user)
     if m:
