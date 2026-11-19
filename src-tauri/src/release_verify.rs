@@ -13,7 +13,7 @@ pub async fn run(ctx: &Ctx, repo: &str, url: &str) -> Result<Value, String> {
     let (receipt, reason) = if profile.is_null() {
         (
             Value::Null,
-            Some("No independent driver enrolled".to_owned()),
+            Some("No checks are set up for this checkout".to_owned()),
         )
     } else {
         match release_intake::call(ctx, "sql_compare", a.clone()).await {
@@ -152,7 +152,7 @@ fn explain(
         why.push("Landed pull requests were not established: the origin lookup did not complete.".to_owned());
     } else {
         if m["missing"].as_u64().unwrap_or(0) > 0 {
-            why.push(format!("{} included commits have no completed pull request lookup. The origin did not answer for them.", m["missing"]));
+            why.push(format!("GitHub did not say which pull request {} of the included commits came from.", m["missing"]));
         }
         if m["ambiguous"].as_u64().unwrap_or(0) > 0 {
             why.push(format!("{} included commits map to more than one pull request.", m["ambiguous"]));
@@ -245,7 +245,7 @@ fn explain(
         why.push("These checks were pinned before confirmations were recorded. Open the setup, read them and pin again.".to_owned());
     }
     if all_live.is_empty() && receipt["release_records"] == true {
-        why.push("The verifier declares no running-product checks, so product behavior was not exercised.".to_owned());
+        why.push("No checks run against the deployed app, so its behaviour was not tried.".to_owned());
     }
     let att = &receipt["review_attestation"];
     if receipt["release_records"] != true {

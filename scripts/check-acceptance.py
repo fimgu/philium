@@ -670,7 +670,7 @@ def main():
             landed = d.get('landed') or ''
             found = (landed.count(' landed at '), landed.count(' contains #'))
             run.check('C2', 'A public parent pull request, read from the real origin by the form: exact head, landed and nested pull requests', (d.get('ids') or {}).get('Head') == head and found == (int(n_landed), int(n_nested)) and ' 0 missing lookups' in landed and '0 ambiguous' in landed, {'head': (d.get('ids') or {}).get('Head'), 'base': (d.get('ids') or {}).get('Target (base)'), 'landed': found[0], 'nested': found[1], 'tail': landed[-70:], 'status': d.get('status')})
-            run.check('C7', 'With no verifier pinned, a public pull request is resolved but never called ready', d.get('headline') == 'Release verification incomplete' and 'No independent driver enrolled' in ' '.join(d.get('reasons') or []), {'headline': d.get('headline'), 'why': ' | '.join(d.get('reasons') or [])[:200]})
+            run.check('C7', 'With no verifier pinned, a public pull request is resolved but never called ready', d.get('headline') == 'Release verification incomplete' and 'No checks are set up for this checkout' in ' '.join(d.get('reasons') or []), {'headline': d.get('headline'), 'why': ' | '.join(d.get('reasons') or [])[:200]})
 
         if want('review') or want('connect'):
             # Before any stand-in origin is switched on. The throwaway home has no GitHub CLI
@@ -776,7 +776,7 @@ def main():
             run.check('C1', 'A read-only origin token saved in the form is kept in the vault and sent only as a bearer to the origin', 'A read-only token is saved' in (v.get('access') or '') and bool(sent) and set(sent) == {'Bearer synthetic-read-token-0001'} and b'synthetic-read-token-0001' in vault.read_bytes() and b'synthetic-read-token-0001' not in (run.profile / 'data/philium.db').read_bytes(), {'access': v.get('access'), 'requests_with_token': len(sent)})
             ids = d.get('ids') or {}
             first_gen = int(ids.get('Generation') or 0)
-            run.check('C2', 'The decision shows the exact generation, target and head, and says no artifact is recorded', first_gen > 0 and ids.get('Target (base)') == g['target'] and ids.get('Head') == g['head'] and 'No independent artifact record' in ids.get('Artifact', ''), ids)
+            run.check('C2', 'The decision shows the exact generation, target and head, and says no artifact is recorded', first_gen > 0 and ids.get('Target (base)') == g['target'] and ids.get('Head') == g['head'] and 'None for this exact head' in ids.get('Build record', ''), ids)
             landed = d.get('landed') or ''
             run.check('C2', 'Landed pull requests and the nested one are listed with their exact commits', all(x in landed for x in [f"#30 landed at {g['m30']}", f"#31 landed at {g['f31']}", f"#32 landed at {g['b1']}", '#30 contains #31', '0 missing lookups, 3 unmapped commits, 0 ambiguous']) and '6 included commits' in (d.get('included') or ''), landed[:400])
             cases = dict((c[1].split(':')[0], c) for c in d.get('cases') or [])
@@ -807,7 +807,7 @@ def main():
             run.check('C6', 'Origin unavailable: nothing is checked and the form says why', d.get('headline') is None and (d.get('status') or '').startswith('Not checked: Origin lookup failed'), d.get('status') or d)
             syn.Origin.repos[A]['prs'][40]['heads'] = [g['fixed']]; syn.Origin.mode = 'members-down'
             d = verify('alpha/same', pr_a).get('verified') or {}
-            run.check('C6', 'Membership lookup unavailable: incomplete, with the number of commits not looked up', d.get('headline') == 'Release verification incomplete' and 'included commits have no completed pull request lookup' in why(d) and 'missing lookups' in (d.get('landed') or '') and not (d.get('landed') or '').startswith('Landed pull requests 0 missing'), why(d)[:260])
+            run.check('C6', 'Membership lookup unavailable: incomplete, with the number of commits not looked up', d.get('headline') == 'Release verification incomplete' and 'of the included commits came from' in why(d) and 'missing lookups' in (d.get('landed') or '') and not (d.get('landed') or '').startswith('Landed pull requests 0 missing'), why(d)[:260])
             syn.Origin.mode = 'ok'
 
             # ---- a fully reviewed synthetic change: positive path and its failure modes -------
@@ -824,7 +824,7 @@ def main():
             d = verify('gamma', pr_g).get('verified') or {}
             run.check('C7', 'A passing subset is not a ship recommendation', 'Contracts: scoped pass' in (d.get('first') or '') and d.get('headline') == 'Release verification incomplete' and 'Review record: code review is not recorded as complete' in why(d) and 'Evidence not accepted for source (not recorded); view (not recorded)' in why(d), {'first': (d.get('first') or '')[-70:], 'why': why(d)[:260]})
             calls = [c[1] for c in syn.Observer.calls[n_obs:]]
-            run.check('C5', 'The running product was observed twice, with the deployment identity checked before and after', calls.count('/view') == 2 and calls.count('/.well-known/philium/deployment') == 2 and calls[0].endswith('deployment') and calls[-1].endswith('deployment') and (d.get('ids') or {}).get('Artifact') == artifact and 'before and after the checks' in (d.get('ids') or {}).get('Deployment', ''), {'calls': calls, 'deployment': (d.get('ids') or {}).get('Deployment')})
+            run.check('C5', 'The running product was observed twice, with the deployment identity checked before and after', calls.count('/view') == 2 and calls.count('/.well-known/philium/deployment') == 2 and calls[0].endswith('deployment') and calls[-1].endswith('deployment') and (d.get('ids') or {}).get('Build record') == artifact and 'before and after the checks' in (d.get('ids') or {}).get('Deployment', ''), {'calls': calls, 'deployment': (d.get('ids') or {}).get('Deployment')})
             # The harness is the independent reviewer of this synthetic change: it confirms the whole
             # change is the one data file it made, and only then records evidence and the attestation.
             whole = syn.git(gamma, 'diff', '--name-status', g_base, g_head) == 'M\tview.json' and blob == '{"column":"status"}' and syn.git(gamma, 'ls-tree', g_head).startswith('100644 blob ')
@@ -840,7 +840,7 @@ def main():
             v = verify('gamma', pr_g)
             d = v.get('verified') or {}
             ready_gen = (d.get('ids') or {}).get('Generation')
-            run.check('C5', 'Reviewed scope with independent evidence: Ready for the reviewed scope, tied to head and artifact', d.get('headline') == 'Ready for the reviewed scope' and (d.get('ids') or {}).get('Head') == g_head and (d.get('ids') or {}).get('Artifact') == artifact and 'Nothing stands in the way' in why(d) and 'unchanged' in (d.get('ids') or {}).get('Origin', ''), {'headline': d.get('headline'), 'ids': d.get('ids'), 'why': why(d)[:200]})
+            run.check('C5', 'Reviewed scope with independent evidence: Ready for the reviewed scope, tied to head and artifact', d.get('headline') == 'Ready for the reviewed scope' and (d.get('ids') or {}).get('Head') == g_head and (d.get('ids') or {}).get('Build record') == artifact and 'Nothing stands in the way' in why(d) and 'unchanged' in (d.get('ids') or {}).get('Origin', ''), {'headline': d.get('headline'), 'ids': d.get('ids'), 'why': why(d)[:200]})
             run.check('C5', 'When the verdict is Ready every row of the table is green', [st for _, st in d.get('table') or []] == ['ok'] * 8, d.get('table'))
             syn.write(ver_g, {'philium/evidence/view.json': evidence['view'].replace('twice', 'once')}); syn.commit_all(ver_g, 'altered')
             d = verify('gamma', pr_g).get('verified') or {}
@@ -907,7 +907,7 @@ def main():
             if whole_d:
                 syn.write(ver_d, {rec_d_path: rec_d}); syn.commit_all(ver_d, 'reviewed')
             d = verify('delta', pr_d).get('verified') or {}
-            run.check('C9', 'With both environments matching and the synthetic change reviewed: ready, and the decision says when the checks were confirmed', d.get('headline') == 'Ready for the reviewed scope' and 'Checks confirmed by you on' in (d.get('confirmed') or '') and (d.get('ids') or {}).get('Artifact') == d_art, {'headline': d.get('headline'), 'confirmed': d.get('confirmed'), 'why': why(d)[:200]})
+            run.check('C9', 'With both environments matching and the synthetic change reviewed: ready, and the decision says when the checks were confirmed', d.get('headline') == 'Ready for the reviewed scope' and 'Checks confirmed by you on' in (d.get('confirmed') or '') and (d.get('ids') or {}).get('Build record') == d_art, {'headline': d.get('headline'), 'confirmed': d.get('confirmed'), 'why': why(d)[:200]})
             (af / 'signed-in').unlink(); n = len(calls(af))
             d = verify('delta', pr_d).get('verified') or {}
             run.check('C9', 'Not signed in to the hosted environment: not ready, and the form says to sign in', d.get('headline') == 'Release verification incomplete' and 'env01: its identity command did not return a complete, well-formed answer before the checks. Check that you are signed in' in why(d) and not any(c.startswith('whoami') or 'pg:fixture' in c for c in calls(af)[n:]), why(d)[:260])

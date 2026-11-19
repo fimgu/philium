@@ -35,7 +35,7 @@ export function readiness(d, m, cov) {
   else {
     const gaps = (m.missing || 0) + (m.ambiguous || 0);
     add("contents", "What is in it", gaps ? "unknown" : "ok",
-      `${count(m.landed?.length || 0, "pull request")} landed, ${m.edges?.length || 0} nested.${gaps ? ` ${count(m.missing || 0, "lookup")} missing, ${m.ambiguous || 0} ambiguous.` : ""}${m.unmapped ? ` ${count(m.unmapped, "commit")} not tied to a pull request.` : ""}`);
+      `${count(m.landed?.length || 0, "pull request")} landed, ${m.edges?.length || 0} nested.${m.missing ? ` GitHub did not say which pull request ${count(m.missing, "commit")} came from.` : ""}${m.ambiguous ? ` ${count(m.ambiguous, "commit")} could belong to more than one.` : ""}${m.unmapped ? ` ${count(m.unmapped, "commit")} not tied to a pull request.` : ""}`);
   }
 
   // 3. Does it merge onto the target as the target is now?
@@ -54,7 +54,7 @@ export function readiness(d, m, cov) {
   const old = cases.filter((c) => c.state === "same_failure_on_target").length;
   const blind = cases.filter((c) => c.state === "incomplete").length;
   add("checks", "Checks on this commit", !cases.length ? "unknown" : broke.length ? "bad" : pass === cases.length ? "ok" : "unknown",
-    !cases.length ? "No checks were run. Pin a verifier for this checkout first."
+    !cases.length ? "No checks were run: none are set up for this checkout."
       : `${pass} of ${cases.length} pass.${broke.length ? ` Failing here: ${broke.map((c) => c.id).join(", ")}.` : ""}${suspects.length ? ` Fails the same way on its own: ${suspects.map((n) => `#${n}`).join(", ")}.` : ""}${old ? ` ${old} already failing on the target, not introduced by this release.` : ""}${blind ? ` ${blind} could not be observed.` : ""}`);
 
   // How much of the release the pinned checks look at. Informing only.
@@ -71,8 +71,8 @@ export function readiness(d, m, cov) {
   const states = seen.flatMap(([, before, after]) => [before, after]);
   const wrong = seen.filter(([, b, a]) => [b, a].some((s) => ["mismatch", "mixed", "not_ready"].includes(s)));
   const running = !seen.length ? "unknown" : wrong.length ? "bad" : states.every((s) => s === "match") ? "ok" : "unknown";
-  add("running", "Running product is this build", running,
-    !seen.length ? "Nothing reports which build is running, so no running-product check can count."
+  add("running", "The deployed app is this build", running,
+    !seen.length ? "Philium cannot see which build is deployed, so checks on the deployed app cannot count."
       : wrong.length ? `A different or mixed build is running on: ${wrong.map(([n]) => n).join(", ")}.`
         : running === "ok" ? `Same revision and artifact before and after the checks on: ${seen.map(([n]) => n).join(", ")}.`
           : `Not established on: ${seen.filter(([, b, a]) => b !== "match" || a !== "match").map(([n]) => n).join(", ")}.`);
@@ -82,8 +82,8 @@ export function readiness(d, m, cov) {
   const liveBad = live.filter((c) => c.state === "mismatch");
   const liveOk = live.filter((c) => c.state === "pass").length;
   const smoke = !live.length ? "unknown" : liveBad.length ? "bad" : liveOk === live.length ? (running === "ok" ? "ok" : "unknown") : "unknown";
-  add("smoke", "Checks on the running product", smoke,
-    !live.length ? "No running-product checks are pinned."
+  add("smoke", "Checks on the deployed app", smoke,
+    !live.length ? "None are set up."
       : `${liveOk} of ${live.length} match.${liveBad.length ? ` Differs: ${liveBad.map((c) => c.id).join(", ")}.` : ""}${liveOk === live.length && running !== "ok" ? " Not counted: the running build is not confirmed." : ""}`);
 
   // 7. Independent build record and review for this exact head.
@@ -94,11 +94,11 @@ export function readiness(d, m, cov) {
   add("record", "Build record and review", record,
     tampered ? `${count(tampered, "piece")} of evidence was altered or is invalid.`
       : record === "ok" ? `Artifact ${short(d.artifact)} and a review are recorded for this head; ${count(evidence.length, "piece")} of evidence verified.`
-        : !d.artifact ? "No independent artifact record for this exact head." : !reviewed ? "No recorded review for this exact head." : "Some evidence is missing or belongs to another head.");
+        : !d.artifact ? "No build record for this exact head." : !reviewed ? "No recorded review for this exact head." : "Some evidence is missing or belongs to another head.");
 
   // 8. Did the owner read and confirm the checks that were run?
   add("confirmed", "Checks confirmed by you", r.checks_confirmed_ms ? "ok" : "unknown",
-    r.checks_confirmed_ms ? `Confirmed ${new Date(r.checks_confirmed_ms).toISOString().slice(0, 16).replace("T", " ")} UTC.` : "You have not read and pinned the checks that ran.");
+    r.checks_confirmed_ms ? `Confirmed ${new Date(r.checks_confirmed_ms).toISOString().slice(0, 16).replace("T", " ")} UTC.` : "You have not confirmed the checks that ran.");
   return rows;
 }
 

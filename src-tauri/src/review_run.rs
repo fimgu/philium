@@ -44,9 +44,16 @@ pub fn current(ctx: &Ctx, repo: &str) -> Option<Value> {
     ctx.db.kv_get(&run_key(repo)).and_then(|s| serde_json::from_str(&s).ok())
 }
 /// Started by the person from Review. A new run for another pull request replaces the old one;
-/// the old items stay on the board under their own pull request.
+/// the old items stay on the board under their own pull request. Starting the same revision
+/// again replaces its plan: the earlier run's unchecked items are cancelled, and what it did
+/// check stays on the board, outside the new list.
 pub fn start(ctx: &Ctx, repo: &str, pr: i64, generation: i64) -> Result<(), String> {
+    ctx.db.exec(
+        "UPDATE tasks SET status='cancelled', updated_at=?3 WHERE repo_id=?1 AND review_gen=?2 AND review_result IS NULL AND status!='cancelled'",
+        params![repo, generation, now()],
+    )?;
     ctx.db.kv_set(&run_key(repo), &json!({"pr": pr, "generation": generation, "started": now()}).to_string())?;
+    ctx.emit("board:changed", json!({ "repo_id": repo }));
     ctx.emit("release:review", json!({ "repo_id": repo }));
     Ok(())
 }
@@ -156,17 +163,19 @@ pub fn headline(items: &[Value]) -> &'static str {
 }
 
 /// What Review shows for one revision of a pull request: the items in tier order, the verdict
-/// they add up to and the report, if any. A new head is a new revision and starts empty.
+/// they add up to and the report, if any. A new head is a new revision and starts empty, and so
+/// does starting the review of the same revision again.
 pub fn items(ctx: &Ctx, repo: &str, pr: i64, gen: i64) -> Result<Value, String> {
+    let run = current(ctx, repo).filter(|r| r["generation"].as_i64() == Some(gen)).unwrap_or(Value::Null);
+    let since = run["started"].as_i64().unwrap_or(0);
     let rows = ctx.db.query(
         "SELECT t.id,t.title,t.status,t.review_result AS result,t.review_origin AS origin,t.review_evidence AS evidence,COALESCE(a.name,t.assigned,t.owner) AS owner, \
          CASE WHEN t.review_result='fail' THEN COALESCE(t.review_severity,t.review_tier) END AS severity \
          FROM tasks t LEFT JOIN agents a ON a.id=COALESCE(t.owner_agent_id,t.assigned_agent_id) \
-         WHERE t.repo_id=?1 AND t.review_gen=?2 AND t.status!='cancelled' ORDER BY t.created_at",
-        params![repo, gen],
+         WHERE t.repo_id=?1 AND t.review_gen=?2 AND t.status!='cancelled' AND t.created_at>=?3 ORDER BY t.created_at",
+        params![repo, gen, since],
     )?;
-    let report = ctx.db.kv_get(&format!("review.report.{repo}.{gen}")).and_then(|s| serde_json::from_str::<Value>(&s).ok()).unwrap_or(Value::Null);
-    let run = current(ctx, repo).filter(|r| r["generation"].as_i64() == Some(gen)).unwrap_or(Value::Null);
+    let report = ctx.db.kv_get(&format!("review.report.{repo}.{gen}")).and_then(|s| serde_json::from_str::<Value>(&s).ok()).filter(|r| r["at"].as_i64().unwrap_or(0) >= since).unwrap_or(Value::Null);
     Ok(json!({"pr": pr, "headline": headline(&rows), "items": rows, "report": report, "run": run,
         "severity": SEVERITY.iter().map(|(t, d)| json!({"level": t, "means": d})).collect::<Vec<_>>()}))
 }
@@ -216,6 +225,38 @@ mod tests {
         // A pass carries no origin and no severity, whatever is sent.
         let r = result(&ctx, "x", "lead", &lead, id, "pass", Some(0), Some("introduced"), ran).unwrap();
         assert_eq!((r["origin"].clone(), r["severity"].clone()), (Value::Null, Value::Null));
+    }
+
+    #[test]
+    fn starting_the_same_review_again_replaces_its_plan_and_report() {
+        let ctx = Ctx::test();
+        board::init(&ctx).unwrap();
+        ctx.db.exec("INSERT INTO repos(id,name,path,default_branch,added_at) VALUES('r','r','/nonexistent','main',0)", []).unwrap();
+        let lead = json!({"repo_id": "r", "role": "orchestrator"});
+        start(&ctx, "r", 7, 1).unwrap();
+        let p = plan(&ctx, "lead", &lead, &json!([{"title": "Merges", "detail": "Merge onto the target."}, {"title": "Migrations", "detail": "Run them."}])).unwrap();
+        let done = p["items"][0]["id"].as_str().unwrap().to_string();
+        result(&ctx, "x", "lead", &lead, &done, "pass", None, None, "git merge-tree on the head: no conflicts.").unwrap();
+        report(&ctx, "lead", &lead, &"Verdict: not ready. The migrations check was not done before the agents stopped. ".repeat(2)).unwrap();
+        // The first run was earlier.
+        ctx.db.exec("UPDATE tasks SET created_at=created_at-60000", []).unwrap();
+        let mut r: Value = serde_json::from_str(&ctx.db.kv_get("review.report.r.1").unwrap()).unwrap();
+        r["at"] = json!(r["at"].as_i64().unwrap() - 60_000);
+        ctx.db.kv_set("review.report.r.1", &r.to_string()).unwrap();
+        let mut run = current(&ctx, "r").unwrap();
+        run["started"] = json!(run["started"].as_i64().unwrap() - 60_000);
+        ctx.db.kv_set(&run_key("r"), &run.to_string()).unwrap();
+        assert_eq!(items(&ctx, "r", 7, 1).unwrap()["items"].as_array().unwrap().len(), 2);
+        start(&ctx, "r", 7, 1).unwrap();
+        let v = items(&ctx, "r", 7, 1).unwrap();
+        assert_eq!((v["items"].as_array().unwrap().len(), v["report"].clone(), v["headline"].as_str()), (0, Value::Null, Some("none")));
+        // What the first run checked stays on the board; what it left undone is cancelled.
+        let left = ctx.db.query("SELECT status, review_result FROM tasks ORDER BY created_at, title", []).unwrap();
+        let states: Vec<(String, Value)> = left.iter().map(|t| (t["status"].as_str().unwrap().to_string(), t["review_result"].clone())).collect();
+        assert!(states.contains(&("cancelled".to_string(), Value::Null)), "{states:?}");
+        assert!(states.iter().any(|(s, r)| s != "cancelled" && r == "pass"), "{states:?}");
+        plan(&ctx, "lead", &lead, &json!([{"title": "Migrations", "detail": "Run them again."}])).unwrap();
+        assert_eq!(items(&ctx, "r", 7, 1).unwrap()["items"].as_array().unwrap().len(), 1);
     }
 
     #[test]

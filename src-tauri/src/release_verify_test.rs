@@ -232,7 +232,7 @@ fn every_cause_gets_its_own_sentence() {
     let why = explain(Some(false), Some(&moved), &json!({"missing":2,"ambiguous":0}), &receipt, None).join("\n");
     for needle in [
         "moved during verification",
-        "2 included commits have no completed pull request lookup",
+        "GitHub did not say which pull request 2 of the included commits came from",
         "child: regression inside this release",
         "Landed #31 fails the same way on its own",
         "merge: merge-only regression",
