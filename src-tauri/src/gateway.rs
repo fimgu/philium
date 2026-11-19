@@ -24,7 +24,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
 
-mod translate;
+pub(crate) mod translate;
 
 use crate::guard::{self, GuardMode};
 use crate::providers::{Kind, Provider};
@@ -744,11 +744,13 @@ async fn proxy(
             let ra = resp.headers().get("retry-after").cloned();
             let bytes = resp.bytes().await.unwrap_or_default();
             if let Some(learned) = translate::parse_effort_rejection(status.as_u16(), &String::from_utf8_lossy(&bytes)) {
-                if let (Some(cb), Some(m)) = (gw.learned_efforts_cb.rd().clone(), model_name.as_deref()) {
-                    cb(&p.id, m, learned);
-                }
                 if let Ok(mut v) = serde_json::from_slice::<Value>(&outgoing) {
+                    // Only a request that carried an effort setting can teach us about effort. A
+                    // refusal that merely mentions thinking must not erase a model's levels.
                     if translate::strip_effort(&mut v) {
+                        if let (Some(cb), Some(m)) = (gw.learned_efforts_cb.rd().clone(), model_name.as_deref()) {
+                            cb(&p.id, m, learned);
+                        }
                         gw.set_effort(agent_name.as_deref(), None);
                         outgoing = Bytes::from(serde_json::to_vec(&v).unwrap_or_default());
                         continue;
@@ -1143,6 +1145,33 @@ mod tests {
             assert_eq!((a.state, a.input_tokens), ("done", Some(12)));
             assert!(!gw.detail(a.id).unwrap().to_string().contains("OAUTH-ACCESS"));
         }
+    }
+
+    /// The effort a person chose reaches each Claude model in the form that model takes: a named
+    /// level for current models, a thinking budget for the 4.5 generation.
+    #[tokio::test]
+    async fn effort_reaches_a_claude_model_in_the_form_it_takes() {
+        let (base, seen) = upstream().await;
+        let (gw, url) = gateway(&base, Kind::ClaudeOauth, GuardMode::Redact).await;
+        gw.tokens.set(Arc::new(|_, _| Box::pin(async { Ok(crate::oauth::Creds { access: "OAUTH-ACCESS".into(), ..Default::default() }) })));
+        gw.set_effort(None, Some("high"));
+        let ask = |model: &'static str| {
+            let url = url.clone();
+            async move {
+                let body = json!({"model": model, "stream": true, "temperature": 0.3, "messages": [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}]});
+                let resp = reqwest::Client::new().post(format!("{url}/chat/completions")).header("authorization", format!("Bearer {}", "t".repeat(48))).json(&body).send().await.unwrap();
+                assert_eq!(resp.status(), 200);
+                let _ = resp.bytes().await;
+            }
+        };
+        ask("claude-opus-5-5").await;
+        ask("claude-haiku-4-5-20251001").await;
+        let sent: Vec<Value> = seen.lk().iter().map(|(_, b)| serde_json::from_str(b).unwrap()).collect();
+        assert_eq!(sent[0]["output_config"], json!({"effort": "high"}), "{}", sent[0]);
+        assert_eq!(sent[0]["thinking"], json!({"type": "adaptive"}));
+        assert!(sent[0].get("temperature").is_none());
+        assert_eq!(sent[1]["thinking"], json!({"type": "enabled", "budget_tokens": 16384}), "{}", sent[1]);
+        assert!(sent[1].get("output_config").is_none());
     }
 
     #[tokio::test]

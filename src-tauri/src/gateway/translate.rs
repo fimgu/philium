@@ -27,6 +27,61 @@ fn thinking_budget(effort: &str) -> u64 {
     }
 }
 
+/// How a Claude model takes reasoning depth. Models up to the 4.5 generation take a thinking
+/// budget in tokens. Every later one takes a named effort level and refuses a budget.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ClaudeDepth {
+    Budget,
+    /// `mycli`: the model also takes `thinking: {type: "adaptive"}`.
+    Effort { adaptive: bool },
+}
+
+pub fn claude_depth(model: &str) -> ClaudeDepth {
+    let m = model.to_ascii_lowercase();
+    // Another vendor's model behind an Anthropic-style endpoint keeps the budget form.
+    let budget_era = ["claude-2", "claude-3", "haiku-4-5", "sonnet-4-5", "opus-4-1", "opus-4-0", "sonnet-4-0", "opus-4-2025", "sonnet-4-2025"];
+    if !m.contains("claude") || budget_era.iter().any(|p| m.contains(p)) {
+        return ClaudeDepth::Budget;
+    }
+    ClaudeDepth::Effort { adaptive: !m.contains("opus-4-5") }
+}
+
+/// The levels a Claude model accepts, lowest first, for when the provider has not listed them.
+pub fn claude_effort_levels(model: &str) -> &'static [&'static str] {
+    let m = model.to_ascii_lowercase();
+    match claude_depth(model) {
+        ClaudeDepth::Budget => &["none", "low", "medium", "high", "max"],
+        ClaudeDepth::Effort { .. } if m.contains("opus-4-5") => &["low", "medium", "high"],
+        ClaudeDepth::Effort { .. } if m.contains("-4-6") => &["low", "medium", "high", "max"],
+        ClaudeDepth::Effort { .. } => &["low", "medium", "high", "xhigh", "max"],
+    }
+}
+
+/// The effort level to send for what the person chose. A level this model lacks becomes the
+/// nearest lower one it has, and a typed token budget becomes the level of about that size, so
+/// a model switch never costs a refused request. A word we do not know is passed on unchanged.
+fn named_level(effort: &str, model: &str) -> String {
+    const ORDER: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+    let raw = effort.trim().to_ascii_lowercase();
+    let numeric = raw.strip_suffix('k').unwrap_or(&raw).trim().parse::<u64>().is_ok();
+    let wanted = if numeric {
+        match thinking_budget(&raw) {
+            0..=2_048 => "low",
+            2_049..=8_192 => "medium",
+            8_193..=16_384 => "high",
+            16_385..=32_000 => "xhigh",
+            _ => "max",
+        }
+    } else if raw == "minimal" {
+        "low"
+    } else {
+        raw.as_str()
+    };
+    let Some(rank) = ORDER.iter().position(|l| *l == wanted) else { return raw };
+    let have = claude_effort_levels(model);
+    ORDER[..=rank].iter().rev().find(|l| have.contains(*l)).or_else(|| have.first()).map(|l| l.to_string()).unwrap_or(raw)
+}
+
 /// Apply an active session effort to a request body before translation/forwarding.
 pub fn inject_effort(body: &mut Value, effort: Option<&str>, is_responses_api: bool) {
     let Some(obj) = body.as_object_mut() else { return };
@@ -56,7 +111,11 @@ pub fn strip_effort(body: &mut Value) -> bool {
     let a = obj.remove("reasoning_effort").is_some();
     let b = obj.remove("reasoning").is_some();
     let c = obj.remove("thinking").is_some();
-    a || b || c
+    let d = obj.get_mut("output_config").and_then(Value::as_object_mut).is_some_and(|o| o.remove("effort").is_some());
+    if obj.get("output_config").and_then(Value::as_object).is_some_and(|o| o.is_empty()) {
+        obj.remove("output_config");
+    }
+    a || b || c || d
 }
 
 /// Inspect an upstream HTTP 400 error body to see if it rejected `reasoning_effort`,
@@ -72,19 +131,21 @@ pub fn parse_effort_rejection(status: u16, body: &str) -> Option<Vec<String>> {
         || low.contains("reasoning.effort")
         || low.contains("thinking")
         || low.contains("budget_tokens")
+        || low.contains("output_config")
         || (low.contains("reasoning") && (low.contains("effort") || low.contains("unsupported") || low.contains("not support")));
     if !mentions_effort {
         return None;
     }
     // Extract single-quoted enum candidates if the error lists supported values
     // e.g. "Supported values are: 'low', 'medium', and 'high'."
-    if low.contains("supported values") || low.contains("valid values") || low.contains("permitted") || low.contains("must be one of") {
+    if low.contains("supported values") || low.contains("valid values") || low.contains("permitted") || low.contains("must be one of") || low.contains("should be") {
         let mut levels = Vec::new();
         let tail = body
             .find("upported values")
             .or_else(|| body.find("alid values"))
             .or_else(|| body.find("ermitted"))
             .or_else(|| body.find("one of"))
+            .or_else(|| body.find("hould be"))
             .map(|i| &body[i..])
             .unwrap_or(body);
         let mut rest = tail;
@@ -216,20 +277,33 @@ pub fn request(body: &Value, flatten_system: bool) -> Value {
         }
     }
     let mut max = body.get("max_tokens").or(body.get("max_completion_tokens")).and_then(Value::as_u64).unwrap_or_else(|| default_max_tokens(&model));
+    let depth = claude_depth(&model);
     let mut thinking = false;
     if let Some(e) = body["reasoning_effort"].as_str().filter(|e| !matches!(*e, "none" | "off")) {
-        let mut budget = thinking_budget(e);
-        if budget + 1024 > max {
-            budget = max.saturating_sub(1024).min(budget);
-        }
-        if budget >= 1024 {
-            out.insert("thinking".into(), json!({"type":"enabled","budget_tokens":budget}));
-            thinking = true;
+        match depth {
+            ClaudeDepth::Budget => {
+                let mut budget = thinking_budget(e);
+                if budget + 1024 > max {
+                    budget = max.saturating_sub(1024).min(budget);
+                }
+                if budget >= 1024 {
+                    out.insert("thinking".into(), json!({"type":"enabled","budget_tokens":budget}));
+                    thinking = true;
+                }
+            }
+            ClaudeDepth::Effort { adaptive } => {
+                out.insert("output_config".into(), json!({ "effort": named_level(e, &model) }));
+                if adaptive {
+                    out.insert("thinking".into(), json!({"type": "adaptive"}));
+                }
+                thinking = true;
+            }
         }
     }
     max = max.max(1);
     out.insert("max_tokens".into(), json!(max));
-    if !thinking {
+    // A model that takes an effort level refuses sampling settings.
+    if !thinking && depth == ClaudeDepth::Budget {
         if let Some(t) = body.get("temperature").filter(|t| t.is_number()) {
             out.insert("temperature".into(), t.clone());
         }
@@ -538,7 +612,8 @@ mod tests {
 
     #[test]
     fn translates_request() {
-        let b = json!({"model":"claude-sonnet-x","stream":true,"stop":"END","temperature":0.2,
+        // A 4.5-generation model: the last Claude generation that accepts a sampling setting.
+        let b = json!({"model":"claude-sonnet-4-5-20250929","stream":true,"stop":"END","temperature":0.2,
           "messages":[
             {"role":"system","content":"be brief"},{"role":"developer","content":"dev"},
             {"role":"user","content":[{"type":"text","text":"look"},
@@ -571,11 +646,55 @@ mod tests {
 
     #[test]
     fn thinking_from_effort() {
-        let b = json!({"model":"claude-opus-x","temperature":0.5,"reasoning_effort":"high","messages":[{"role":"user","content":"hi"}]});
+        // A model of the 4.5 generation takes a thinking budget.
+        let b = json!({"model":"claude-haiku-4-5-20251001","temperature":0.5,"reasoning_effort":"high","messages":[{"role":"user","content":"hi"}]});
         let r = request(&b, true);
         assert_eq!(r["thinking"], json!({"type":"enabled","budget_tokens":16384}));
         assert!(r.get("temperature").is_none());
-        assert_eq!(r["max_tokens"], 32000);
+        assert!(r.get("output_config").is_none());
+        assert_eq!(r["max_tokens"], 64000);
+    }
+
+    /// Current Claude models refuse a thinking budget and sampling settings. They take a named
+    /// effort level, and each model has its own set of levels.
+    #[test]
+    fn current_claude_models_take_an_effort_level() {
+        let ask = |model: &str, effort: &str| request(&json!({"model": model, "temperature": 0.5, "reasoning_effort": effort, "messages": [{"role": "user", "content": "hi"}]}), true);
+        for model in ["claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-2", "claude-haiku-5-5", "claude-opus-4-8"] {
+            let r = ask(model, "xhigh");
+            assert_eq!(r["output_config"], json!({"effort": "xhigh"}), "{model}");
+            assert_eq!(r["thinking"], json!({"type": "adaptive"}), "{model}");
+            assert!(r["thinking"].get("budget_tokens").is_none() && r.get("temperature").is_none(), "{model}");
+        }
+        // A level the model lacks becomes the nearest lower one it has.
+        assert_eq!(ask("claude-sonnet-4-6", "xhigh")["output_config"]["effort"], "high");
+        assert_eq!(ask("claude-opus-4-5-20251101", "max")["output_config"]["effort"], "high");
+        assert!(ask("claude-opus-4-5-20251101", "high").get("thinking").is_none());
+        // A typed budget becomes the level of about that size.
+        assert_eq!(ask("claude-opus-5-5", "16k")["output_config"]["effort"], "high");
+        assert_eq!(ask("claude-opus-5-5", "2000")["output_config"]["effort"], "low");
+        // Auto and None send nothing, so the provider's own default applies; no sampling either.
+        for effort in ["none", "off"] {
+            let r = ask("claude-opus-5-5", effort);
+            assert!(r.get("output_config").is_none() && r.get("thinking").is_none() && r.get("temperature").is_none());
+        }
+        let plain = request(&json!({"model": "claude-opus-5-5", "temperature": 0.5, "messages": [{"role": "user", "content": "hi"}]}), true);
+        assert!(plain.get("output_config").is_none() && plain.get("temperature").is_none());
+        // Another vendor's model behind an Anthropic-style endpoint keeps the budget form.
+        assert_eq!(ask("kimi-k3", "high")["thinking"]["budget_tokens"], 16_384);
+
+        assert_eq!(claude_effort_levels("claude-opus-5-5"), ["low", "medium", "high", "xhigh", "max"]);
+        assert_eq!(claude_effort_levels("claude-sonnet-4-6"), ["low", "medium", "high", "max"]);
+        assert_eq!(claude_effort_levels("claude-haiku-4-5-20251001"), ["none", "low", "medium", "high", "max"]);
+
+        // Withdrawing a refused effort removes it in this form too and keeps other output settings.
+        let mut sent = ask("claude-opus-5-5", "max");
+        sent["output_config"]["format"] = json!({"type": "json_schema"});
+        assert!(strip_effort(&mut sent));
+        assert_eq!(sent["output_config"], json!({"format": {"type": "json_schema"}}));
+        assert!(sent.get("thinking").is_none());
+        let refusal = r#"{"type":"error","error":{"type":"invalid_request_error","message":"output_config.effort: Input should be 'low', 'medium' or 'high'"}}"#;
+        assert_eq!(parse_effort_rejection(400, refusal), Some(vec!["low".into(), "medium".into(), "high".into()]));
     }
 
     fn sse(events: &[Value]) -> String {
@@ -737,7 +856,7 @@ mod tests {
             ("16k", 1_024, None),
         ] {
             let translated = request(&json!({
-                "model": "claude-sonnet-5-5",
+                "model": "claude-haiku-4-5-20251001",
                 "reasoning_effort": effort,
                 "max_tokens": max_tokens,
                 "messages": [{"role": "user", "content": "hi"}]
@@ -760,7 +879,7 @@ mod tests {
     fn dynamic_effort_injection_and_rejection_parsing() {
         // Dynamic token budgets & named levels
         let ant_16k = request(&json!({
-            "model": "claude-sonnet-5-5",
+            "model": "claude-haiku-4-5-20251001",
             "reasoning_effort": "16k",
             "messages": [{"role": "user", "content": "hi"}]
         }), true);
@@ -770,7 +889,7 @@ mod tests {
         assert_eq!(ant_16k["max_tokens"], 64_000);
 
         let ant_num = request(&json!({
-            "model": "claude-sonnet-5-5",
+            "model": "claude-haiku-4-5-20251001",
             "reasoning_effort": "4096",
             "messages": [{"role": "user", "content": "hi"}]
         }), true);

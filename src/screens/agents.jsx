@@ -528,8 +528,14 @@ function AgentView(props) {
   const changeModel = async (newRef) => {
     if (!newRef || newRef === a()?.model_ref) return true;
     try {
+      const before = effort();
       await rpc("agents.set_model", { id: props.id, model: newRef });
-      rpc("agents.get_effort", { id: props.id }).then((v) => setEffort(v || "default")).catch(() => {});
+      // Effort levels differ by model. Say so when the chosen level did not survive the switch.
+      rpc("agents.get_effort", { id: props.id }).then((v) => {
+        const now = v || "default";
+        setEffort(now);
+        if (before !== "default" && now !== before) toast(`${newRef.split("/").pop()} has no ${before} effort level. Effort is now Auto.`, "info");
+      }).catch(() => {});
       toast(`Switched ${a()?.name ?? "agent"} model to ${newRef} (0 tokens used)`, "secure");
       refetch();
       return true;

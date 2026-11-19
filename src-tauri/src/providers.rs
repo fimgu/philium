@@ -397,6 +397,29 @@ fn format_effort_label(v: &str) -> String {
 
 /// Extract reasoning effort options dynamically from a raw `/models` entry without hardcoding level names.
 fn parse_discovered_efforts(m: &Value) -> Option<Vec<EffortOption>> {
+    // 0. Anthropic `/v1/models`: `capabilities.effort` names each level with its own `supported`
+    //    flag, and `capabilities.thinking.types` says which thinking styles the model takes.
+    if let Some(effort) = m.pointer("/capabilities/effort").filter(|e| e.is_object()) {
+        let on = |v: Option<&Value>| v.and_then(|x| x.get("supported")).and_then(Value::as_bool).unwrap_or(false);
+        let opt = |value: &str| EffortOption { value: value.to_string(), label: format_effort_label(value), hint: None };
+        if effort.get("supported").and_then(Value::as_bool).unwrap_or(false) {
+            const KNOWN: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+            let mut out: Vec<EffortOption> = KNOWN.iter().filter(|l| on(effort.get(**l))).map(|l| opt(l)).collect();
+            // A level this build has not heard of is still offered, after the known ones.
+            for (name, v) in effort.as_object().into_iter().flatten() {
+                if name != "supported" && !KNOWN.contains(&name.as_str()) && on(Some(v)) {
+                    out.push(opt(name));
+                }
+            }
+            return Some(out);
+        }
+        // No effort levels. A model that still takes a thinking budget keeps the budget steps.
+        if on(m.pointer("/capabilities/thinking/types/enabled")) {
+            return Some(["none", "low", "medium", "high", "max"].iter().map(|l| opt(l)).collect());
+        }
+        return Some(vec![]);
+    }
+
     // 1. Explicit array of levels from provider (`/models` `supported_reasoning_levels`, `reasoning_efforts`, `thinking.efforts`, etc.)
     if let Some(arr) = m
         .get("supported_reasoning_levels")
@@ -507,6 +530,17 @@ pub fn model_effort_details(kind: Kind, _model_id: &str, discovered: Option<&[Ef
     // When the upstream `/models` endpoint only returns bare model IDs without capability
     // metadata, provide the protocol's standard effort levels (which will be refined automatically
     // if the upstream endpoint ever rejects one).
+    // Claude models differ: the 4.5 generation takes a thinking budget, later ones take named
+    // levels, and which levels exist depends on the model.
+    if matches!(kind, Kind::Anthropic | Kind::ClaudeOauth) && _model_id.to_ascii_lowercase().contains("claude") {
+        let mut out = vec![EffortOption { value: "default".into(), label: "Auto".into(), hint: Some("Use the provider's default for this model".into()) }];
+        out.extend(crate::gateway::translate::claude_effort_levels(_model_id).iter().map(|l| EffortOption {
+            value: (*l).into(),
+            label: format_effort_label(l),
+            hint: None,
+        }));
+        return out;
+    }
     let levels: &[(&str, &str)] = match kind {
         Kind::Anthropic | Kind::ClaudeOauth => &[
             ("default", "Auto"),
@@ -550,6 +584,15 @@ pub fn validate_effort_for_ref(ctx: &Ctx, model_ref: Option<&str>, requested: &s
     }
     if let Ok((p, mid)) = resolve(ctx, model_ref) {
         let disc = discovered_efforts_map(ctx, &p.id);
+        // A Claude model's levels are known even before the provider lists them. A typed token
+        // budget ("16k") is always allowed; the gateway turns it into the nearest level.
+        let typed_budget = req.strip_suffix('k').unwrap_or(&req).trim().parse::<u64>().is_ok();
+        if !disc.contains_key(&mid) && !typed_budget && matches!(p.kind, Kind::Anthropic | Kind::ClaudeOauth) && mid.to_ascii_lowercase().contains("claude") {
+            let allowed = model_efforts(p.kind, &mid, None);
+            if !allowed.iter().any(|l| l.eq_ignore_ascii_case(&req)) {
+                return Err(format!("`{}` offers effort [{}] (got `{requested}`)", mid, allowed.join(", ")));
+            }
+        }
         if let Some(explicit) = disc.get(&mid) {
             if explicit.is_empty() {
                 return Err(format!("Provider `{}` reports that `{}` does not accept reasoning effort", p.id, mid));
@@ -1114,6 +1157,40 @@ mod tests {
         assert_eq!(resolve(&ctx, Some("cn")).unwrap().1, "m");
         assert_eq!(resolve(&ctx, None).unwrap().0.id, "cn");
         assert!(resolve(&ctx, Some("nope/x")).is_err());
+    }
+
+    /// Effort differs by model. The provider's own list wins; without it a Claude model still
+    /// gets the levels of its generation, and a level the model lacks is refused before sending.
+    #[test]
+    fn claude_effort_levels_follow_the_model() {
+        let listed = json!({"data":[
+            {"id":"claude-opus-5-5","capabilities":{"thinking":{"supported":true,"types":{"enabled":{"supported":false},"mycli":{"supported":true}}},
+                "effort":{"supported":true,"low":{"supported":true},"medium":{"supported":true},"high":{"supported":true},"xhigh":{"supported":true},"max":{"supported":true}}}},
+            {"id":"claude-sonnet-4-6","capabilities":{"effort":{"supported":true,"low":{"supported":true},"medium":{"supported":true},"high":{"supported":true},"xhigh":{"supported":false},"max":{"supported":true}}}},
+            {"id":"claude-haiku-4-5","capabilities":{"thinking":{"supported":true,"types":{"enabled":{"supported":true},"mycli":{"supported":false}}},"effort":{"supported":false}}},
+            {"id":"claude-plain","capabilities":{"thinking":{"supported":false},"effort":{"supported":false}}}
+        ]});
+        let parsed = parse_models_ordered(&listed);
+        let of = |i: usize| model_efforts(Kind::ClaudeOauth, &parsed[i].id, parsed[i].efforts.as_deref());
+        assert_eq!(of(0), ["default", "low", "medium", "high", "xhigh", "max"]);
+        assert_eq!(of(1), ["default", "low", "medium", "high", "max"]);
+        assert_eq!(of(2), ["default", "none", "low", "medium", "high", "max"]);
+        assert!(of(3).is_empty());
+
+        // Before the provider has listed anything, the model's generation decides.
+        assert_eq!(model_efforts(Kind::ClaudeOauth, "claude-fable-5-2", None), ["default", "low", "medium", "high", "xhigh", "max"]);
+        assert_eq!(model_efforts(Kind::Anthropic, "claude-opus-4-5-20251101", None), ["default", "low", "medium", "high"]);
+        assert_eq!(model_efforts(Kind::Anthropic, "claude-haiku-4-5-20251001", None), ["default", "none", "low", "medium", "high", "max"]);
+
+        let ctx = Ctx::test();
+        let mut claude = p("claude", "https://api.anthropic.com/v1");
+        claude.kind = Kind::ClaudeOauth;
+        upsert(&ctx, &claude).unwrap();
+        assert_eq!(validate_effort_for_ref(&ctx, Some("claude/claude-opus-5-5"), "xhigh").unwrap(), "xhigh");
+        assert!(validate_effort_for_ref(&ctx, Some("claude/claude-opus-5-5"), "none").is_err());
+        assert!(validate_effort_for_ref(&ctx, Some("claude/claude-sonnet-4-6"), "xhigh").is_err());
+        assert_eq!(validate_effort_for_ref(&ctx, Some("claude/claude-opus-5-5"), "16k").unwrap(), "16k");
+        assert_eq!(validate_effort_for_ref(&ctx, Some("claude/claude-opus-5-5"), "auto").unwrap(), "default");
     }
 
     /// A picker shows the latest models first, so the list keeps the provider's own order

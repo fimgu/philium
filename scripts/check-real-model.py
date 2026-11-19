@@ -87,6 +87,7 @@ await until(() => STATES.test(head()), 'coordinator ready', 120000).catch(() => 
 const ready = head();
 if (!/Idle/.test(ready)) return { entry, preset, defaultModel, chosenModel, started, ready, problems: problems(), tail: convo().slice(-500) };
 const hello = await turn('In one short sentence: which repository are you working in, and what is your role here?');
+if (!P.ask) return { entry, preset, defaultModel, chosenModel, started, hello, head: head(), problems: problems() };
 const delegated = await turn(P.ask, 300000);
 const pills = await until(() => { const p = all('.cluster-subpill').map(txt); return p.length ? p : null; }, 'helper listed under the coordinator', 30000).catch(() => []);
 await go('Board');
@@ -144,6 +145,31 @@ await sleep(P.secs * 1000);
 return { resumed, delegated, pills, tail: convo().slice(-600), problems: problems() };
 '''
 
+EFFORT = AGENT + r'''
+await workspace(P.checkout);
+await openAgent(P.lead);
+const resumed = await live();
+// Mail that arrived while it was stopped starts a turn right after the resume. Wait that out.
+await until(() => /Idle/.test(head()), 'coordinator idle', 120000).catch(() => null);
+await sleep(4000);
+await until(() => /Idle/.test(head()), 'coordinator idle after its mail', 240000).catch(() => null);
+await sendOnly('/effort ' + P.level);
+await sleep(1500);
+const notices = toasts();
+const reply = await turn('Reply with exactly one word: ready', 180000);
+// The same small reasoning task at the lowest and the highest level, to see whether the level
+// changes how much the model writes and thinks (the gateway records the output tokens).
+const task = 'Without using any tool: how many five-digit palindromes are divisible by 7? Work it out, then reply with the number only.';
+const depth = {};
+for (const level of P.compare || []) {
+  await sendOnly('/effort ' + level); await sleep(1200);
+  depth[level] = (await turn(task, 240000)).tail.slice(-60);
+}
+// The effort menu's text sits at the end of the conversation pane: the levels this model offers.
+const levels = (convo().match(/not guaranteed\.\s*([A-Za-z ]+)$/) || [])[1] || '';
+return { resumed, notices, reply, levels, depth, toasts: toasts(), problems: problems() };
+'''
+
 AFTER = acc.AFTER_RESTART.replace(acc.AGENT, AGENT).replace("await say(P.say, 'SYNTHETIC REPLY from')", 'await turn(P.say, 300000)')
 assert AFTER != acc.AFTER_RESTART and 'turn(P.say' in AFTER, 'the acceptance scenarios changed; update this script'
 
@@ -151,6 +177,7 @@ assert AFTER != acc.AFTER_RESTART and 'turn(P.say' in AFTER, 'the acceptance sce
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('app'); ap.add_argument('--model', default='claude-sonnet-5-5'); ap.add_argument('--out')
+    ap.add_argument('--only', choices=['effort'], help='effort: start a coordinator and check only the effort step (about one minute)')
     ap.add_argument('--keep', action='store_true', help='keep the scratch folder (the copied access token is removed either way)')
     args = ap.parse_args()
     real = Path.home() / 'Philium Pilot/data'
@@ -217,6 +244,28 @@ def main():
         save()
         return r, (r.get('result') or {})
 
+    def refusals():
+        """Requests the provider refused, as the gateway recorded them: model and status only."""
+        try:
+            db = sqlite3.connect(f'file:{data}/philium.db?mode=ro', uri=True)
+            rows_ = db.execute('select model, status, count(*) from requests where status >= 400 group by 1, 2').fetchall()
+            db.close()
+            return [f'{m} status {st} x{n}' for m, st, n in rows_]
+        except sqlite3.Error as e:
+            return [type(e).__name__]
+
+    def marked_without_effort():
+        """Models the Pilot has concluded take no effort setting. It concludes that when the provider
+        refuses a request that carried one; the request is then resent without it and recorded as
+        answered, so this note is the only trace of the refusal."""
+        try:
+            db = sqlite3.connect(f'file:{data}/philium.db?mode=ro', uri=True)
+            row = db.execute("select v from kv where k like 'models_efforts.%'").fetchall()
+            db.close()
+            return sorted(m for (v,) in row for m, levels in json.loads(v).items() if not levels)
+        except (sqlite3.Error, ValueError) as e:
+            return [type(e).__name__]
+
     def ps():
         return subprocess.run(['/bin/ps', '-axo', 'pid=,ppid=,command='], capture_output=True, text=True).stdout.splitlines()
 
@@ -237,6 +286,25 @@ def main():
                 time.sleep(2)
         print(f'-- sweep {label}: {len(mine)} leftover process(es) ended', flush=True)
 
+    class Done(Exception):
+        """The chosen part has run; go on to the clean-up."""
+
+    def effort_step():
+        """Each model has its own levels, and a level must not cost a refused request."""
+        r, v = ui('effort', EFFORT, {'checkout': 'workbench', 'lead': 'lead', 'level': 'high', 'compare': ['low', 'max']}, 800)
+        refused = refusals() + [f'{m} marked as taking no effort after a refusal' for m in marked_without_effort()]
+        check('real-effort', 'With effort set to High the model answers and no request is refused', said((v.get('reply') or {}).get('tail')).lower().endswith('ready') and not refused, {'reply': said((v.get('reply') or {}).get('tail'))[-80:], 'refused': refused, 'notices': v.get('notices'), 'error': r.get('error')})
+        # Not a pass or fail: what the gateway recorded for the same task at the lowest and highest level.
+        try:
+            db = sqlite3.connect(f'file:{data}/philium.db?mode=ro', uri=True)
+            last = db.execute('select tokens_out, duration_ms, status from requests order by ts desc limit 2').fetchall()
+            db.close()
+            raw_results['effort_depth'] = {'low': {'output_tokens': last[1][0], 'ms': last[1][1], 'status': last[1][2]}, 'max': {'output_tokens': last[0][0], 'ms': last[0][1], 'status': last[0][2]}, 'answers': v.get('depth')}
+            print(f"-- same task, effort low: {last[1][0]} output tokens in {last[1][1]} ms; effort max: {last[0][0]} output tokens in {last[0][1]} ms; answers {clean(v.get('depth'))[:160]}", flush=True)
+        except (sqlite3.Error, IndexError) as e:
+            print(f'-- effort depth not measured: {type(e).__name__}', flush=True)
+        check('real-effort', 'The effort menu lists the levels this model has, xhigh included and no None', 'xhigh' in (v.get('levels') or '').lower().replace(' ', '') and 'none' not in (v.get('levels') or '').lower(), v.get('levels'))
+
     try:
         repo = syn.new_repo(root / 'run/workbench')
         syn.write(repo, {'README.md': '# Workbench\n\nA tiny synthetic project used to try a coordinator.\n', 'app.py': 'print("hi")\n'})
@@ -245,6 +313,11 @@ def main():
         r, v = ui('register', REGISTER, {'repo': str(repo)}, 120)
         check('real-B1', 'The Claude sign-in and its models are listed, and a checkout registers', any('workbench' in x for x in v.get('labels') or []) and any('Claude' in c and 'models' in c for c in v.get('cards') or []), v or r.get('error'))
 
+        if args.only == 'effort':
+            r, v = ui('start', START, {'checkout': 'workbench', 'lead': 'lead', 'model': args.model, 'ask': '', 'task': 'NOTES', 'work_ms': 1000}, 400)
+            check('real-B1', 'The real model answers a typed message in the coordinator conversation', ((v.get('hello') or {}).get('state')) == 'Idle' and 'provider error' not in ((v.get('hello') or {}).get('tail') or ''), v.get('hello') or v.get('problems') or r.get('error'))
+            effort_step()
+            raise Done()
         ask = ('Create one board task titled exactly "Add NOTES file". Then start one helper agent named scribe and hand that task to it. '
                'The helper must create a file NOTES.md containing exactly the line: hello from philium  Then it must commit the file and submit the task. '
                'Do not do the work yourself. Reply with one short sentence once the helper has been started.')
@@ -297,6 +370,10 @@ def main():
 
         r, v = ui('board2', BOARD.replace('NOTES|No changes|diff', 'DONE|No changes|diff'), {'checkout': 'workbench', 'task': 'Slow check', 'open_agent': True, 'wait_status': 'In review', 'wait_ms': 5000}, 200)
         check('real-B5', "The recovered task ends submitted with DONE.md in the helper's Changes", v.get('column') in ('In review', 'Done') and 'DONE.md' in (v.get('changes') or ''), {'column': v.get('column'), 'owner': v.get('owner'), 'changes': (v.get('changes') or '')[:200]})
+
+        effort_step()
+    except Done:
+        pass
     finally:
         sweep('end')
         # What the gateway recorded: that a real provider answered, without any content.
