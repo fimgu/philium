@@ -2,6 +2,8 @@
 
 Select the product checkout in Philium Pilot. In **Review → Release PR revisions → Configure local contract verification**, pin a **separate trusted verifier checkout**. To run live read-only HTTP assertions, explicitly enter its trusted loopback observer port. Then paste the parent PR URL and choose **Verify release**. The history is private to this checkout. Checking does not post comments, approve, merge, publish, deploy or send files to a model.
 
+**Setting up checks without a second checkout.** Open **Review → Release check → Checks for this checkout** and choose **Draft checks with an agent**. The agent reads the release and proposes checks through the `checks_propose` tool; each appears as one plain sentence with the exact fact under it. Choose **Use these checks**, read them, then **Confirm and pin these checks**. Philium keeps accepted checks in its own private store (`data/checks/<checkout>` in the profile), which agents cannot read and a pull request cannot touch. Agents can propose facts about committed files and the database only; checks against a running product are yours to set up. A checks file or a registered verifier checkout, described below, is still available under **Advanced**, where the section was formerly called "Configure local contract verification".
+
 The installed executable offers the same operation without a window, Jcode or Herdr:
 
 ```sh
