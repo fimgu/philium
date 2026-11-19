@@ -163,7 +163,7 @@ const task = 'Without using any tool: how many five-digit palindromes are divisi
 const depth = {};
 for (const level of P.compare || []) {
   await sendOnly('/effort ' + level); await sleep(1200);
-  depth[level] = (await turn(task, 240000)).tail.slice(-60);
+  depth[level] = (await turn(task, 240000)).tail.replace(/Requests a reasoning effort level[\s\S]*$/, '').replace(/Copy reply\s*$/, '').trim().slice(-40);
 }
 // The effort menu's text sits at the end of the conversation pane: the levels this model offers.
 const levels = (convo().match(/not guaranteed\.\s*([A-Za-z ]+)$/) || [])[1] || '';
