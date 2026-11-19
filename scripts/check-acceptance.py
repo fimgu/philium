@@ -873,7 +873,9 @@ def main():
             run.check('D1', 'That terminal carries no variable of another agent harness', bool(env) and not any(k.startswith(('JCODE_', 'HERDR_')) for k in vars_), [k for k in vars_ if k.startswith(('JCODE_', 'HERDR_'))])
             if want('review'):
                 run.check('B6', 'Release history and decisions appear only in the checkout they belong to', all(len(s.get('review') or []) >= 2 for s in a) and all(s.get('review') == [] for s in b), {'alpha': a[0].get('review'), 'beta': b[0].get('review')})
-            run.check('B6', 'All Workspaces lists every task', set(v.get('all') or []) == a_tasks | {'Beta only task'}, v.get('all'))
+            # The orchestrated review, run earlier on a third checkout, left its three items on the board.
+            review_items = {'P0 Migrations apply in order on an empty database', 'P1 The list shows the status column', 'P4 The notes mention the new column'} if want('review') else set()
+            run.check('B6', 'All Workspaces lists every task', set(v.get('all') or []) == a_tasks | {'Beta only task'} | review_items, v.get('all'))
 
         if want('probe'):
             for name, provider, strict in [('probe', None, False), ('strictprobe', 'Synthetic Strict', True)]:
