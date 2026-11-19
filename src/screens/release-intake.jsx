@@ -1,5 +1,8 @@
 import { createResource, createSignal, For, Show } from 'solid-js';
 import { rpc } from '../lib/rpc.js';
+import { readiness, summaryMarkdown, tone, HEADLINE } from '../lib/readiness.js';
+
+const MARK = { ok: '✓', bad: '✕', unknown: '?' }, STATE = { ok: 'Pass', bad: 'Fail', unknown: 'Unknown: not a pass' };
 
 // One plain sentence per contract state, so a child failure, a merge-only regression, a failure
 // already on the target and missing evidence never read alike.
@@ -25,12 +28,6 @@ const DEPLOYMENT = {
   absent: 'not established (no observer or identity command)',
   unknown: 'unavailable, stale or incomplete',
 };
-const HEADLINE = {
-  not_ready: 'Do not ship',
-  superseded: 'Head or target changed. Verify again.',
-  ready_for_reviewed_scope: 'Ready for the reviewed scope',
-  incomplete: 'Release verification incomplete',
-};
 
 export function ReleaseIntake(props) {
   const [url,setUrl]=createSignal(''), [busy,setBusy]=createSignal(false), [message,setMessage]=createSignal('');
@@ -49,6 +46,8 @@ export function ReleaseIntake(props) {
   const pathFor=name=>paths()[name]??(profile.latest?.programs||[]).find(p=>p.name===name)?.path??'';
   async function enroll(){setBusy(true);try{const programs=Object.fromEntries((preview()?.checks?.programs||[]).map(n=>[n,pathFor(n)]));await call('sql_enroll',{driver:driver(),stage_port:port()?Number(port()):null,programs});await reloadProfile();setMessage('Checks confirmed and pinned for this checkout.');}catch(e){setMessage(String(e));}finally{setBusy(false);}}
   const show=v=>typeof v==='string'?v:JSON.stringify(v);
+  // The table as text, to paste where the team reads it. Copying needs the window to be in front.
+  async function copySummary(d){try{await navigator.clipboard.writeText(summaryMarkdown(d,readiness(d,members())));setMessage('Summary copied. Paste it where your team reads it.');}catch{setMessage('Copying is not available right now. Open "Summary to paste" and select the text.');}}
   const Checks=props=><div aria-label={props.label}>
     <For each={props.checks.cases}>{c=><p data-check={c.id}><strong>{c.id}</strong> · {c.kind}: <code>{show(c.what)}</code> must be <code>{show(c.expect)}</code></p>}</For>
     <For each={props.checks.live_cases}>{c=><p data-check={c.id}><strong>{c.id}</strong> · {c.kind}: <code>{c.what}</code> must be <code>{show(c.expect)}</code></p>}</For>
@@ -66,8 +65,8 @@ export function ReleaseIntake(props) {
   async function inspect(seq,pr,discover=false){setDecision(null);setMembers(null);setGraph(null);setReceipt(null);setBusy(true);try{setDecision(await call('decision',{generation:seq}));setReceipt(await call('sql_receipt',{generation:seq}));const g=await call('graph',{generation:seq});const scope=await call('followup',{generation:seq});setGraph({...g,scope,pr,seq});setMembers(await call(discover?'discover_members':'members',{generation:seq}).catch(()=>null));setMessage(`Inspected #${pr}, generation ${seq}.`);}catch(e){setMessage(`Revisions recorded for #${pr}. Ancestry not verified: ${String(e)}`);}finally{setBusy(false);}}
   async function mark(g){if(busy())return;setBusy(true);try{await call('checkpoint',{generation:g.seq});await inspect(g.seq,g.pr);}catch(e){setMessage(String(e));}finally{setBusy(false);}}
   const deployment=(d,r)=>{const before=r?.deployment_identity?.state,after=r?.deployment_after?.state;if(!before)return 'not observed';const text=s=>DEPLOYMENT[s]||s;return after&&after!==before?`before: ${text(before)}; after: ${text(after)}`:`${text(before)}${after?' before and after the checks':''}`;};
-  return <details aria-label="Release PR revisions"><summary>Release PR revisions</summary>
-    <p>Paste a pull request to check its exact base, head, landed pull requests and pinned contracts. Checking never posts, approves, pushes or deploys.</p>
+  return <details aria-label="Release PR revisions" open><summary>Release check</summary>
+    <p>Paste a release pull request. Philium checks its exact base, head, landed pull requests and your pinned checks, and answers one question: is this revision good to go? Checking never posts, approves, pushes or deploys.</p>
     <details aria-label="Release verification setup"><summary>Configure local contract verification</summary><p>Select a separate trusted checkout containing <code>philium/sql-contracts.json</code>. Its committed expectations are pinned until you enroll it again.</p><select aria-label="Independent SQL driver" disabled={busy()} value={driver()} onChange={e=>pick(e.currentTarget.value)}><option value="">Select a checkout</option><For each={drivers.latest||[]}>{r=><option value={r.id}>{r.name} · {r.id.slice(0,8)}</option>}</For></select> <label>Trusted loopback deployment observer port (optional) <input type="number" min="1024" max="65535" disabled={busy()} value={port()} onInput={e=>setPort(e.currentTarget.value)}/></label>
       <Show when={preview()?.error}><p role="alert">{preview().error}</p></Show>
       <Show when={preview()?.checks}>{c=><section aria-label="Checks to confirm"><h3>Read these checks before you pin</h3><p>Verifier commit <code>{c().pin}</code>. Pinning confirms exactly these checks. Nothing counts as ready before you do.</p><Checks label="Proposed checks" checks={c()}/>
@@ -81,7 +80,10 @@ export function ReleaseIntake(props) {
     </details>
     <p aria-label="Verification setup summary">{profile.latest ? <>Set up for this checkout: verifier <strong>{profile.latest.driver_name || profile.latest.driver}</strong> pinned at <code>{String(profile.latest.pin).slice(0, 12)}</code>, deployment observer {profile.latest.observer_port ? `on loopback port ${profile.latest.observer_port}` : 'not configured'}. Paste a pull request to verify.</> : 'Not set up yet: without a pinned verifier a pull request can be resolved but not verified. Open the configuration above once.'}</p>
     <form onSubmit={resolve}><label>Pull request URL <input type="url" required value={url()} disabled={busy()} onInput={e=>setUrl(e.currentTarget.value)}/></label> <button disabled={busy()||!url().trim()}>Verify release</button></form>
-    <Show when={decision()}>{d=><section aria-label="Release decision"><h3>{HEADLINE[d().decision] || d().decision}</h3><p>#{d().pr} · <code>{d().head}</code> · {new Date(d().checked_ms).toLocaleString()}. Contracts: {d().contract_decision.replaceAll('_',' ')}. No review posted.</p><For each={d().receipt?.live_cases || []}>{c=><p>{c.id}: {c.state}</p>}</For><Show when={d().receipt?.checks_confirmed_ms}><p aria-label="Checks confirmation">Checks confirmed by you on {new Date(d().receipt.checks_confirmed_ms).toLocaleString()}.</p></Show>
+    <Show when={decision()}>{d=><section aria-label="Release decision" class={`decision ${tone(d().decision)}`}><div class="verdict"><span class="glyph" aria-hidden="true">{({ok:'✓',bad:'✕',old:'↻'})[tone(d().decision)]||'?'}</span><div class="grow"><h3>{HEADLINE[d().decision] || d().decision}</h3><p>#{d().pr} · <code>{d().head}</code> · {new Date(d().checked_ms).toLocaleString()}. Contracts: {d().contract_decision.replaceAll('_',' ')}. No review posted.</p></div><button type="button" onClick={()=>copySummary(d())}>Copy summary</button></div>
+      <table class="ready" aria-label="Release readiness"><tbody><For each={readiness(d(),members())}>{row=><tr data-row={row.id} data-state={row.state}><td class="mark"><span class={row.state} title={STATE[row.state]}>{MARK[row.state]}</span></td><th scope="row">{row.label}</th><td>{row.detail}</td></tr>}</For></tbody></table>
+      <small>Green needs all of its evidence. Unknown is not a pass, and a new head starts a new table.</small>
+      <details aria-label="Summary to paste"><summary>Summary to paste</summary><pre>{summaryMarkdown(d(),readiness(d(),members()))}</pre></details><Show when={d().receipt?.checks_confirmed_ms}><p aria-label="Checks confirmation">Checks confirmed by you on {new Date(d().receipt.checks_confirmed_ms).toLocaleString()}.</p></Show>
       <Show when={(rows.latest?.list||[]).some(r=>r.pr===d().pr&&r.seq>d().generation)}><p aria-label="Earlier revision"><strong>Saved result for an earlier revision.</strong> A newer head of #{d().pr} is recorded. It starts without a verdict and does not inherit this one.</p></Show>
       <dl aria-label="Verified identities">
         <dt>Generation</dt><dd>{d().generation}</dd>
@@ -92,7 +94,7 @@ export function ReleaseIntake(props) {
         <dt>Deployment</dt><dd>{deployment(d(), d().receipt)}</dd>
         <dt>Verifier</dt><dd>{d().receipt?.driver_pin ? <>pinned at <code>{d().receipt.driver_pin}</code>{d().receipt.release_record_pin ? <>, record read at <code>{d().receipt.release_record_pin}</code></> : ', no release record for this head'}</> : 'none pinned'}</dd>
       </dl>
-      <Show when={(d().why || []).length} fallback={<Show when={d().why}><p aria-label="Decision reasons">Nothing stands in the way within the reviewed scope. This is not a GitHub approval.</p></Show>}><ul aria-label="Decision reasons"><For each={d().why}>{w=><li>{w}</li>}</For></ul></Show>
+      <Show when={(d().why || []).length} fallback={<Show when={d().why}><p aria-label="Decision reasons">Nothing stands in the way within the reviewed scope. This is not a GitHub approval.</p></Show>}><><div class="why">Why it is not ready</div><ul aria-label="Decision reasons"><For each={d().why}>{w=><li>{w}</li>}</For></ul></></Show>
       <Show when={!d().why && d().reason}><p aria-label="Decision reasons">{d().reason}</p></Show>
     </section>}</Show>
     <p role="status">{message()}</p><Show when={rows.latest?.error}><p role="alert">{rows.latest.error}</p></Show>

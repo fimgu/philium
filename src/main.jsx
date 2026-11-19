@@ -15,6 +15,7 @@ import { soundEnabled, setSoundEnabled, playSound } from "./lib/sound.js";
 import "./lib/alerts.js";
 import "./styles/tokens.css";
 import "./styles/components.css";
+import "./styles/sheet.css";
 
 const SCREENS = [
   { id: "home", label: "Home", icon: "home", group: "work", load: () => import("./screens/home.jsx") },

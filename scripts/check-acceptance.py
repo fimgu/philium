@@ -478,6 +478,8 @@ const read = () => {
     landed: txt(all('section[aria-label="Landed pull requests"]', box)[0]),
     included: txt(all('details[aria-label="Included commits"] summary', box)[0]),
     history: all('p[data-generation]', box).map((p) => txt(p).slice(0, 26)),
+    table: d ? all('table[aria-label="Release readiness"] tr', d).map((tr) => [tr.dataset.row, tr.dataset.state]) : [],
+    summary: d ? (d.querySelector('details[aria-label="Summary to paste"] pre')?.textContent || '') : '',
   };
 };
 if (P.url) {
@@ -647,6 +649,7 @@ def main():
             run.check('C3', 'The child failure names the landed changes that fail on their own; the merge-only regression names none', 'fails the same way on its own (child failure)' in cases.get('child-change', ['', ''])[1] and '#31' in cases.get('child-change', ['', ''])[1] and 'child failure' not in cases.get('merge-result', ['', ''])[1] and 'Merge-only regression' in cases.get('merge-result', ['', ''])[1], [c[1][:150] for c in cases.values()][:2])
             w = why(d)
             run.check('C3', 'The decision is Do not ship and gives one plain reason per cause', d.get('headline') == 'Do not ship' and all(x in w for x in ['child-change: regression inside this release', 'fails the same way on its own', 'merge-result: merge-only regression', 'old-defect: already failing on the target', 'never-observed: missing evidence']) and all(n in w.split(' | ')[0] for n in ['#30', '#31']) and '#3' not in w.split(' | ')[1], w[:500] or d.get('status'))
+            run.check('C3', 'The decision is laid out as a table: the failing checks row is red, and the pasteable summary says so without calling anything unknown a pass', dict(d.get('table') or []).get('checks') == 'bad' and dict(d.get('table') or []).get('candidate') == 'ok' and '| FAIL | Checks on this commit' in (d.get('summary') or '') and 'Unknown is not a pass' in (d.get('summary') or ''), {'table': d.get('table'), 'summary': (d.get('summary') or '')[:160]})
 
             # ---- reopen: setup persists; a new head starts without a verdict ------------------
             syn.Origin.repos[A]['prs'][40]['heads'] = [g['fixed']]
@@ -701,9 +704,11 @@ def main():
             d = v.get('verified') or {}
             ready_gen = (d.get('ids') or {}).get('Generation')
             run.check('C5', 'Reviewed scope with independent evidence: Ready for the reviewed scope, tied to head and artifact', d.get('headline') == 'Ready for the reviewed scope' and (d.get('ids') or {}).get('Head') == g_head and (d.get('ids') or {}).get('Artifact') == artifact and 'Nothing stands in the way' in why(d) and 'unchanged' in (d.get('ids') or {}).get('Origin', ''), {'headline': d.get('headline'), 'ids': d.get('ids'), 'why': why(d)[:200]})
+            run.check('C5', 'When the verdict is Ready every row of the table is green', [st for _, st in d.get('table') or []] == ['ok'] * 7, d.get('table'))
             syn.write(ver_g, {'philium/evidence/view.json': evidence['view'].replace('twice', 'once')}); syn.commit_all(ver_g, 'altered')
             d = verify('gamma', pr_g).get('verified') or {}
             run.check('C6', 'Altered evidence: not ready, and the altered file is named', d.get('headline') == 'Release verification incomplete' and 'view (altered: the file no longer matches its recorded hash)' in why(d), why(d)[:260])
+            run.check('C6', 'Altered evidence turns the record row red; nothing else changes colour', dict(d.get('table') or []).get('record') == 'bad' and dict(d.get('table') or []).get('checks') == 'ok', d.get('table'))
             (ver_g / 'philium/evidence/view.json').unlink(); syn.commit_all(ver_g, 'removed')
             d = verify('gamma', pr_g).get('verified') or {}
             run.check('C6', 'Missing evidence: not ready, and the missing file is named', d.get('headline') == 'Release verification incomplete' and 'view (missing: the recorded file is not in the verifier)' in why(d), why(d)[:260])
@@ -711,6 +716,7 @@ def main():
             syn.Observer.state['mode'] = 'wrong'; n_obs = len(syn.Observer.calls)
             d = verify('gamma', pr_g).get('verified') or {}
             run.check('C6', 'Wrong deployment: not ready, named as such, and the product is not sampled', d.get('headline') == 'Release verification incomplete' and 'Wrong deployment before the checks' in why(d) and not any(c[1] == '/view' for c in syn.Observer.calls[n_obs:]), why(d)[:260])
+            run.check('C6', 'A wrong deployment turns the running-product row red and its checks are not counted', dict(d.get('table') or []).get('running') == 'bad' and dict(d.get('table') or []).get('smoke') != 'ok', d.get('table'))
             syn.Observer.state['mode'] = 'down'
             d = verify('gamma', pr_g).get('verified') or {}
             run.check('C6', 'Absent deployment: not ready, and the observer is named as not answering', d.get('headline') == 'Release verification incomplete' and 'Deployment unavailable before the checks' in why(d), why(d)[:260])

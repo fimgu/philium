@@ -11,8 +11,9 @@ export default function Workday() {
   const act = async (fn) => { setBusy(true); setMessage(""); try { await fn(); await refetch(); } catch (e) { setMessage(String(e)); } finally { setBusy(false); } };
   const record = (e) => { e.preventDefault(); act(async () => { await rpc("workday.fallback", { tool: tool(), note: note() }, { local: true }); setNote(""); setMessage("Fallback recorded."); }); };
   return <Page title="Workday" sub="What you did here, and when you had to leave" actions={<><Button onClick={() => refetch()} disabled={busy()}>Refresh</Button><Button disabled={busy()} onClick={() => act(async () => { const r = await rpc("workday.export", {}, { local: true }); setMessage(`Summary written to ${r.path}`); })}>Export summary</Button></>}>
-    <Show when={data()?.error}><p role="alert">{data().error}</p></Show>
-    <Show when={data() && !data().error}>{() => <div aria-label="Workday ledger">
+    <div class="sheet"><Show when={data()?.error}><p role="alert">{data().error}</p></Show>
+    <Show when={data() && !data().error}>{() => <div aria-label="Workday ledger" class="sheet">
+      <div class="tiles"><div class="tile"><span class="label">Done in Philium</span><span class="value">{data().completed}</span></div><div class="tile"><span class="label">Times you needed something else</span><span class="value">{data().fallbacks.length}</span></div><div class="tile"><span class="label">Watching since</span><span class="value words">{data().started ? new Date(data().started).toLocaleString() : "The first action recorded"}</span></div></div>
       <p>Philium records the name and outcome of each action you take on a screen. It does not record what you typed, any path or any output, and nothing leaves this Mac. It cannot see when you switch to another tool, so record that below when it happens.</p>
       <p aria-label="Observation window">{data().started ? `Observation window started ${new Date(data().started).toLocaleString()}.` : "No observation window started. Showing everything recorded so far."} <Button size="sm" disabled={busy()} onClick={() => act(() => rpc("workday.start", {}, { local: true }))}>Start a new window now</Button></p>
       <section aria-label="Fallbacks"><h2>Times you needed something else: {data().fallbacks.length}</h2>
@@ -25,6 +26,6 @@ export default function Workday() {
         </tbody></table>
       </section>
     </div>}</Show>
-    <p role="status">{message()}</p>
+    <p role="status">{message()}</p></div>
   </Page>;
 }
