@@ -463,7 +463,13 @@ export function ModelPicker(props) {
 
   // Clicks are delegated to the document, so the click that opens the list, and every click
   // inside it, also reaches this listener. Only a click elsewhere closes the list.
-  const outside = (e) => { if (!btn?.contains(e.target) && !e.target?.closest?.(".model-picker-pop")) close(); };
+  // A click inside can redraw the row it landed on ("Show older models"), which detaches the
+  // clicked element before this listener runs. The event's own path still records where it was.
+  const outside = (e) => {
+    const path = e.composedPath?.() ?? [];
+    const inside = (n) => n === btn || n?.classList?.contains?.("model-picker-pop");
+    if (!path.some(inside) && !btn?.contains(e.target) && !e.target?.closest?.(".model-picker-pop")) close();
+  };
   const onResize = () => close();
   onMount(() => {
     document.addEventListener("click", outside);

@@ -262,10 +262,16 @@ return { before, resumed, note: delivered, redirected, interrupted, after, stopp
 '''
 
 MODEL_PICKER = AGENT + r'''
-await workspace(P.checkout);
-await openAgent(P.lead);
-const resumed = await live();
-await until(() => /Idle/.test(head()), 'idle', 30000).catch(() => null);
+// An agent of its own, outside any checkout: an agent with helpers keeps one model for the family.
+await workspace('All Workspaces');
+await go('Agents'); await click('New agent');
+const m = await until(modal, 'spawn dialog');
+await fill('Name', P.name, m);
+choose(field('Repo', m), 'No repo');
+await click('Start Agent', m);
+const started = await until(() => (!modal() ? 'started' : (all('.err', m).map(txt)[0] || null)), 'spawn result', 45000);
+if (started !== 'started') return { opened: false, started };
+await until(() => head().startsWith(P.name) && /Idle/.test(head()), 'the new agent is idle', 45000).catch(() => null);
 const shownModel = () => txt(document.querySelector('.agent-head button[aria-label="Choose model"]'));
 const modelBefore = shownModel();
 await sendOnly('/model');
@@ -295,7 +301,7 @@ const modelAfter = await until(() => (shownModel() !== modelBefore ? shownModel(
 await sleep(300);
 const composerFocused = document.activeElement === composer();
 const reply = await say('Still there after the switch?', 'SYNTHETIC REPLY from').catch((e) => String(e));
-return { opened: true, resumed, modelBefore, first, other, everything, searched, focused, closed, modelAfter, composerFocused, reply };
+return { opened: true, modelBefore, first, other, everything, searched, focused, closed, modelAfter, composerFocused, reply, toasts: toasts() };
 '''
 
 DELEGATE_SLOW = AGENT + r'''
@@ -602,14 +608,14 @@ def main():
             run.check('B5', 'A second reopen shows the same agents, the same two tasks and the same handover', sorted(v.get('rows') or []) == ['ibis', 'lead', 'wren'] and (v.get('boardBefore') or {}).get('owner') == 'Handed to ibis · stopped' and (v.get('boardBefore') or {}).get('tasks') == 2 and (v.get('boardAfter') or {}).get('owner') == 'ibis', {'rows': v.get('rows'), 'before': v.get('boardBefore'), 'after': v.get('boardAfter')} if v else r.get('error'))
 
             # The model picker, opened by typing /model to the coordinator.
-            r = run.ui(MODEL_PICKER, {'checkout': 'alpha/same', 'lead': 'lead', 'other': 'Second'}, 200)
+            r = run.ui(MODEL_PICKER, {'name': 'solo', 'other': 'Second'}, 200)
             v = run.value(r)
             first, other, every, found = v.get('first') or {}, v.get('other') or {}, v.get('everything') or {}, v.get('searched') or {}
-            run.check('B1', 'Typing /model opens the model list with the search ready, instead of printing a line', v.get('opened') is True and first.get('searchFocused') is True, {'opened': v.get('opened'), 'focus': first.get('searchFocused'), 'toasts': v.get('toasts')} if v else r.get('error'))
+            run.check('B1', 'Typing /model opens the model list with the search ready, instead of printing a line', v.get('opened') is True and first.get('searchFocused') is True, {'opened': v.get('opened'), 'focus': first.get('searchFocused'), 'started': v.get('started'), 'toasts': v.get('toasts')} if v else r.get('error'))
             run.check('B1', 'The list has one switch per provider this agent may use and leaves out the untrusted one', first.get('chips') == ['Synthetic (on)', 'Second'] and 'hidden' in (first.get('foot') or ''), {'chips': first.get('chips'), 'foot': first.get('foot')})
             run.check('B1', 'A provider shows the newest model of each family first and keeps the older ones behind one button', other.get('items') == ['nova-3-2', 'nova-mini-3', 'spark-2-1'] and other.get('more') == 'Show 5 older models' and len(every.get('items') or []) == 8, {'latest': other.get('items'), 'more': other.get('more'), 'all': every.get('items')})
             run.check('B1', 'Search looks across every provider at once', found.get('items') == ['synthetic-1'] and found.get('chips') == 0, found)
-            run.check('B1', 'An arrow key reaches the first model; choosing it switches the agent, returns to the message box, and the agent answers on the new model', (v.get('focused') or '').startswith('nova-3-2') and v.get('closed') is True and 'nova-3-2' in (v.get('modelAfter') or '') and v.get('composerFocused') is True and 'SYNTHETIC REPLY from lead' in (v.get('reply') or ''), {'focused': v.get('focused'), 'after': v.get('modelAfter'), 'composer': v.get('composerFocused'), 'reply': (v.get('reply') or '')[:60]})
+            run.check('B1', 'An arrow key reaches the first model; choosing it switches the agent, returns to the message box, and the agent answers on the new model', (v.get('focused') or '').startswith('nova-3-2') and v.get('closed') is True and 'nova-3-2' in (v.get('modelAfter') or '') and v.get('composerFocused') is True and 'SYNTHETIC REPLY from solo' in (v.get('reply') or ''), {'focused': v.get('focused'), 'after': v.get('modelAfter'), 'composer': v.get('composerFocused'), 'reply': (v.get('reply') or '')[:60], 'toasts': v.get('toasts')})
 
         if want('review'):
             origin = syn.serve(syn.Origin); observer = syn.serve(syn.Observer)
