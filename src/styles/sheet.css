@@ -107,3 +107,5 @@
 
 .sheet .report { background: var(--bg-sunken); border: 1px solid var(--line); border-radius: var(--radius-s); padding: 6px 14px; user-select: text; }
 .sheet .report p, .sheet .report li, .sheet .report td { max-width: none; }
+
+.sheet button.primary:not(.btn) { background: var(--accent); border-color: var(--accent); color: #0b0c0e; font-weight: 600; }

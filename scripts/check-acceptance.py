@@ -333,6 +333,18 @@ const pinned = await until(() => { const t = txt(setup.querySelector('[aria-labe
 return { before, started, by, proposed, toConfirm, pinned, redrawn, summary: txt(box.querySelector('[aria-label="Verification setup summary"]')), labels: Array.from(picker().options).map(txt), left: all('section[aria-label="Proposed checks"]', setup).length };
 '''
 
+CONNECT = r'''
+await workspace(P.checkout);
+await go('Review');
+const box = await until(() => all('details[aria-label="Release PR revisions"]')[0], 'release section', 15000);
+if (!box.open) box.querySelector('summary').click();
+const line = () => txt(box.querySelector('[aria-label="GitHub connection"]'));
+const before = await until(() => (line().startsWith('GitHub:') ? line() : null), 'connection line', 10000);
+await click('Connect GitHub', box);
+const said = await until(() => { const t = txt(all('p[role="status"]', box)[0]); return /^GitHub (not )?connected/.test(t) ? t : null; }, 'answer', 30000);
+return { before, said, after: line() };
+'''
+
 ORCHESTRATE = r'''
 await workspace(P.checkout);
 await go('Review');
@@ -606,6 +618,13 @@ def main():
             found = (landed.count(' landed at '), landed.count(' contains #'))
             run.check('C2', 'A public parent pull request, read from the real origin by the form: exact head, landed and nested pull requests', (d.get('ids') or {}).get('Head') == head and found == (int(n_landed), int(n_nested)) and ' 0 missing lookups' in landed and '0 ambiguous' in landed, {'head': (d.get('ids') or {}).get('Head'), 'base': (d.get('ids') or {}).get('Target (base)'), 'landed': found[0], 'nested': found[1], 'tail': landed[-70:], 'status': d.get('status')})
             run.check('C7', 'With no verifier pinned, a public pull request is resolved but never called ready', d.get('headline') == 'Release verification incomplete' and 'No independent driver enrolled' in ' '.join(d.get('reasons') or []), {'headline': d.get('headline'), 'why': ' | '.join(d.get('reasons') or [])[:200]})
+
+        if want('review') or want('connect'):
+            # Before any stand-in origin is switched on. The throwaway home has no GitHub CLI
+            # sign-in, so the honest outcome is a plain refusal that says what to do.
+            r = run.ui(CONNECT, {'checkout': 'gamma'}, 120)
+            v = run.value(r)
+            run.check('C1', 'Connect GitHub uses the GitHub CLI sign-in of the person\'s own home, and without one it says so and stays disconnected', 'not connected' in (v.get('before') or '') and (v.get('said') or '').startswith('GitHub not connected') and ('gh auth login' in (v.get('said') or '')) and 'not connected' in (v.get('after') or ''), v or r.get('error'))
 
         if want('coord'):
             r = run.ui(COORDINATE, {'checkout': 'alpha/same', 'lead': 'lead', 'worker': 'wren', 'task': 'Add status column'}, 220)

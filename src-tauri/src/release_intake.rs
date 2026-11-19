@@ -90,6 +90,73 @@ pub(crate) fn fixture_origin() -> Option<String> {
         .filter(|p| *p >= 1024)?;
     Some(format!("http://127.0.0.1:{port}"))
 }
+/// GitHub through the GitHub CLI's own sign-in on this Mac, once the person has connected it.
+/// Philium keeps no token: it asks the CLI when it needs one, and remembers only which signed-in
+/// account reads which origin.
+const GH_LOGINS: &str = "origin:github-cli";
+fn gh_exe() -> Option<&'static str> {
+    ["/opt/homebrew/bin/gh", "/usr/local/bin/gh", "/usr/bin/gh"].into_iter().find(|p| Path::new(p).is_file())
+}
+/// Run the CLI as the person would: with their own home, where it keeps its sign-in, and without
+/// any token or configuration override from this process.
+async fn gh(args: &[&str]) -> Option<(bool, String, String)> {
+    let mut c = tokio::process::Command::new(gh_exe()?);
+    c.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    if let Some(home) = crate::pilot::real_home() {
+        c.env("HOME", home);
+    }
+    for k in ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "GH_CONFIG_DIR", "GH_TOKEN", "GITHUB_TOKEN", "GH_HOST", "GH_ENTERPRISE_TOKEN"] {
+        c.env_remove(k);
+    }
+    let out = tokio::time::timeout(Duration::from_secs(8), c.output()).await.ok()?.ok()?;
+    Some((out.status.success(), String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned()))
+}
+/// The accounts the CLI is signed in to on github.com, the active one first as the CLI lists them.
+fn gh_accounts(status: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in status.lines() {
+        if let Some(rest) = line.split("Logged in to github.com account ").nth(1) {
+            if let Some(name) = rest.split_whitespace().next().filter(|n| n.len() <= 39 && n.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')) {
+                if !out.iter().any(|x| x == name) {
+                    out.push(name.to_owned());
+                }
+            }
+        }
+    }
+    out
+}
+async fn gh_token(login: &str) -> Option<String> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, String)>>> = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some((at, token)) = cache.lock().ok()?.get(login).cloned() {
+        if at.elapsed() < Duration::from_secs(300) {
+            return Some(token);
+        }
+    }
+    let (ok, stdout, _) = gh(&["auth", "token", "--hostname", "github.com", "--user", login]).await?;
+    let token = stdout.trim().to_owned();
+    if !ok || token.len() < 20 || token.len() > 300 || !token.bytes().all(|b| b.is_ascii_graphic()) {
+        return None;
+    }
+    cache.lock().ok()?.insert(login.to_owned(), (std::time::Instant::now(), token.clone()));
+    Some(token)
+}
+fn gh_logins() -> serde_json::Map<String, Value> {
+    crate::secrets::get(GH_LOGINS).and_then(|s| serde_json::from_str::<Value>(&s).ok()).and_then(|v| v.as_object().cloned()).unwrap_or_default()
+}
+/// What to present to GitHub for this request: a token the person saved, else the connected
+/// CLI account for that origin, else nothing (public repositories need nothing).
+async fn bearer_for(path: &str) -> Option<String> {
+    if let Some(token) = crate::secrets::get(ORIGIN_TOKEN) {
+        return Some(token);
+    }
+    if fixture_origin().is_some() {
+        return None;
+    }
+    let slug = path.split('/').take(2).collect::<Vec<_>>().join("/").to_ascii_lowercase();
+    let login = gh_logins().get(&slug)?.as_str()?.to_owned();
+    gh_token(&login).await
+}
 pub(crate) async fn github_public(path: &str) -> Option<Value> {
     let client = reqwest::Client::builder()
         .no_proxy()
@@ -104,9 +171,9 @@ pub(crate) async fn github_public(path: &str) -> Option<Value> {
             fixture_origin().as_deref().unwrap_or("https://api.github.com")
         ))
         .header("Cache-Control", "no-cache");
-    // A read-only token the person saved for private repositories. It lives in the vault,
-    // which agents cannot read, and is only ever sent to this one origin.
-    if let Some(token) = crate::secrets::get(ORIGIN_TOKEN) {
+    // A token the person saved, or the GitHub CLI account they connected. Either is only ever
+    // sent to this one origin, and agents can read neither.
+    if let Some(token) = bearer_for(path).await {
         request = request.bearer_auth(token);
     }
     let mut r = request.send().await.ok()?;
@@ -432,6 +499,34 @@ pub async fn call(ctx: &Ctx, method: &str, a: Value) -> Result<Value, String> {
     let untouched:Vec<Value>=prs.iter().filter(|p|p["read"].as_array().is_some_and(|x|x.is_empty())).map(|p|p["pr"].clone()).collect();
     Ok(json!({"check_files":read.len(),"prs":prs,"untouched":untouched}))
  },
+ // Use the GitHub CLI's sign-in for this checkout's origin. The person asks for it with one
+ // press. Of the accounts signed in on this Mac, the first that can read the origin is used.
+ "origin_connect"=>{
+    if fixture_origin().is_some(){return Err("GitHub is replaced by a stand-in in this profile".into());}
+    if gh_exe().is_none(){return Err("The GitHub CLI (gh) is not installed on this Mac. Install it and run `gh auth login`, or save a read-only token under Checks for this checkout.".into());}
+    let (_,out,err)=gh(&["auth","status","--hostname","github.com"]).await.ok_or("The GitHub CLI did not answer")?;
+    let accounts=gh_accounts(&format!("{out}\n{err}"));
+    if accounts.is_empty(){return Err("The GitHub CLI on this Mac is not signed in. Run `gh auth login` in a terminal, then press Connect GitHub again.".into());}
+    let slug=o.to_ascii_lowercase();
+    for login in &accounts{
+        let Some(token)=gh_token(login).await else{continue};
+        let client=reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).timeout(Duration::from_secs(8)).user_agent("Philium-release-review").build().map_err(|e|e.to_string())?;
+        let can=client.get(format!("https://api.github.com/repos/{slug}")).bearer_auth(&token).send().await.is_ok_and(|r|r.status()==200);
+        if can{
+            let mut map=gh_logins();map.insert(slug.clone(),json!(login));
+            crate::secrets::set(GH_LOGINS,&Value::Object(map).to_string())?;
+            ctx.log_event("origin_connected",None,&json!({"origin":"github.com","through":"github-cli"}));
+            return Ok(json!({"login":login,"origin":slug}));
+        }
+    }
+    Err(format!("None of the GitHub accounts signed in with the GitHub CLI on this Mac ({}) can read {slug}. Sign in to the right account with `gh auth login`.",accounts.join(", ")))
+ },
+ "origin_disconnect"=>{
+    let mut map=gh_logins();map.remove(&o.to_ascii_lowercase());
+    crate::secrets::set(GH_LOGINS,&Value::Object(map).to_string())?;
+    Ok(json!({"login":Value::Null}))
+ },
+ "origin_connection"=>Ok(json!({"login":gh_logins().get(&o.to_ascii_lowercase()).cloned().unwrap_or(Value::Null),"origin":o,"token_saved":crate::secrets::get(ORIGIN_TOKEN).is_some()})),
  "mergeable"=>{let seq=a["generation"].as_i64().ok_or("Select a recorded generation")?;let rows=ctx.db.query("SELECT base,head FROM release_refs WHERE repo=? AND origin=? AND seq=?",params![repo,o,seq])?;let row=rows.first().ok_or("Generation does not belong to this checkout")?;Ok(mergeable(Path::new(r[0]["path"].as_str().ok_or("Checkout unavailable")?),row["base"].as_str().ok_or("Invalid base")?,row["head"].as_str().ok_or("Invalid head")?).await)},
  "history"=>Ok(json!(ctx.db.query("SELECT seq,pr,base,head,observed FROM release_refs WHERE repo=? AND origin=? ORDER BY seq DESC LIMIT 30",params![repo,o])?)),
  "resolve"=>{let n=target(&arg_str(&a,"url")?,&o)?;let _g=FETCH.try_lock().map_err(|_|"Another origin lookup is in progress")?;
@@ -485,6 +580,13 @@ mod tests {
         assert_eq!(touched(&["migrations/62.sql", "cmd/main.go"], &read), ["migrations/62.sql"]);
         assert!(touched(&["helm/values.yaml", "docs/manifest.json.bak"], &read).is_empty());
         assert!(touched(&[], &read).is_empty());
+    }
+    #[test]
+    fn the_github_cli_accounts_are_read_from_its_status() {
+        let status = "github.com\n  ✓ Logged in to github.com account first-one (keyring)\n  - Active account: true\n  - Token: gho_************\n\n  ✓ Logged in to github.com account second (keyring)\n  ✓ Logged in to github.com account first-one (keyring)\n";
+        assert_eq!(gh_accounts(status), ["first-one", "second"]);
+        assert!(gh_accounts("You are not logged into any GitHub hosts. To log in, run: gh auth login").is_empty());
+        assert!(gh_accounts("Logged in to github.com account bad/name (keyring)").is_empty());
     }
     #[test]
     fn generations_and_scope() {
