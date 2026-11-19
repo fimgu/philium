@@ -7,7 +7,7 @@ import { kindResources } from "../lib/kind-resources.js";
 import { For, Show, createSignal, createResource, createMemo, createEffect, on, onCleanup, Suspense } from "solid-js";
 import { NotFound, Page, Button, Badge, Dot, Empty, Modal, Field, Input, TextArea, Select, Toggle, Segmented, ModelPicker, confirm, toast } from "../ui/kit.jsx";
 import { Icon } from "../ui/icons.jsx";
-import { Conversation, Composer, KvTelemetryBar, speedEffort, effortSpeed, agentAttachmentLoader } from "../ui/conversation.jsx";
+import { Conversation, Composer, KvTelemetryBar, speedEffort, effortSpeed, agentAttachmentLoader, PlainError } from "../ui/conversation.jsx";
 import { AgentTerminals } from "../ui/agent-terminals.jsx";
 import { AgentBrowser } from "../ui/agent-browser.jsx";
 import { rpc, useEvent, fmt, sendError } from "../lib/rpc.js";
@@ -678,7 +678,7 @@ function AgentView(props) {
           </For>
         </div>
       </Show>
-      <Show when={a()?.error}><div class="shield danger" style={{ margin: "8px 16px 0" }}>{a().error}</div></Show>
+      <Show when={a()?.error}><div class="shield danger" style={{ margin: "8px 16px 0" }}><PlainError text={a().error} /></div></Show>
       <Show when={(a()?.warnings ?? []).length}>
         <div style={{ padding: "6px 16px 0" }}><WarningPills warnings={a().warnings} max={6} /></div>
       </Show>

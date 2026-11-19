@@ -203,6 +203,8 @@ def brain(req):
         if step == 0:
             return {'tool': ('mcp_philium_shell_run', {'command': f'git mv status.txt {m.group(1)} && git commit -qm "Rename" && ls'})}
         return f'REDIRECTED: the file is now {m.group(1)}.'
+    if 'RATE LIMITED' in last_user and step == 0:
+        return {'status': 429}
     m = re.search(r'SLOW (\d+)', last_user)
     if m and step == 0:
         return {'delay': int(m.group(1)), 'text': 'SLOW TURN FINISHED'}
@@ -242,9 +244,16 @@ class Model(http.server.BaseHTTPRequestHandler):
         entry = {'t': time.time(), 'agent': name, 'role': role, 'turns': len(users), 'last_user': users[-1][:80] if users else '',
                  'key_ok': key == f'Bearer {Model.expect_key}' if Model.expect_key else None,
                  'history': ' | '.join(u[:40] for u in users[-4:]),
-                 'plan': plan if isinstance(plan, str) else (plan.get('tool', [None])[0] or f"slow {plan.get('delay')}"),
+                 'plan': plan if isinstance(plan, str) else (plan.get('tool', [None])[0] or (f"status {plan['status']}" if plan.get('status') else f"slow {plan.get('delay')}")),
                  'tool_results': [text_of(m)[:900] for m in req.get('messages', []) if m.get('role') == 'tool'][-2:]}
         Model.seen.append(entry)
+        if isinstance(plan, dict) and plan.get('status'):
+            # A refusal as a provider sends it, with the wait it asks for.
+            b = json.dumps({'type': 'error', 'error': {'type': 'rate_limit_error', 'message': 'Synthetic rate limit for this check.'}}).encode()
+            self.send_response(plan['status']); self.send_header('Content-Type', 'application/json'); self.send_header('retry-after', '2')
+            self.send_header('Content-Length', str(len(b))); self.end_headers(); self.wfile.write(b)
+            entry['ended'] = f"refused {plan['status']}"
+            return
         if not req.get('stream'):
             return self._send(200, {'id': 'x', 'object': 'chat.completion', 'choices': [{'index': 0, 'message': {'role': 'assistant', 'content': plan if isinstance(plan, str) else ''}, 'finish_reason': 'stop'}]})
         self.send_response(200); self.send_header('Content-Type', 'text/event-stream'); self.send_header('Connection', 'close'); self.end_headers()

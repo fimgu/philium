@@ -292,6 +292,19 @@ const finished = await until(() => {
 return { whileWorking, edited, finished, left: queued() };
 '''
 
+ERRORS = AGENT + r'''
+// A provider refusal reads as one sentence with the fix; the original stays under Error details.
+await workspace('All Workspaces');
+await openAgent(P.name);
+await live();
+const errors = () => all('.msg.error', document.querySelector('.agent-main'));
+const before = errors().length;
+await sendOnly('RATE LIMITED now');
+const shown = await until(() => errors().length > before ? errors()[errors().length - 1] : null, 'the refusal shown', 90000).catch(() => null);
+if (!shown) return { shown: false, convo: convo().slice(-400), banner: txt(document.querySelector('.agent-view .shield.danger')) };
+return { shown: true, plain: txt(shown).slice(0, 300), details: (shown.querySelector('details pre')?.textContent || '').slice(0, 500), idle: /Idle/.test(head()) };
+'''
+
 MODEL_PICKER = AGENT + r'''
 // An agent of its own, outside any checkout: an agent with helpers keeps one model for the family.
 await workspace('All Workspaces');
@@ -731,6 +744,10 @@ def main():
             run.check('B1', 'A message typed while the agent works is queued above the box with Edit and Remove, not refused', w.get('queued') and len(w['queued']) == 2 and 'Queued · sent when solo finishes this step' in (w.get('label') or '') and 'Enter queues your message' in (w.get('status') or ''), w or r.get('error'))
             run.check('B1', 'Edit takes a queued message back into the box', e.get('queued') and len(e['queued']) == 1 and 'QUEUED second note' in (e.get('box') or ''), e)
             run.check('B1', 'When the step ends the queued messages reach the agent together, in order, and the queue empties', 'QUEUED first note QUEUED second note' in (v.get('finished') or '') and v.get('left') == [], {'finished': v.get('finished'), 'left': v.get('left')})
+
+            r = run.ui(ERRORS, {'name': 'solo'}, 150)
+            v = run.value(r)
+            run.check('B1', 'A provider refusal reads as one sentence with the fix, and the original is kept under Error details', v.get('shown') is True and 'limiting requests right now' in (v.get('plain') or '') and 'switch model with /model' in (v.get('plain') or '') and ('429' in (v.get('details') or '') or 'rate_limit' in (v.get('details') or '')), v or r.get('error'))
 
         if want('review'):
             origin = syn.serve(syn.Origin); observer = syn.serve(syn.Observer)

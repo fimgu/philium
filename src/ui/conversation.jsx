@@ -10,6 +10,7 @@ import { ConversationActivity } from "./conversation-activity.jsx";
 import { ViewToggle } from "./conversation-view.jsx";
 import { conversationView } from "../lib/conversation-view.js";
 import "../styles/composer.css";
+import { plainError } from "../lib/plain-error.js";
 import { draftFor, newDraft, clearSentDraft, attachImage, sendableImages } from "../lib/drafts.js";
 import { validateImages, normalizeImage, createImageCache, MAX_IMAGES } from "../lib/images.js";
 
@@ -223,7 +224,7 @@ export function Conversation(props) {
                   </Show>
                 </div>
               </Match>
-              <Match when={it().kind === "error"}><div class="msg error"><Show when={String(it().text).includes("philium_guard")} fallback={it().text}><strong>Request blocked by secret guard</strong><p class="small">This conversation contains content the guard identified as a secret. This request was not sent to the provider. Start a fresh conversation without sensitive content.</p><details class="tool-raw"><summary>Error details</summary><pre class="conv-pre">{it().text}</pre></details></Show></div></Match>
+              <Match when={it().kind === "error"}><div class="msg error"><Show when={String(it().text).includes("philium_guard")} fallback={<PlainError text={it().text} />}><strong>Request blocked by secret guard</strong><p class="small">This conversation contains content the guard identified as a secret. This request was not sent to the provider. Start a fresh conversation without sensitive content.</p><details class="tool-raw"><summary>Error details</summary><pre class="conv-pre">{it().text}</pre></details></Show></div></Match>
               <Match when={it().kind === "note"}><div class="faint xs" style={{ "align-self": "center" }}>{it().text}</div></Match>
             </Switch>
           )}
@@ -362,6 +363,12 @@ export const effortSpeed = (e) => (e === "low" || e === "minimal" || e === "none
  * Images arrive by paste, drop (anywhere over the agent pane via props.dropTarget),
  * Attach menu file picker, or native screenshot. onSend(text, images) receives HAL
  * image parts [{ data: base64, media_type, name }] built only at send time. */
+/** An error as one plain sentence with its fix; the original text under Error details. */
+export function PlainError(props) {
+  const e = () => plainError(props.text);
+  return <>{e().plain}<Show when={e().raw}><details class="tool-raw"><summary>Error details</summary><pre class="conv-pre">{e().raw}</pre></details></Show></>;
+}
+
 export function Composer(props) {
   const localDraft = newDraft();
   const record = () => props.draftKey ? draftFor(props.draftKey) : localDraft;

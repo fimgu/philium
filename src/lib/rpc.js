@@ -1,3 +1,4 @@
+import { plainError } from "./plain-error.js";
 // Backend bridge. All Rust calls go through `rpc("module.method", args)`.
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -24,7 +25,7 @@ export const hal = (method, path, body) => {
 
 export const sendError = (error) => /session is busy|"type"\s*:\s*"busy"/i.test(String(error))
   ? "This agent is still working or waiting for approval. Your draft was kept. Wait, approve the request, or press Stop before sending."
-  : String(error);
+  : plainError(error).plain;
 
 /** Subscribe to a backend event for the lifetime of the current component. */
 export function useEvent(topic, fn) {
