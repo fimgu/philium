@@ -8,13 +8,13 @@ export function ManagedJobs(props){
   const [profiles,setProfiles]=createSignal([]),[profile,setProfile]=createSignal(''),[task,setTask]=createSignal(props.taskId||''),[cmd,setCmd]=createSignal(''),[minutes,setMinutes]=createSignal(10),[form,setForm]=createSignal(false),[plan,setPlan]=createSignal(null);
   const [tail,setTail]=createSignal(null),[release,setRelease]=createSignal('');let live=true,seq=0,lseq=0,timer;
   const invoke=(method,args={})=>rpc('managed.'+method,{repo_id:props.id,...args,...(props.taskId?{task_id:props.taskId}:{})},{local:true});
-  async function refresh(){const n=++seq;clearTimeout(timer);try{const r=await invoke('list');if(!live||seq!==n)return;setView('data',reconcile(r));if(r.jobs.some(j=>j.state!=='released'))timer=setTimeout(refresh,5000);}catch(e){if(live&&seq===n)setError(String(e));}}
+  async function refresh(){const n=++seq;clearTimeout(timer);try{const r=await invoke('list');if(!live||seq!==n)return;setView('data',reconcile(r));if((r.jobs||[]).some(j=>j.state!=='released'))timer=setTimeout(refresh,5000);}catch(e){if(live&&seq===n)setError(String(e));}}
   onMount(refresh);onCleanup(()=>{live=false;seq++;lseq++;clearTimeout(timer);});
   async function act(fn){if(busy())return;setError('');setBusy(true);try{await fn();}catch(e){if(live)setError(String(e));}finally{if(live)setBusy(false);}}
   async function openForm(){await refresh();if(!live)return;const p=await rpc('environments.profiles',{},{local:true});if(!live)return;setProfiles(p);setProfile(p.length===1?p[0]:'');setForm(true);}
   async function logs(j){const n=++lseq;setError('');setTail({id:j.id,text:'Reading logs…'});try{const r=await invoke('logs',{id:j.id});if(live&&n===lseq)setTail({id:j.id,text:r.text||'No output yet.',cut:r.truncated});}catch(e){if(live&&n===lseq)setTail({id:j.id,text:String(e)});}}
   const usable=()=>data()?.tasks.find(t=>t.id===task());
-  return <section aria-label="Managed task sandboxes"><h2>Task sandboxes</h2><p>One offline container per claimed task. Philium verifies its identity before cleanup. Shared clusters are never removed here.</p>
+  return <section aria-label="Managed task sandboxes"><h2 title="One offline container per claimed task. Philium verifies its identity before cleanup. Shared clusters are never removed here.">Task sandboxes</h2>
     <button disabled={busy()} onClick={()=>act(openForm)}>New task sandbox</button> <button disabled={busy()} onClick={()=>act(refresh)}>Refresh sandboxes</button>
     <Show when={error()}><p role="alert">{error()}</p></Show>
     <Show when={form()}><fieldset disabled={busy()||!!plan()}><legend>Run a local command</legend>
