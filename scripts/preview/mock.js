@@ -49,7 +49,7 @@
         [1, '#5556 CLI session survives an interruption', 'done', 'blocked', 'ibis: The test needs a running session service; none is available in the sandbox. Needs a local cluster or staging.'],
         [2, 'Existing database connections still open after #5544', 'open', null, null],
         [4, 'Helm values document the new image override keys', 'open', null, null],
-      ].map(([tier, title, status, result, evidence, owner, origin], i) => ({ id: 't' + i, tier, title: `P${tier} ${title}`, status, result, evidence, owner: owner || null, origin: origin || null })),
+      ].map(([tier, title, status, result, evidence, owner, origin], i) => ({ id: 't' + i, title, status, result, evidence, owner: owner || null, origin: origin || null, severity: result === 'fail' ? tier : null })),
       report: q.get('review') === 'do_not_ship' ? { by: 'lead', at: now, text: '# Review of release #5542\n\n**Verdict: do not ship.** One P0 item failed: the head conflicts with the target in 4 files.\n\n| Tier | Item | Result |\n|---|---|---|\n| P0 | Migrations 59 to 64 | pass |\n| P0 | Conflicts with the target | fail |\n| P1 | #5501 git access | pass |\n| P1 | #5556 CLI session | blocked |\n\nCould not be checked: #5556 needs a running session service.' } : null } : null,
     'release_intake.coverage': { check_files: 3, prs: [5519, 5523, 5527, 5531, 5536, 5540].map((pr, i) => ({ pr, files: 12 + i * 9, read: i < 2 ? ['docs/github-app-manifest.json'] : [] })), untouched: state === 'ready' ? [] : [5527, 5531, 5536, 5540] },
     'release_intake.members': { landed: [5519, 5523, 5527, 5531, 5536, 5540].map((pr, i) => ({ pr, oid: (i + 3).toString(16).repeat(40) })), edges: [{ outer: 5536, inner: 5527 }], missing: 0, unmapped: 1, ambiguous: 0 },

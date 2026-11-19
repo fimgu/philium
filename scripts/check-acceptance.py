@@ -402,11 +402,11 @@ const sec = await until(() => all('section[aria-label="Agent review"]', box)[0],
 if (!sec) return { started };
 const rows = () => all('tr[data-item]', all('section[aria-label="Agent review"]', box)[0]);
 await until(() => rows().length >= 3, 'plan listed', 120000).catch(() => null);
-const planned = rows().map((tr) => [tr.dataset.tier, txt(tr.querySelector('th'))]);
+const planned = rows().map((tr) => txt(tr.querySelector('th')));
 await until(() => rows().filter((tr) => tr.dataset.result).length >= 3 && all('details[aria-label="Review report"]', box).length, 'results and report', 180000).catch(() => null);
 const now = all('section[aria-label="Agent review"]', box)[0];
 return { started, planned, headline: txt(now.querySelector('h3')), progress: txt(now.querySelector('.verdict p')),
-  items: rows().map((tr) => [tr.dataset.tier, tr.dataset.result, txt(tr.querySelector('td:last-child')).slice(0, 220), tr.dataset.origin]),
+  items: rows().map((tr) => [tr.dataset.severity, tr.dataset.result, txt(tr.querySelector('td:last-child')).slice(0, 220), tr.dataset.origin, txt(tr.querySelector('th'))]),
   report: (now.querySelector('details[aria-label="Review report"] [data-report]')?.dataset.report || '').slice(0, 160), reportBy: txt(now.querySelector('details[aria-label="Review report"] summary')),
   facts: txt(all('section[aria-label="Release decision"] h3', box)[0]) };
 '''
@@ -926,10 +926,10 @@ def main():
             r = run.ui(ORCHESTRATE, {'checkout': 'gamma', 'url': 'https://github.com/philium-fixture/gamma/pull/7'}, 400)
             v = run.value(r)
             items = v.get('items') or []
-            run.check('C2', 'One action reviews a release: the facts are checked and an orchestrator writes a plan in tiers P0 to P5', 'is organising the review of #7' in (v.get('started') or '') and [t for t, _ in v.get('planned') or []] == ['0', '1', '4'] and bool(v.get('facts')), {'started': v.get('started'), 'planned': v.get('planned'), 'facts': v.get('facts'), 'error': r.get('error')})
-            run.check('C2', 'Each item is done by an agent and recorded as pass, fail or blocked with what it ran', [x[1] for x in items] == ['pass', 'pass', 'fail'] and 'finch: Read view.json on the head commit' in ' '.join(x[2] for x in items), items)
-            last = items[2] if len(items) == 3 else ['', '', '', '']
-            run.check('C2', 'Every finding is labelled introduced, pre-existing or origin unverified; an unlabelled failure is refused', last[3] == 'pre_existing' and last[2].startswith('pre-existing') and 'Unlabelled first try refused.' in last[2] and [x[3] for x in items[:2]] == ['', ''], last)
+            run.check('C2', 'One action reviews a release: the facts are checked and an orchestrator writes a plan of checks', 'is organising the review of #7' in (v.get('started') or '') and sorted(v.get('planned') or []) == ['Migrations apply in order on an empty database', 'The list shows the status column', 'The notes mention the new column'] and bool(v.get('facts')), {'started': v.get('started'), 'planned': v.get('planned'), 'facts': v.get('facts'), 'error': r.get('error')})
+            run.check('C2', 'Each check is done by an agent and recorded as pass, fail or blocked with what it ran; findings come first', [x[1] for x in items] == ['fail', 'pass', 'pass'] and 'finch: Read view.json on the head commit' in ' '.join(x[2] for x in items), items)
+            found = items[0] if len(items) == 3 else ['', '', '', '', '']
+            run.check('C2', 'Every finding has a severity (P0 to P5) and is labelled introduced, pre-existing or origin unverified; an unlabelled failure is refused', found[0] == '4' and found[4].startswith('P4') and found[3] == 'pre_existing' and found[2].startswith('pre-existing') and 'Unlabelled first try refused.' in found[2] and [x[0] for x in items[1:]] == ['', ''], found)
             con = sqlite3.connect(f"file:{run.profile / 'data/philium.db'}?mode=ro", uri=True)
             starts = con.execute("SELECT a.role, w.base_commit FROM worktrees w JOIN agents a ON a.id=w.agent_id JOIN repos r ON r.id=w.repo_id WHERE r.name='gamma'").fetchall(); con.close()
             under_review = syn.Origin.repos[G]['prs'][7]['heads'][-1]
@@ -958,7 +958,7 @@ def main():
             if want('review'):
                 run.check('B6', 'Release history and decisions appear only in the checkout they belong to', all(len(s.get('review') or []) >= 2 for s in a) and all(s.get('review') == [] for s in b), {'alpha': a[0].get('review'), 'beta': b[0].get('review')})
             # The orchestrated review, run earlier on a third checkout, left its three items on the board.
-            review_items = {'P0 Migrations apply in order on an empty database', 'P1 The list shows the status column', 'P4 The notes mention the new column'} if want('review') else set()
+            review_items = {'Migrations apply in order on an empty database', 'The list shows the status column', 'The notes mention the new column'} if want('review') else set()
             run.check('B6', 'All Workspaces lists every task', set(v.get('all') or []) == a_tasks | {'Beta only task'} | review_items, v.get('all'))
 
         if want('probe'):

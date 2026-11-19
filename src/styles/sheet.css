@@ -115,3 +115,7 @@
 .sheet .origin.introduced { color: var(--danger); }
 .sheet .origin.unverified { color: var(--strict); }
 .sheet .origin.pre_existing { color: var(--text-faint); }
+
+/* A finding's severity: P0 and P1 block the release. */
+.sheet .tier.sev0, .sheet .tier.sev1 { background: var(--danger-dim); color: var(--danger); }
+.sheet .tier.sev2 { background: var(--strict-dim); color: var(--strict); }

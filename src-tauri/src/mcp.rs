@@ -186,10 +186,10 @@ pub fn tool_list() -> Vec<Value> {
           json!({ "q": s, "limit": i }), &["q"]),
         t("memory_save", "Save for this repository only. Global writes are unavailable. Category: fact, preference, correction, entity.",
           json!({ "content": s, "category": s, "project": b }), &["content", "category"]),
-        t("review_plan", "Release review, orchestrator only: write the plan. Each item is {title, tier (0 = P0 ... 5 = P5), detail (what to verify and how)}. The items appear on the board and in Review.",
+        t("review_plan", "Release review, orchestrator only: write the plan once, riskiest check first. Each item is {title, detail (what to verify and how)}. The checks appear on the board and in Review.",
           json!({ "items": { "type": "array", "items": { "type": "object" } } }), &["items"]),
-        t("review_result", "Release review: record the outcome of one item you checked. result is pass, fail or blocked. evidence is the exact commands you ran and what they showed, on which commit; for blocked, what you need. For a fail, origin is required: run the same check on the target too; introduced (fails on the head, passes on the target), pre_existing (fails the same way on the target) or unverified (the target could not be checked, or fails differently).",
-          json!({ "task_id": s, "result": { "type": "string", "enum": ["pass", "fail", "blocked"] }, "origin": { "type": "string", "enum": ["introduced", "pre_existing", "unverified"] }, "evidence": s }), &["task_id", "result", "evidence"]),
+        t("review_result", "Release review: record the outcome of one item you checked. result is pass, fail or blocked. evidence is the exact commands you ran and what they showed, on which commit; for blocked, what you need. For a fail, severity and origin are required. severity is 0 to 5: 0 and 1 block the release (0: data loss, security, the release does not install or upgrade; 1: a main behaviour is broken), 2 to 5 should be looked at, in decreasing importance. origin: run the same check on the target too; introduced (fails on the head, passes on the target), pre_existing (fails the same way on the target) or unverified (the target could not be checked, or fails differently).",
+          json!({ "task_id": s, "result": { "type": "string", "enum": ["pass", "fail", "blocked"] }, "severity": { "type": "integer", "minimum": 0, "maximum": 5 }, "origin": { "type": "string", "enum": ["introduced", "pre_existing", "unverified"] }, "evidence": s }), &["task_id", "result", "evidence"]),
         t("review_report", "Release review, orchestrator: save the final report in Markdown, verdict first.", json!({ "markdown": s }), &["markdown"]),
         t("checks_propose", "Propose release checks for your checkout: facts that must be true in every release. Send {contracts:{schema?,cases:[...]}} once, when asked to draft checks. A person reviews and confirms them in Review; nothing counts before that.",
           json!({ "contracts": { "type": "object" } }), &["contracts"]),
@@ -430,7 +430,7 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
             Ok(result)
         }
         "review_plan" => crate::review_run::plan(ctx, &me, &row, &a["items"]),
-        "review_result" => crate::review_run::result(ctx, agent, &me, &row, arg(&a, "task_id")?, arg(&a, "result")?, a["origin"].as_str(), arg(&a, "evidence")?),
+        "review_result" => crate::review_run::result(ctx, agent, &me, &row, arg(&a, "task_id")?, arg(&a, "result")?, a["severity"].as_i64().or_else(|| a["severity"].as_str().and_then(|s| s.trim().trim_start_matches(['P', 'p']).parse().ok())), a["origin"].as_str(), arg(&a, "evidence")?),
         "review_report" => crate::review_run::report(ctx, &me, &row, arg(&a, "markdown")?),
         "checks_propose" => {
             let repo = row["repo_id"].as_str().filter(|id| !id.is_empty()).ok_or("Release checks belong to a registered checkout")?;

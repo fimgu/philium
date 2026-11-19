@@ -138,9 +138,9 @@ def brain(req):
         ids = re.findall(r'"id":\s*"([0-9a-f]+)"', results[0]) if results else []
         if step == 0:
             return {'tool': ('mcp_philium_review_plan', {'items': [
-                {'title': 'Migrations apply in order on an empty database', 'tier': 0, 'detail': 'Run the migration test against a fresh database.'},
-                {'title': 'The list shows the status column', 'tier': 1, 'detail': 'Read view.json on the head and confirm the column.'},
-                {'title': 'The notes mention the new column', 'tier': 4, 'detail': 'Read the README.'}]})}
+                {'title': 'Migrations apply in order on an empty database', 'detail': 'Run the migration test against a fresh database.'},
+                {'title': 'The list shows the status column', 'detail': 'Read view.json on the head and confirm the column.'},
+                {'title': 'The notes mention the new column', 'detail': 'Read the README.'}]})}
         if len(ids) < 3:
             return f'REVIEW FAILED writing the plan: {one(results[0])}'
         if step == 1:
@@ -152,9 +152,9 @@ def brain(req):
             return {'tool': ('mcp_philium_review_result', {'task_id': ids[2], 'result': 'fail', 'evidence': ran})}
         if step == 4:
             refused = 'needs its origin' in results[3]
-            return {'tool': ('mcp_philium_review_result', {'task_id': ids[2], 'result': 'fail', 'origin': 'pre_existing', 'evidence': ran + (' Unlabelled first try refused.' if refused else ' Unlabelled first try accepted.')})}
+            return {'tool': ('mcp_philium_review_result', {'task_id': ids[2], 'result': 'fail', 'severity': 4, 'origin': 'pre_existing', 'evidence': ran + (' Unlabelled first try refused.' if refused else ' Unlabelled first try accepted.')})}
         if step == 5:
-            return {'tool': ('mcp_philium_review_report', {'markdown': '# Review of the release\n\nVerdict: ready for your sign-off. P0 and P1 passed.\n\n| Tier | Item | Result | Origin |\n|---|---|---|---|\n| P0 | Migrations | pass | |\n| P1 | Status column | pass | |\n| P4 | Notes | fail | pre-existing |\n\nFindings: the notes never mention columns (pre-existing).'})}
+            return {'tool': ('mcp_philium_review_report', {'markdown': '# Review of the release\n\nVerdict: ready for your sign-off. No P0 or P1 finding.\n\n| Severity | Finding | Origin |\n|---|---|---|\n| P4 | The notes never mention columns | pre-existing |\n\nPassed: migrations, the status column.'})}
         return 'REVIEW ORGANISED ' + one(results[-1])
     m = re.search(r'REVIEW ITEM ([0-9a-f]+):', last_user)
     if m:

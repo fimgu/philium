@@ -37,6 +37,8 @@ pub fn init(ctx: &Arc<Ctx>) -> Result<(), String> {
         "ALTER TABLE tasks ADD COLUMN review_evidence TEXT",
         // Whether a failure was introduced by the release, was already on the target, or is unverified.
         "ALTER TABLE tasks ADD COLUMN review_origin TEXT",
+        // How bad a finding is: 0 (P0) to 5 (P5). P0 and P1 block the release.
+        "ALTER TABLE tasks ADD COLUMN review_severity INTEGER",
     ] {
         if let Err(e) = ctx.db.exec(sql, []) {
             if !e.contains("duplicate column") {

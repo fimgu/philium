@@ -49,6 +49,7 @@ export default function Review() {
   const key = () => slug() && JSON.stringify([activeRepoId(), slug()]);
   return <Page title="Review" sub="Is this release good to go?"><div class="sheet">
     <Show when={key()} keyed>{k=><ReleaseIntake repo={JSON.parse(k)[0]}/>}</Show>
+    <details aria-label="More review tools"><summary>More</summary>
     <Show when={workspace()?.id} keyed>{id => <LocalChecks repo={id}/>}</Show>
     <Show when={workspace()?.id} keyed>{id => <details aria-label="Kubernetes tenant plan">
       <summary>Kubernetes tenant plan · not applied</summary>
@@ -69,5 +70,6 @@ export default function Review() {
     <Show when={key()} keyed fallback={<Empty title="Select a GitHub workspace" body="Use the workspace picker to view a saved PR review for one repository." />}>
       {_identity => <Reader workspace={workspace} slug={slug()} />}
     </Show>
+    </details>
   </div></Page>;
 }

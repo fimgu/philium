@@ -111,15 +111,16 @@ function agentSection(review, cell) {
   const items = review?.items || [];
   if (!items.length) return [];
   const result = (it) => ({ pass: "PASS", fail: "FAIL", blocked: "BLOCKED" })[it.result] || (it.status === "claimed" ? "IN PROGRESS" : "TO DO");
+  const weight = (it) => it.result === "fail" ? (it.severity ?? 1) : it.result === "blocked" ? 10 : !it.result ? 12 : 20;
   const short = (s) => { const t = cell(s || ""); return t.length > 180 ? `${t.slice(0, 177).replace(/\s+\S*$/, "")}…` : t; };
   return [
     `### Agents' review: ${AGENT_SUMMARY[review.headline] || review.headline} (${items.filter((i) => i.result).length} of ${items.length} items have a result)`,
     "",
-    "| Result | Tier | Item | Origin | What was run |",
+    "| Result | Severity | Check | Origin | What was run |",
     "|---|---|---|---|---|",
-    ...items.map((it) => `| ${result(it)} | P${it.tier} | ${cell(String(it.title).replace(/^P\d\s+/, ""))} | ${it.result === "fail" ? ORIGIN_WORDS[it.origin] || "origin unverified" : ""} | ${short(it.evidence)} |`),
+    ...[...items].sort((a, b) => weight(a) - weight(b)).map((it) => `| ${result(it)} | ${it.result === "fail" ? `P${it.severity ?? "?"}` : ""} | ${cell(String(it.title).replace(/^P\d\s+/, ""))} | ${it.result === "fail" ? ORIGIN_WORDS[it.origin] || "origin unverified" : ""} | ${short(it.evidence)} |`),
     "",
-    "Agents did these checks and wrote what they ran. A failure is introduced (fails here, passes on the target), pre-existing (fails the same way on the target) or origin unverified.",
+    "P0 and P1 block the release; P2 to P5 should be looked at, in decreasing importance. Introduced: fails here, passes on the target. Pre-existing: fails the same way on the target.",
     "",
   ];
 }
