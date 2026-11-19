@@ -134,6 +134,7 @@ pub fn report(ctx: &Ctx, me: &str, row: &Value, text: &str) -> Result<Value, Str
     let gen = run["generation"].as_i64().unwrap_or(0);
     ctx.db.kv_set(&format!("review.report.{repo}.{gen}"), &json!({"by": me, "at": now(), "text": text}).to_string())?;
     ctx.emit("release:review", json!({ "repo_id": repo }));
+    crate::attention::announce(ctx);
     Ok(json!({"saved": true, "next": "Tell the person the verdict in two sentences. They read the report in Review."}))
 }
 

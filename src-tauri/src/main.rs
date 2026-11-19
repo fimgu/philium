@@ -11,6 +11,7 @@
 //! The web UI never sees a token or key.
 
 mod agents;
+mod attention;
 mod agentshell;
 mod board;
 mod checks;
@@ -315,6 +316,7 @@ fn main() {
     let ui_script=if scripted{std::env::args().nth(2)}else{None};
     if scripted&&ui_script.is_none(){eprintln!("Usage: --pilot-ui-script SCRIPT [SECONDS]");std::process::exit(2);}
     let offscreen=scripted||first_arg.as_deref()==Some("--pilot-check-review-form");
+    if offscreen{attention::HIDDEN.store(true,std::sync::atomic::Ordering::Relaxed);}
     if offscreen {let home=std::env::var_os("HOME").map(std::path::PathBuf::from);if !cfg!(target_os="macos")||config.config().identifier!=pilot::ID||!home.is_some_and(|p|std::fs::read_to_string(p.join(".philium-pilot-fixture")).ok().as_deref()==Some("disposable\n")){eprintln!("Disposable Pilot home required");std::process::exit(2);}for w in &mut config.config_mut().app.windows{w.visible=false;w.focus=false;w.focusable=false;w.skip_taskbar=true;w.incognito=true;}}
     let checking = std::env::args().nth(1).as_deref() == Some("--pilot-check");
     if checking && config.config().identifier != pilot::ID {
@@ -356,6 +358,7 @@ fn main() {
             let db = db::Db::open(&data_dir.join("philium.db")).map_err(|e| format!("database: {e}"))?;
             let ctx = Ctx::new(db, data_dir, philium_root(), gateway.clone(), gateway_url);
             ctx.set_handle(app.handle().clone());
+            attention::refresh(&ctx);
             let c_learn = ctx.clone();
             gateway.set_learned_efforts_cb(Arc::new(move |pid, mid, levels| {
                 providers::record_learned_efforts(&c_learn, pid, mid, levels);

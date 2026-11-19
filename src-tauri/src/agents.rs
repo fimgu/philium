@@ -149,6 +149,7 @@ fn set_state(ctx: &Ctx, id: &str, state: &str) {
         rusqlite::params![id, state, now()],
     );
     ctx.emit("agents:changed", json!({ "id": id, "state": state }));
+    crate::attention::refresh(ctx);
 }
 
 
@@ -753,6 +754,7 @@ fn schedule_continue(ctx: &Arc<Ctx>, id: &str) {
         let _ = ctx.db.kv_set(&retry_key(id), &json!({ "attempt": attempt, "gave_up": true }).to_string());
         ctx.log_event("agent_rate_limit_gave_up", Some(id), &json!({ "attempts": attempt }));
         ctx.emit("agents:changed", json!({ "id": id }));
+        crate::attention::refresh(ctx);
         return;
     };
     let spread = id.bytes().fold(0i64, |h, b| (h * 31 + b as i64) % 45) * 1000;
@@ -1275,6 +1277,7 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
                 let _ = ctx.db.exec("DELETE FROM kv WHERE k=?1", [format!("{k}.{id}")]);
             }
             ctx.log_event("agent_removed", Some(&id), &report);
+            crate::attention::refresh(ctx);
             ctx.emit("agents:changed", json!({ "id": id, "removed": true }));
             Ok(report)
         }
