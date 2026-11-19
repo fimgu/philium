@@ -95,3 +95,15 @@
 .sheet fieldset { border: 1px solid var(--line); border-radius: var(--radius-s); padding: 10px 12px; margin: 8px 0; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; min-width: 0; }
 .sheet legend { color: var(--text-faint); font-size: var(--fs-xs); padding: 0 6px; }
 .sheet [data-check] { margin: 8px 0; }
+
+/* The review plan: items in tiers, each with its state. */
+.sheet .mark .doing { background: var(--accent-dim); color: var(--accent); }
+.sheet .mark .todo { background: var(--surface-active); color: var(--text-faint); }
+.sheet .tier { display: inline-block; min-width: 26px; margin-right: 8px; padding: 0 5px; border-radius: 4px; font-size: 10px; font-weight: 600; text-align: center; color: var(--text-dim); background: var(--surface-active); vertical-align: 1px; }
+.sheet table.plan th { white-space: normal; width: 34%; }
+.sheet table.plan td { white-space: pre-wrap; overflow-wrap: anywhere; }
+.sheet form button[type="button"] { background: var(--accent); border-color: var(--accent); color: #0b0c0e; font-weight: 600; }
+.sheet form button:not([type]):not(.btn) { background: var(--surface-hover); border-color: var(--line-strong); color: var(--text); font-weight: 400; }
+
+.sheet .report { background: var(--bg-sunken); border: 1px solid var(--line); border-radius: var(--radius-s); padding: 6px 14px; user-select: text; }
+.sheet .report p, .sheet .report li, .sheet .report td { max-width: none; }

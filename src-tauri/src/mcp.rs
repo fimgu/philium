@@ -186,6 +186,11 @@ pub fn tool_list() -> Vec<Value> {
           json!({ "q": s, "limit": i }), &["q"]),
         t("memory_save", "Save for this repository only. Global writes are unavailable. Category: fact, preference, correction, entity.",
           json!({ "content": s, "category": s, "project": b }), &["content", "category"]),
+        t("review_plan", "Release review, orchestrator only: write the plan. Each item is {title, tier (0 = P0 ... 5 = P5), detail (what to verify and how)}. The items appear on the board and in Review.",
+          json!({ "items": { "type": "array", "items": { "type": "object" } } }), &["items"]),
+        t("review_result", "Release review: record the outcome of one item you checked. result is pass, fail or blocked. evidence is the exact commands you ran and what they showed, on which commit; for blocked, what you need.",
+          json!({ "task_id": s, "result": { "type": "string", "enum": ["pass", "fail", "blocked"] }, "evidence": s }), &["task_id", "result", "evidence"]),
+        t("review_report", "Release review, orchestrator: save the final report in Markdown, verdict first.", json!({ "markdown": s }), &["markdown"]),
         t("checks_propose", "Propose release checks for your checkout: facts that must be true in every release. Send {contracts:{schema?,cases:[...]}} once, when asked to draft checks. A person reviews and confirms them in Review; nothing counts before that.",
           json!({ "contracts": { "type": "object" } }), &["contracts"]),
         t("session_search", "Search Philium session metadata (agent, task, branch) bound to this repository ID. Raw conversations and imported histories are not included.",
@@ -423,6 +428,9 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
             result["files"] = json!({});
             Ok(result)
         }
+        "review_plan" => crate::review_run::plan(ctx, &me, &row, &a["items"]),
+        "review_result" => crate::review_run::result(ctx, agent, &me, &row, arg(&a, "task_id")?, arg(&a, "result")?, arg(&a, "evidence")?),
+        "review_report" => crate::review_run::report(ctx, &me, &row, arg(&a, "markdown")?),
         "checks_propose" => {
             let repo = row["repo_id"].as_str().filter(|id| !id.is_empty()).ok_or("Release checks belong to a registered checkout")?;
             crate::release_sql::propose(ctx, repo, &me, &a["contracts"])

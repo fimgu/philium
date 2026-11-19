@@ -29,6 +29,12 @@ pub fn init(ctx: &Arc<Ctx>) -> Result<(), String> {
         // Who the work was handed to. Unlike the lease, this survives a stop, a quit and a crash.
         "ALTER TABLE tasks ADD COLUMN assigned TEXT",
         "ALTER TABLE tasks ADD COLUMN assigned_agent_id TEXT",
+        // An item of a release review: which pull request, which tier, and what the agent found.
+        "ALTER TABLE tasks ADD COLUMN review_pr INTEGER",
+        "ALTER TABLE tasks ADD COLUMN review_gen INTEGER",
+        "ALTER TABLE tasks ADD COLUMN review_tier INTEGER",
+        "ALTER TABLE tasks ADD COLUMN review_result TEXT",
+        "ALTER TABLE tasks ADD COLUMN review_evidence TEXT",
     ] {
         if let Err(e) = ctx.db.exec(sql, []) {
             if !e.contains("duplicate column") {

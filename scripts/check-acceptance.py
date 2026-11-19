@@ -333,6 +333,28 @@ const pinned = await until(() => { const t = txt(setup.querySelector('[aria-labe
 return { before, started, by, proposed, toConfirm, pinned, redrawn, summary: txt(box.querySelector('[aria-label="Verification setup summary"]')), labels: Array.from(picker().options).map(txt), left: all('section[aria-label="Proposed checks"]', setup).length };
 '''
 
+ORCHESTRATE = r'''
+await workspace(P.checkout);
+await go('Review');
+const box = await until(() => all('details[aria-label="Release PR revisions"]')[0], 'release section', 15000);
+if (!box.open) box.querySelector('summary').click();
+const status = () => txt(all('p[role="status"]', box)[0]);
+type(box.querySelector('form input[type="url"]'), P.url);
+await click('Review with agents', box);
+const started = await until(() => (/is organising the review|Review not started|Not checked/.test(status()) ? status() : null), 'review started', 150000);
+const sec = await until(() => all('section[aria-label="Agent review"]', box)[0], 'agent review shown', 60000).catch(() => null);
+if (!sec) return { started };
+const rows = () => all('tr[data-item]', all('section[aria-label="Agent review"]', box)[0]);
+await until(() => rows().length >= 3, 'plan listed', 120000).catch(() => null);
+const planned = rows().map((tr) => [tr.dataset.tier, txt(tr.querySelector('th'))]);
+await until(() => rows().filter((tr) => tr.dataset.result).length >= 3 && all('details[aria-label="Review report"]', box).length, 'results and report', 180000).catch(() => null);
+const now = all('section[aria-label="Agent review"]', box)[0];
+return { started, planned, headline: txt(now.querySelector('h3')), progress: txt(now.querySelector('.verdict p')),
+  items: rows().map((tr) => [tr.dataset.tier, tr.dataset.result, txt(tr.querySelector('td:last-child')).slice(0, 150)]),
+  report: (now.querySelector('details[aria-label="Review report"] [data-report]')?.dataset.report || '').slice(0, 160), reportBy: txt(now.querySelector('details[aria-label="Review report"] summary')),
+  facts: txt(all('section[aria-label="Release decision"] h3', box)[0]) };
+'''
+
 DELEGATE_SLOW = AGENT + r'''
 await workspace(P.checkout);
 await openAgent(P.lead);
@@ -890,6 +912,15 @@ def main():
             run.check('C1', 'With no checks yet, an agent started from Review proposes them and they are listed in plain words', len(v.get('proposed') or []) == 2 and 'committed file' in ' '.join(v.get('proposed') or []) and 'Proposed by' in (v.get('by') or ''), {'started': v.get('started'), 'by': v.get('by'), 'proposed': v.get('proposed'), 'status': v.get('status'), 'error': r.get('error')})
             run.check('C1', 'The proposal counts only after the person accepts it and confirms the same checks', v.get('toConfirm') == v.get('proposed') and 'You confirmed its checks' in (v.get('pinned') or '') and 'No checks confirmed' in ((v.get('before') or {}).get('pinned') or '') and v.get('left') == 0, {'before': (v.get('before') or {}).get('pinned'), 'pinned': v.get('pinned'), 'left': v.get('left'), 'status': v.get('status'), 'alerts': v.get('alerts'), 'connected': v.get('connected'), 'redrawn': v.get('redrawn'), 'sections': v.get('sections'), 'buttons': v.get('buttons'), 'toasts': v.get('toasts')})
             run.check('C1', 'The checks are kept by Philium itself: no second checkout appears and the person names no folder', 'kept by Philium' in (v.get('pinned') or '') and 'kept by Philium' in (v.get('summary') or '') and sorted(v.get('labels') or []) == sorted(labels) and len(kept) == 1, {'summary': v.get('summary'), 'labels': v.get('labels'), 'kept': [str(k.relative_to(run.profile)) for k in kept]})
+
+        if want('review') or want('orchestrate'):
+            # The whole review from one action: paste the pull request, press once.
+            r = run.ui(ORCHESTRATE, {'checkout': 'gamma', 'url': 'https://github.com/philium-fixture/gamma/pull/7'}, 400)
+            v = run.value(r)
+            items = v.get('items') or []
+            run.check('C2', 'One action reviews a release: the facts are checked and an orchestrator writes a plan in tiers P0 to P5', 'is organising the review of #7' in (v.get('started') or '') and [t for t, _ in v.get('planned') or []] == ['0', '1', '4'] and bool(v.get('facts')), {'started': v.get('started'), 'planned': v.get('planned'), 'facts': v.get('facts'), 'error': r.get('error')})
+            run.check('C2', 'Each item is done by an agent and recorded as pass, fail or blocked with what it ran', [x[1] for x in items] == ['pass', 'pass', 'blocked'] and 'finch: Read view.json on the head commit' in ' '.join(x[2] for x in items) and 'Needs the previous notes' in ' '.join(x[2] for x in items), items)
+            run.check('C2', 'The items add up to a verdict in which P0 and P1 decide, and the orchestrator leaves a written report', 'passed' in (v.get('headline') or '') and '3 of 3 items have a result' in (v.get('progress') or '') and 'Verdict: ready for your sign-off' in (v.get('report') or '') and 'Report by' in (v.get('reportBy') or ''), {'headline': v.get('headline'), 'progress': v.get('progress'), 'report': v.get('report'), 'by': v.get('reportBy')})
 
     finally:
         model.shutdown()

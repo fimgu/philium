@@ -388,6 +388,31 @@ pub async fn call(ctx: &Ctx, method: &str, a: Value) -> Result<Value, String> {
     if !matches!((previous,current),(Ok(a),Ok(b)) if sha(&a)&&a==b){return Ok(full("Merge base changed or cannot be verified"));}
     Ok(json!({"mode":"followup","from":old,"to":head,"commits":delta["commits"],"reason":"Review the cumulative change and prior findings. Broaden to full review if scope changed. Required workflows still need current-head evidence."}))},
  "graph"=>{let seq=a["generation"].as_i64().ok_or("Select a recorded generation")?;let rows=ctx.db.query("SELECT base,head FROM release_refs WHERE repo=? AND origin=? AND seq=?",params![repo,o,seq])?;let row=rows.first().ok_or("Generation does not belong to this checkout")?;graph(Path::new(r[0]["path"].as_str().ok_or("Checkout unavailable")?),&o,row["base"].as_str().ok_or("Invalid base")?,row["head"].as_str().ok_or("Invalid head")?).await},
+ // A review led by an orchestrator. Starting one records which pull request it is about and
+ // returns what the orchestrator is told; the items it then plans are read back for the screen.
+ "review_start"|"review_items"=>{
+    let seq=a["generation"].as_i64().ok_or("Verify a pull request first")?;
+    let rows=ctx.db.query("SELECT pr,base,head FROM release_refs WHERE repo=? AND origin=? AND seq=?",params![repo,o,seq])?;
+    let row=rows.first().ok_or("Generation does not belong to this checkout")?;
+    let pr=row["pr"].as_i64().ok_or("Invalid pull request")?;
+    if method=="review_items"{return crate::review_run::items(ctx,&repo,pr,seq);}
+    let (base,head)=(row["base"].as_str().ok_or("Invalid base")?,row["head"].as_str().ok_or("Invalid head")?);
+    let mut facts:Vec<String>=Vec::new();
+    if let Ok(m)=Box::pin(call(ctx,"members",a.clone())).await{
+        let landed:Vec<String>=m["landed"].as_array().into_iter().flatten().filter_map(|p|p["pr"].as_i64()).map(|n|format!("#{n}")).collect();
+        if !landed.is_empty(){facts.push(format!("{} pull requests landed in it: {}.",landed.len(),landed.join(", ")));}
+        let nested:Vec<String>=m["edges"].as_array().into_iter().flatten().map(|e|format!("#{} contains #{}",e["outer"],e["inner"])).collect();
+        if !nested.is_empty(){facts.push(format!("Nested: {}.",nested.join(", ")));}
+    }
+    let merge=mergeable(Path::new(r[0]["path"].as_str().ok_or("Checkout unavailable")?),base,head).await;
+    match merge["state"].as_str(){
+        Some("conflicts")=>facts.push(format!("It does not merge onto the target as it is now: conflicts in {}.",merge["files"].as_array().into_iter().flatten().filter_map(Value::as_str).collect::<Vec<_>>().join(", "))),
+        Some("clean")=>facts.push("It merges onto the target without conflicts.".into()),
+        _=>{}
+    }
+    crate::review_run::start(ctx,&repo,pr,seq)?;
+    Ok(json!({"pr":pr,"brief":crate::review_run::brief(pr,base,head,&facts.join(" "))}))
+ },
  // Which landed pull requests change a file that a pinned check reads. It informs: a pull
  // request no check touches is named, and the verdict is not changed by it.
  "coverage"=>{

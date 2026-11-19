@@ -132,6 +132,31 @@ def brain(req):
         if '"id"' not in results[1]:
             return f'DELEGATION FAILED starting the worker: {one(results[1])}'
         return f'DELEGATED "{title}" to {worker}.'
+    # A release review: the orchestrator plans in tiers, hands one item to a helper, records the
+    # two others itself and writes the report. The helper records its own item.
+    if 'You are leading the review of release pull request' in last_user:
+        ids = re.findall(r'"id":\s*"([0-9a-f]+)"', results[0]) if results else []
+        if step == 0:
+            return {'tool': ('mcp_philium_review_plan', {'items': [
+                {'title': 'Migrations apply in order on an empty database', 'tier': 0, 'detail': 'Run the migration test against a fresh database.'},
+                {'title': 'The list shows the status column', 'tier': 1, 'detail': 'Read view.json on the head and confirm the column.'},
+                {'title': 'The notes mention the new column', 'tier': 4, 'detail': 'Read the README.'}]})}
+        if len(ids) < 3:
+            return f'REVIEW FAILED writing the plan: {one(results[0])}'
+        if step == 1:
+            return {'tool': ('mcp_philium_agent_spawn', {'name': 'finch', 'role': 'helper', 'task_id': ids[1], 'brief': f'REVIEW ITEM {ids[1]}: read view.json on the head and record the result with review_result.'})}
+        if step == 2:
+            return {'tool': ('mcp_philium_review_result', {'task_id': ids[0], 'result': 'pass', 'evidence': 'Ran the migration test on the head commit against an empty database: 3 passed, 0 failed.'})}
+        if step == 3:
+            return {'tool': ('mcp_philium_review_result', {'task_id': ids[2], 'result': 'blocked', 'evidence': 'The README could not be compared: there are no earlier release notes. Needs the previous notes.'})}
+        if step == 4:
+            return {'tool': ('mcp_philium_review_report', {'markdown': '# Review of the release\n\nVerdict: ready for your sign-off. P0 and P1 passed.\n\n| Tier | Item | Result |\n|---|---|---|\n| P0 | Migrations | pass |\n| P1 | Status column | pass |\n| P4 | Notes | blocked |\n\nNot checked: the notes, for lack of earlier release notes.'})}
+        return 'REVIEW ORGANISED ' + one(results[-1])
+    m = re.search(r'REVIEW ITEM ([0-9a-f]+):', last_user)
+    if m:
+        if step == 0:
+            return {'tool': ('mcp_philium_review_result', {'task_id': m.group(1), 'result': 'pass', 'evidence': 'Read view.json on the head commit: the column is status, as the item expects.'})}
+        return 'REVIEW ITEM DONE ' + one(results[0])
     if 'Draft release checks' in last_user:
         if step == 0:
             return {'tool': ('mcp_philium_checks_propose', {'contracts': {'cases': [
