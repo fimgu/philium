@@ -88,3 +88,6 @@
 .sheet p[data-fallback], .sheet p[data-generation] { max-width: none; }
 .sheet [aria-label="Checks confirmation"] { font-size: var(--fs-xs); color: var(--text-faint); margin: 2px 0 8px; }
 .sheet .why { font-size: var(--fs-xs); color: var(--text-faint); text-transform: uppercase; letter-spacing: 0.06em; margin: 12px 0 2px; }
+
+.sheet .informs { margin-left: 8px; padding: 0 6px; border-radius: 8px; font-size: 10px; font-weight: 500; color: var(--text-faint); border: 1px solid var(--line-strong); vertical-align: 1px; }
+.sheet tr[data-informs="yes"] th { color: var(--text-dim); }

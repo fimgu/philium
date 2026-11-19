@@ -163,6 +163,7 @@ async fn reviewed_disposable_change() {
             Some(membership.clone()),
             receipt,
             None,
+            json!({"state":"clean"}),
         )
         .unwrap()
     };

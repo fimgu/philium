@@ -231,6 +231,74 @@ pub(crate) async fn graph(
     }
     Ok(json!({"merge_base":ancestor,"target":base,"head":head,"commits":commits}))
 }
+/// Would this head merge onto the target as it is now? Asked of Git itself, locally. The trees
+/// Git computes on the way go to a throwaway object folder, never into the checkout.
+pub(crate) async fn mergeable(path: &Path, base: &str, head: &str) -> Value {
+    use tokio::io::AsyncReadExt;
+    let unknown = |why: &str| json!({"state":"unknown","detail":why});
+    if !sha(base) || !sha(head) {
+        return unknown("Revisions not pinned");
+    }
+    let Ok(objects) = local_git(path, &["rev-parse", "--path-format=absolute", "--git-path", "objects"]).await else {
+        return unknown("Checkout unavailable");
+    };
+    let scratch = std::env::temp_dir().join(format!("philium-merge-{}-{}", std::process::id(), crate::db::now()));
+    if std::fs::create_dir_all(&scratch).is_err() {
+        return unknown("No scratch folder");
+    }
+    let trial = async {
+        let mut child = tokio::process::Command::new("/usr/bin/git")
+            .current_dir(path)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", "/var/empty")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .env("GIT_ALLOW_PROTOCOL", "")
+            .env("GIT_NO_REPLACE_OBJECTS", "1")
+            .env("GIT_GRAFT_FILE", "/dev/null")
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .env("GIT_OBJECT_DIRECTORY", &scratch)
+            .env("GIT_ALTERNATE_OBJECT_DIRECTORIES", &objects)
+            .args(["--no-pager", "-c", "core.commitGraph=false", "merge-tree", "--write-tree", "--name-only", "--no-messages", base, head])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .ok()?;
+        let mut buf = Vec::new();
+        child.stdout.take()?.take(262_145).read_to_end(&mut buf).await.ok()?;
+        let status = child.wait().await.ok()?;
+        Some((status.code(), String::from_utf8_lossy(&buf).into_owned()))
+    };
+    let out = tokio::time::timeout(Duration::from_secs(30), trial).await;
+    let _ = std::fs::remove_dir_all(&scratch);
+    match out {
+        Ok(Some((Some(0), _))) => json!({"state":"clean"}),
+        // Exit 1: the first line is the tree, the rest are the files in conflict.
+        Ok(Some((Some(1), text))) => {
+            let mut lines = text.lines();
+            // Git also exits 1 when it cannot read a revision. Only a tree followed by file
+            // names is a conflict.
+            if !lines.next().is_some_and(|l| sha(l.trim())) {
+                return unknown("Git could not compute the merge");
+            }
+            let mut files: Vec<&str> = lines.map(str::trim).filter(|l| !l.is_empty()).collect();
+            files.dedup();
+            if files.is_empty() {
+                return unknown("Git reported a conflict without naming a file");
+            }
+            json!({"state":"conflicts","count":files.len(),"files":files.iter().take(20).collect::<Vec<_>>()})
+        }
+        _ => unknown("Git could not compute the merge"),
+    }
+}
+/// The files a pull request changed that a pinned check reads.
+fn touched(changed: &[&str], read: &[String]) -> Vec<String> {
+    read.iter().filter(|f| changed.contains(&f.as_str())).cloned().collect()
+}
 pub async fn call(ctx: &Ctx, method: &str, a: Value) -> Result<Value, String> {
     let repo = arg_str(&a, "repo_id")?;
     let r = ctx
@@ -320,6 +388,26 @@ pub async fn call(ctx: &Ctx, method: &str, a: Value) -> Result<Value, String> {
     if !matches!((previous,current),(Ok(a),Ok(b)) if sha(&a)&&a==b){return Ok(full("Merge base changed or cannot be verified"));}
     Ok(json!({"mode":"followup","from":old,"to":head,"commits":delta["commits"],"reason":"Review the cumulative change and prior findings. Broaden to full review if scope changed. Required workflows still need current-head evidence."}))},
  "graph"=>{let seq=a["generation"].as_i64().ok_or("Select a recorded generation")?;let rows=ctx.db.query("SELECT base,head FROM release_refs WHERE repo=? AND origin=? AND seq=?",params![repo,o,seq])?;let row=rows.first().ok_or("Generation does not belong to this checkout")?;graph(Path::new(r[0]["path"].as_str().ok_or("Checkout unavailable")?),&o,row["base"].as_str().ok_or("Invalid base")?,row["head"].as_str().ok_or("Invalid head")?).await},
+ // Which landed pull requests change a file that a pinned check reads. It informs: a pull
+ // request no check touches is named, and the verdict is not changed by it.
+ "coverage"=>{
+    let members=Box::pin(call(ctx,"members",a.clone())).await?;
+    let profile=Box::pin(call(ctx,"sql_profile",a.clone())).await?;
+    let read:Vec<String>=profile["checks"]["files"].as_array().into_iter().flatten().filter_map(|f|f.as_str().map(str::to_owned)).collect();
+    let path=Path::new(r[0]["path"].as_str().ok_or("Checkout unavailable")?);
+    let mut prs=Vec::new();
+    for p in members["landed"].as_array().into_iter().flatten().take(100){
+        let oid=p["oid"].as_str().filter(|o|sha(o)).ok_or("Invalid landed revision")?;
+        let line=local_git(path,&["rev-list","--parents","-n","1",oid,"--"]).await?;
+        let Some(first)=line.split_ascii_whitespace().nth(1).filter(|o|sha(o)) else{continue};
+        let names=local_git_limited(path,&["diff","--name-only","--no-renames",first,oid,"--"],false,1_048_576).await?;
+        let changed:Vec<&str>=names.lines().collect();
+        prs.push(json!({"pr":p["pr"],"files":changed.len(),"read":touched(&changed,&read)}));
+    }
+    let untouched:Vec<Value>=prs.iter().filter(|p|p["read"].as_array().is_some_and(|x|x.is_empty())).map(|p|p["pr"].clone()).collect();
+    Ok(json!({"check_files":read.len(),"prs":prs,"untouched":untouched}))
+ },
+ "mergeable"=>{let seq=a["generation"].as_i64().ok_or("Select a recorded generation")?;let rows=ctx.db.query("SELECT base,head FROM release_refs WHERE repo=? AND origin=? AND seq=?",params![repo,o,seq])?;let row=rows.first().ok_or("Generation does not belong to this checkout")?;Ok(mergeable(Path::new(r[0]["path"].as_str().ok_or("Checkout unavailable")?),row["base"].as_str().ok_or("Invalid base")?,row["head"].as_str().ok_or("Invalid head")?).await)},
  "history"=>Ok(json!(ctx.db.query("SELECT seq,pr,base,head,observed FROM release_refs WHERE repo=? AND origin=? ORDER BY seq DESC LIMIT 30",params![repo,o])?)),
  "resolve"=>{let n=target(&arg_str(&a,"url")?,&o)?;let _g=FETCH.try_lock().map_err(|_|"Another origin lookup is in progress")?;
  if let Some(v)=github_public(&format!("{o}/pulls/{n}")).await{if v["base"]["repo"]["full_name"].as_str().is_some_and(|s|s.eq_ignore_ascii_case(&o)){return record(&ctx.db,&repo,&o,n,&json!({"number":v["number"],"url":v["html_url"],"baseRefOid":v["base"]["sha"],"headRefOid":v["head"]["sha"]}));}}
@@ -332,6 +420,47 @@ pub async fn call(ctx: &Ctx, method: &str, a: Value) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// The trial merge names the files in conflict, says "unknown" when it cannot tell, and
+    /// leaves the checkout's own object store exactly as it was.
+    #[tokio::test]
+    async fn a_trial_merge_names_conflicts_without_writing_into_the_checkout() {
+        let dir = std::env::temp_dir().join(format!("philium-mergeable-{}-{}", std::process::id(), crate::db::now()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |a: &[&str]| crate::workspace::git(&dir, a).unwrap();
+        let commit = |m: &str| {
+            git(&["add", "."]);
+            git(&["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgsign=false", "commit", "-qm", m]);
+            git(&["rev-parse", "HEAD"]).trim().to_string()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        std::fs::write(dir.join("b.txt"), "one\n").unwrap();
+        let root = commit("root");
+        std::fs::write(dir.join("a.txt"), "target\n").unwrap();
+        let target = commit("target");
+        git(&["checkout", "-q", "-b", "side", &root]);
+        std::fs::write(dir.join("b.txt"), "side\n").unwrap();
+        let clean_head = commit("side changes b");
+        std::fs::write(dir.join("a.txt"), "side\n").unwrap();
+        let conflict_head = commit("side changes a");
+        let objects = || git(&["count-objects", "-v"]);
+        let before = objects();
+        assert_eq!(mergeable(&dir, &target, &clean_head).await["state"], "clean");
+        let c = mergeable(&dir, &target, &conflict_head).await;
+        assert_eq!((c["state"].as_str(), c["count"].as_u64()), (Some("conflicts"), Some(1)), "{c}");
+        assert_eq!(c["files"], json!(["a.txt"]));
+        assert_eq!(mergeable(&dir, &target, "not-a-revision").await["state"], "unknown");
+        assert_eq!(mergeable(&dir, &target, &"f".repeat(40)).await["state"], "unknown");
+        assert_eq!(objects(), before, "nothing was written into the checkout");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn a_pull_request_is_covered_only_by_a_check_that_reads_what_it_changed() {
+        let read = vec!["docs/manifest.json".to_string(), "migrations/62.sql".to_string()];
+        assert_eq!(touched(&["migrations/62.sql", "cmd/main.go"], &read), ["migrations/62.sql"]);
+        assert!(touched(&["helm/values.yaml", "docs/manifest.json.bak"], &read).is_empty());
+        assert!(touched(&[], &read).is_empty());
+    }
     #[test]
     fn generations_and_scope() {
         let db = Db::memory();

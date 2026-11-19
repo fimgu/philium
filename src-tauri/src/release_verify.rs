@@ -22,6 +22,7 @@ pub async fn run(ctx: &Ctx, repo: &str, url: &str) -> Result<Value, String> {
         }
     };
     let last = release_intake::call(ctx, "resolve", req).await.ok();
+    let mergeable = release_intake::call(ctx, "mergeable", a.clone()).await.unwrap_or_else(|_| json!({"state":"unknown"}));
     let reason = match (reason, membership_error) {
         (existing, Some(error)) => Some(format!(
             "{}Membership discovery: {error}",
@@ -29,7 +30,7 @@ pub async fn run(ctx: &Ctx, repo: &str, url: &str) -> Result<Value, String> {
         )),
         (existing, None) => existing,
     };
-    finish(ctx, repo, first, last, members, receipt, reason)
+    finish(ctx, repo, first, last, members, receipt, reason, mergeable)
 }
 
 fn finish(
@@ -40,6 +41,7 @@ fn finish(
     members: Option<Value>,
     receipt: Value,
     reason: Option<String>,
+    mergeable: Value,
 ) -> Result<Value, String> {
     let current = last.as_ref().map(|v| {
         v["generation"] == first["generation"]
@@ -75,14 +77,27 @@ fn finish(
                 && m["ambiguous"] == 0
                 && receipt["review_scope_verified"] == true
                 // Nothing counts as ready until the person confirmed these exact checks by pinning.
-                && receipt["checks_confirmed_ms"].as_i64().is_some() =>
+                && receipt["checks_confirmed_ms"].as_i64().is_some()
+                // A head that cannot merge onto the target as it is now has to change first.
+                && mergeable["state"] == "clean" =>
         {
             "ready_for_reviewed_scope"
         }
         _ => "incomplete",
     };
-    let why = explain(current, last.as_ref(), m, &receipt, reason.as_deref());
-    let v = json!({"pr":first["pr"],"generation":first["generation"],"head":first["head"],"base":first["base"],"artifact":receipt["artifact"],"checked_ms":crate::db::now(),"origin_current":current,"decision":decision,"contract_decision":outcome,"membership":members,"receipt":receipt,"reason":reason,"why":why});
+    let mut why = explain(current, last.as_ref(), m, &receipt, reason.as_deref());
+    match mergeable["state"].as_str() {
+        Some("clean") => {}
+        Some("conflicts") => {
+            let files: Vec<&str> = mergeable["files"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+            let n = mergeable["count"].as_u64().unwrap_or(files.len() as u64);
+            let shown = files.iter().take(4).copied().collect::<Vec<_>>().join(", ");
+            let more = if n as usize > files.len().min(4) { format!(" and {} more", n as usize - files.len().min(4)) } else { String::new() };
+            why.push(format!("Does not merge onto the target as it is now: conflicts in {shown}{more}. The head has to change, and a new head starts a new verification."));
+        }
+        _ => why.push("Whether this head merges onto the target could not be established locally.".into()),
+    }
+    let v = json!({"pr":first["pr"],"generation":first["generation"],"head":first["head"],"base":first["base"],"artifact":receipt["artifact"],"checked_ms":crate::db::now(),"origin_current":current,"decision":decision,"contract_decision":outcome,"membership":members,"receipt":receipt,"reason":reason,"why":why,"mergeable":mergeable});
     ctx.db.with(|c|c.execute_batch("CREATE TABLE IF NOT EXISTS release_decisions(repo TEXT NOT NULL REFERENCES repos(id) ON DELETE CASCADE,seq INTEGER NOT NULL REFERENCES release_refs(seq),summary TEXT NOT NULL,PRIMARY KEY(repo,seq))"))?;
     ctx.db.exec(
         "INSERT OR REPLACE INTO release_decisions(repo,seq,summary) VALUES(?,?,?)",

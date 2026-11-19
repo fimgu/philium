@@ -478,7 +478,8 @@ const read = () => {
     landed: txt(all('section[aria-label="Landed pull requests"]', box)[0]),
     included: txt(all('details[aria-label="Included commits"] summary', box)[0]),
     history: all('p[data-generation]', box).map((p) => txt(p).slice(0, 26)),
-    table: d ? all('table[aria-label="Release readiness"] tr', d).map((tr) => [tr.dataset.row, tr.dataset.state]) : [],
+    table: d ? all('table[aria-label="Release readiness"] tr', d).filter((tr) => tr.dataset.informs !== 'yes').map((tr) => [tr.dataset.row, tr.dataset.state]) : [],
+    informing: d ? all('table[aria-label="Release readiness"] tr', d).filter((tr) => tr.dataset.informs === 'yes').map((tr) => [tr.dataset.row, tr.dataset.state, txt(tr.querySelector('td:last-child'))]) : [],
     summary: d ? (d.querySelector('details[aria-label="Summary to paste"] pre')?.textContent || '') : '',
   };
 };
@@ -650,6 +651,7 @@ def main():
             w = why(d)
             run.check('C3', 'The decision is Do not ship and gives one plain reason per cause', d.get('headline') == 'Do not ship' and all(x in w for x in ['child-change: regression inside this release', 'fails the same way on its own', 'merge-result: merge-only regression', 'old-defect: already failing on the target', 'never-observed: missing evidence']) and all(n in w.split(' | ')[0] for n in ['#30', '#31']) and '#3' not in w.split(' | ')[1], w[:500] or d.get('status'))
             run.check('C3', 'The decision is laid out as a table: the failing checks row is red, and the pasteable summary says so without calling anything unknown a pass', dict(d.get('table') or []).get('checks') == 'bad' and dict(d.get('table') or []).get('candidate') == 'ok' and '| FAIL | Checks on this commit' in (d.get('summary') or '') and 'Unknown is not a pass' in (d.get('summary') or ''), {'table': d.get('table'), 'summary': (d.get('summary') or '')[:160]})
+            run.check('C3', 'Beside the verdict the table says how many landed pull requests a pinned check reads, as information only', [x[0] for x in d.get('informing') or []] == ['coverage'] and 'landed pull request' in (d.get('informing') or [['', '', '']])[0][2] and dict(d.get('table') or []).get('merge') == 'ok', d.get('informing'))
 
             # ---- reopen: setup persists; a new head starts without a verdict ------------------
             syn.Origin.repos[A]['prs'][40]['heads'] = [g['fixed']]
@@ -704,7 +706,7 @@ def main():
             d = v.get('verified') or {}
             ready_gen = (d.get('ids') or {}).get('Generation')
             run.check('C5', 'Reviewed scope with independent evidence: Ready for the reviewed scope, tied to head and artifact', d.get('headline') == 'Ready for the reviewed scope' and (d.get('ids') or {}).get('Head') == g_head and (d.get('ids') or {}).get('Artifact') == artifact and 'Nothing stands in the way' in why(d) and 'unchanged' in (d.get('ids') or {}).get('Origin', ''), {'headline': d.get('headline'), 'ids': d.get('ids'), 'why': why(d)[:200]})
-            run.check('C5', 'When the verdict is Ready every row of the table is green', [st for _, st in d.get('table') or []] == ['ok'] * 7, d.get('table'))
+            run.check('C5', 'When the verdict is Ready every row of the table is green', [st for _, st in d.get('table') or []] == ['ok'] * 8, d.get('table'))
             syn.write(ver_g, {'philium/evidence/view.json': evidence['view'].replace('twice', 'once')}); syn.commit_all(ver_g, 'altered')
             d = verify('gamma', pr_g).get('verified') or {}
             run.check('C6', 'Altered evidence: not ready, and the altered file is named', d.get('headline') == 'Release verification incomplete' and 'view (altered: the file no longer matches its recorded hash)' in why(d), why(d)[:260])

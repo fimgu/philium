@@ -15,11 +15,15 @@ export const HEADLINE = {
 export const tone = (decision) =>
   ({ ready_for_reviewed_scope: "ok", not_ready: "bad", superseded: "old", incomplete: "unknown" })[decision] || "unknown";
 
-/** d: a release decision with its receipt. m: origin membership for the same generation, or null. */
-export function readiness(d, m) {
+/**
+ * d: a release decision with its receipt. m: origin membership for the same generation, or null.
+ * cov: which landed pull requests a pinned check reads, or null. Rows marked `informs` do not
+ * change the verdict; they say what the verdict does not cover.
+ */
+export function readiness(d, m, cov) {
   const r = d?.receipt || {};
   const rows = [];
-  const add = (id, label, state, detail) => rows.push({ id, label, state, detail });
+  const add = (id, label, state, detail, informs = false) => rows.push({ id, label, state, detail, informs });
 
   // 1. Is this still the revision the origin has?
   const moved = d.decision === "superseded" || d.origin_current === false;
@@ -34,7 +38,14 @@ export function readiness(d, m) {
       `${count(m.landed?.length || 0, "pull request")} landed, ${m.edges?.length || 0} nested.${gaps ? ` ${count(m.missing || 0, "lookup")} missing, ${m.ambiguous || 0} ambiguous.` : ""}${m.unmapped ? ` ${count(m.unmapped, "commit")} not tied to a pull request.` : ""}`);
   }
 
-  // 3. The pinned checks on this commit.
+  // 3. Does it merge onto the target as the target is now?
+  const merge = d.mergeable?.state;
+  add("merge", "Merges onto the target", merge === "clean" ? "ok" : merge === "conflicts" ? "bad" : "unknown",
+    merge === "clean" ? "No conflicts with the target as it is now."
+      : merge === "conflicts" ? `Conflicts in ${count(d.mergeable.count ?? d.mergeable.files?.length ?? 0, "file")}: ${(d.mergeable.files || []).slice(0, 6).join(", ")}${(d.mergeable.count || 0) > 6 ? ", ..." : ""}. The head has to change first.`
+        : "Not established locally.");
+
+  // 4. The pinned checks on this commit.
   const cases = r.cases || [];
   const pass = cases.filter((c) => c.state === "candidate_pass").length;
   const broke = cases.filter((c) => REGRESSION.includes(c.state));
@@ -46,7 +57,14 @@ export function readiness(d, m) {
     !cases.length ? "No checks were run. Pin a verifier for this checkout first."
       : `${pass} of ${cases.length} pass.${broke.length ? ` Failing here: ${broke.map((c) => c.id).join(", ")}.` : ""}${suspects.length ? ` Fails the same way on its own: ${suspects.map((n) => `#${n}`).join(", ")}.` : ""}${old ? ` ${old} already failing on the target, not introduced by this release.` : ""}${blind ? ` ${blind} could not be observed.` : ""}`);
 
-  // 4. Is the running product this build? Before and after the checks, on every place observed.
+  // How much of the release the pinned checks look at. Informing only.
+  if (cov?.prs?.length) {
+    const none = cov.untouched || [];
+    add("coverage", "Every pull request has a check", none.length ? "unknown" : "ok",
+      `${cov.prs.length - none.length} of ${count(cov.prs.length, "landed pull request")} change a file that a pinned check reads.${none.length ? ` No check reads anything changed by ${none.slice(0, 12).map((n) => `#${n}`).join(", ")}${none.length > 12 ? ", ..." : ""}.` : ""}`, true);
+  }
+
+  // 5. Is the running product this build? Before and after the checks, on every place observed.
   const seen = [];
   if (r.observer_configured || r.deployment_identity) seen.push(["local observer", r.deployment_identity?.state, r.deployment_after?.state]);
   for (const t of r.targets || []) seen.push([t.name, t.identity_before?.state, t.identity_after?.state]);
@@ -59,7 +77,7 @@ export function readiness(d, m) {
         : running === "ok" ? `Same revision and artifact before and after the checks on: ${seen.map(([n]) => n).join(", ")}.`
           : `Not established on: ${seen.filter(([, b, a]) => b !== "match" || a !== "match").map(([n]) => n).join(", ")}.`);
 
-  // 5. Checks against the running product. They count only while row 4 is green.
+  // 6. Checks against the running product. They count only while the row above is green.
   const live = r.live_cases || [];
   const liveBad = live.filter((c) => c.state === "mismatch");
   const liveOk = live.filter((c) => c.state === "pass").length;
@@ -68,7 +86,7 @@ export function readiness(d, m) {
     !live.length ? "No running-product checks are pinned."
       : `${liveOk} of ${live.length} match.${liveBad.length ? ` Differs: ${liveBad.map((c) => c.id).join(", ")}.` : ""}${liveOk === live.length && running !== "ok" ? " Not counted: the running build is not confirmed." : ""}`);
 
-  // 6. Independent build record and review for this exact head.
+  // 7. Independent build record and review for this exact head.
   const evidence = Object.values(r.evidence_status || {});
   const tampered = evidence.filter((s) => s === "altered" || s === "invalid").length;
   const reviewed = r.review_attestation && typeof r.review_attestation === "object" && !r.review_attestation.error;
@@ -78,7 +96,7 @@ export function readiness(d, m) {
       : record === "ok" ? `Artifact ${short(d.artifact)} and a review are recorded for this head; ${count(evidence.length, "piece")} of evidence verified.`
         : !d.artifact ? "No independent artifact record for this exact head." : !reviewed ? "No recorded review for this exact head." : "Some evidence is missing or belongs to another head.");
 
-  // 7. Did the owner read and confirm the checks that were run?
+  // 8. Did the owner read and confirm the checks that were run?
   add("confirmed", "Checks confirmed by you", r.checks_confirmed_ms ? "ok" : "unknown",
     r.checks_confirmed_ms ? `Confirmed ${new Date(r.checks_confirmed_ms).toISOString().slice(0, 16).replace("T", " ")} UTC.` : "You have not read and pinned the checks that ran.");
   return rows;
@@ -95,7 +113,7 @@ export function summaryMarkdown(d, rows) {
     "",
     "| Result | Question | Detail |",
     "|---|---|---|",
-    ...rows.map((r) => `| ${mark[r.state]} | ${cell(r.label)} | ${cell(r.detail)} |`),
+    ...rows.map((r) => `| ${mark[r.state]}${r.informs ? " (informs)" : ""} | ${cell(r.label)} | ${cell(r.detail)} |`),
     "",
     ...(d.why?.length ? ["Why it is not ready:", ...d.why.map((w) => `- ${cell(w)}`), ""] : []),
     "Unknown is not a pass. Computed locally by Philium for this exact revision. This is not a GitHub approval.",

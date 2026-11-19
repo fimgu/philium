@@ -111,7 +111,12 @@ fn preview(v: &Value) -> Value {
         let identity = if t["identity"].is_object() { json!({"what":line(&t["identity"]),"revision":t["identity"]["revision"],"digest":t["identity"]["digest"]}) } else { Value::Null };
         json!({"name":t["name"],"identity":identity,"cases":checks})
     }).collect();
-    json!({"cases":cases,"live_cases":live,"targets":targets,"programs":crate::release_command::programs(v),"release_records":v["release_records"]==true})
+    // The committed files these checks read: each document, and the schema behind the SQL checks.
+    let mut files: BTreeSet<String> = v["cases"].as_array().into_iter().flatten().filter_map(|c| c["document"].as_str().map(str::to_owned)).collect();
+    if v["cases"].as_array().into_iter().flatten().any(|c| c["document"].is_null()) {
+        files.extend(v["schema"].as_str().map(str::to_owned));
+    }
+    json!({"cases":cases,"live_cases":live,"targets":targets,"programs":crate::release_command::programs(v),"release_records":v["release_records"]==true,"files":files})
 }
 fn observe(schema: &str, c: &Value) -> Option<String> {
     let mut db = Connection::open_in_memory().ok()?;

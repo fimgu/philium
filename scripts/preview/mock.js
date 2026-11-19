@@ -17,6 +17,7 @@
     checks_confirmed_ms: now - 3600e3, release_decision: 'observed', artifact: full ? 'sha256:9f2c41d0aa7b' : null,
   };
   const decision = { pr: 5542, generation: 2, head: H, base: B, artifact: receipt.artifact, checked_ms: now - 120e3, origin_current: true,
+    mergeable: state === 'bad' ? { state: 'conflicts', count: 4, files: ['example-repo-app/cli/cmd/main.go', 'example-repo-app/cli/cmd/cli/connect.go', 'example-repo-app/cli/cmd/plugins_test.go', 'example-repo-app/internal/entrypoint/background.go'] } : { state: 'clean' },
     decision: { ready: 'ready_for_reviewed_scope', bad: 'not_ready', incomplete: 'incomplete' }[state], contract_decision: state === 'bad' ? 'regression_in_release' : 'no_regression', receipt,
     why: state === 'ready' ? [] : state === 'bad'
       ? ['github-app-permissions fails on this head and passes on the target: a regression inside this release. Landed #5531 fails the same way on its own.']
@@ -34,6 +35,7 @@
     'release_intake.verify_url': decision, 'release_intake.decision': decision, 'release_intake.sql_receipt': receipt,
     'release_intake.graph': { head: H, target: B, merge_base: B, commits: Array.from({ length: 6 }, (_, i) => ({ oid: (i + 10).toString(16).repeat(20), parents: i % 3 ? ['x'] : ['x', 'y'] })) },
     'release_intake.followup': { mode: 'full', reason: 'No code review is recorded for this pull request yet.', commits: [] },
+    'release_intake.coverage': { check_files: 3, prs: [5519, 5523, 5527, 5531, 5536, 5540].map((pr, i) => ({ pr, files: 12 + i * 9, read: i < 2 ? ['docs/github-app-manifest.json'] : [] })), untouched: state === 'ready' ? [] : [5527, 5531, 5536, 5540] },
     'release_intake.members': { landed: [5519, 5523, 5527, 5531, 5536, 5540].map((pr, i) => ({ pr, oid: (i + 3).toString(16).repeat(40) })), edges: [{ outer: 5536, inner: 5527 }], missing: 0, unmapped: 1, ambiguous: 0 },
     'workspace.overview': { resources: [{ kind: 'worktree', handle: '~/Philium Pilot/workspace/worktrees/example-repo/lead-1a2b3c', state: 'live', agent_name: 'lead' }, { kind: 'port_block', handle: '41000-41019', state: 'live', agent_name: 'scribe' }], tasks: [], agents: [] },
     'environments.profiles': ['default'],
