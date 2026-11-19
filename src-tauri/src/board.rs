@@ -47,6 +47,7 @@ pub fn init(ctx: &Arc<Ctx>) -> Result<(), String> {
         }
     }
     ctx.db.with(|c| c.execute_batch("CREATE TABLE IF NOT EXISTS task_events(id INTEGER PRIMARY KEY AUTOINCREMENT,task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,actor TEXT NOT NULL,kind TEXT NOT NULL,body TEXT NOT NULL,created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS mail_reads(message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,agent TEXT NOT NULL,read_at INTEGER NOT NULL,PRIMARY KEY(message_id,agent)); UPDATE tasks SET status='open' WHERE status='todo';"))?;
+    crate::review_run::tidy(ctx)?;
     // No agent process survives a restart. Their claims reopen now instead of looking owned
     // until a lease runs out; the assignment stays, so the board still shows whose work it was.
     for t in ctx.db.query("SELECT id,owner FROM tasks WHERE status='claimed' AND owner_agent_id IS NOT NULL", [])? {
@@ -479,6 +480,16 @@ fn submit_inner(
     )?;
     changed(ctx);
     get(ctx, id)
+}
+/// A release review item whose pass or fail is recorded is finished. The outcome is the work and
+/// the person reads it in Review, so it does not wait on the board for acceptance.
+pub fn close_checked(ctx: &Arc<Ctx>, actor: &str, id: &str, outcome: &str) -> Result<(), String> {
+    let _lock = WRITE.lk();
+    ctx.db.exec("UPDATE tasks SET status='done',lease_expires_at=NULL,updated_at=?2 WHERE id=?1 AND status!='cancelled'", rusqlite::params![id, now()])?;
+    ctx.db.exec("DELETE FROM leases WHERE kind='task' AND key=?1", [id])?;
+    event(ctx, id, actor, "checked", &json!({ "result": outcome }))?;
+    changed(ctx);
+    Ok(())
 }
 pub fn release_agent(ctx: &Arc<Ctx>, agent_id: &str) {
     let _lock = WRITE.lk();

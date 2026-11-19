@@ -58,6 +58,23 @@ pub fn start(ctx: &Ctx, repo: &str, pr: i64, generation: i64) -> Result<(), Stri
     Ok(())
 }
 
+/// On start, bring the board in line with the reviews: an item with a pass or a fail is finished,
+/// and an unchecked item left from an earlier run of the review now in progress is cancelled.
+/// Earlier versions left both open.
+pub fn tidy(ctx: &Ctx) -> Result<(), String> {
+    ctx.db.exec("DELETE FROM leases WHERE kind='task' AND key IN (SELECT id FROM tasks WHERE review_pr IS NOT NULL AND review_result IN ('pass','fail') AND status NOT IN ('done','cancelled'))", [])?;
+    ctx.db.exec("UPDATE tasks SET status='done',lease_expires_at=NULL WHERE review_pr IS NOT NULL AND review_result IN ('pass','fail') AND status NOT IN ('done','cancelled')", [])?;
+    for r in ctx.db.query("SELECT substr(k,12) AS repo, v FROM kv WHERE k LIKE 'review.run.%'", [])? {
+        let (Some(repo), Some(run)) = (r["repo"].as_str(), r["v"].as_str().and_then(|v| serde_json::from_str::<Value>(v).ok())) else { continue };
+        let (Some(gen), Some(started)) = (run["generation"].as_i64(), run["started"].as_i64()) else { continue };
+        ctx.db.exec(
+            "UPDATE tasks SET status='cancelled' WHERE repo_id=?1 AND review_gen=?2 AND review_result IS NULL AND created_at<?3 AND status!='cancelled'",
+            params![repo, gen, started],
+        )?;
+    }
+    Ok(())
+}
+
 fn repo_of(row: &Value) -> Result<&str, String> {
     row["repo_id"].as_str().filter(|id| !id.is_empty()).ok_or_else(|| "A release review belongs to a registered checkout".to_string())
 }
@@ -124,8 +141,13 @@ pub fn result(ctx: &Arc<Ctx>, agent_id: &str, me: &str, row: &Value, task_id: &s
         return Err("Record the outcome of the item you were given, or let the orchestrator record it".into());
     }
     ctx.db.exec("UPDATE tasks SET review_result=?1, review_evidence=?2, review_origin=?3, review_severity=?4, updated_at=?5 WHERE id=?6", params![outcome, format!("{me}: {evidence}"), origin, severity, now(), task_id])?;
-    // Hand the item in when this agent holds it, so the board shows it done by its owner.
-    let handed_in = board::submit(ctx, agent_id, task_id, &format!("{}: {evidence}", outcome.to_uppercase()), None).is_ok();
+    // A pass or a fail finishes the item on the board. A blocked item is handed in when this agent
+    // holds it, so it waits in review for the person.
+    let handed_in = if outcome == "blocked" {
+        board::submit(ctx, agent_id, task_id, &format!("BLOCKED: {evidence}"), None).is_ok()
+    } else {
+        board::close_checked(ctx, agent_id, task_id, &outcome).is_ok()
+    };
     ctx.emit("release:review", json!({ "repo_id": repo }));
     Ok(json!({"recorded": outcome, "severity": severity.map(|s| format!("P{s}")), "origin": origin, "handed_in": handed_in}))
 }
@@ -225,6 +247,26 @@ mod tests {
         // A pass carries no origin and no severity, whatever is sent.
         let r = result(&ctx, "x", "lead", &lead, id, "pass", Some(0), Some("introduced"), ran).unwrap();
         assert_eq!((r["origin"].clone(), r["severity"].clone()), (Value::Null, Value::Null));
+    }
+
+    #[test]
+    fn a_checked_item_is_finished_on_the_board_and_leftovers_are_tidied_on_start() {
+        let ctx = Ctx::test();
+        board::init(&ctx).unwrap();
+        ctx.db.exec("INSERT INTO repos(id,name,path,default_branch,added_at) VALUES('r','r','/nonexistent','main',0)", []).unwrap();
+        let lead = json!({"repo_id": "r", "role": "orchestrator"});
+        start(&ctx, "r", 7, 1).unwrap();
+        let p = plan(&ctx, "lead", &lead, &json!([{"title": "Merges", "detail": "Merge onto the target."}, {"title": "Staging", "detail": "Try it on staging."}, {"title": "Docs", "detail": "Read the notes."}])).unwrap();
+        let id = |i: usize| p["items"][i]["id"].as_str().unwrap().to_string();
+        let status = |id: &str| ctx.db.query("SELECT status FROM tasks WHERE id=?1", [id]).unwrap()[0]["status"].as_str().unwrap().to_string();
+        result(&ctx, "x", "lead", &lead, &id(0), "pass", None, None, "git merge-tree on the head: no conflicts.").unwrap();
+        result(&ctx, "x", "lead", &lead, &id(1), "blocked", None, None, "Needs a sign-in to the staging cluster.").unwrap();
+        assert_eq!((status(&id(0)), status(&id(1)), status(&id(2))), ("done".into(), "open".into(), "open".into()));
+        // An earlier version left the checked item open; the run then started again.
+        ctx.db.exec("UPDATE tasks SET status='open'", []).unwrap();
+        ctx.db.exec("UPDATE tasks SET created_at=created_at-60000", []).unwrap();
+        tidy(&ctx).unwrap();
+        assert_eq!((status(&id(0)), status(&id(1)), status(&id(2))), ("done".into(), "open".into(), "cancelled".into()));
     }
 
     #[test]
