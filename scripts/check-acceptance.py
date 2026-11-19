@@ -302,7 +302,12 @@ const before = errors().length;
 await sendOnly('RATE LIMITED now');
 const shown = await until(() => errors().length > before ? errors()[errors().length - 1] : null, 'the refusal shown', 90000).catch(() => null);
 if (!shown) return { shown: false, convo: convo().slice(-400), banner: txt(document.querySelector('.agent-view .shield.danger')) };
-return { shown: true, plain: txt(shown).slice(0, 300), details: (shown.querySelector('details pre')?.textContent || '').slice(0, 500), idle: /Idle/.test(head()) };
+const out = { shown: true, plain: txt(shown).slice(0, 300), details: (shown.querySelector('details pre')?.textContent || '').slice(0, 500) };
+// The agent says when it continues, then continues on its own after the wait.
+out.waiting = await until(() => { const b = all('.shield[role="status"]', document.querySelector('.agent-view')).map(txt).find((t) => /continues at/.test(t)); return b || null; }, 'the wait announced', 15000).catch(() => '');
+out.continued = await until(() => { const t = convo(), i = t.lastIndexOf('SYNTHETIC REPLY'); return i > t.lastIndexOf('limiting requests') && t.slice(i).includes('stopped by the model provider') ? t.slice(i, i + 160) : null; }, 'continued after the wait', 220000).catch(() => '');
+out.after = all('.shield[role="status"]', document.querySelector('.agent-view')).map(txt).find((t) => /rate limit/.test(t)) || '';
+return out;
 '''
 
 MODEL_PICKER = AGENT + r'''
@@ -745,9 +750,10 @@ def main():
             run.check('B1', 'Edit takes a queued message back into the box', e.get('queued') and len(e['queued']) == 1 and 'QUEUED second note' in (e.get('box') or ''), e)
             run.check('B1', 'When the step ends the queued messages reach the agent together, in order, and the queue empties', 'QUEUED first note QUEUED second note' in (v.get('finished') or '') and v.get('left') == [], {'finished': v.get('finished'), 'left': v.get('left')})
 
-            r = run.ui(ERRORS, {'name': 'solo'}, 150)
+            r = run.ui(ERRORS, {'name': 'solo'}, 320)
             v = run.value(r)
             run.check('B1', 'A provider refusal reads as one sentence with the fix, and the original is kept under Error details', v.get('shown') is True and 'limiting requests right now' in (v.get('plain') or '') and 'switch model with /model' in (v.get('plain') or '') and ('429' in (v.get('details') or '') or 'rate_limit' in (v.get('details') or '')), v or r.get('error'))
+            run.check('B1', 'An agent stopped by a rate limit says when it continues, then continues on its own', 'continues at' in (v.get('waiting') or '') and 'stopped by the model provider' in (v.get('continued') or '') and not v.get('after'), {k: v.get(k) for k in ('waiting', 'continued', 'after')})
 
         if want('review'):
             origin = syn.serve(syn.Origin); observer = syn.serve(syn.Observer)

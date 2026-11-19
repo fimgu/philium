@@ -724,6 +724,60 @@ pub fn parse_sse(block: &str) -> Vec<Value> {
     serde_json::from_str::<Value>(&data.join("\n")).ok().into_iter().filter(|v| v.get("type").is_some()).collect()
 }
 
+/// Waits before an agent stopped by a provider's rate limit continues on its own, in minutes.
+/// After the last one it stays idle until the person sends something.
+const RATE_LIMIT_WAITS: [i64; 6] = [2, 5, 10, 20, 30, 60];
+const CONTINUE_AFTER_LIMIT: &str = "Philium: your last step was stopped by the model provider's rate limit, which has had time to reset. Continue where you left off. Do not repeat work that is already recorded.";
+
+/// A turn refused because the account or the provider is over its limit, as opposed to a
+/// request that is wrong. Retrying the same request later is the fix.
+pub(crate) fn rate_limited(error: &str) -> bool {
+    let e = error.to_ascii_lowercase();
+    e.contains("http 429") || e.contains(" 429 ") || e.contains("rate_limit") || e.contains("rate limit") || e.contains("overloaded")
+}
+
+fn retry_key(id: &str) -> String {
+    format!("agent.retry.{id}")
+}
+
+/// When a rate-limited agent continues, if it will: `{attempt, until}` or `{attempt, gave_up}`.
+pub(crate) fn retry_state(ctx: &Ctx, id: &str) -> Option<Value> {
+    ctx.db.kv_get(&retry_key(id)).filter(|s| !s.is_empty()).and_then(|s| serde_json::from_str(&s).ok())
+}
+
+/// Schedule the agent to continue after the next wait. Agents of one provider hit its limit
+/// together, so each waits a little longer than the others, by a few seconds from its id.
+fn schedule_continue(ctx: &Arc<Ctx>, id: &str) {
+    let attempt = retry_state(ctx, id).and_then(|v| v["attempt"].as_u64()).unwrap_or(0) as usize;
+    let Some(minutes) = RATE_LIMIT_WAITS.get(attempt) else {
+        let _ = ctx.db.kv_set(&retry_key(id), &json!({ "attempt": attempt, "gave_up": true }).to_string());
+        ctx.log_event("agent_rate_limit_gave_up", Some(id), &json!({ "attempts": attempt }));
+        ctx.emit("agents:changed", json!({ "id": id }));
+        return;
+    };
+    let spread = id.bytes().fold(0i64, |h, b| (h * 31 + b as i64) % 45) * 1000;
+    let until = now() + minutes * 60_000 + spread;
+    let _ = ctx.db.kv_set(&retry_key(id), &json!({ "attempt": attempt + 1, "until": until }).to_string());
+    ctx.log_event("agent_rate_limited", Some(id), &json!({ "attempt": attempt + 1, "continues_at": until }));
+    ctx.emit("agents:changed", json!({ "id": id }));
+    let Ok(handle) = tokio::runtime::Handle::try_current() else { return };
+    let (ctx, id) = (ctx.clone(), id.to_owned());
+    handle.spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis((until - now()).max(0) as u64)).await;
+        // Only this schedule, and only an idle running agent: the person may have sent
+        // something meanwhile, stopped the agent, or a later failure rescheduled it.
+        if retry_state(&ctx, &id).and_then(|v| v["until"].as_i64()) != Some(until) {
+            return;
+        }
+        if get_row(&ctx, &id).map_or(true, |r| r["state"] != "idle") || runtime(&id).is_none() {
+            return;
+        }
+        if let Err(e) = send(&ctx, &id, CONTINUE_AFTER_LIMIT).await {
+            ctx.log_event("agent_continue_failed", Some(&id), &json!({ "error": e }));
+        }
+    });
+}
+
 /// Agent state machine driven by HAL events.
 pub fn next_state(current: &str, event_type: &str) -> Option<&'static str> {
     if matches!(current, "stopped" | "failed" | "done" | "tearing_down") {
@@ -753,7 +807,20 @@ fn apply_event(ctx: &Arc<Ctx>, id: &str, ev: &Value) {
     }
     match ty {
         "permission.requested" => ctx.emit("agents:approval", json!({ "id": id, "event": ev })),
-        "turn.failed" => ctx.log_event("agent_turn_failed", Some(id), &json!({ "error": ev["error"] })),
+        "turn.failed" => {
+            ctx.log_event("agent_turn_failed", Some(id), &json!({ "error": ev["error"] }));
+            let error = ev["error"].as_str().map(str::to_string).unwrap_or_else(|| ev["error"].to_string());
+            if rate_limited(&error) {
+                schedule_continue(ctx, id);
+            }
+        }
+        // A step that went through: the limit is behind it.
+        "assistant.completed" => {
+            if retry_state(ctx, id).is_some() {
+                let _ = ctx.db.kv_set(&retry_key(id), "");
+                ctx.emit("agents:changed", json!({ "id": id }));
+            }
+        }
         _ => {}
     }
 }
@@ -777,8 +844,13 @@ pub(crate) fn message_body(text: &str, images: Value) -> Value {
     json!({ "text": text, "images": images, "allow_browser": true })
 }
 
-pub async fn send_with_images(_ctx: &Arc<Ctx>, id: &str, text: &str, images: Value) -> Result<Value, String> {
+pub async fn send_with_images(ctx: &Arc<Ctx>, id: &str, text: &str, images: Value) -> Result<Value, String> {
     let r = rt(id)?;
+    if text != CONTINUE_AFTER_LIMIT {
+        if let Some(v) = retry_state(ctx, id).filter(|v| v["until"].is_i64()) {
+            let _ = ctx.db.kv_set(&retry_key(id), &json!({ "attempt": v["attempt"] }).to_string());
+        }
+    }
     // Only HAL events change turn state. A rejected request is not a new turn,
     // and setting state after acceptance can race a fast completion event.
     r.hal
@@ -904,6 +976,9 @@ fn with_live(ctx: &Ctx, mut row: Value) -> Value {
     row["strict"] = json!(row["strict"].as_i64() == Some(1));
     if let Some(e) = ctx.db.kv_get(&format!("agent_error.{id}")).filter(|e| !e.is_empty()) {
         row["error"] = json!(e);
+    }
+    if let Some(r) = retry_state(ctx, &id) {
+        row["rate_limited"] = r;
     }
     if let Some(rt) = runtime(&id) {
         row["cwd"] = json!(rt.cwd);
@@ -1196,7 +1271,7 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
             crate::browser::forget_agent(ctx, &id);
             ctx.db.exec("DELETE FROM agents WHERE id=?1", [&id])?;
             let _ = ctx.db.exec("DELETE FROM agent_queue WHERE agent_id=?1", [&id]);
-            for k in ["agent_error", "agent_seq"] {
+            for k in ["agent_error", "agent_seq", "agent.retry"] {
                 let _ = ctx.db.exec("DELETE FROM kv WHERE k=?1", [format!("{k}.{id}")]);
             }
             ctx.log_event("agent_removed", Some(&id), &report);
@@ -1527,6 +1602,30 @@ mod tests {
         assert!(reserve_local_kind(&ctx, "a", "philium-a-two", json!({})).is_err());
         crate::reaper::release(&ctx, &rid);
         assert!(reserve_local_kind(&ctx, "a", "philium-a-two", json!({})).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_rate_limited_agent_continues_later_and_gives_up_after_the_last_wait() {
+        assert!(rate_limited(r#"provider error: HTTP 429 from http://127.0.0.1:1/p/claude/chat/completions: {"type":"error","error":{"type":"rate_limit_error"}}"#));
+        assert!(rate_limited(r#"{"type":"overloaded_error"}"#));
+        assert!(!rate_limited("provider error: HTTP 400: invalid request"));
+        let ctx = Ctx::test();
+        ctx.db.exec("INSERT INTO agents(id,name,model_ref,state,created_at,last_active_at) VALUES('a','fixture','p/m','idle',0,0)", []).unwrap();
+        let t = now();
+        schedule_continue(&ctx, "a");
+        let first = retry_state(&ctx, "a").unwrap();
+        assert_eq!(first["attempt"], 1);
+        let wait = first["until"].as_i64().unwrap() - t;
+        assert!((120_000..=165_000).contains(&wait), "{wait}");
+        for _ in 1..RATE_LIMIT_WAITS.len() {
+            schedule_continue(&ctx, "a");
+        }
+        assert_eq!(retry_state(&ctx, "a").unwrap()["attempt"], 6);
+        schedule_continue(&ctx, "a");
+        assert_eq!(retry_state(&ctx, "a").unwrap()["gave_up"], true);
+        // The row the screens read says so.
+        assert_eq!(with_live(&ctx, get_row(&ctx, "a").unwrap())["rate_limited"]["gave_up"], true);
+        std::fs::remove_dir_all(ctx.data_dir.parent().unwrap()).ok();
     }
 
     #[tokio::test]

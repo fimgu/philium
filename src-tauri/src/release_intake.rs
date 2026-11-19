@@ -376,7 +376,8 @@ pub(crate) fn lead(ctx: &Ctx, kind: &str, repo: &str) -> Value {
         return Value::Null;
     };
     let error = r["id"].as_str().and_then(|id| ctx.db.kv_get(&format!("agent_error.{id}"))).filter(|e| !e.is_empty());
-    json!({"id": r["id"], "name": r["name"], "state": r["state"], "error": error, "started": r["hal_session_id"].is_string()})
+    let limited = r["id"].as_str().and_then(|id| crate::agents::retry_state(ctx, id));
+    json!({"id": r["id"], "name": r["name"], "state": r["state"], "error": error, "started": r["hal_session_id"].is_string(), "rate_limited": limited})
 }
 
 pub async fn call(ctx: &Ctx, method: &str, a: Value) -> Result<Value, String> {

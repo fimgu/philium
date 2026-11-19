@@ -679,6 +679,7 @@ function AgentView(props) {
         </div>
       </Show>
       <Show when={a()?.error}><div class="shield danger" style={{ margin: "8px 16px 0" }}><PlainError text={a().error} /></div></Show>
+          <Show when={a()?.rate_limited && a()?.state === "idle"}><div class="shield" role="status" style={{ margin: "8px 16px 0" }}>{a().rate_limited.until ? `The model provider's rate limit stopped the last step. ${a().name} continues at ${new Date(a().rate_limited.until).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}, or when you send a message.` : `Stopped at the rate limit after several tries. Send a message to continue.`}</div></Show>
       <Show when={(a()?.warnings ?? []).length}>
         <div style={{ padding: "6px 16px 0" }}><WarningPills warnings={a().warnings} max={6} /></div>
       </Show>
