@@ -395,7 +395,9 @@ export function ModelPicker(props) {
       if (!map.has(m.pid)) map.set(m.pid, { pid: m.pid, name: m.provName, trusted: m.trusted, kind: m.kind, items: [] });
       map.get(m.pid).items.push(m);
     }
-    return [...map.values()];
+    // In the order the providers were added, as the Providers screen lists them.
+    const at = (pid) => { const i = (props.providers ?? []).findIndex((p) => p.id === pid); return i < 0 ? 1e6 : i; };
+    return [...map.values()].sort((x, y) => at(x.pid) - at(y.pid));
   });
   const trustLabel = (g) => (g.trusted ? (["chatgpt_oauth", "claude_oauth"].includes(g.kind) ? "Subscription · Trusted" : "API · Trusted") : "Untrusted · Strict");
   const searching = () => Boolean(q().trim());
@@ -455,7 +457,9 @@ export function ModelPicker(props) {
   };
   const pick = (ref) => { props.onValue?.(ref); close(true); };
   // `/model` asks for the list without a click on the button.
-  createEffect(on(() => props.openRequest, (n) => { if (n) { requested = true; show(); } }, { defer: true }));
+  // Opened after the current event has finished: when the request comes from a click (the Send
+  // button), that same click would otherwise reach the listener below and close the list at once.
+  createEffect(on(() => props.openRequest, (n) => { if (n) setTimeout(() => { requested = true; show(); }, 0); }, { defer: true }));
 
   // Clicks are delegated to the document, so the click that opens the list, and every click
   // inside it, also reaches this listener. Only a click elsewhere closes the list.

@@ -116,11 +116,11 @@ for (const p of P.repos) {
 }
 const labels = await until(() => { const o = Array.from(picker().options).map(txt); return o.length > P.repos.length ? o : null; }, 'checkouts in the picker', 15000).catch(() => Array.from(picker().options).map(txt));
 await go('Providers');
-const add = async (name, key, trusted) => {
+const add = async (name, key, trusted, url = P.model_url) => {
   await click('Add provider');
   const m = await until(modal, 'provider dialog');
   await fill('Name', name, m);
-  await fill('Base URL', P.model_url, m);
+  await fill('Base URL', url, m);
   if (key) await fill('API key', key, m);
   const t = all('label.toggle', m).find((x) => txt(x).includes('Untrusted provider'));
   if (trusted && t.classList.contains('on')) { t.click(); await sleep(80); }
@@ -132,8 +132,9 @@ const add = async (name, key, trusted) => {
 const keyed = await add('Synthetic', P.key, true);
 const keyless = keyed === 'saved' ? null : await add('Synthetic', '', true);
 const strict = await add('Synthetic Strict', keyed === 'saved' ? P.key : '', false);
+const second = P.model_url2 && keyed === 'saved' ? await add('Second', P.key, true, P.model_url2) : null;
 await until(() => all('.card', pane()).filter((c) => /1 models/.test(txt(c))).length >= 2, 'models discovered', 20000).catch(() => null);
-return { labels, keyed, keyless, strict, cards: all('.card', pane()).map(txt).filter((c) => c.startsWith('Synthetic')) };
+return { labels, keyed, keyless, strict, second, cards: all('.card', pane()).map(txt).filter((c) => c.startsWith('Synthetic')) };
 '''
 
 COORDINATE = r'''
@@ -258,6 +259,43 @@ const disabled = composer() ? composer().disabled : null;
 await click('Changes', document.querySelector('.agent-head'));
 const changes = await until(() => { const t = convo(); return /state\.txt|notes\.txt/.test(t) ? t.slice(0, 900) : null; }, 'changes', 15000).catch(() => convo().slice(0, 400));
 return { before, resumed, note: delivered, redirected, interrupted, after, stopped, disabled, changes };
+'''
+
+MODEL_PICKER = AGENT + r'''
+await workspace(P.checkout);
+await openAgent(P.lead);
+const resumed = await live();
+await until(() => /Idle/.test(head()), 'idle', 30000).catch(() => null);
+const shownModel = () => txt(document.querySelector('.agent-head button[aria-label="Choose model"]'));
+const modelBefore = shownModel();
+await sendOnly('/model');
+const pop = await until(() => all('.model-picker-pop')[0], 'the list opened by /model', 8000).catch(() => null);
+if (!pop) return { opened: false, modelBefore, toasts: toasts() };
+const search = () => pop.querySelector('input');
+const chip = (name) => all('.model-picker-prov-chip', pop).find((c) => txt(c) === name);
+const chips = () => all('.model-picker-prov-chip', pop).map((c) => txt(c) + (c.classList.contains('on') ? ' (on)' : ''));
+const items = () => all('button.model-picker-item', pop).map(txt);
+const labels = () => all('.model-picker-group-label', pop).map(txt);
+const more = () => txt(pop.querySelector('.model-picker-more'));
+const first = { chips: chips(), items: items(), labels: labels(), searchFocused: document.activeElement === search(), foot: txt(pop.querySelector('.model-picker-foot')) };
+chip(P.other).click(); await sleep(250);
+const other = { chips: chips(), items: items(), labels: labels(), more: more() };
+pop.querySelector('.model-picker-more').click(); await sleep(250);
+const everything = { items: items(), more: more() };
+type(search(), 'synthetic'); await sleep(300);
+const searched = { items: items(), labels: labels(), chips: chips().length };
+type(search(), ''); await sleep(250);
+chip(P.other).click(); await sleep(250);
+search().focus();
+search().dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true })); await sleep(150);
+const focused = txt(document.activeElement);
+document.activeElement.click(); note('choose the focused model');
+const closed = await until(() => !all('.model-picker-pop').length, 'the list closed', 8000).then(() => true, () => false);
+const modelAfter = await until(() => (shownModel() !== modelBefore ? shownModel() : null), 'the model shown in the header changed', 10000).catch(() => shownModel());
+await sleep(300);
+const composerFocused = document.activeElement === composer();
+const reply = await say('Still there after the switch?', 'SYNTHETIC REPLY from').catch((e) => String(e));
+return { opened: true, resumed, modelBefore, first, other, everything, searched, focused, closed, modelAfter, composerFocused, reply };
 '''
 
 DELEGATE_SLOW = AGENT + r'''
@@ -467,6 +505,7 @@ def main():
     only = set(filter(None, args.only.split(',')))
     want = lambda name: not only or name in only
     model = syn.serve(syn.Model); syn.Model.expect_key = KEY
+    model2 = syn.serve(syn.SecondModel)
     try:
         # Checkouts: two with the same folder name, a release fixture, and separate verifiers.
         alpha = syn.new_repo(scratch / 'alpha/same', 'philium-fixture/alpha'); graph = syn.release_graph(alpha)
@@ -488,7 +527,7 @@ def main():
         url = f'http://127.0.0.1:{model.server_port}/v1'
 
         repos = [str(alpha), str(beta), str(ver_a), str(gamma), str(ver_g), str(delta), str(ver_d)] + ([str(Path(args.public[0]).resolve())] if args.public else [])
-        r = run.ui(SETUP, {'repos': repos, 'model_url': url, 'key': KEY}, 240)
+        r = run.ui(SETUP, {'repos': repos, 'model_url': url, 'model_url2': f'http://127.0.0.1:{model2.server_port}/v1', 'key': KEY}, 240)
         v = run.value(r)
         labels = ['All Workspaces', 'alpha/same', 'beta/same', 'gamma', 'verifier-alpha', 'verifier-gamma', 'delta', 'verifier-delta'] + ([Path(args.public[0]).resolve().name] if args.public else [])
         run.check('B6', 'Two same-named checkouts register from the Repos screen with distinct labels', sorted(v.get('labels') or []) == sorted(labels), v.get('labels') or r.get('error'))
@@ -561,6 +600,16 @@ def main():
             r = run.ui(AFTER_RESTART, {'checkout': 'alpha/same', 'worker': 'ibis', 'task': 'Long migration', 'agents': 3}, 200)
             v = run.value(r)
             run.check('B5', 'A second reopen shows the same agents, the same two tasks and the same handover', sorted(v.get('rows') or []) == ['ibis', 'lead', 'wren'] and (v.get('boardBefore') or {}).get('owner') == 'Handed to ibis · stopped' and (v.get('boardBefore') or {}).get('tasks') == 2 and (v.get('boardAfter') or {}).get('owner') == 'ibis', {'rows': v.get('rows'), 'before': v.get('boardBefore'), 'after': v.get('boardAfter')} if v else r.get('error'))
+
+            # The model picker, opened by typing /model to the coordinator.
+            r = run.ui(MODEL_PICKER, {'checkout': 'alpha/same', 'lead': 'lead', 'other': 'Second'}, 200)
+            v = run.value(r)
+            first, other, every, found = v.get('first') or {}, v.get('other') or {}, v.get('everything') or {}, v.get('searched') or {}
+            run.check('B1', 'Typing /model opens the model list with the search ready, instead of printing a line', v.get('opened') is True and first.get('searchFocused') is True, {'opened': v.get('opened'), 'focus': first.get('searchFocused'), 'toasts': v.get('toasts')} if v else r.get('error'))
+            run.check('B1', 'The list has one switch per provider this agent may use and leaves out the untrusted one', first.get('chips') == ['Synthetic (on)', 'Second'] and 'hidden' in (first.get('foot') or ''), {'chips': first.get('chips'), 'foot': first.get('foot')})
+            run.check('B1', 'A provider shows the newest model of each family first and keeps the older ones behind one button', other.get('items') == ['nova-3-2', 'nova-mini-3', 'spark-2-1'] and other.get('more') == 'Show 5 older models' and len(every.get('items') or []) == 8, {'latest': other.get('items'), 'more': other.get('more'), 'all': every.get('items')})
+            run.check('B1', 'Search looks across every provider at once', found.get('items') == ['synthetic-1'] and found.get('chips') == 0, found)
+            run.check('B1', 'An arrow key reaches the first model; choosing it switches the agent, returns to the message box, and the agent answers on the new model', (v.get('focused') or '').startswith('nova-3-2') and v.get('closed') is True and 'nova-3-2' in (v.get('modelAfter') or '') and v.get('composerFocused') is True and 'SYNTHETIC REPLY from lead' in (v.get('reply') or ''), {'focused': v.get('focused'), 'after': v.get('modelAfter'), 'composer': v.get('composerFocused'), 'reply': (v.get('reply') or '')[:60]})
 
         if want('review'):
             origin = syn.serve(syn.Origin); observer = syn.serve(syn.Observer)

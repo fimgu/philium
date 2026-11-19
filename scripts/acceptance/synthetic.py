@@ -179,6 +179,7 @@ class Model(http.server.BaseHTTPRequestHandler):
     seen = []          # redacted: who asked, what it was told to do, how the stream ended
     expect_key = None
     probe = {}
+    models = ['synthetic-1']   # in the provider's own order, newest first
 
     def log_message(self, *a):
         pass
@@ -189,7 +190,7 @@ class Model(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path.rstrip('/').endswith('/models'):
-            return self._send(200, {'object': 'list', 'data': [{'id': 'synthetic-1'}]})
+            return self._send(200, {'object': 'list', 'data': [{'id': m} for m in self.models]})
         self._send(404, {})
 
     def do_POST(self):
@@ -232,6 +233,11 @@ class Model(http.server.BaseHTTPRequestHandler):
             entry['ended'] = 'complete'
         except (BrokenPipeError, ConnectionResetError):
             entry['ended'] = 'client closed'
+
+
+class SecondModel(Model):
+    """A second trusted provider with several model families, for the model picker."""
+    models = ['nova-3-2', 'nova-mini-3', 'spark-2-1', 'nova-3-1', 'nova-3', 'spark-2', 'spark-1', 'nova-2-5']
 
 
 class Origin(http.server.BaseHTTPRequestHandler):
