@@ -165,8 +165,10 @@ fn port_base(ctx: &Ctx) -> i64 {
     (0..).map(|i| 42000 + i * 20).find(|p| !used.contains(p)).unwrap()
 }
 
-/// HAL permission rules for an agent. Last matching rule wins.
-pub fn permission_rules(strict: bool) -> Value {
+/// HAL permission rules for an agent. Last matching rule wins. `own` are the agent's own
+/// folders outside the workspace, such as its $TMPDIR: it is told to put throwaway files there,
+/// so writing them needs no approval.
+pub fn permission_rules(strict: bool, own: &[&std::path::Path]) -> Value {
     let mut rules = vec![
         json!({"action": "read", "resource": "*", "effect": "allow"}),
         // Secrets never readable: they could end up in a provider request.
@@ -182,6 +184,9 @@ pub fn permission_rules(strict: bool) -> Value {
         // paths are outside it and ask; parent escapes are denied.
         json!({"action": "edit", "resource": "**", "effect": "allow"}),
         json!({"action": "edit", "resource": "/**", "effect": "ask"}),
+    ];
+    rules.extend(own.iter().map(|d| json!({"action": "edit", "resource": format!("{}/**", d.display()), "effect": "allow"})));
+    rules.extend([
         json!({"action": "edit", "resource": "../**", "effect": "deny"}),
         json!({"action": "edit", "resource": "**/.env*", "effect": "deny"}),
         // All execution goes through Philium (shell_run): visible and reapable.
@@ -192,7 +197,7 @@ pub fn permission_rules(strict: bool) -> Value {
         json!({"action": "mcp", "resource": "philium/browser_*", "effect": "ask"}),
         json!({"action": "subagent", "resource": "*", "effect": "allow"}),
         json!({"action": "browser", "resource": "*", "effect": "deny"}),
-    ];
+    ]);
     if strict {
         // Untrusted provider: the OS sandbox already hides private data, so
         // reads stay open (tooling, libraries). No nested agents.
@@ -479,7 +484,7 @@ async fn provision(ctx: &Arc<Ctx>, id: &str, fresh: bool, brief: Option<String>)
     );
     let mut config = setup.config;
     config["server"]["workspace"] = json!(cwd);
-    config["permissions"] = permission_rules(strict);
+    config["permissions"] = permission_rules(strict, &[&tmp, &scratch]);
     config["limits"] = json!({ "workspace": { "allow_outside": false } });
     let role = row["role"].as_str().unwrap_or("worker").to_string();
     let parent_name = row["parent_id"]
@@ -1732,13 +1737,18 @@ mod tests {
 
     #[test]
     fn shell_is_denied_and_secrets_unreadable() {
-        let p = permission_rules(false);
+        let own = std::path::Path::new("/data/agents/wren/tmp");
+        let p = permission_rules(false, &[own]);
         let rules = p["rules"].as_array().unwrap();
+        // Its own $TMPDIR is writable without asking, after the rule that asks for absolute
+        // paths and before the denies that nothing may re-open.
+        let at = |res: &str, effect: &str| rules.iter().position(|r| r["action"] == "edit" && r["resource"] == res && r["effect"] == effect).unwrap();
+        assert!(at("/**", "ask") < at("/data/agents/wren/tmp/**", "allow") && at("/data/agents/wren/tmp/**", "allow") < at("**/.env*", "deny"));
         // Last matching rule wins: shell deny must not be followed by a shell allow.
         let last_shell = rules.iter().rev().find(|r| r["action"] == "shell").unwrap();
         assert_eq!(last_shell["effect"], "deny");
         assert!(rules.iter().any(|r| r["resource"] == "**/.env*" && r["effect"] == "deny"));
-        let s = permission_rules(true);
+        let s = permission_rules(true, &[]);
         let last_sub = s["rules"].as_array().unwrap().iter().rev().find(|r| r["action"] == "subagent").unwrap();
         assert_eq!(last_sub["effect"], "deny");
         // The secret denies must be the last read rule touching .env (nothing re-opens it).
@@ -1749,7 +1759,7 @@ mod tests {
     #[test]
     fn browser_capability_requires_mcp_approval() {
         for strict in [false, true] {
-            let p = permission_rules(strict);
+            let p = permission_rules(strict, &[]);
             let rules = p["rules"].as_array().unwrap();
             let broad = rules.iter().position(|r| r["action"] == "mcp" && r["resource"] == "philium/*").unwrap();
             let browser = rules.iter().position(|r| r["action"] == "mcp" && r["resource"] == "philium/browser_*").unwrap();

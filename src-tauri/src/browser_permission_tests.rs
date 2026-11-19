@@ -219,7 +219,7 @@ async fn browser_mcp_requires_consent_and_scopes_grants() {
             &providers::ConfigOpts::default(),
         );
         let mut config = setup.config;
-        config["permissions"] = agents::permission_rules(strict);
+        config["permissions"] = agents::permission_rules(strict, &[]);
         config["server"]["workspace"] = json!(launch_dir);
         config["mcp"] = json!({"servers":{"philium":{"transport":"streamable_http","url":format!("{mcp_url}/mcp")}}});
         let ld = launch_dir.clone();
