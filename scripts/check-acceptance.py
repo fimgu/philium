@@ -304,6 +304,28 @@ const reply = await say('Still there after the switch?', 'SYNTHETIC REPLY from')
 return { opened: true, modelBefore, first, other, everything, searched, focused, closed, modelAfter, composerFocused, reply, toasts: toasts() };
 '''
 
+DRAFT = r'''
+await workspace(P.checkout);
+await go('Review');
+const box = await until(() => all('details[aria-label="Release PR revisions"]')[0], 'release section', 15000);
+if (!box.open) box.querySelector('summary').click();
+const setup = box.querySelector('details[aria-label="Release verification setup"]');
+if (!setup.open) setup.querySelector('summary').click();
+const status = () => txt(all('p[role="status"]', box)[0]);
+const before = { pinned: txt(setup.querySelector('[aria-label="Pinned verifier"]')), summary: txt(box.querySelector('[aria-label="Verification setup summary"]')) };
+await click('Draft checks with an agent', setup);
+const started = await until(() => (/is drafting checks|Not started/.test(status()) ? status() : null), 'agent started', 60000);
+const prop = await until(() => all('section[aria-label="Proposed checks"]', setup)[0], 'proposal shown', 120000).catch(() => null);
+if (!prop) return { before, started, status: status() };
+const proposed = all('[data-check]', prop).map(txt), by = txt(prop.querySelector('h3'));
+await click('Use these checks', prop);
+await until(() => all('section[aria-label="Checks to confirm"]', setup)[0], 'checks to confirm', 20000);
+const toConfirm = all('section[aria-label="Checks to confirm"] [data-check]', setup).map(txt);
+await click('Confirm and pin these checks', setup);
+const pinned = await until(() => { const t = txt(setup.querySelector('[aria-label="Pinned verifier"]')); return t.includes('You confirmed') ? t : null; }, 'pinned', 25000).catch(() => status());
+return { before, started, by, proposed, toConfirm, pinned, summary: txt(box.querySelector('[aria-label="Verification setup summary"]')), labels: Array.from(picker().options).map(txt), left: all('section[aria-label="Proposed checks"]', setup).length };
+'''
+
 DELEGATE_SLOW = AGENT + r'''
 await workspace(P.checkout);
 await openAgent(P.lead);
@@ -450,7 +472,7 @@ if (P.pin) {
   out.proposedTargets = all('[data-target]', proposal).map((t) => txt(t.querySelector('p')));
   for (const [name, path] of Object.entries(P.pin.programs || {})) type(await until(() => proposal.querySelector(`input[aria-label="Path of ${name}"]`), `path field for ${name}`), path);
   await click('Confirm and pin these checks', setup);
-  out.pinResult = await until(() => (pinned().includes(out.proposed.length ? 'You confirmed its checks' : 'pinned at') && !setup.querySelector('button').disabled ? 'pinned' : (status_().startsWith('Checks confirmed') ? 'pinned' : (status_() && !status_().startsWith('Checks') ? status_() : null))), 'verifier pinned', 25000).catch((e) => String(e));
+  out.pinResult = await until(() => (pinned().includes(out.proposed.length ? 'You confirmed its checks' : 'pinned at') && !all('button', setup).find((b) => txt(b) === 'Confirm and pin these checks').disabled ? 'pinned' : (status_().startsWith('Checks confirmed') ? 'pinned' : (status_() && !status_().startsWith('Checks') ? status_() : null))), 'verifier pinned', 25000).catch((e) => String(e));
 }
 if (P.token) {
   if (!setup.open) setup.querySelector('summary').click();
@@ -851,6 +873,17 @@ def main():
             run.check('B7', 'A fallback is recorded from the screen and the summary is written inside the profile', 'Manual database edit' in (v.get('fallback') or '') and str(run.profile / 'data/workday') in (v.get('exported') or ''), v.get('exported') or v.get('fallback'))
         foreign = sorted(c for c in run.children if 'jcode' in c.lower() or 'herdr' in c.lower())
         run.check('D1', 'No process of another agent harness ran under the Pilot', not foreign, {'foreign': foreign, 'programs': sorted({Path(c).name for c in run.children})})
+        if want('review') or want('draft'):
+            # No folder, no second checkout: an agent drafts checks from inside Review, the
+            # person accepts and confirms, and Philium keeps them in its own store. Runs last,
+            # so the agent it starts is not counted by the checks above.
+            r = run.ui(DRAFT, {'checkout': 'beta/same'}, 260)
+            v = run.value(r)
+            kept = list((run.profile / 'data/checks').glob('*/philium/sql-contracts.json'))
+            run.check('C1', 'With no checks yet, an agent started from Review proposes them and they are listed in plain words', len(v.get('proposed') or []) == 2 and 'committed file' in ' '.join(v.get('proposed') or []) and 'Proposed by' in (v.get('by') or ''), {'started': v.get('started'), 'by': v.get('by'), 'proposed': v.get('proposed'), 'status': v.get('status'), 'error': r.get('error')})
+            run.check('C1', 'The proposal counts only after the person accepts it and confirms the same checks', v.get('toConfirm') == v.get('proposed') and 'You confirmed its checks' in (v.get('pinned') or '') and 'No checks confirmed' in ((v.get('before') or {}).get('pinned') or '') and v.get('left') == 0, {'before': (v.get('before') or {}).get('pinned'), 'pinned': v.get('pinned'), 'left': v.get('left')})
+            run.check('C1', 'The checks are kept by Philium itself: no second checkout appears and the person names no folder', 'kept by Philium' in (v.get('pinned') or '') and 'kept by Philium' in (v.get('summary') or '') and sorted(v.get('labels') or []) == sorted(labels) and len(kept) == 1, {'summary': v.get('summary'), 'labels': v.get('labels'), 'kept': [str(k.relative_to(run.profile)) for k in kept]})
+
     finally:
         model.shutdown()
         out = {'app': str(run.exe), 'rows': run.rows, 'children': sorted(run.children)}

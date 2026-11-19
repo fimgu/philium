@@ -132,6 +132,12 @@ def brain(req):
         if '"id"' not in results[1]:
             return f'DELEGATION FAILED starting the worker: {one(results[1])}'
         return f'DELEGATED "{title}" to {worker}.'
+    if 'Draft release checks' in last_user:
+        if step == 0:
+            return {'tool': ('mcp_philium_checks_propose', {'contracts': {'cases': [
+                {'id': 'view-column', 'why': 'The list keeps showing the status column', 'document': 'view.json', 'pointer': '/column', 'expect': 'status'},
+                {'id': 'app-private', 'document': 'docs/app.json', 'pointer': '/public', 'expect': False}]}})}
+        return 'PROPOSED CHECKS ' + one(results[0])
     if 'WHAT HAPPENED' in last_user:
         if step == 0:
             return {'tool': ('mcp_philium_agent_status', {})}

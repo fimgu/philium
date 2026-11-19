@@ -98,11 +98,57 @@ fn spec(raw: &str) -> Result<Value, String> {
     crate::release_command::validate(&v, &mut ids)?;
     Ok(v)
 }
+/// Checks kept by Philium itself rather than in a registered checkout.
+pub(crate) const KEPT: &str = "kept-by-philium";
+/// Where a checkout's checks live: a registered checkout, or Philium's own store inside its
+/// private data folder, which no agent can read or change and no pull request can touch.
+fn checks_dir(ctx: &Ctx, repo: &str, driver: &str) -> Result<std::path::PathBuf, String> {
+    if driver == KEPT {
+        if repo.is_empty() || !repo.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+            return Err("Checkout unavailable".into());
+        }
+        return Ok(ctx.data_dir.join("checks").join(repo));
+    }
+    let r = ctx.db.query("SELECT path FROM repos WHERE id=?", [driver])?.pop().ok_or("Driver not registered")?;
+    Ok(std::path::PathBuf::from(r["path"].as_str().ok_or("Missing driver path")?))
+}
+/// Put a checks file into Philium's own store for this checkout and commit it there.
+fn keep(ctx: &Ctx, repo: &str, raw: &str, message: &str) -> Result<(), String> {
+    spec(raw)?;
+    let dir = checks_dir(ctx, repo, KEPT)?;
+    std::fs::create_dir_all(dir.join("philium")).map_err(|e| e.to_string())?;
+    let git = |args: &[&str]| crate::workspace::git(&dir, args);
+    if !dir.join(".git").exists() {
+        git(&["init", "-q", "-b", "main"])?;
+    }
+    std::fs::write(dir.join("philium/sql-contracts.json"), raw).map_err(|e| e.to_string())?;
+    git(&["add", "--", "philium/sql-contracts.json"])?;
+    git(&["-c", "user.name=Philium", "-c", "user.email=philium@localhost.invalid", "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", "commit", "-q", "--allow-empty", "-m", message])?;
+    Ok(())
+}
+const PROPOSALS: &str = "CREATE TABLE IF NOT EXISTS release_check_proposals(id INTEGER PRIMARY KEY AUTOINCREMENT,repo TEXT NOT NULL REFERENCES repos(id) ON DELETE CASCADE,agent TEXT NOT NULL,contracts TEXT NOT NULL,created INTEGER NOT NULL,state TEXT NOT NULL DEFAULT 'proposed')";
+/// An agent's proposal for a checkout's checks. It changes nothing until the person accepts it
+/// in Review and then confirms the checks. Agents propose facts about committed files and the
+/// database only; checks that run a program against a live environment are the person's to set up.
+pub(crate) fn propose(ctx: &Ctx, repo: &str, agent: &str, contracts: &Value) -> Result<Value, String> {
+    let raw = serde_json::to_string(contracts).map_err(|_| "Invalid checks")?;
+    if raw.len() > 32768 {
+        return Err("Checks exceed 32 KiB".into());
+    }
+    let v = spec(&raw).map_err(|e| format!("{e}. Send {{\"cases\":[...]}} with 1 to 8 checks: a file check has id, document (a .json path), pointer and expect; a database check has id, query, seed and expect (an array of rows) and needs a top-level schema (a .sql path)."))?;
+    if v.get("live_cases").is_some() || v.get("targets").is_some() {
+        return Err("Propose file and database checks only. Checks on a running product are set up by the person.".into());
+    }
+    ctx.db.with(|c| c.execute_batch(PROPOSALS))?;
+    ctx.db.exec("INSERT INTO release_check_proposals(repo,agent,contracts,created) VALUES(?,?,?,?)", params![repo, agent, raw, now()])?;
+    ctx.emit("release:proposals", json!({ "repo_id": repo }));
+    Ok(json!({"proposed": v["cases"].as_array().map(Vec::len).unwrap_or(0), "next": "The person reviews these in Review. Nothing counts until they confirm them."}))
+}
 /// What the person is about to confirm, in a shape the form can list line by line.
 fn preview(v: &Value) -> Value {
     let cases: Vec<Value> = v["cases"].as_array().into_iter().flatten().map(|c| match c["document"].as_str() {
-        Some(doc) => json!({"id":c["id"],"kind":"committed file","what":format!("{doc} at {}", c["pointer"].as_str().unwrap_or("")),"expect":c["expect"]}),
-        None => json!({"id":c["id"],"kind":"SQLite contract","what":c["query"],"expect":c["expect"]}),
+        Some(doc) => json!({"id":c["id"],"kind":"committed file","what":format!("{doc} at {}", c["pointer"].as_str().unwrap_or("")),"expect":c["expect"],"why":c["why"]}),
+        None => json!({"id":c["id"],"kind":"database fact","what":c["query"],"expect":c["expect"],"why":c["why"]}),
     }).collect();
     let live: Vec<Value> = v["live_cases"].as_array().into_iter().flatten().map(|c| json!({"id":c["id"],"kind":"running product (loopback observer)","what":format!("GET {} at {}", c["path"].as_str().unwrap_or(""), c["pointer"].as_str().unwrap_or("")),"expect":c["expect"]})).collect();
     let line = |c: &Value| format!("{} {}", c["program"].as_str().unwrap_or(""), c["args"].as_array().into_iter().flatten().filter_map(Value::as_str).map(|a| if a.contains(' ') { format!("'{a}'") } else { a.to_owned() }).collect::<Vec<_>>().join(" "));
@@ -329,11 +375,68 @@ pub async fn call(
 ) -> Result<Value, String> {
     ctx.db.with(|c| c.execute_batch(DB))?;
     ctx.db.with(|c|c.execute_batch("CREATE TABLE IF NOT EXISTS release_stage_ports(repo TEXT PRIMARY KEY REFERENCES repos(id) ON DELETE CASCADE,port INTEGER NOT NULL);CREATE TABLE IF NOT EXISTS release_observer_programs(repo TEXT NOT NULL REFERENCES repos(id) ON DELETE CASCADE,name TEXT NOT NULL,path TEXT NOT NULL,PRIMARY KEY(repo,name));CREATE TABLE IF NOT EXISTS release_confirmations(repo TEXT PRIMARY KEY REFERENCES repos(id) ON DELETE CASCADE,pin TEXT NOT NULL,confirmed INTEGER NOT NULL)"))?;
+    // Keep this checkout's checks in Philium's own store: one checks file is copied in and
+    // committed there. The person still reads and confirms them before anything counts.
+    if method == "sql_import" {
+        let _guard = LANE.try_lock().map_err(|_| "Comparison in progress")?;
+        let file = Path::new(a["file"].as_str().map(str::trim).filter(|f| f.starts_with('/')).ok_or("Enter the absolute path of a checks file")?);
+        let meta = std::fs::metadata(file).map_err(|_| "That file does not exist")?;
+        if !meta.is_file() || meta.len() > 32768 {
+            return Err("Choose a checks file under 32 KiB".into());
+        }
+        let raw = std::fs::read_to_string(file).map_err(|_| "That file cannot be read as text")?;
+        keep(ctx, repo, &raw, "Checks imported from a file")?;
+        return Ok(json!({"driver": KEPT}));
+    }
+    // What agents have proposed for this checkout, in the same plain shape as pinned checks.
+    if method == "sql_proposals" {
+        ctx.db.with(|c| c.execute_batch(PROPOSALS))?;
+        let rows = ctx.db.query("SELECT id,agent,contracts,created FROM release_check_proposals WHERE repo=? AND state='proposed' ORDER BY id DESC LIMIT 5", [repo])?;
+        return Ok(json!(rows
+            .into_iter()
+            .filter_map(|r| {
+                let v = spec(r["contracts"].as_str()?).ok()?;
+                Some(json!({"id":r["id"],"agent":r["agent"],"created":r["created"],"checks":preview(&v)}))
+            })
+            .collect::<Vec<_>>()));
+    }
+    // Accepting moves a proposal into Philium's store. The person still has to read and confirm.
+    if method == "sql_accept" || method == "sql_dismiss" {
+        ctx.db.with(|c| c.execute_batch(PROPOSALS))?;
+        let id = a["id"].as_i64().ok_or("Choose a proposal")?;
+        let row = ctx.db.query("SELECT contracts FROM release_check_proposals WHERE repo=? AND id=? AND state='proposed'", params![repo, id])?.pop().ok_or("That proposal is no longer open")?;
+        let accept = method == "sql_accept";
+        if accept {
+            let _guard = LANE.try_lock().map_err(|_| "Comparison in progress")?;
+            keep(ctx, repo, row["contracts"].as_str().ok_or("Invalid proposal")?, "Checks proposed by an agent and accepted")?;
+        }
+        ctx.db.exec("UPDATE release_check_proposals SET state=? WHERE repo=? AND id=?", params![if accept { "accepted" } else { "dismissed" }, repo, id])?;
+        return Ok(json!({"driver": KEPT}));
+    }
+    // What to tell an agent that drafts checks. With a verified pull request it names the release.
+    if method == "sql_brief" {
+        let range = match a["generation"].as_i64() {
+            Some(seq) => {
+                let rows = ctx.db.query("SELECT pr,base,head FROM release_refs WHERE repo=? AND origin=? AND seq=?", params![repo, o, seq])?;
+                let r = rows.first().ok_or("Generation does not belong to this checkout")?;
+                format!("for pull request #{}. The target is {} and the release head is {}. Run `git diff --stat {}...{}` and read the changed files that matter", r["pr"].as_i64().unwrap_or(0), r["base"].as_str().unwrap_or(""), r["head"].as_str().unwrap_or(""), r["base"].as_str().unwrap_or(""), r["head"].as_str().unwrap_or(""))
+            }
+            None => "for this checkout. Read its recent history with `git log --stat -15` and the files that matter".to_owned(),
+        };
+        return Ok(json!(format!(
+            "Draft release checks {range}: data migrations, API descriptions, permissions and configuration defaults. Do not change any file and do not start the product.\n\n\
+             A check is one fact that must be true in a release and that a wrong change would break. Propose at most 8, the most important first. Two kinds exist:\n\
+             1. A value in a committed JSON file: {{\"id\":\"short-name\",\"why\":\"one plain sentence a manager would understand\",\"document\":\"path/in/repo.json\",\"pointer\":\"/json/pointer\",\"expect\":<the JSON value>}}\n\
+             2. A fact about the database after one SQL schema file is applied with SQLite: {{\"id\":\"short-name\",\"why\":\"one plain sentence\",\"seed\":\"INSERT ...;\",\"query\":\"SELECT ...\",\"expect\":[[...rows...]]}}, with the schema file named once at the top as \"schema\":\"path/to/file.sql\".\n\n\
+             Send them once with the tool `checks_propose`, as {{\"contracts\":{{\"schema\":\"...\",\"cases\":[...]}}}} (leave out schema when there is no database check). If the tool refuses, fix what it names and send again. \
+             Then reply with one plain sentence per check saying what it protects. The person reads and confirms them in Review; nothing counts before that."
+        )));
+    }
     // Read-only look at a verifier's current checks, before the person confirms them by pinning.
     if method == "sql_preview" {
         let driver = a["driver"].as_str().filter(|d| *d != repo).ok_or("Choose a separate trusted driver checkout")?;
-        let r = ctx.db.query("SELECT path FROM repos WHERE id=?", [driver])?.pop().ok_or("Driver not registered")?;
-        let p = Path::new(r["path"].as_str().ok_or("Missing driver path")?);
+        let dir = checks_dir(ctx, repo, driver)?;
+        let p = dir.as_path();
         let pin = local_git(p, &["rev-parse", "--verify", "HEAD^{commit}"]).await?;
         let raw = local_git(p, &["cat-file", "blob", &format!("{pin}:philium/sql-contracts.json")]).await.map_err(|_| "This checkout has no committed philium/sql-contracts.json")?;
         let mut out = preview(&spec(&raw)?);
@@ -368,12 +471,8 @@ pub async fn call(
             .as_str()
             .filter(|d| *d != repo)
             .ok_or("Choose a separate trusted driver checkout")?;
-        let r = ctx
-            .db
-            .query("SELECT path FROM repos WHERE id=?", [driver])?
-            .pop()
-            .ok_or("Driver not registered")?;
-        let p = Path::new(r["path"].as_str().ok_or("Missing driver path")?);
+        let dir = checks_dir(ctx, repo, driver)?;
+        let p = dir.as_path();
         let common = |dir: &Path| dir.canonicalize().map_err(|_| "Missing checkout");
         let driver_git = local_git(
             p,
@@ -484,15 +583,8 @@ pub async fn call(
         v["artifacts"] = json!({});
         v["release_review"] = Value::Null;
         let load = async {
-            let row = ctx
-                .db
-                .query(
-                    "SELECT path FROM repos WHERE id=?",
-                    [profile["driver"].as_str()?],
-                )
-                .ok()?
-                .pop()?;
-            let dp = Path::new(row["path"].as_str()?);
+            let dir = checks_dir(ctx, repo, profile["driver"].as_str()?).ok()?;
+            let dp = dir.as_path();
             let args = ["rev-parse", "--path-format=absolute", "--git-common-dir"];
             let d = std::fs::canonicalize(local_git(dp, &args).await.ok()?).ok()?;
             let p = std::fs::canonicalize(local_git(path, &args).await.ok()?).ok()?;
@@ -833,6 +925,30 @@ pub(crate) async fn stage_probe(port: Option<u16>, head: &str, digest: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Checks an agent proposes are refused unless they are well formed and about committed
+    /// files or the database, and Philium's own store keeps exactly what was accepted.
+    #[test]
+    fn proposed_checks_are_validated_and_kept_in_philiums_own_store() {
+        let ctx = crate::ctx::Ctx::test();
+        let good = json!({"cases":[{"id":"app-private","document":"docs/app.json","pointer":"/public","expect":false}]});
+        let bad = propose(&ctx, "r1", "scribe", &json!({"cases":[]})).unwrap_err();
+        assert!(bad.contains("1 to 8 checks"), "{bad}");
+        let mut live = good.clone();
+        live["live_cases"] = json!([{"id":"health","path":"/health","pointer":"/status","expect":"ok"}]);
+        assert!(propose(&ctx, "r1", "scribe", &live).unwrap_err().contains("file and database checks only"));
+
+        let raw = good.to_string();
+        keep(&ctx, "r1", &raw, "first").unwrap();
+        keep(&ctx, "r1", &raw, "same again").unwrap();
+        let dir = checks_dir(&ctx, "r1", KEPT).unwrap();
+        assert!(dir.starts_with(&ctx.data_dir), "inside the private data folder");
+        assert_eq!(std::fs::read_to_string(dir.join("philium/sql-contracts.json")).unwrap(), raw);
+        assert_eq!(crate::workspace::git(&dir, &["rev-list", "--count", "HEAD"]).unwrap().trim(), "2");
+        assert!(keep(&ctx, "r1", "{\"cases\":[]}", "bad").is_err());
+        assert!(checks_dir(&ctx, "../elsewhere", KEPT).is_err());
+        assert!(checks_dir(&ctx, "r1", "not-registered").is_err());
+    }
+
     #[test]
     fn schema_with_explicit_indexes_is_observed() {
         let schema = "-- comment\nCREATE TABLE IF NOT EXISTS m (w text NOT NULL, g bigint NOT NULL, u text NOT NULL, at timestamptz, PRIMARY KEY (w, g));\nCREATE UNIQUE INDEX IF NOT EXISTS one_user ON m(w, u);\nCREATE INDEX IF NOT EXISTS by_user ON m(u);";

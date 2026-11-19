@@ -91,3 +91,7 @@
 
 .sheet .informs { margin-left: 8px; padding: 0 6px; border-radius: 8px; font-size: 10px; font-weight: 500; color: var(--text-faint); border: 1px solid var(--line-strong); vertical-align: 1px; }
 .sheet tr[data-informs="yes"] th { color: var(--text-dim); }
+
+.sheet fieldset { border: 1px solid var(--line); border-radius: var(--radius-s); padding: 10px 12px; margin: 8px 0; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; min-width: 0; }
+.sheet legend { color: var(--text-faint); font-size: var(--fs-xs); padding: 0 6px; }
+.sheet [data-check] { margin: 8px 0; }

@@ -1937,8 +1937,16 @@ pub fn prompt_map(ctx: &Ctx, repo_id: &str, wt_path: Option<&Path>) -> Option<St
         let def_br = land["default_branch"].as_str().unwrap_or("main");
         if let Some(wts) = land["worktrees"].as_array() {
             if !wts.is_empty() {
+                // The checkout and Philium's own worktrees come first. Of the worktrees made
+                // outside Philium only a few are listed and the rest are counted, so a checkout
+                // with dozens of them does not crowd out what matters.
+                let outside = wts.iter().filter(|w| w["kind"] == "external").count();
                 lines.push(format!("worktrees ({}, base `{}`):", wts.len(), def_br));
-                for w in wts.iter().take(8) {
+                let shown: Vec<&Value> = wts.iter().filter(|w| w["kind"] != "external").take(8).chain(wts.iter().filter(|w| w["kind"] == "external").take(3)).collect();
+                if outside > 3 {
+                    lines.push(format!("  ({} more made outside Philium are not listed; `repo_context {{}}` shows them)", outside - 3));
+                }
+                for w in shown {
                     let kind = w["kind"].as_str().unwrap_or("wt");
                     let br = w["branch"].as_str().unwrap_or("?");
                     let path = w["path"].as_str().unwrap_or("");

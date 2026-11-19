@@ -79,21 +79,35 @@ function Worktree(props) {
 function Branches(props) {
   const [q, setQ] = createSignal("");
   const usedBy = createMemo(() => { const m = {}; for (const w of props.trees) (m[w.branch] ??= []).push(w.agent_name ?? "manual"); return m; });
+  // A checkout can carry thousands of branches. The short view is the branch in use, branches
+  // with a worktree here and the few most recent; the rest is one click or a search away.
+  const [everything, setEverything] = createSignal(false);
+  const isLocal = (b) => !b.name.startsWith("origin/") && !b.name.includes("/remotes/");
+  const counts = createMemo(() => { const named = (props.branches ?? []).filter((b) => b?.name && !b.name.endsWith("/HEAD")); const local = named.filter(isLocal).length; return { local, remote: named.length - local }; });
   const rows = createMemo(() => {
     const t = q().trim().toLowerCase();
     const all = (props.branches ?? []).filter((b) => b?.name && !b.name.endsWith("/HEAD") && (!t || b.name.toLowerCase().includes(t)));
-    const local = all.filter((b) => !b.name.startsWith("origin/") && !b.name.includes("/remotes/"));
-    const remote = all.filter((b) => !local.includes(b));
+    const local = all.filter(isLocal);
+    const remote = all.filter((b) => !isLocal(b));
     const out = [];
-    if (local.length) { out.push({ h: "Local", n: local.length }); local.forEach((b) => out.push({ b })); }
-    if (remote.length) { out.push({ h: "Remote", n: remote.length }); remote.forEach((b) => out.push({ b })); }
+    if (t || everything()) {
+      if (local.length) { out.push({ h: "Local", n: local.length }); local.forEach((b) => out.push({ b })); }
+      if (remote.length) { out.push({ h: "Remote", n: remote.length }); remote.forEach((b) => out.push({ b })); }
+      return out;
+    }
+    const used = usedBy();
+    const short = local.filter((b, i) => b.current || used[b.name] || i < 6);
+    if (short.length) { out.push({ h: "In use and recent", n: short.length }); short.forEach((b) => out.push({ b })); }
+    const hidden = local.length - short.length + remote.length;
+    if (hidden) out.push({ more: `Show ${local.length - short.length} more local and ${remote.length} remote branches` });
     return out;
   });
   return <section class="rp-sec">
-    <div class="rp-sec-head"><h3>Branches</h3><span class="xs faint">{(props.branches ?? []).length}</span><div class="grow" /><div class="rp-search"><Input aria-label="Search branches" placeholder="Search branches" value={q()} onValue={setQ} /></div></div>
+    <div class="rp-sec-head"><h3>Branches</h3><span class="xs faint">{counts().local} local · {counts().remote} remote</span><Show when={everything() && !q()}><button type="button" class="btn ghost sm" onClick={() => setEverything(false)}>Show fewer</button></Show><div class="grow" /><div class="rp-search"><Input aria-label="Search branches" placeholder="Search branches" value={q()} onValue={setQ} /></div></div>
     <Show when={rows().length} fallback={<p class="ws-muted rp-pad">{q() ? "No branches match." : "No branches yet."}</p>}>
       <div class="ws-branch-list" style={{ height: `${Math.min(rows().length, 9) * 34 + 2}px` }}><VirtualList items={rows()} rowHeight={34}>{(r) => r.h
         ? <div class="br-group"><span>{r.h}</span><span class="faint">{r.n}</span></div>
+        : r.more ? <div class="br-row"><button type="button" class="btn ghost sm" onClick={() => setEverything(true)}>{r.more}</button></div>
         : <div class="br-row">
             <Icon name="branch" size={12} />
             <code class="ellipsis grow" title={r.b.name}>{r.b.name}</code>

@@ -41,6 +41,13 @@
     'environments.profiles': ['default'],
     'environments.containers': [{ id: 'abc123def4567890', name: 'kind-control-plane', status: 'Up 3 hours', image: 'kindest/node:v1.31.0', cluster: 'dev' }, { id: 'bcd234efa5678901', name: 'pg-test', status: 'Up 3 hours', image: 'postgres:16', project: 'example-repo' }, { id: 'cde345fab6789012', name: 'redis-test', status: 'Exited (0) 2 days ago', image: 'redis:7', project: 'example-repo' }],
   };
+  // setup=none: a checkout with no checks yet and one proposal from an agent.
+  if (q.get('setup') === 'none') {
+    data['release_intake.sql_profile'] = null;
+    data['release_intake.sql_proposals'] = [{ id: 1, agent: 'heron', created: now - 60e3, checks: { cases: [
+      { id: 'github-app-private', why: 'The GitHub app stays private to your organisation', kind: 'committed file', what: 'docs/github-app-manifest.json at /public', expect: false },
+      { id: 'mapping-one-account-per-user', why: 'One GitHub account maps to exactly one user', kind: 'database fact', what: "SELECT github_user_id FROM github_user_mappings WHERE user_id='u1'", expect: [[100]] }], live_cases: [], targets: [], programs: [], release_records: false } }];
+  }
   const reply = (method) => (method in data ? data[method] : /list$|_list$|history$|names$|jobs$|drivers$|models$/.test(method) ? [] : null);
   window.__TAURI_INTERNALS__ = {
     invoke: async (cmd, args) => (cmd === 'rpc' ? structuredClone(reply(args.method)) : cmd.startsWith('plugin:event') ? 1 : cmd === 'drafts_load' ? { text: '', images: [] } : null),
@@ -53,6 +60,7 @@
     await sleep(900);
     Array.from(document.querySelectorAll('button.nav-item')).find((b) => b.textContent.trim() === screen)?.click();
     await sleep(900);
+    if (screen === 'Review' && q.get('verify') === '0' && q.get('open')) document.querySelectorAll(q.get('open')).forEach((d) => { d.open = true; });
     if (screen === 'Review' && q.get('verify') !== '0') {
       const url = document.querySelector('form input[type="url"]'); if (url) { type(url, 'https://github.com/acme/example-repo/pull/5542'); url.closest('form').querySelector('button').click(); }
       await sleep(900);

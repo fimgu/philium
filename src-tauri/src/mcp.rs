@@ -186,6 +186,8 @@ pub fn tool_list() -> Vec<Value> {
           json!({ "q": s, "limit": i }), &["q"]),
         t("memory_save", "Save for this repository only. Global writes are unavailable. Category: fact, preference, correction, entity.",
           json!({ "content": s, "category": s, "project": b }), &["content", "category"]),
+        t("checks_propose", "Propose release checks for your checkout: facts that must be true in every release. Send {contracts:{schema?,cases:[...]}} once, when asked to draft checks. A person reviews and confirms them in Review; nothing counts before that.",
+          json!({ "contracts": { "type": "object" } }), &["contracts"]),
         t("session_search", "Search Philium session metadata (agent, task, branch) bound to this repository ID. Raw conversations and imported histories are not included.",
           json!({ "q": s, "repo_only": b, "limit": i }), &[]),
         t("resource_register", "Declare something you created outside Philium's tools (container, process, temp dir) so it is cleaned up with you. Use kind_cluster for managed clusters.",
@@ -420,6 +422,10 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
             result["body"] = json!(crate::board::REVIEW_POLICY);
             result["files"] = json!({});
             Ok(result)
+        }
+        "checks_propose" => {
+            let repo = row["repo_id"].as_str().filter(|id| !id.is_empty()).ok_or("Release checks belong to a registered checkout")?;
+            crate::release_sql::propose(ctx, repo, &me, &a["contracts"])
         }
         "memory_search" | "memory_save" | "session_search" => {
             // Personal memory and past sessions never go to agents on untrusted (Strict) providers.
