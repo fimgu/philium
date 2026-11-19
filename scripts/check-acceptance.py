@@ -388,7 +388,7 @@ await go('Review');
 const box = await until(() => all('details[aria-label="Release PR revisions"]')[0], 'release section', 15000);
 if (!box.open) box.querySelector('summary').click();
 const line = () => txt(box.querySelector('[aria-label="GitHub connection"]'));
-const before = await until(() => (line().startsWith('GitHub:') ? line() : null), 'connection line', 10000);
+const before = await until(() => (line().startsWith('GitHub') ? line() : null), 'connection line', 10000);
 await click('Connect GitHub', box);
 const said = await until(() => { const t = txt(all('p[role="status"]', box)[0]); return /^GitHub (not )?connected/.test(t) ? t : null; }, 'answer', 30000);
 return { before, said, after: line() };
@@ -407,7 +407,7 @@ const sec = await until(() => all('section[aria-label="Agent review"]', box)[0],
 if (!sec) return { started };
 const rows = () => all('tr[data-item]', all('section[aria-label="Agent review"]', box)[0]);
 await until(() => rows().length >= 3, 'plan listed', 120000).catch(() => null);
-const planned = rows().map((tr) => txt(tr.querySelector('th')));
+const planned = rows().map((tr) => txt(tr.querySelector('th')).replace(/^P\d\s*/, ''));
 await until(() => rows().filter((tr) => tr.dataset.result).length >= 3 && all('details[aria-label="Review report"]', box).length, 'results and report', 180000).catch(() => null);
 const now = all('section[aria-label="Agent review"]', box)[0];
 return { started, planned, headline: txt(now.querySelector('h3')), progress: txt(now.querySelector('.verdict p')),

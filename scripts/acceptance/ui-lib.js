@@ -17,7 +17,9 @@
     };
     const shown = (el) => !!el && !el.closest('.hidden') && !el.closest('[hidden]');
     const all = (sel, root = document) => Array.from(root.querySelectorAll(sel)).filter(shown);
-    const txt = (el) => (el?.innerText ?? el?.textContent ?? '').replace(/\s+/g, ' ').trim();
+    // What a person reads. Text inside a closed section has no rendered text; it is what the
+    // person sees on opening it, so the source text stands in for it.
+    const txt = (el) => ((el?.innerText || '').trim() ? el.innerText : el?.textContent ?? '').replace(/\s+/g, ' ').trim();
     const pane = () => document.querySelector('.screen-pane:not(.hidden)') || document;
     const button = (label, root) => all('button', root || document).find((b) => txt(b) === label)
       || all('button', root || document).find((b) => txt(b).includes(label));
