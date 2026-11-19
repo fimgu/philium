@@ -589,9 +589,20 @@ function AgentView(props) {
   const busy = () => ["running", "waiting"].includes(a()?.state);
   let agentMain;
 
+  // What is typed while the agent works waits here, survives a quit, and is sent when the step ends.
+  const [queued, { refetch: refetchQueue }] = createResource(() => props.id, (id) => rpc("agents.queue_list", { id }).catch(() => []));
+  useEvent("agents:queue", (p) => { if (p.id === props.id || p.id === a()?.id) refetchQueue(); });
+  const queue = async (text, images = []) => {
+    try { await rpc("agents.queue_add", { id: props.id, text, images }, { action: true }); refetchQueue(); return true; }
+    catch (e) { toast(String(e), "danger"); return false; }
+  };
   const send = async (text, images = []) => {
     try { await rpc("agents.send", { id: props.id, text, images }, { action: true }); return true; }
-    catch (e) { toast(sendError(e), "danger"); return false; }
+    catch (e) {
+      // It started working a moment before: queue instead of refusing.
+      if (/session is busy|"type"\s*:\s*"busy"/i.test(String(e))) return queue(text, images);
+      toast(sendError(e), "danger"); return false;
+    }
   };
   const decide = (request_id, decision, scope) =>
     live() ? rpc("agents.permission", { id: props.id, request_id, decision, scope }, { action: true }).catch((e) => toast(String(e), "danger")) : Promise.resolve();
@@ -679,7 +690,10 @@ function AgentView(props) {
             <Show when={historyMore()}><div class="history-more small dim" role="status">More saved history is available. Showing loaded pages only. <Button size="sm" disabled={historyLoading()} onClick={() => load(props.id, historyCursor())}>Load more history</Button></div></Show>
             <Conversation events={events()} busy={busy()} readOnly={!live()} loadAttachment={agentAttachmentLoader(props.id)} emptyText={historyLoading() ? "Loading saved conversation…" : historyError() ? "History could not be loaded. Retry above." : live() ? "Send the first message to start." : "No saved messages. This agent is stopped. Resume it to continue."}
               onApprove={(id, scope) => decide(id, "approve", scope)} onDeny={(id) => decide(id, "deny")} />
-            <Composer draftKey={`agent:${props.id}`} dropTarget={() => agentMain} onSend={send} busy={busy()} disabled={!live()} onCancel={() => rpc("agents.cancel", { id: props.id }, { action: true }).catch((e) => toast(String(e), "danger"))}
+            <Composer draftKey={`agent:${props.id}`} dropTarget={() => agentMain} onSend={send} busy={busy()} disabled={!live()}
+              onQueue={queue} queued={queued() ?? []} queueTarget={a()?.name}
+              onTakeQueued={(q) => rpc("agents.queue_take", { id: props.id, item: q.id }).then((r) => r?.text).catch((e) => { toast(String(e), "danger"); return null; })}
+              onRemoveQueued={(q) => rpc("agents.queue_remove", { id: props.id, item: q.id }).catch((e) => toast(String(e), "danger"))} onCancel={() => rpc("agents.cancel", { id: props.id }, { action: true }).catch((e) => toast(String(e), "danger"))}
               effort={effort()} speed={effortSpeed(effort())} effortOptions={activeModel()?.effort_details ?? []} effortPending={effortPending()} onEffort={changeEffort} onSpeed={changeEffort} onSlashModel={handleSlashModel}
               placeholder={live() ? `Message ${a()?.name ?? ""} (or /effort, /model)` : "Agent is stopped"} />
           </Show>
@@ -743,7 +757,10 @@ export function AgentGridCard(props) {
     if (!msg || !live() || sending()) return;
     setSending(true);
     try {
-      await rpc("agents.send", { id: a().id, text: msg, images: [] }, { action: true });
+      if (busy()) {
+        await rpc("agents.queue_add", { id: a().id, text: msg, images: [] }, { action: true });
+        toast(`Queued for ${a().name}: sent when this step ends`, "info");
+      } else await rpc("agents.send", { id: a().id, text: msg, images: [] }, { action: true });
       setText("");
     } catch (err) {
       toast(sendError(err), "danger");

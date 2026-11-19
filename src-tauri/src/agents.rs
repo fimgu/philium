@@ -786,10 +786,32 @@ pub async fn send_with_images(_ctx: &Arc<Ctx>, id: &str, text: &str, images: Val
         .await
 }
 
-/// Hand an idle agent the mail it should act on: from the person, its lead or its helpers.
-/// Called when mail arrives, when a turn ends and after a start. A busy agent gets it when
-/// its turn ends. At most 30 automatic deliveries an hour per agent, so two agents cannot
-/// keep each other busy; beyond that the mail waits in the inbox.
+/// What the person typed while the agent worked, oldest first, as one message: the text joined
+/// by blank lines, the images together, and the rows it came from.
+fn queued_message(ctx: &Ctx, id: &str) -> Option<(String, Value, Vec<i64>)> {
+    let rows = ctx.db.query("SELECT id,text,images FROM agent_queue WHERE agent_id=?1 ORDER BY id", [id]).ok()?;
+    if rows.is_empty() {
+        return None;
+    }
+    let text = rows.iter().filter_map(|r| r["text"].as_str()).map(str::trim).filter(|t| !t.is_empty()).collect::<Vec<_>>().join("\n\n");
+    let images: Vec<Value> = rows.iter().flat_map(|r| serde_json::from_str::<Vec<Value>>(r["images"].as_str().unwrap_or("[]")).unwrap_or_default()).collect();
+    Some((text, json!(images), rows.iter().filter_map(|r| r["id"].as_i64()).collect()))
+}
+
+fn queue_list(ctx: &Ctx, id: &str) -> Result<Value, String> {
+    let rows = ctx.db.query("SELECT id,text,images,created_at FROM agent_queue WHERE agent_id=?1 ORDER BY id", [id])?;
+    Ok(json!(rows.into_iter().map(|r| json!({
+        "id": r["id"], "text": r["text"], "created_at": r["created_at"],
+        "images": serde_json::from_str::<Vec<Value>>(r["images"].as_str().unwrap_or("[]")).map(|v| v.len()).unwrap_or(0),
+    })).collect::<Vec<_>>()))
+}
+
+/// Hand an idle agent what is waiting for it. First what the person typed while it worked,
+/// then mail from the person, its lead or its helpers. Called when mail or a queued message
+/// arrives, when a turn ends and after a start, so a busy agent gets it when its turn ends.
+/// Mail is limited to 30 automatic deliveries an hour per agent, so two agents cannot keep
+/// each other busy; beyond that the mail waits in the inbox. The person's messages are not
+/// limited.
 pub fn deliver_mail(ctx: &Arc<Ctx>, id: &str) {
     let Ok(handle) = tokio::runtime::Handle::try_current() else { return };
     let (ctx, id) = (ctx.clone(), id.to_owned());
@@ -798,6 +820,20 @@ pub fn deliver_mail(ctx: &Arc<Ctx>, id: &str) {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         let Some(row) = get_row(&ctx, &id) else { return };
         if row["state"] != "idle" || runtime(&id).is_none() {
+            return;
+        }
+        if let Some((text, images, rows)) = queued_message(&ctx, &id) {
+            match send_with_images(&ctx, &id, &text, images).await {
+                Ok(_) => {
+                    for r in rows {
+                        let _ = ctx.db.exec("DELETE FROM agent_queue WHERE id=?1", [r]);
+                    }
+                    ctx.log_event("agent_queue_delivered", Some(&id), &json!({ "messages": text.matches("\n\n").count() + 1 }));
+                }
+                // Kept in the queue: the next turn end tries again.
+                Err(e) => ctx.log_event("agent_queue_undelivered", Some(&id), &json!({ "error": e })),
+            }
+            ctx.emit("agents:queue", json!({ "id": id }));
             return;
         }
         let key = format!("agent.mailwake.{id}");
@@ -1075,6 +1111,33 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
             },
         ),
         "send" => send_with_images(ctx, &id()?, &ctx::arg_str(&args, "text")?, args.get("images").cloned().unwrap_or(json!([]))).await,
+        // Typed while the agent works: kept, survives a quit, delivered when the turn ends.
+        "queue_add" => {
+            let id = id()?;
+            let text = ctx::arg_str(&args, "text").unwrap_or_default();
+            let images = args.get("images").cloned().filter(Value::is_array).unwrap_or(json!([]));
+            if text.trim().is_empty() && images.as_array().map_or(true, Vec::is_empty) {
+                return Err("Nothing to queue".into());
+            }
+            if text.len() > 100_000 {
+                return Err("The message is too long to queue".into());
+            }
+            ctx.db.exec("INSERT INTO agent_queue(agent_id,text,images,created_at) VALUES(?1,?2,?3,?4)", rusqlite::params![id, text, images.to_string(), now()])?;
+            ctx.emit("agents:queue", json!({ "id": id }));
+            // The turn may have ended while this was typed.
+            deliver_mail(ctx, &id);
+            queue_list(ctx, &id)
+        }
+        "queue_list" => queue_list(ctx, &id()?),
+        // Edit takes a queued message back into the box; remove drops it.
+        "queue_take" | "queue_remove" => {
+            let id = id()?;
+            let item = args["item"].as_i64().ok_or("missing `item`")?;
+            let row = ctx.db.query("SELECT text FROM agent_queue WHERE id=?1 AND agent_id=?2", rusqlite::params![item, id])?.pop().ok_or("Already sent")?;
+            ctx.db.exec("DELETE FROM agent_queue WHERE id=?1", [item])?;
+            ctx.emit("agents:queue", json!({ "id": id }));
+            Ok(if method == "queue_take" { json!({ "text": row["text"] }) } else { Value::Null })
+        }
         "cancel" => {
             let r = rt(&id()?)?;
             r.hal.call(reqwest::Method::POST, &format!("/sessions/{}/cancel", r.session), None).await
@@ -1132,6 +1195,7 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
             }
             crate::browser::forget_agent(ctx, &id);
             ctx.db.exec("DELETE FROM agents WHERE id=?1", [&id])?;
+            let _ = ctx.db.exec("DELETE FROM agent_queue WHERE agent_id=?1", [&id]);
             for k in ["agent_error", "agent_seq"] {
                 let _ = ctx.db.exec("DELETE FROM kv WHERE k=?1", [format!("{k}.{id}")]);
             }
@@ -1463,6 +1527,27 @@ mod tests {
         assert!(reserve_local_kind(&ctx, "a", "philium-a-two", json!({})).is_err());
         crate::reaper::release(&ctx, &rid);
         assert!(reserve_local_kind(&ctx, "a", "philium-a-two", json!({})).is_ok());
+    }
+
+    #[tokio::test]
+    async fn messages_typed_while_an_agent_works_are_kept_in_order_and_sent_as_one() {
+        let ctx = Ctx::test();
+        ctx.db.exec("INSERT INTO agents(id,name,model_ref,state,created_at,last_active_at) VALUES('a','fixture','p/m','running',0,0)", []).unwrap();
+        assert!(call(&ctx, "queue_add", json!({"id":"fixture","text":"  "})).await.is_err());
+        call(&ctx, "queue_add", json!({"id":"fixture","text":"Also check the CLI."})).await.unwrap();
+        call(&ctx, "queue_add", json!({"id":"a","text":"Skip the docs.","images":[{"sha256":"x"}]})).await.unwrap();
+        let listed = call(&ctx, "queue_add", json!({"id":"a","text":"And the tests."})).await.unwrap();
+        assert_eq!(listed.as_array().unwrap().len(), 3);
+        assert_eq!(listed[1]["images"], 1);
+        // Taking one back into the box removes it from what will be sent.
+        let second = listed[1]["id"].as_i64().unwrap();
+        assert_eq!(call(&ctx, "queue_take", json!({"id":"a","item":second})).await.unwrap()["text"], "Skip the docs.");
+        assert!(call(&ctx, "queue_take", json!({"id":"a","item":second})).await.unwrap_err().contains("Already sent"));
+        let (text, images, rows) = queued_message(&ctx, "a").unwrap();
+        assert_eq!((text.as_str(), images, rows.len()), ("Also check the CLI.\n\nAnd the tests.", json!([]), 2));
+        // Still running: nothing was delivered, everything is still queued.
+        assert_eq!(call(&ctx, "queue_list", json!({"id":"a"})).await.unwrap().as_array().unwrap().len(), 2);
+        std::fs::remove_dir_all(ctx.data_dir.parent().unwrap()).ok();
     }
 
     #[tokio::test]

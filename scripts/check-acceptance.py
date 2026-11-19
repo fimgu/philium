@@ -262,6 +262,36 @@ const changes = await until(() => { const t = convo(); return /state\.txt|notes\
 return { before, resumed, note: delivered, redirected, interrupted, after, stopped, disabled, changes };
 '''
 
+QUEUE = AGENT + r'''
+// Typing while the agent works: the message waits above the box and is sent when the step ends.
+await workspace('All Workspaces');
+await openAgent(P.name);
+await live();
+await sendOnly('SLOW 10');
+await until(() => document.querySelector('button.composer-send.stop'), 'the agent is working', 20000);
+const queued = () => all('[data-queued]').map(txt);
+type(composer(), 'QUEUED first note');
+await sleep(150);
+composer().dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+await until(() => queued().length === 1, 'first message queued', 8000);
+type(composer(), 'QUEUED second note');
+await until(() => document.querySelector('button.composer-send[aria-label="Queue message"]'), 'queue button', 5000);
+document.querySelector('button.composer-send[aria-label="Queue message"]').click();
+await until(() => queued().length === 2, 'second message queued', 8000);
+const whileWorking = { queued: queued(), label: txt(document.querySelector('[aria-label="Queued messages"] .xs')), status: txt(document.querySelector('.composer-status')) };
+// Edit takes one back into the box; Enter queues it again.
+button('Edit', all('[data-queued]')[1]).click();
+await until(() => queued().length === 1 && /QUEUED second note/.test(composer().value), 'taken back', 8000);
+const edited = { queued: queued(), box: composer().value };
+composer().dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+await until(() => queued().length === 2, 'queued again', 8000);
+const finished = await until(() => {
+  const t = convo(), i = t.lastIndexOf('SYNTHETIC REPLY');
+  return queued().length === 0 && t.includes('SLOW TURN FINISHED') && i > t.lastIndexOf('SLOW TURN FINISHED') ? t.slice(i, i + 160) : null;
+}, 'queued messages delivered after the step', 60000).catch(() => null);
+return { whileWorking, edited, finished, left: queued() };
+'''
+
 MODEL_PICKER = AGENT + r'''
 // An agent of its own, outside any checkout: an agent with helpers keeps one model for the family.
 await workspace('All Workspaces');
@@ -694,6 +724,13 @@ def main():
             run.check('B1', 'A provider shows the newest model of each family first and keeps the older ones behind one button', other.get('items') == ['nova-3-2', 'nova-mini-3', 'spark-2-1'] and other.get('more') == 'Show 5 older models' and len(every.get('items') or []) == 8, {'latest': other.get('items'), 'more': other.get('more'), 'all': every.get('items')})
             run.check('B1', 'Search looks across every provider at once', [i.replace(' ✓', '') for i in found.get('items') or []] == ['synthetic-1'] and found.get('chips') == 0, found)
             run.check('B1', 'An arrow key reaches the first model; choosing it switches the agent, returns to the message box, and the agent answers on the new model', (v.get('focused') or '').startswith('nova-3-2') and v.get('closed') is True and 'nova-3-2' in (v.get('modelAfter') or '') and v.get('composerFocused') is True and 'SYNTHETIC REPLY from solo' in (v.get('reply') or ''), {'focused': v.get('focused'), 'after': v.get('modelAfter'), 'composer': v.get('composerFocused'), 'reply': (v.get('reply') or '')[:60], 'toasts': v.get('toasts')})
+
+            r = run.ui(QUEUE, {'name': 'solo'}, 150)
+            v = run.value(r)
+            w, e = v.get('whileWorking') or {}, v.get('edited') or {}
+            run.check('B1', 'A message typed while the agent works is queued above the box with Edit and Remove, not refused', w.get('queued') and len(w['queued']) == 2 and 'Queued · sent when solo finishes this step' in (w.get('label') or '') and 'Enter queues your message' in (w.get('status') or ''), w or r.get('error'))
+            run.check('B1', 'Edit takes a queued message back into the box', e.get('queued') and len(e['queued']) == 1 and 'QUEUED second note' in (e.get('box') or ''), e)
+            run.check('B1', 'When the step ends the queued messages reach the agent together, in order, and the queue empties', 'QUEUED first note QUEUED second note' in (v.get('finished') or '') and v.get('left') == [], {'finished': v.get('finished'), 'left': v.get('left')})
 
         if want('review'):
             origin = syn.serve(syn.Origin); observer = syn.serve(syn.Observer)

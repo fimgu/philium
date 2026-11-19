@@ -458,7 +458,7 @@ export function Composer(props) {
     const target = record();
     const draft = target.text(), attached = target.images();
     const t = draft.trim();
-    if (!target.ready() || (!t && !attached.length) || props.disabled || props.busy || sending() || adding()) return;
+    if (!target.ready() || (!t && !attached.length) || props.disabled || (props.busy && !props.onQueue) || sending() || adding()) return;
     // Intercept /effort and /model locally with 0 LLM tokens spent
     if (!attached.length && /^\/effort(\s+.*)?$/i.test(t)) {
       const arg = t.replace(/^\/effort\s*/i, "").trim().toLowerCase();
@@ -490,12 +490,20 @@ export function Composer(props) {
     }
     target.setSending(true);
     try {
-      const accepted = await props.onSend(t, await sendableImages(attached));
+      // While the agent works, a message is queued and delivered when the current step ends.
+      const deliver = props.busy && props.onQueue ? props.onQueue : props.onSend;
+      const accepted = await deliver(t, await sendableImages(attached));
       if (accepted !== false) clearSentDraft(target, draft, attached);
     } catch (e) { toast(String(e), "danger"); }
     finally { target.setSending(false); }
   };
   const remove = (image) => { setImages(images().filter((x) => x !== image)); input?.focus(); };
+  // A queued message taken back into the box, in front of whatever is being typed.
+  const editQueued = async (q) => {
+    const back = await props.onTakeQueued?.(q);
+    if (typeof back === "string") record().setText((old) => old?.trim() ? `${back}\n\n${old}` : back);
+    input?.focus();
+  };
   const empty = () => !text().trim() && !images().length;
   return (
     <div class="composer composer-card" classList={{ dragging: over() }}
@@ -503,6 +511,18 @@ export function Composer(props) {
       onDragLeave={(e) => { if (!props.dropTarget && !e.currentTarget.contains(e.relatedTarget)) setOver(false); }}
       onDrop={(e) => { if (props.dropTarget) return; e.preventDefault(); setOver(false); if (canAttach()) add(e.dataTransfer.files); }}>
       <Show when={over()}><div class="composer-drop" aria-hidden="true"><Icon name="image" size={16} /> Drop images to attach</div></Show>
+      <Show when={props.queued?.length}>
+        <div class="composer-queue" aria-label="Queued messages">
+          <div class="xs dim">{props.busy ? `Queued · sent when ${props.queueTarget || "the agent"} finishes this step` : "Queued · sending now"}</div>
+          <For each={props.queued}>{(q) => (
+            <div class="composer-queued" data-queued={q.id}>
+              <span class="composer-queued-text">{q.text}{q.images ? ` · ${q.images} image${q.images > 1 ? "s" : ""}` : ""}</span>
+              <Show when={!q.images}><button type="button" class="link xs" onClick={() => editQueued(q)}>Edit</button></Show>
+              <button type="button" class="link xs" onClick={() => props.onRemoveQueued?.(q)}>Remove</button>
+            </div>
+          )}</For>
+        </div>
+      </Show>
       <Show when={slashHint()}>
         {(h) => (
           <div class="composer-slash-bar xs">
@@ -580,7 +600,7 @@ export function Composer(props) {
           <Show when={notice()} fallback={
             record().loading() ? "Restoring draft…" :
             props.effortPending ? "Updating effort…" :
-            props.busy ? "Working. Your draft is kept. Stop interrupts." : ""}>
+            props.busy ? (props.onQueue ? "Working. Enter queues your message for when this step ends. Stop interrupts." : "Working. Your draft is kept. Stop interrupts.") : ""}>
             <span class="composer-notice" role="alert">{notice()} <button type="button" class="link" onClick={() => setNotice("")}>Dismiss</button></span>
           </Show>
           <Show when={permission()}>
@@ -590,6 +610,9 @@ export function Composer(props) {
           </Show>
           <Show when={record().error()}><span class="composer-notice" role="alert">{record().error()} <button type="button" class="link" disabled={record().loading() || record().pending()} onClick={() => record().retry?.()}>Retry</button></span></Show>
         </div>
+        <Show when={props.busy && props.onQueue && !empty()}>
+          <button type="button" class="composer-send" aria-label="Queue message" title="Queue (Enter): sent when this step ends" onClick={send} disabled={props.disabled || !record().ready() || sending() || adding() > 0}><Icon name="send" size={13} /></button>
+        </Show>
         <Show when={props.busy} fallback={
           <button type="button" class="composer-send" aria-label="Send" title="Send (Enter) · Shift+Enter for a new line" onClick={send} disabled={props.disabled || !record().ready() || sending() || adding() > 0 || empty()}><Icon name="send" size={14} /></button>}>
           <button type="button" class="composer-send stop" aria-label="Stop" title="Stop the current turn" onClick={props.onCancel}><Icon name="stop" size={12} /></button>
