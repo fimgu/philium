@@ -50,7 +50,7 @@
   }
   const reply = (method) => (method in data ? data[method] : /list$|_list$|history$|names$|jobs$|drivers$|models$/.test(method) ? [] : null);
   window.__TAURI_INTERNALS__ = {
-    invoke: async (cmd, args) => (cmd === 'rpc' ? structuredClone(reply(args.method)) : cmd.startsWith('plugin:event') ? 1 : cmd === 'drafts_load' ? { text: '', images: [] } : null),
+    invoke: async (cmd, args) => (cmd === 'rpc' && (window.__calls = window.__calls || []).push(args.method), cmd === 'rpc' ? structuredClone(reply(args.method)) : cmd.startsWith('plugin:event') ? 1 : cmd === 'drafts_load' ? { text: '', images: [] } : null),
     transformCallback: () => Math.floor(Math.random() * 1e9), metadata: { currentWindow: { label: 'main' }, currentWebview: { label: 'main', windowLabel: 'main' } }, convertFileSrc: (p) => p,
   };
   window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener() {} };
@@ -67,6 +67,15 @@
       if (q.get('open')) document.querySelectorAll(q.get('open')).forEach((d) => { d.open = true; });
     }
     if (screen === 'Environments' && q.get('machine')) { Array.from(document.querySelectorAll('button')).find((b) => b.textContent.trim() === 'Inspect local machine')?.click(); await sleep(900); }
+    // click=<button text>: press it, then show which backend calls the page made, for debugging.
+    if (q.get('click')) {
+      const before = (window.__calls || []).length;
+      Array.from(document.querySelectorAll('button')).find((b) => b.textContent.trim() === q.get('click'))?.click();
+      await sleep(900);
+      const note = document.createElement('pre'); note.style.cssText = 'position:fixed;right:8px;bottom:8px;z-index:9999;background:#000;color:#0f0;padding:8px;font-size:11px;max-width:520px;white-space:pre-wrap';
+      note.textContent = 'calls after click: ' + (window.__calls || []).slice(before).join(', ') + '\nstatus: ' + Array.from(document.querySelectorAll('p[role="status"]')).map((p) => p.textContent).join(' | ');
+      document.body.appendChild(note);
+    }
     const body = document.querySelector('.page-body'); if (q.get('y') && body) body.scrollTop = Number(q.get('y'));
     document.title = 'ready';
   });

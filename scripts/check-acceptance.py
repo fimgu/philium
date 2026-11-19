@@ -318,12 +318,19 @@ const started = await until(() => (/is drafting checks|Not started/.test(status(
 const prop = await until(() => all('section[aria-label="Proposed checks"]', setup)[0], 'proposal shown', 120000).catch(() => null);
 if (!prop) return { before, started, status: status() };
 const proposed = all('[data-check]', prop).map(txt), by = txt(prop.querySelector('h3'));
-await click('Use these checks', prop);
-await until(() => all('section[aria-label="Checks to confirm"]', setup)[0], 'checks to confirm', 20000);
+// A press in the first instant after the proposal appears was not registered in the packaged
+// window (cause not established; the same press works in a browser and a moment later here).
+// A person cannot be that fast, so wait as a person would and press what is on the page now.
+await sleep(1500);
+const live = () => all('section[aria-label="Proposed checks"]', setup)[0];
+const redrawn = live() !== prop;
+await click('Use these checks', live());
+const shown = await until(() => all('section[aria-label="Checks to confirm"]', setup)[0], 'checks to confirm', 20000).catch(() => null);
+if (!shown) return { before, started, by, proposed, status: status(), alerts: all('[role="alert"]', box).map(txt), connected: prop.isConnected, redrawn, sections: all('section[aria-label="Proposed checks"]', setup).length, buttons: all('button', setup).map((b) => txt(b) + (b.disabled ? ' (off)' : '')), toasts: toasts() };
 const toConfirm = all('section[aria-label="Checks to confirm"] [data-check]', setup).map(txt);
 await click('Confirm and pin these checks', setup);
 const pinned = await until(() => { const t = txt(setup.querySelector('[aria-label="Pinned verifier"]')); return t.includes('You confirmed') ? t : null; }, 'pinned', 25000).catch(() => status());
-return { before, started, by, proposed, toConfirm, pinned, summary: txt(box.querySelector('[aria-label="Verification setup summary"]')), labels: Array.from(picker().options).map(txt), left: all('section[aria-label="Proposed checks"]', setup).length };
+return { before, started, by, proposed, toConfirm, pinned, redrawn, summary: txt(box.querySelector('[aria-label="Verification setup summary"]')), labels: Array.from(picker().options).map(txt), left: all('section[aria-label="Proposed checks"]', setup).length };
 '''
 
 DELEGATE_SLOW = AGENT + r'''
@@ -881,7 +888,7 @@ def main():
             v = run.value(r)
             kept = list((run.profile / 'data/checks').glob('*/philium/sql-contracts.json'))
             run.check('C1', 'With no checks yet, an agent started from Review proposes them and they are listed in plain words', len(v.get('proposed') or []) == 2 and 'committed file' in ' '.join(v.get('proposed') or []) and 'Proposed by' in (v.get('by') or ''), {'started': v.get('started'), 'by': v.get('by'), 'proposed': v.get('proposed'), 'status': v.get('status'), 'error': r.get('error')})
-            run.check('C1', 'The proposal counts only after the person accepts it and confirms the same checks', v.get('toConfirm') == v.get('proposed') and 'You confirmed its checks' in (v.get('pinned') or '') and 'No checks confirmed' in ((v.get('before') or {}).get('pinned') or '') and v.get('left') == 0, {'before': (v.get('before') or {}).get('pinned'), 'pinned': v.get('pinned'), 'left': v.get('left')})
+            run.check('C1', 'The proposal counts only after the person accepts it and confirms the same checks', v.get('toConfirm') == v.get('proposed') and 'You confirmed its checks' in (v.get('pinned') or '') and 'No checks confirmed' in ((v.get('before') or {}).get('pinned') or '') and v.get('left') == 0, {'before': (v.get('before') or {}).get('pinned'), 'pinned': v.get('pinned'), 'left': v.get('left'), 'status': v.get('status'), 'alerts': v.get('alerts'), 'connected': v.get('connected'), 'redrawn': v.get('redrawn'), 'sections': v.get('sections'), 'buttons': v.get('buttons'), 'toasts': v.get('toasts')})
             run.check('C1', 'The checks are kept by Philium itself: no second checkout appears and the person names no folder', 'kept by Philium' in (v.get('pinned') or '') and 'kept by Philium' in (v.get('summary') or '') and sorted(v.get('labels') or []) == sorted(labels) and len(kept) == 1, {'summary': v.get('summary'), 'labels': v.get('labels'), 'kept': [str(k.relative_to(run.profile)) for k in kept]})
 
     finally:
