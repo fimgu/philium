@@ -346,13 +346,62 @@ pub fn inject_cache_breakpoints(v: &mut Value, anthropic: bool) {
     if let Some(last_tool) = v["tools"].as_array_mut().and_then(|t| t.last_mut()).filter(|t| t.is_object()) {
         last_tool["cache_control"] = json!({"type": "ephemeral"});
     }
-    if let Some(sys) = v.get_mut("system") {
-        mark_block_ephemeral(sys);
+    // A subscription body passes through here twice, with identity blocks added in between.
+    // The shared prefix marked the first time stays the only system breakpoint.
+    let system_marked = v["system"].as_array().is_some_and(|a| a.iter().any(|b| b.get("cache_control").is_some()));
+    if !system_marked {
+        if let Some(sys) = v.get_mut("system") {
+            mark_block_ephemeral(sys);
+        }
     }
     if let Some(msgs) = v["messages"].as_array_mut() {
         for m in msgs.iter_mut().rev().take(2) {
             mark_block_ephemeral(&mut m["content"]);
         }
+    }
+    cap_cache_breakpoints(v);
+}
+
+/// Anthropic refuses a request with more than four breakpoints. Keep the tool list first, then
+/// system blocks in order, then the newest messages; an older mark beyond that is dropped.
+fn cap_cache_breakpoints(v: &mut Value) {
+    fn keep(b: &mut Value, left: &mut usize) {
+        if b.get("cache_control").is_some() {
+            if *left > 0 {
+                *left -= 1;
+            } else if let Some(o) = b.as_object_mut() {
+                o.remove("cache_control");
+            }
+        }
+    }
+    let mut left = 4usize;
+    if let Some(tools) = v["tools"].as_array_mut() {
+        for b in tools.iter_mut().rev() {
+            keep(b, &mut left);
+        }
+    }
+    if let Some(system) = v["system"].as_array_mut() {
+        for b in system.iter_mut() {
+            keep(b, &mut left);
+        }
+    }
+    if let Some(msgs) = v["messages"].as_array_mut() {
+        for m in msgs.iter_mut().rev() {
+            if let Some(blocks) = m["content"].as_array_mut() {
+                for b in blocks.iter_mut().rev() {
+                    keep(b, &mut left);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+fn count_cache_breakpoints(v: &Value) -> usize {
+    match v {
+        Value::Object(o) => usize::from(o.contains_key("cache_control")) + o.values().map(count_cache_breakpoints).sum::<usize>(),
+        Value::Array(a) => a.iter().map(count_cache_breakpoints).sum(),
+        _ => 0,
     }
 }
 
@@ -624,6 +673,41 @@ mod tests {
         assert_eq!(split_ant["system"][0]["cache_control"], json!({"type": "ephemeral"}));
         assert_eq!(split_ant["system"][1]["text"], "Agent: lion (orchestrator)");
         assert!(split_ant["system"][1].get("cache_control").is_none());
+    }
+
+    /// The subscription path marks, adds its identity blocks, then marks again. An agent prompt
+    /// with a shared prefix used to carry five breakpoints from the second message on, and the
+    /// provider refused every such request.
+    #[test]
+    fn a_subscription_body_never_exceeds_four_breakpoints() {
+        let mut ant = request(&json!({
+            "model": "claude-sonnet-5-5",
+            "messages": [
+                {"role": "system", "content": format!("SHARED_REPO_PREFIX\n{CACHE_BREAK_MARKER}\nAgent: lead (orchestrator)")},
+                {"role": "user", "content": "u1"},
+                {"role": "assistant", "content": "a1"},
+                {"role": "user", "content": "u2"}
+            ],
+            "tools": [{"type": "function", "function": {"name": "t1", "parameters": {"type": "object"}}}]
+        }), true);
+        inject_cache_breakpoints(&mut ant, true);
+        crate::oauth::shape_claude_body(&mut ant);
+        inject_cache_breakpoints(&mut ant, true);
+        assert_eq!(count_cache_breakpoints(&ant), 4, "{ant}");
+        let marked: Vec<_> = ant["system"].as_array().unwrap().iter().filter(|b| b.get("cache_control").is_some()).collect();
+        assert_eq!(marked.len(), 1);
+        assert_eq!(marked[0]["text"], "SHARED_REPO_PREFIX");
+        assert!(ant["messages"][2]["content"][0].get("cache_control").is_some());
+
+        // A caller that brings its own marks is trimmed from the oldest message, never refused.
+        let turns: Vec<Value> = (0..6)
+            .map(|i| json!({"role": if i % 2 == 0 { "user" } else { "assistant" }, "content": [{"type": "text", "text": format!("m{i}"), "cache_control": {"type": "ephemeral"}}]}))
+            .collect();
+        let mut many = json!({"system": [{"type": "text", "text": "s", "cache_control": {"type": "ephemeral"}}], "messages": turns});
+        inject_cache_breakpoints(&mut many, true);
+        assert_eq!(count_cache_breakpoints(&many), 4);
+        assert!(many["messages"][5]["content"][0].get("cache_control").is_some());
+        assert!(many["messages"][0]["content"][0].get("cache_control").is_none());
     }
 
     #[test]
