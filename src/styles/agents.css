@@ -359,6 +359,17 @@ details.msg summary { cursor: pointer; display: flex; align-items: center; gap: 
   background: rgba(127, 213, 161, 0.12); padding: 1px 5px; border-radius: 4px;
 }
 .model-picker-check { color: var(--accent); font-weight: 700; }
+.model-picker-prov-chip { padding: 3px 10px; font-size: var(--fs-xs); }
+.model-picker-prov-chip.untrusted:not(.on) { border-color: rgba(232, 168, 85, 0.5); color: #f3c178; }
+.model-picker-prov-chip:focus-visible, .model-picker-item:focus-visible, .model-picker-more:focus-visible { outline: 1px solid var(--accent); outline-offset: -1px; }
+.model-picker-item:focus-visible { background: rgba(255, 255, 255, 0.05); }
+.model-item-title { font-size: var(--fs-sm, 13px); font-weight: 600; }
+.model-item-check { color: var(--accent); font-weight: 700; }
+.model-picker-more {
+  width: 100%; margin-top: 2px; padding: 6px 8px; border: 0; border-radius: 6px; background: transparent;
+  color: var(--text-dim); font-size: var(--fs-xs); text-align: left; cursor: pointer;
+}
+.model-picker-more:hover { background: rgba(255, 255, 255, 0.05); color: var(--text); }
 
 /* AffectUI-style Live KV Cache & Context Token Telemetry Bar */
 .kv-telemetry-bar {

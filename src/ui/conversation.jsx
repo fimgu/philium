@@ -401,7 +401,7 @@ export function Composer(props) {
       return { kind: "effort", label: `Zero-token local command: /effort ${summary}` };
     }
     if (t.startsWith("/model")) {
-      return { kind: "model", label: "Zero-token in-session model switch: /model <provider/model or substring>" };
+      return { kind: "model", label: "Press Enter to choose from a list, or type a name: /model sonnet. Switching costs no tokens." };
     }
     return null;
   });

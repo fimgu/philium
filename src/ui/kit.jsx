@@ -1,6 +1,7 @@
 // Philium UI primitives. Screens compose these; no third-party UI kit.
 // Rule: never render untrusted text as HTML. Solid's text binding is safe.
-import { For, Show, ErrorBoundary, createSignal, onCleanup, onMount, splitProps, createMemo } from "solid-js";
+import { For, Show, ErrorBoundary, createSignal, createEffect, on, onCleanup, onMount, splitProps, createMemo } from "solid-js";
+import { splitLatest } from "../lib/model-list.js";
 import { Portal } from "solid-js/web";
 
 /** Readable text for any thrown value: strips "Error: " and Rust/Tauri noise. */
@@ -324,7 +325,9 @@ export function Menu(props) {
 }
 
 /**
- * Clean, provider-scoped ModelPicker popover.
+ * Model picker: a provider switch, the latest model of each family first, older ones one click
+ * away, and a search across every provider. Opens from its button, or when `openRequest` changes
+ * (typing `/model`).
  * Respects session trust boundaries:
  * - Standard session (`strict === false` and `!allowUntrusted`): only accepted trusted providers.
  * - Strict session (`strict === true` and `lockedProvider`): only models on that locked provider.
@@ -333,9 +336,10 @@ export function Menu(props) {
 export function ModelPicker(props) {
   const [open, setOpen] = createSignal(false);
   const [q, setQ] = createSignal("");
-  const [expanded, setExpanded] = createSignal("");
+  const [prov, setProv] = createSignal("");
+  const [older, setOlder] = createSignal(false);
   const [pos, setPos] = createSignal({ top: 60, left: 60, width: 360 });
-  let btn, searchEl;
+  let btn, searchEl, requested = false;
 
   const provById = createMemo(() =>
     Object.fromEntries((props.providers ?? []).map((p) => [p.id, p]))
@@ -384,27 +388,35 @@ export function ModelPicker(props) {
     return normalized().filter((m) => !m.trusted).length;
   });
 
-  const filtered = createMemo(() => {
-    const needle = q().trim().toLowerCase();
-    return accepted().filter((m) => {
-      if (!needle) return true;
-      return (
-        m.display.toLowerCase().includes(needle) ||
-        m.modelId.toLowerCase().includes(needle) ||
-        m.provName.toLowerCase().includes(needle) ||
-        m.ref.toLowerCase().includes(needle)
-      );
-    });
-  });
-
-  const grouped = createMemo(() => {
+  // One entry per provider that has a model this session may use, in the order they arrive.
+  const provList = createMemo(() => {
     const map = new Map();
-    for (const m of filtered()) {
+    for (const m of accepted()) {
       if (!map.has(m.pid)) map.set(m.pid, { pid: m.pid, name: m.provName, trusted: m.trusted, kind: m.kind, items: [] });
       map.get(m.pid).items.push(m);
     }
     return [...map.values()];
   });
+  const trustLabel = (g) => (g.trusted ? (["chatgpt_oauth", "claude_oauth"].includes(g.kind) ? "Subscription · Trusted" : "API · Trusted") : "Untrusted · Strict");
+  const searching = () => Boolean(q().trim());
+
+  // What the list shows: every match grouped by provider while searching, otherwise the chosen
+  // provider's latest models with the older ones behind one button.
+  const sections = createMemo(() => {
+    const needle = q().trim().toLowerCase();
+    if (needle) {
+      return provList()
+        .map((g) => ({ ...g, more: 0, items: g.items.filter((m) =>
+          m.display.toLowerCase().includes(needle) || m.modelId.toLowerCase().includes(needle) ||
+          m.provName.toLowerCase().includes(needle) || m.ref.toLowerCase().includes(needle)) }))
+        .filter((g) => g.items.length);
+    }
+    const g = provList().find((x) => x.pid === prov()) || provList()[0];
+    if (!g) return [];
+    const { latest, older: rest } = splitLatest(g.items, { keep: props.value ? [props.value] : [] });
+    return [{ ...g, items: older() ? [...latest, ...rest] : latest, more: rest.length }];
+  });
+  const shown = () => sections().flatMap((g) => g.items);
 
   const activeItem = createMemo(() =>
     normalized().find((m) => m.ref === props.value) || (props.value ? {
@@ -416,36 +428,63 @@ export function ModelPicker(props) {
     } : null)
   );
 
-  const toggle = (e) => {
-    e.stopPropagation();
-    if (props.disabled) return;
-    if (open()) {
-      setOpen(false);
-      return;
-    }
+  const show = () => {
+    if (props.disabled || !btn) return;
     const r = btn.getBoundingClientRect();
     const w = Math.min(window.innerWidth - 24, Math.max(360, Math.min(440, r.width)));
     const left = Math.max(12, Math.min(r.left, window.innerWidth - w - 12));
-    const top = r.bottom + 6 + 380 > window.innerHeight ? Math.max(12, r.top - 380) : r.bottom + 6;
+    const top = r.bottom + 6 + 400 > window.innerHeight ? Math.max(12, r.top - 400) : r.bottom + 6;
     setPos({ top, left, width: w });
     setQ("");
-    setExpanded(currentProvId() || (accepted().length && accepted().every(m => m.pid === accepted()[0].pid) ? accepted()[0].pid : ""));
+    setOlder(false);
+    setProv(provList().some((g) => g.pid === currentProvId()) ? currentProvId() : (provList()[0]?.pid || ""));
     setOpen(true);
     queueMicrotask(() => searchEl?.focus());
   };
+  const toggle = (e) => {
+    e.stopPropagation();
+    requested = false;
+    if (open()) setOpen(false);
+    else show();
+  };
+  const close = (restoreFocus = false) => {
+    if (!open()) return;
+    setOpen(false);
+    if (requested) { requested = false; props.onDismiss?.(); }
+    else if (restoreFocus === true) btn?.focus();
+  };
+  const pick = (ref) => { props.onValue?.(ref); close(true); };
+  // `/model` asks for the list without a click on the button.
+  createEffect(on(() => props.openRequest, (n) => { if (n) { requested = true; show(); } }, { defer: true }));
 
-  const close = (restoreFocus = false) => { setOpen(false); if (restoreFocus === true) btn?.focus(); };
   // Clicks are delegated to the document, so the click that opens the list, and every click
   // inside it, also reaches this listener. Only a click elsewhere closes the list.
   const outside = (e) => { if (!btn?.contains(e.target) && !e.target?.closest?.(".model-picker-pop")) close(); };
+  const onResize = () => close();
   onMount(() => {
     document.addEventListener("click", outside);
-    window.addEventListener("resize", close);
+    window.addEventListener("resize", onResize);
   });
   onCleanup(() => {
     document.removeEventListener("click", outside);
-    window.removeEventListener("resize", close);
+    window.removeEventListener("resize", onResize);
   });
+
+  // Arrow keys walk the models; from the search box the first Down lands on the first model.
+  const onKeys = (e) => {
+    const pop = e.currentTarget;
+    if (e.key === "Escape") { e.preventDefault(); close(true); return; }
+    if (e.key === "Enter" && e.target === searchEl && shown().length && (searching() || shown().length === 1)) {
+      e.preventDefault(); pick(shown()[0].ref); return;
+    }
+    if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+    const items = Array.from(pop.querySelectorAll("button.model-picker-item"));
+    if (!items.length) return;
+    e.preventDefault();
+    const i = items.indexOf(document.activeElement);
+    if (e.key === "ArrowUp" && i <= 0) { searchEl?.focus(); return; }
+    items[e.key === "ArrowDown" ? Math.min(items.length - 1, i + 1) : i - 1]?.focus();
+  };
 
   return (
     <>
@@ -458,7 +497,7 @@ export function ModelPicker(props) {
         aria-expanded={open()}
         aria-label="Choose model"
         onClick={toggle}
-        title={props.title ?? (activeItem() ? `Model: ${activeItem().ref} (click to switch in-session)` : "Choose a model")}
+        title={props.title ?? (activeItem() ? `Model: ${activeItem().ref} (click, or type /model, to switch)` : "Choose a model")}
       >
         <Show when={activeItem()} fallback={<span class="dim">{props.placeholder ?? "Choose model…"}</span>}>
           {(it) => (
@@ -475,19 +514,10 @@ export function ModelPicker(props) {
           <div
             class="model-picker-pop"
             role="dialog"
-            aria-label="Models by provider"
+            aria-label="Choose a model"
             style={{ top: `${pos().top}px`, left: `${pos().left}px`, width: `${pos().width}px` }}
             onClick={(e) => e.stopPropagation()}
-            onKeyDown={(e) => {
-              if (e.key === "Escape") { e.preventDefault(); close(true); }
-              if (e.key === "ArrowDown" && e.target === searchEl) {
-                e.preventDefault(); e.currentTarget.querySelector('button')?.focus();
-              }
-              if (e.key === "Enter" && e.target === searchEl && q().trim() && filtered().length === 1) {
-                props.onValue?.(filtered()[0].ref);
-                close(true);
-              }
-            }}
+            onKeyDown={onKeys}
           >
             <div class="model-picker-head">
               <input
@@ -495,63 +525,64 @@ export function ModelPicker(props) {
                 type="text"
                 class="input sm model-picker-search"
                 aria-label="Search models or providers"
-                placeholder="Search models or providers…"
+                placeholder="Search every provider…"
                 value={q()}
                 onInput={(e) => setQ(e.currentTarget.value)}
                 spellcheck={false}
               />
             </div>
+            <Show when={!searching() && provList().length > 1}>
+              <div class="model-picker-providers" role="tablist" aria-label="Provider">
+                <For each={provList()}>
+                  {(g) => (
+                    <button type="button" role="tab" aria-selected={g.pid === prov()}
+                      class={`model-picker-prov-chip ${g.pid === prov() ? "on" : ""} ${g.trusted ? "" : "untrusted"}`}
+                      title={`${g.items.length} models · ${trustLabel(g)}`}
+                      onClick={() => { setProv(g.pid); setOlder(false); }}>
+                      {g.name}
+                    </button>
+                  )}
+                </For>
+              </div>
+            </Show>
             <div class="model-picker-list">
-              <Show when={grouped().length} fallback={<div class="xs dim" style={{ padding: "14px" }}>No matching models in accepted providers.</div>}>
-                <For each={grouped()}>
+              <Show when={sections().length} fallback={<div class="xs dim" style={{ padding: "14px" }}>No matching models in accepted providers.</div>}>
+                <For each={sections()}>
                   {(g) => (
                     <div class="model-picker-group">
-                      <button type="button" class="model-picker-group-head"
-                        aria-expanded={Boolean(q().trim()) || expanded() === g.pid}
-                        onClick={() => { setQ(""); setExpanded(expanded() === g.pid ? "" : g.pid); }}>
-                        <span aria-hidden="true">{q().trim() || expanded() === g.pid ? "▾" : "▸"}</span>
-                        <b>{g.name}</b><span class="xs faint">{g.items.length} models</span>
-                        <span class={`model-trust-tag ${g.trusted ? "ok" : "strict"}`}>
-                          {g.trusted ? (["chatgpt_oauth", "claude_oauth"].includes(g.kind) ? "Subscription · Trusted" : "API · Trusted") : "Untrusted · Strict"}
-                        </span>
-                        <Show when={currentProvId() && g.pid === currentProvId()}>
-                          <span class="model-kv-tag">Selected provider</span>
-                        </Show>
-                      </button>
-                      <Show when={q().trim() || expanded() === g.pid}>
-                      <div role="group" aria-label={`${g.name} models`}>
-                      <For each={g.items}>
-                        {(m) => {
-                          const active = () => m.ref === props.value;
-                          return (
-                            <button
-                              type="button"
-                              aria-pressed={active()}
-                              class={`model-picker-item ${active() ? "on" : ""}`}
-                              onClick={() => {
-                                props.onValue?.(m.ref);
-                                close(true);
-                              }}
-                            >
-                              <div class="grow" style={{ "min-width": 0 }}>
-                                <div class="row gap-4">
-                                  <span class="model-item-title ellipsis">{m.display}</span>
-                                  <Show when={m.display !== m.modelId}>
-                                    <span class="mono xs faint ellipsis">{m.modelId}</span>
-                                  </Show>
-                                </div>
-                              </div>
-                              <Show when={m.priceIn != null && m.priceOut != null}>
-                                <span class="mono xs faint">${m.priceIn}/${m.priceOut}</span>
-                              </Show>
-                              <Show when={active()}>
-                                <span class="model-item-check">✓</span>
-                              </Show>
-                            </button>
-                          );
-                        }}
-                      </For>
+                      <div class="model-picker-group-label">
+                        <span>{searching() ? g.name : (older() ? `All ${g.name} models` : `Latest from ${g.name}`)}</span>
+                        <span class={`model-picker-trust ${g.trusted ? "trusted" : "untrusted"}`}>{trustLabel(g)}</span>
                       </div>
+                      <div role="group" aria-label={`${g.name} models`}>
+                        <For each={g.items}>
+                          {(m) => {
+                            const active = () => m.ref === props.value;
+                            return (
+                              <button type="button" aria-pressed={active()} class={`model-picker-item ${active() ? "on" : ""}`} onClick={() => pick(m.ref)}>
+                                <div class="grow" style={{ "min-width": 0 }}>
+                                  <div class="row gap-4">
+                                    <span class="model-item-title ellipsis">{m.display}</span>
+                                    <Show when={m.display !== m.modelId}>
+                                      <span class="mono xs faint ellipsis">{m.modelId}</span>
+                                    </Show>
+                                  </div>
+                                </div>
+                                <Show when={m.priceIn != null && m.priceOut != null}>
+                                  <span class="mono xs faint">${m.priceIn}/${m.priceOut}</span>
+                                </Show>
+                                <Show when={active()}>
+                                  <span class="model-item-check">✓</span>
+                                </Show>
+                              </button>
+                            );
+                          }}
+                        </For>
+                      </div>
+                      <Show when={!searching() && g.more > 0}>
+                        <button type="button" class="model-picker-more" aria-expanded={older()} onClick={() => setOlder(!older())}>
+                          {older() ? "Show only the latest" : `Show ${g.more} older model${g.more === 1 ? "" : "s"}`}
+                        </button>
                       </Show>
                     </div>
                   )}
@@ -566,7 +597,7 @@ export function ModelPicker(props) {
                 <span>{hiddenUntrustedCount()} untrusted-provider model(s) hidden (spawn a Strict agent to use them).</span>
               </Show>
               <Show when={!props.strict && hiddenUntrustedCount() === 0}>
-                <span>Choose a provider, then a model. Search across available providers.</span>
+                <span>↑↓ to move, Enter to choose, Esc to close.</span>
               </Show>
             </div>
           </div>

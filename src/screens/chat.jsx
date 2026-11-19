@@ -59,9 +59,11 @@ export default function Chat() {
     return true;
   };
 
+  const [pickModel, setPickModel] = createSignal(0);
   const handleSlashModel = async (query) => {
     if (!query) {
-      toast(`Current model: ${chosen()} (use /model <name>)`, "info");
+      // Bare /model opens the picker; /model <name> still switches straight away.
+      setPickModel((n) => n + 1);
       return true;
     }
     const q = query.toLowerCase();
@@ -143,6 +145,8 @@ export default function Chat() {
           providers={providers() ?? []}
           allowUntrusted={true}
           currentProvider={(chosen() || "").split("/")[0]}
+          openRequest={pickModel()}
+          onDismiss={() => document.querySelector(".screen-pane:not(.hidden) textarea.composer-input")?.focus()}
         />
         <Button variant="primary" onClick={newChat}><Icon name="plus" size={12} /> New chat</Button>
       </>}>

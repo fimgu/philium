@@ -734,6 +734,27 @@ pub fn models(ctx: &Ctx, provider: Option<&str>) -> Result<Vec<Value>, String> {
         r["efforts"] = json!(model_efforts(kind, &mid, exp));
         r["effort_details"] = json!(model_effort_details(kind, &mid, exp));
     }
+    // Each provider's models in the provider's own order (newest first for most APIs), so a
+    // picker can show the latest on top. A model the saved order does not know sorts last.
+    let mut ranks: std::collections::HashMap<String, std::collections::HashMap<String, i64>> = std::collections::HashMap::new();
+    for r in &mut rows {
+        let pid = r["provider_id"].as_str().unwrap_or("").to_string();
+        let order = ranks.entry(pid.clone()).or_insert_with(|| {
+            ctx.db
+                .kv_get(&format!("models_order.{pid}"))
+                .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+                .unwrap_or_default()
+                .into_iter()
+                .enumerate()
+                .map(|(i, m)| (m, i as i64))
+                .collect()
+        });
+        r["rank"] = json!(order.get(r["model_id"].as_str().unwrap_or("")).copied().unwrap_or(1_000_000));
+    }
+    rows.sort_by(|a, b| {
+        let key = |r: &Value| (r["provider_id"].as_str().unwrap_or("").to_string(), r["rank"].as_i64().unwrap_or(1_000_000), r["model_id"].as_str().unwrap_or("").to_string());
+        key(a).cmp(&key(b))
+    });
     Ok(rows)
 }
 
@@ -1093,5 +1114,19 @@ mod tests {
         assert_eq!(resolve(&ctx, Some("cn")).unwrap().1, "m");
         assert_eq!(resolve(&ctx, None).unwrap().0.id, "cn");
         assert!(resolve(&ctx, Some("nope/x")).is_err());
+    }
+
+    /// A picker shows the latest models first, so the list keeps the provider's own order
+    /// instead of sorting names; a model the saved order does not know comes last.
+    #[test]
+    fn models_come_in_the_providers_order() {
+        let ctx = Ctx::test();
+        upsert(&ctx, &p("cn", "https://a/v1")).unwrap();
+        for id in ["alpha-1", "zeta-9", "mid-5", "unlisted"] {
+            ctx.db.exec("INSERT INTO models(provider_id,model_id,discovered_at) VALUES('cn',?1,1)", [id]).unwrap();
+        }
+        ctx.db.kv_set("models_order.cn", r#"["zeta-9","mid-5","alpha-1"]"#).unwrap();
+        let ids: Vec<String> = models(&ctx, Some("cn")).unwrap().iter().map(|m| m["model_id"].as_str().unwrap().to_string()).collect();
+        assert_eq!(ids, ["zeta-9", "mid-5", "alpha-1", "unlisted"]);
     }
 }

@@ -539,9 +539,11 @@ function AgentView(props) {
     }
   };
 
+  const [pickModel, setPickModel] = createSignal(0);
   const handleSlashModel = async (query) => {
     if (!query) {
-      toast(`Current model: ${a()?.model_ref} (use /model <name> or click the model picker in the header)`, "info");
+      // Bare /model opens the picker; /model <name> still switches straight away.
+      setPickModel((n) => n + 1);
       return true;
     }
     const q = query.toLowerCase();
@@ -609,6 +611,8 @@ function AgentView(props) {
           providers={providers() ?? []}
           strict={!!a()?.strict}
           currentProvider={(a()?.model_ref || "").split("/")[0]}
+          openRequest={pickModel()}
+          onDismiss={() => agentMain?.querySelector("textarea.composer-input")?.focus()}
         />
         <Show when={a()?.strict}><Badge tone="strict"><Icon name="shield" size={11} /> Strict</Badge></Show>
         <Show when={a()?.parent_id}>
