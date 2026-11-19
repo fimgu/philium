@@ -513,10 +513,12 @@ REMOVE = AGENT + r'''
 await workspace(P.checkout);
 await openAgent(P.name);
 document.querySelector('.agent-head button[title="Remove agent and clean up"]').click(); note('click remove');
-const confirmBtn = await until(() => button('Delete anyway') || (!all('.agent-row').some((r) => txt(r).startsWith(P.name)) ? 'gone' : null), 'confirmation or removal', 30000);
+// An empty list is the list reloading, not the agent gone.
+const goneNow = () => { const rows = all('.agent-row'); return rows.length > 0 && !rows.some((r) => txt(r).startsWith(P.name)); };
+const confirmBtn = await until(() => button('Delete anyway') || (goneNow() ? 'gone' : null), 'confirmation or removal', 30000);
 let confirmed = false;
 if (confirmBtn !== 'gone') { confirmed = true; confirmBtn.click(); }
-const gone = await until(() => !all('.agent-row').some((r) => txt(r).startsWith(P.name)), 'agent removed', 40000).then(() => true, () => false);
+const gone = await until(goneNow, 'agent removed', 40000).then(() => true, () => false);
 await sleep(1500);
 const seen = { rightAfter: all('.agent-row').length, page: txt(pane()).slice(0, 260), picker: txt(picker().selectedOptions[0]) };
 await go('Board'); await go('Agents'); await sleep(1500);
