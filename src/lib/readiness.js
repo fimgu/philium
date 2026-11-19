@@ -103,7 +103,28 @@ export function readiness(d, m, cov) {
 }
 
 /** A summary to paste where the team reads it. Plain Markdown, no approval implied. */
-export function summaryMarkdown(d, rows) {
+/** The agents' review in words for a pasted summary. */
+export const AGENT_SUMMARY = { none: "plan not written yet", do_not_ship: "do not ship", not_ready: "not ready yet", passed: "passed, waiting for sign-off" };
+export const ORIGIN_WORDS = { introduced: "introduced", pre_existing: "pre-existing", unverified: "origin unverified" };
+
+function agentSection(review, cell) {
+  const items = review?.items || [];
+  if (!items.length) return [];
+  const result = (it) => ({ pass: "PASS", fail: "FAIL", blocked: "BLOCKED" })[it.result] || (it.status === "claimed" ? "IN PROGRESS" : "TO DO");
+  const short = (s) => { const t = cell(s || ""); return t.length > 180 ? `${t.slice(0, 177).replace(/\s+\S*$/, "")}…` : t; };
+  return [
+    `### Agents' review: ${AGENT_SUMMARY[review.headline] || review.headline} (${items.filter((i) => i.result).length} of ${items.length} items have a result)`,
+    "",
+    "| Result | Tier | Item | Origin | What was run |",
+    "|---|---|---|---|---|",
+    ...items.map((it) => `| ${result(it)} | P${it.tier} | ${cell(String(it.title).replace(/^P\d\s+/, ""))} | ${it.result === "fail" ? ORIGIN_WORDS[it.origin] || "origin unverified" : ""} | ${short(it.evidence)} |`),
+    "",
+    "Agents did these checks and wrote what they ran. A failure is introduced (fails here, passes on the target), pre-existing (fails the same way on the target) or origin unverified.",
+    "",
+  ];
+}
+
+export function summaryMarkdown(d, rows, review) {
   const mark = { ok: "PASS", bad: "FAIL", unknown: "UNKNOWN" };
   const cell = (s) => String(s).replaceAll("|", "\\|").replace(/\s+/g, " ").trim();
   return [
@@ -116,6 +137,7 @@ export function summaryMarkdown(d, rows) {
     ...rows.map((r) => `| ${mark[r.state]}${r.informs ? " (informs)" : ""} | ${cell(r.label)} | ${cell(r.detail)} |`),
     "",
     ...(d.why?.length ? ["Why it is not ready:", ...d.why.map((w) => `- ${cell(w)}`), ""] : []),
+    ...(review?.pr === d.pr ? agentSection(review, cell) : []),
     "Unknown is not a pass. Computed locally by Philium for this exact revision. This is not a GitHub approval.",
   ].join("\n");
 }

@@ -84,3 +84,20 @@ test("the summary names every row and never calls unknown a pass", () => {
   assert.match(text, /record \\\| for this head/);
   assert.match(text, /Unknown is not a pass/);
 });
+
+test("the pasted summary carries the agents' findings with their origin, for the same pull request only", () => {
+  const review = { pr: 7, headline: "do_not_ship", items: [
+    { tier: 0, title: "P0 Conflicts with the target", result: "fail", origin: "introduced", evidence: "lead: Introduced by #31: git merge-tree shows conflicts in cli/main.go | cli/connect.go" },
+    { tier: 2, title: "P2 Export order", result: "fail", origin: "pre_existing", evidence: "heron: fails the same way on the target" },
+    { tier: 1, title: "P1 Sign-in", result: "pass", evidence: "finch: go test ./auth passed" },
+    { tier: 1, title: "P1 CLI resume", status: "claimed" },
+  ] };
+  const text = summaryMarkdown(ready(), readiness(ready(), members), review);
+  assert.match(text, /### Agents' review: do not ship \(3 of 4 items have a result\)/);
+  assert.match(text, /\| FAIL \| P0 \| Conflicts with the target \| introduced \| lead: Introduced by #31: git merge-tree shows conflicts in cli\/main\.go \\\| cli\/connect\.go \|/);
+  assert.match(text, /\| FAIL \| P2 \| Export order \| pre-existing \|/);
+  assert.match(text, /\| PASS \| P1 \| Sign-in \|  \|/);
+  assert.match(text, /\| IN PROGRESS \| P1 \| CLI resume \|/);
+  assert.doesNotMatch(summaryMarkdown(ready(), readiness(ready(), members), { ...review, pr: 8 }), /Agents' review/);
+  assert.doesNotMatch(summaryMarkdown(ready(), readiness(ready(), members)), /Agents' review/);
+});
