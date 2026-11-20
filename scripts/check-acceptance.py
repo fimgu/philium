@@ -541,6 +541,38 @@ const exported = await until(() => { const t = all('p[role="status"]', pane()).m
 return { remembered, before, fallback, exported, window: txt(all('[aria-label="Observation window"]', ledger)[0]) };
 '''
 
+STORAGE = r'''
+await go('Settings');
+const sec = await until(() => all('section[aria-label="Storage"]')[0], 'storage section', 20000);
+const parts = await until(() => { const r = all('tr[data-part]', sec).map((tr) => [tr.dataset.part, txt(all('td', tr)[0])]); return r.length ? r : null; }, 'storage parts', 30000);
+await click('Clean up now', sec);
+const last = await until(() => txt(all('[aria-label="Last clean up"]', sec)[0]) || null, 'last clean up', 60000);
+return { parts, last, disk: txt(all('p', sec)[0]) };
+'''
+
+GATE = r'''
+await workspace(P.checkout);
+await go('Review');
+const box = await until(() => all('details[aria-label="Release PR revisions"]')[0], 'release section', 15000);
+if (!box.open) box.querySelector('summary').click();
+type(box.querySelector('form input[type="url"]'), P.url);
+await click('Verify release', box);
+const panel = await until(() => all('section[aria-label="Checks on this pull request"]')[0], 'checks panel', 110000);
+const head = () => txt(panel.querySelector('h3'));
+const rows = () => all('tr[data-check]', panel);
+await until(() => rows().length === P.checks, 'the gate lists its checks', 30000);
+const start = all('button', panel).find((b) => ['Run checks', 'Run again'].includes(txt(b)));
+start.click();
+await until(() => head().startsWith('Checks are running'), 'checks started', 15000);
+await until(() => !head().startsWith('Checks are running') && rows().every((r) => r.dataset.outcome !== 'pending'), 'checks finished', 150000);
+const outcomes = Object.fromEntries(rows().map((r) => [r.dataset.check, r.dataset.outcome]));
+const waiting = head();
+type(await until(() => panel.querySelector(`input[aria-label="Issue that tracks ${P.preexisting}"]`), 'issue field'), '#12');
+await click('Link issue', panel);
+const after = await until(() => (head() !== waiting ? head() : null), 'the verdict moved on', 20000);
+return { outcomes, waiting, after, tracked: txt(all(`tr[data-check="${P.preexisting}"]`, panel)[0]), progress: txt(all('pre[aria-label="Check progress"]', panel)[0]).slice(-300) };
+'''
+
 REVIEW = r'''
 await workspace(P.checkout);
 await go('Review');
@@ -648,15 +680,18 @@ def main():
         syn.write(delta, {'view.json': '{"column":"name"}'}); d_base = syn.commit_all(delta, 'base')
         syn.write(delta, {'view.json': '{"column":"status"}'}); d_head = syn.commit_all(delta, 'show status')
         ver_d = syn.new_repo(scratch / 'verifier-delta'); syn.write(ver_d, {'philium/sql-contracts.json': syn.target_contract()}); syn.commit_all(ver_d)
+        epsilon = syn.new_repo(scratch / 'epsilon', 'philium-fixture/epsilon')
+        syn.write(epsilon, {'view.json': '{"column":"name"}'}); e_base = syn.commit_all(epsilon, 'base')
+        syn.write(epsilon, {'view.json': '{"column":"status"}'}); e_head = syn.commit_all(epsilon, 'show status')
         bin_dir = scratch / 'bin'; bin_dir.mkdir()
         for name, body in [('mycli', syn.MYCLI_STANDIN), ('kubectl', syn.KUBECTL_STANDIN)]:
             (bin_dir / name).write_text(body); (bin_dir / name).chmod(0o755)
         url = f'http://127.0.0.1:{model.server_port}/v1'
 
-        repos = [str(alpha), str(beta), str(ver_a), str(gamma), str(ver_g), str(delta), str(ver_d)] + ([str(Path(args.public[0]).resolve())] if args.public else [])
+        repos = [str(alpha), str(beta), str(ver_a), str(gamma), str(ver_g), str(delta), str(ver_d), str(epsilon)] + ([str(Path(args.public[0]).resolve())] if args.public else [])
         r = run.ui(SETUP, {'repos': repos, 'model_url': url, 'model_url2': f'http://127.0.0.1:{model2.server_port}/v1', 'key': KEY}, 240)
         v = run.value(r)
-        labels = ['All Workspaces', 'alpha/same', 'beta/same', 'gamma', 'verifier-alpha', 'verifier-gamma', 'delta', 'verifier-delta'] + ([Path(args.public[0]).resolve().name] if args.public else [])
+        labels = ['All Workspaces', 'alpha/same', 'beta/same', 'gamma', 'verifier-alpha', 'verifier-gamma', 'delta', 'verifier-delta', 'epsilon'] + ([Path(args.public[0]).resolve().name] if args.public else [])
         run.check('B6', 'Two same-named checkouts register from the Repos screen with distinct labels', sorted(v.get('labels') or []) == sorted(labels), v.get('labels') or r.get('error'))
         run.check('B1', 'A provider with an API key can be saved', v.get('keyed') == 'saved', v.get('keyed') or r.get('error'))
         vault = run.profile / 'data/secrets/vault.json'
@@ -870,6 +905,17 @@ def main():
             v = verify('gamma', pr_g, inspect=int(ready_gen or 1))
             d, old = v.get('verified') or {}, v.get('inspected') or {}
             run.check('C4', 'A new head after a Ready verdict starts incomplete: the old record does not carry over', (d.get('ids') or {}).get('Head') == g_next and d.get('headline') == 'Release verification incomplete' and "An earlier head's record does not carry over" in why(d) and old.get('headline') == 'Ready for the reviewed scope' and 'Saved result for an earlier revision' in (old.get('earlier') or ''), {'new': d.get('headline'), 'why': why(d)[:160], 'old': old.get('headline')})
+            # ---- the repo's own checks on a pull request, from Review ---------------------------
+            E = 'philium-fixture/epsilon'
+            syn.Origin.repos[E] = {'prs': {11: {'base': e_base, 'heads': [e_head]}}, 'landed': {e_head: (11, False)}}
+            gate_file = run.profile / 'data/pipelines/philium-fixture-epsilon/.philium/pipeline.yaml'
+            gate_file.parent.mkdir(parents=True, exist_ok=True)
+            plat = 'darwin/arm64' if os.uname().machine == 'arm64' else 'darwin/amd64'
+            gate_file.write_text(f'version: 1\nbranch: main\nplatforms: [{plat}]\ntiers:\n  fast:\n    - {{ id: view-has-status, run: "grep -q status view.json" }}\n    - {{ id: notes-present, run: "test -e NOTES.md" }}\n')
+            r = run.ui(GATE, {'checkout': 'epsilon', 'url': f'https://github.com/{E}/pull/11', 'checks': 2, 'preexisting': 'notes-present'}, 260)
+            v = run.value(r)
+            run.check('C9', 'Review runs the repo\'s own checks on the pull request: a check its change fixes passes, one that fails on the base too is told apart', (v.get('outcomes') or {}) == {'view-has-status': 'pass', 'notes-present': 'pre_existing'}, v.get('outcomes') or v.get('progress') or r.get('error'))
+            run.check('C9', 'A failure the base has too waits for a person, and linking the issue that tracks it lets the verdict move on without running again', (v.get('waiting') or '').startswith('Waiting for you: 1 decision') and (v.get('after') or '').startswith('Checks pass') and 'Tracked in #12' in (v.get('tracked') or ''), {'waiting': v.get('waiting'), 'after': v.get('after'), 'tracked': v.get('tracked')})
             # ---- command targets: a hosted environment through its own CLI, a local cluster through kubectl
             D = 'philium-fixture/delta'
             syn.Origin.repos[D] = {'prs': {9: {'base': d_base, 'heads': [d_head]}}, 'landed': {d_head: (9, False)}}
@@ -1002,6 +1048,16 @@ def main():
             need = ['workspace.repo_add', 'providers.save'] + (['agents.spawn', 'agents.send', 'agents.stop', 'agents.resume', 'agents.cancel'] if want('coord') else [])
             run.check('B7', 'The workday ledger lists the actions taken on screen, by checkout, without their content', all(k in acts for k in need) and 'synthetic' not in json.dumps(acts).lower().replace('synthetic strict', ''), {k: acts.get(k) for k in need[:4]} if v else r.get('error'))
             run.check('B7', 'A fallback is recorded from the screen and the summary is written inside the profile', 'Manual database edit' in (v.get('fallback') or '') and str(run.profile / 'data/workday') in (v.get('exported') or ''), v.get('exported') or v.get('fallback'))
+        if want('storage') or not only:
+            dead = subprocess.Popen(['/usr/bin/true']); dead.wait()
+            leftover = run.home / f'Library/Caches/philium-pipeline/runs/app-{dead.pid}/philium-x/src'
+            leftover.mkdir(parents=True); (leftover / 'file').write_text('x' * 4096)
+            ghost = run.profile / 'data/agents/ghost-agent/tmp'; ghost.mkdir(parents=True); (ghost / 'file').write_text('x')
+            r = run.ui(STORAGE, {}, 150)
+            v = run.value(r)
+            parts = dict(v.get('parts') or [])
+            run.check('E2', 'Settings shows what Philium keeps on disk, part by part, with the build caches of the private home', all(k in parts for k in ['database', 'worktrees', 'agents', 'check_runs', 'agent_caches']) and 'free of' in (v.get('disk') or ''), v.get('parts') or r.get('error'))
+            run.check('E2', 'Clean up now reports what it did, and nothing a check run or a removed agent left behind is still on disk', (v.get('last') or '').startswith('Last clean up') and not leftover.parents[1].exists() and not ghost.parent.exists(), {'last': v.get('last'), 'leftover': leftover.parents[1].exists(), 'ghost': ghost.parent.exists()})
         foreign = sorted(c for c in run.children if 'jcode' in c.lower() or 'herdr' in c.lower())
         run.check('D1', 'No process of another agent harness ran under the Pilot', not foreign, {'foreign': foreign, 'programs': sorted({Path(c).name for c in run.children})})
         if want('review') or want('draft'):
