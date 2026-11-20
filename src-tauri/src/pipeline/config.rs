@@ -401,7 +401,7 @@ impl Pipeline {
     fn check_template(&self, t: &str, what: &str) -> Result<(), String> {
         for var in template_vars(t)? {
             let ok = match var.split_once('.') {
-                None => matches!(var.as_str(), "run" | "workdir" | "tmp" | "sha" | "base" | "gate"),
+                None => matches!(var.as_str(), "run" | "workdir" | "tmp" | "sha" | "base" | "gate" | "changed"),
                 Some(("port", s)) => matches!(self.services.get(s), Some(Service::Run { .. }) | Some(Service::Compose { port: Some(_), .. })),
                 Some(("kubeconfig" | "context", s)) => matches!(self.services.get(s), Some(Service::Kind { .. })),
                 Some(("fixture", k)) => self.fixtures.contains_key(k),
@@ -438,7 +438,7 @@ fn relative(p: &str, what: &str) -> Result<(), String> {
 
 /// Philium's own template names. Any other `${...}` belongs to the shell and is left alone.
 pub fn is_philium_var(name: &str) -> bool {
-    matches!(name, "run" | "workdir" | "tmp" | "sha" | "base" | "gate") || ["port.", "kubeconfig.", "context.", "fixture."].iter().any(|p| name.starts_with(p))
+    matches!(name, "run" | "workdir" | "tmp" | "sha" | "base" | "gate" | "changed") || ["port.", "kubeconfig.", "context.", "fixture."].iter().any(|p| name.starts_with(p))
 }
 
 /// Philium names used as `${...}` in a template. `$${` is a literal `${`.

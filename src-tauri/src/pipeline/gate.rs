@@ -24,7 +24,18 @@ fn label() -> String {
 }
 
 /// Run `checks` on one SHA in a fresh checkout with fresh services.
-pub(crate) async fn side(p: &Pipeline, checks: &[&super::config::Check], repo: &Path, sha: &str, base: &str, gate_dir: &Path, overlay: Option<(&str, &[String])>, host: &Host, say: &(dyn Fn(String) + Sync)) -> Result<Vec<(String, runner::Outcome)>, String> {
+/// The files a change adds or edits, from its base to its candidate. Every side of
+/// a run gets this same list, so the base is checked over the same scope.
+pub fn changed_files(repo: &Path, base: &str, candidate: &str) -> Result<Vec<String>, String> {
+    let o = std::process::Command::new("git").arg("-C").arg(repo).args(["diff", "--name-only", "--diff-filter=ACMR", &format!("{base}...{candidate}")]).output().map_err(|e| format!("git: {e}"))?;
+    if !o.status.success() {
+        return Err(format!("could not list the change's files: {}", String::from_utf8_lossy(&o.stderr).trim()));
+    }
+    Ok(String::from_utf8_lossy(&o.stdout).lines().filter(|l| !l.is_empty()).map(str::to_string).collect())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn side(p: &Pipeline, checks: &[&super::config::Check], repo: &Path, sha: &str, base: &str, changed: &[String], gate_dir: &Path, overlay: Option<(&str, &[String])>, host: &Host, say: &(dyn Fn(String) + Sync)) -> Result<Vec<(String, runner::Outcome)>, String> {
     let label = label();
     let root = host.scratch.join(&label);
     let work = root.join("src");
@@ -39,7 +50,9 @@ pub(crate) async fn side(p: &Pipeline, checks: &[&super::config::Check], repo: &
         if !needed.is_empty() {
             say(format!("starting {} on {}", needed.iter().cloned().collect::<Vec<_>>().join(", "), &sha[..12]));
         }
-        let extra: HashMap<String, String> = [("sha", sha.to_string()), ("base", base.to_string()), ("gate", gate_dir.display().to_string())].into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+        let list = rundir.join("changed.txt");
+        std::fs::write(&list, changed.iter().map(|f| format!("{f}\n")).collect::<String>()).map_err(|e| e.to_string())?;
+        let extra: HashMap<String, String> = [("sha", sha.to_string()), ("base", base.to_string()), ("gate", gate_dir.display().to_string()), ("changed", list.display().to_string())].into_iter().map(|(k, v)| (k.to_string(), v)).collect();
         let services = runner::up(p, &needed, &label, &work, &rundir, host, &extra).await;
         let pre = runner::preflight(&work, &rundir, Some(gate_dir), host).await;
         if let Err(e) = &pre {
@@ -87,17 +100,18 @@ pub async fn run_tier(db: &Db, t: &Target<'_>, g: &Gate, tier: Tier, host: &Host
 
 #[allow(clippy::too_many_arguments)]
 async fn sides(db: &Db, t: &Target<'_>, p: &Pipeline, checks: &[&super::config::Check], run: &str, config_from: &str, gate_dir: &Path, host: &Host, say: &(dyn Fn(String) + Sync)) -> Result<(), String> {
-    let first = side(p, checks, t.path, t.candidate, t.base, gate_dir, None, host, say).await?;
+    let changed = changed_files(t.path, t.base, t.candidate)?;
+    let first = side(p, checks, t.path, t.candidate, t.base, &changed, gate_dir, None, host, say).await?;
     store(db, run, Side::Candidate, t.candidate, &first)?;
     // A failure is run again on the same SHA: passing the second time is a flake, not a pass.
     let failed: Vec<&super::config::Check> = checks.iter().copied().filter(|c| first.iter().any(|(id, o)| id == &c.id && o.status.failed())).collect();
     if !failed.is_empty() {
-        let again = side(p, &failed, t.path, t.candidate, t.base, gate_dir, None, host, say).await?;
+        let again = side(p, &failed, t.path, t.candidate, t.base, &changed, gate_dir, None, host, say).await?;
         store(db, run, Side::Rerun, t.candidate, &again)?;
         // What failed twice runs on the base, same fixtures, to compute its origin.
         let twice: Vec<&super::config::Check> = failed.iter().copied().filter(|c| again.iter().any(|(id, o)| id == &c.id && o.status.failed())).collect();
         if !twice.is_empty() {
-            let base = side(p, &twice, t.path, t.base, t.base, gate_dir, None, host, say).await?;
+            let base = side(p, &twice, t.path, t.base, t.base, &changed, gate_dir, None, host, say).await?;
             store(db, run, Side::Base, t.base, &base)?;
         }
     }
@@ -105,7 +119,7 @@ async fn sides(db: &Db, t: &Target<'_>, p: &Pipeline, checks: &[&super::config::
     if let Some(pr) = t.pr {
         for e in records::escapes_fixed_by(db, t.key, pr) {
             if let Some(c) = e.check_id.as_deref().and_then(|id| p.check(id)) {
-                let outs = side(p, &[c], t.path, &e.buggy_sha, t.base, gate_dir, None, host, say).await?;
+                let outs = side(p, &[c], t.path, &e.buggy_sha, t.base, &changed, gate_dir, None, host, say).await?;
                 if let Some((_, o)) = outs.first() {
                     super::replay::remember(db, t.key, config_from, &e.id, &e.buggy_sha, None, &c.id, o.status, None)?;
                 }
@@ -179,6 +193,36 @@ pub(crate) mod tests {
             shared.display()
         ))
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_base_is_checked_over_the_same_files_as_the_change() {
+        let root = tmp("scope");
+        let (r, _) = repo(&root);
+        // "notes" is already bad on the base; the change edits it and adds a good file.
+        std::fs::write(r.join("notes"), "bad\n").unwrap();
+        git(&r, &["add", "."]);
+        git(&r, &["commit", "-qm", "base"]);
+        let base = git(&r, &["rev-parse", "HEAD"]);
+        std::fs::write(r.join("notes"), "bad\nmore\n").unwrap();
+        std::fs::write(r.join("fresh"), "good\n").unwrap();
+        git(&r, &["add", "."]);
+        git(&r, &["commit", "-qm", "change"]);
+        let head = git(&r, &["rev-parse", "HEAD"]);
+        assert_eq!(changed_files(&r, &base, &head).unwrap(), vec!["fresh", "notes"]);
+        let p = Pipeline::parse(&format!(
+            "version: 1\nbranch: main\nplatforms: [{}]\ntiers: {{ fast: [ {{ id: scoped, run: \"while read f; do if [ -e \\\"$f\\\" ] && grep -q bad \\\"$f\\\"; then echo \\\"bad: $f\\\"; exit 1; fi; done < ${{changed}}\" }} ] }}\n",
+            crate::pipeline::config::host_platform()
+        ))
+        .unwrap();
+        let mut h = host(&root);
+        h.caches = root.join("caches");
+        let db = crate::pipeline::records::tests::db();
+        let g = Gate { pipeline: p, from: "t".into(), pinned: true, source: crate::pipeline::config::GateSource::Folder({ let f = root.join("gatefolder"); std::fs::create_dir_all(&f).unwrap(); f }) };
+        let t = Target { key: "r", path: &r, pr: Some(3), head: &head, base: &base, candidate: &head };
+        let (_, v) = run_tier(&db, &t, &g, Tier::Fast, &h, &|_| {}).await.unwrap();
+        assert_eq!(v.outcomes[0].1, verdict::Outcome::PreExisting, "the base fails over the same files: {:?}", v.reasons);
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[tokio::test]

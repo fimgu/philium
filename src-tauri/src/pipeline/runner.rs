@@ -383,6 +383,9 @@ fn container(platform: &str, image: &str, name: &str, script: &str, workdir: &Pa
     if let Some(g) = env.get("PHILIUM_GATE") {
         c.arg("-v").arg(format!("{g}:/philium/gate:ro"));
     }
+    if let Some(l) = env.get("PHILIUM_CHANGED") {
+        c.arg("-v").arg(format!("{l}:/philium/changed.txt:ro"));
+    }
     c.arg("-v").arg(format!("{}:/philium/home", home.display())).arg("-v").arg(format!("{}:/philium/tmp", tmp.display()));
     c.args(["-e", "HOME=/philium/home", "-e", "TMPDIR=/philium/tmp", "-e", "CI=true", "-e", "LANG=C.UTF-8"]);
     for (var, dir) in caches {
@@ -472,7 +475,7 @@ pub async fn run_check(p: &Pipeline, c: &Check, workdir: &Path, rundir: &Path, s
         None => {
             // A fixture that points at a service this run did not start is simply absent;
             // a check that uses it then cannot run.
-            for (var, name) in [("sha", "PHILIUM_SHA"), ("base", "PHILIUM_BASE"), ("gate", "PHILIUM_GATE")] {
+            for (var, name) in [("sha", "PHILIUM_SHA"), ("base", "PHILIUM_BASE"), ("gate", "PHILIUM_GATE"), ("changed", "PHILIUM_CHANGED")] {
                 if let Some(v) = services.vars.get(var) {
                     env.insert(name.into(), v.clone());
                 }

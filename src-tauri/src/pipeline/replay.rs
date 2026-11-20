@@ -158,14 +158,14 @@ pub struct Report {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn one(p: &Pipeline, repo: &Path, sha: &str, base: &str, check: &str, gate_dir: &Path, overlay: Option<&Overlay>, host: &Host) -> Result<runner::Outcome, String> {
+async fn one(p: &Pipeline, repo: &Path, sha: &str, base: &str, changed: &[String], check: &str, gate_dir: &Path, overlay: Option<&Overlay>, host: &Host) -> Result<runner::Outcome, String> {
     let c = p.check(check).ok_or_else(|| format!("no check {check}"))?;
     let ov = overlay.map(|o| (o.from.as_str(), o.paths.as_slice()));
-    let mut outs = super::gate::side(p, &[c], repo, sha, base, gate_dir, ov, host, &|_| {}).await?;
+    let mut outs = super::gate::side(p, &[c], repo, sha, base, changed, gate_dir, ov, host, &|_| {}).await?;
     Ok(outs.pop().map(|x| x.1).ok_or("no result")?)
 }
 
-fn parent(repo: &Path, sha: &str) -> Result<String, String> {
+pub(crate) fn parent(repo: &Path, sha: &str) -> Result<String, String> {
     let o = std::process::Command::new("git").arg("-C").arg(repo).args(["rev-parse", &format!("{sha}^")]).output().map_err(|e| format!("git: {e}"))?;
     if !o.status.success() {
         return Err(format!("{} has no parent; name the bug's base", &sha[..12]));
@@ -184,15 +184,20 @@ pub async fn run(db: &Db, repo_key: &str, repo: &Path, p: &Pipeline, set: &Repla
             Some(x) => x.clone(),
             None => parent(repo, &b.buggy)?,
         };
-        let on_bug = one(p, repo, &b.buggy, &base, &b.check, gate_dir, b.overlay.as_ref(), host).await?;
+        // The bug's scope: what its change touched, plus any laid-over tests. The
+        // control is checked over exactly the same files.
+        let mut changed = super::gate::changed_files(repo, &base, &b.buggy)?;
+        for f in b.overlay.iter().flat_map(|o| o.paths.iter()) {
+            if !changed.contains(f) {
+                changed.push(f.clone());
+            }
+        }
+        let on_bug = one(p, repo, &b.buggy, &base, &changed, &b.check, gate_dir, b.overlay.as_ref(), host).await?;
         // The control: the fix when known, else the commit before the bug. A check
         // that also fails there proves nothing about this bug.
         let on_fix = match &b.fixed {
-            Some(f) => Some(one(p, repo, f, &b.buggy, &b.check, gate_dir, b.overlay.as_ref(), host).await?),
-            None => {
-                let before = parent(repo, &base).unwrap_or_else(|_| base.clone());
-                Some(one(p, repo, &base, &before, &b.check, gate_dir, b.overlay.as_ref(), host).await?)
-            }
+            Some(f) => Some(one(p, repo, f, &b.buggy, &changed, &b.check, gate_dir, b.overlay.as_ref(), host).await?),
+            None => Some(one(p, repo, &base, &base, &changed, &b.check, gate_dir, b.overlay.as_ref(), host).await?),
         };
         // With an expected text, the bug's own signature decides: it shows on the buggy
         // commit, and not on the control. Without one, the control must pass.
