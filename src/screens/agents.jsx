@@ -951,6 +951,24 @@ export default function Agents() {
   const list = store.agents;
   const refetch = store.refetchAgents;
   const [spawn, setSpawn] = createSignal(null);
+  // Stopped or failed agents: what they found stays in Review and Board after they go.
+  const finished = () => (list() || []).filter((a) => a.state === "stopped" || a.state === "failed");
+  async function removeFinished() {
+    const names = finished().map((a) => a.name);
+    if (!(await confirm(`Remove ${names.length} finished agent${names.length === 1 ? "" : "s"}?`, `${names.join(", ")}. Their folders and saved history go; what they found stays in Review and Board. Agents that are working or waiting for you stay.`, { danger: true, ok: "Remove" }))) return;
+    const r = await rpc("agents.remove_many", { scope: "finished" }, { action: true }).catch((e) => ({ error: String(e) }));
+    if (r.error) return toast(r.error, "bad");
+    let removed = r.removed?.length || 0;
+    if (r.unsaved?.length) {
+      const ok = await confirm(`${r.unsaved.length} of them have unsaved files`, `${r.unsaved.map((u) => u.name).join(", ")} still have changes in their folders that were never committed. Delete them anyway?`, { danger: true, ok: "Delete anyway" });
+      if (ok) {
+        const r2 = await rpc("agents.remove_many", { scope: "finished", force: true, ids: r.unsaved.map((u) => u.id) }, { action: true }).catch(() => ({}));
+        removed += r2.removed?.length || 0;
+      }
+    }
+    toast(`Removed ${removed} agent${removed === 1 ? "" : "s"}${r.kept?.length ? `; kept ${r.kept.join(", ")} (a helper is still working)` : ""}`, "good");
+    refetch?.();
+  }
   const [filter, setFilter] = createSignal("all");
   const [search, setSearch] = createSignal("");
   const [viewMode, setViewModeRaw] = createSignal(localStorage.getItem("agents.viewMode") || "split");
@@ -1088,6 +1106,9 @@ export default function Agents() {
         </Show>
       }
       actions={<div class="row" style={{ gap: "8px", "flex-wrap": "wrap" }}>
+        <Show when={finished().length}>
+          <Button size="sm" onClick={removeFinished}>Remove finished ({finished().length})</Button>
+        </Show>
         <Show when={scoped().length}>
           <input
             type="search"

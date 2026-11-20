@@ -90,7 +90,7 @@ export function ReleaseIntake(props) {
   const [review,{refetch:reloadReview}]=createResource(()=>decision()?.generation??graph()?.seq??null,g=>g?call('review_items',{generation:g}).catch(()=>null):null);
   useEvent('release:review',()=>{reloadReview();reloadDrafter();});useEvent('board:changed',()=>reloadReview());useEvent('agents:changed',()=>{reloadReview();reloadDrafter();});
   async function reviewWithAgents(){if(busy())return;await resolve({preventDefault(){}});const d=decision();if(!d)return;setBusy(true);
-    try{const r=await call('review_start',{generation:d.generation});if(!r?.brief)throw new Error('Philium did not prepare the review. Try again.');await tidy(r.previous_lead);
+    try{const r=await call('review_start',{generation:d.generation});if(!r?.brief)throw new Error('Philium did not prepare the review. Try again.');if(r.previous_lead?.id)await rpc('agents.remove_many',{scope:'tree',root:r.previous_lead.id},{action:true}).catch(()=>null);
       // The orchestrator and its helpers start on the pull request's head, the revision under review.
       rpc('pipeline.run',{repo_id:props.repo,generation:d.generation,tier:'fast'},{action:true}).catch(()=>null);const a=await rpc('agents.spawn',{role:'orchestrator',repo_id:props.repo,brief:r.brief,base:r.head},{action:true});await call('lead',{kind:'review',agent:a.id}).catch(()=>null);await reloadReview();setMessage(`${a?.name||'An orchestrator'} is organising the review of #${r.pr}. The plan appears below as it is written. You can leave this screen.`);}
     catch(e){setMessage(`Review not started: ${String(e)}`);}finally{setBusy(false);}}

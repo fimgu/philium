@@ -1252,39 +1252,57 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
             });
             Ok(Value::Null)
         }
-        "remove" => {
-            let id = id()?;
-            if !ctx.db.query("SELECT id FROM agents WHERE parent_id=?1 LIMIT 1", [&id])?.is_empty() {
-                return Err("Remove this agent's helpers first".into());
-            }
+        "remove" => remove_one(ctx, &id()?, args["force"].as_bool().unwrap_or(false)).await,
+        // Several at once, helpers before their lead. `scope: "finished"` is every stopped or
+        // failed agent; `scope: "tree"` is `root` and its helpers, unless one is still working or
+        // waiting for the person. Agents with unsaved files are listed, not deleted, unless `force`.
+        "remove_many" => {
             let force = args["force"].as_bool().unwrap_or(false);
-            stop(ctx, &id, "tearing_down");
-            let (c, i) = (ctx.clone(), id.clone());
-            let report = match tokio::task::spawn_blocking(move || crate::reaper::teardown_agent(&c, &i, force)).await {
-                Ok(Ok(report)) => report,
-                // A refused or failed teardown must not leave the agent looking half removed.
-                Ok(Err(e)) => { set_state(ctx, &id, "stopped"); return Err(e); }
-                Err(e) => { set_state(ctx, &id, "stopped"); return Err(e.to_string()); }
+            let rows = ctx.db.query("SELECT id,name,state,parent_id FROM agents", [])?;
+            let busy = |st: &str| matches!(st, "running" | "provisioning" | "tearing_down" | "waiting");
+            let mut picked: Vec<String> = match args["scope"].as_str() {
+                Some("finished") => rows.iter().filter(|r| matches!(r["state"].as_str(), Some("stopped" | "failed"))).filter_map(|r| r["id"].as_str().map(str::to_string)).collect(),
+                Some("tree") => {
+                    let root = ctx::arg_str(&args, "root")?;
+                    let mut tree = vec![root.clone()];
+                    let mut i = 0;
+                    while i < tree.len() {
+                        let parent = tree[i].clone();
+                        tree.extend(rows.iter().filter(|r| r["parent_id"].as_str() == Some(parent.as_str())).filter_map(|r| r["id"].as_str().map(str::to_string)));
+                        i += 1;
+                    }
+                    tree.retain(|id| rows.iter().any(|r| r["id"].as_str() == Some(id.as_str()) && !busy(r["state"].as_str().unwrap_or(""))));
+                    tree
+                }
+                _ => return Err("scope is finished or tree".into()),
             };
-            if report["needs_confirmation"].as_bool() == Some(true) {
-                set_state(ctx, &id, "stopped");
-                return Ok(report);
+            if let Some(only) = args["ids"].as_array() {
+                let only: Vec<&str> = only.iter().filter_map(Value::as_str).collect();
+                picked.retain(|id| only.contains(&id.as_str()));
             }
-            if let Some(row) = get_row(ctx, &id) {
-                if let Some(n) = row["name"].as_str() {
-                    let _ = std::fs::remove_dir_all(ctx.agent_dir(n));
+            let name = |id: &str| rows.iter().find(|r| r["id"].as_str() == Some(id)).and_then(|r| r["name"].as_str()).unwrap_or(id).to_string();
+            let (mut removed, mut unsaved, mut kept) = (vec![], vec![], vec![]);
+            // Leaves first: an agent goes once none of its helpers remain.
+            loop {
+                let remaining: Vec<String> = picked.iter().filter(|id| !removed.contains(*id) && !unsaved.iter().any(|u: &Value| u["id"].as_str() == Some(id.as_str())) && !kept.contains(*id)).cloned().collect();
+                let ready: Vec<String> = remaining.iter().filter(|id| ctx.db.query("SELECT id FROM agents WHERE parent_id=?1 LIMIT 1", [id.as_str()]).map(|r| r.is_empty()).unwrap_or(false)).cloned().collect();
+                if ready.is_empty() {
+                    kept.extend(remaining);
+                    break;
+                }
+                for id in ready {
+                    match remove_one(ctx, &id, force).await {
+                        Ok(r) if r["needs_confirmation"].as_bool() == Some(true) => unsaved.push(json!({ "id": id, "name": name(&id), "reason": r["reason"] })),
+                        Ok(_) => removed.push(id),
+                        Err(_) => kept.push(id),
+                    }
                 }
             }
-            crate::browser::forget_agent(ctx, &id);
-            ctx.db.exec("DELETE FROM agents WHERE id=?1", [&id])?;
-            let _ = ctx.db.exec("DELETE FROM agent_queue WHERE agent_id=?1", [&id]);
-            for k in ["agent_error", "agent_seq", "agent.retry"] {
-                let _ = ctx.db.exec("DELETE FROM kv WHERE k=?1", [format!("{k}.{id}")]);
-            }
-            ctx.log_event("agent_removed", Some(&id), &report);
-            crate::attention::refresh(ctx);
-            ctx.emit("agents:changed", json!({ "id": id, "removed": true }));
-            Ok(report)
+            Ok(json!({
+                "removed": removed.iter().map(|i| name(i)).collect::<Vec<_>>(),
+                "unsaved": unsaved,
+                "kept": kept.iter().map(|i| name(i)).collect::<Vec<_>>(),
+            }))
         }
         "events" => {
             let after = args["after"].as_i64().unwrap_or(0).max(0);
@@ -1594,9 +1612,69 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
     }
 }
 
+/// Remove one agent: stop it, tear down its folders, forget it. Unsaved work asks first.
+async fn remove_one(ctx: &Arc<Ctx>, id: &str, force: bool) -> Result<Value, String> {
+    let id = id.to_string();
+    if !ctx.db.query("SELECT id FROM agents WHERE parent_id=?1 LIMIT 1", [&id])?.is_empty() {
+        return Err("Remove this agent's helpers first".into());
+    }
+    stop(ctx, &id, "tearing_down");
+    let (c, i) = (ctx.clone(), id.clone());
+    let report = match tokio::task::spawn_blocking(move || crate::reaper::teardown_agent(&c, &i, force)).await {
+        Ok(Ok(report)) => report,
+        // A refused or failed teardown must not leave the agent looking half removed.
+        Ok(Err(e)) => { set_state(ctx, &id, "stopped"); return Err(e); }
+        Err(e) => { set_state(ctx, &id, "stopped"); return Err(e.to_string()); }
+    };
+    if report["needs_confirmation"].as_bool() == Some(true) {
+        set_state(ctx, &id, "stopped");
+        return Ok(report);
+    }
+    if let Some(row) = get_row(ctx, &id) {
+        if let Some(n) = row["name"].as_str() {
+            let _ = std::fs::remove_dir_all(ctx.agent_dir(n));
+        }
+    }
+    crate::browser::forget_agent(ctx, &id);
+    ctx.db.exec("DELETE FROM agents WHERE id=?1", [&id])?;
+    let _ = ctx.db.exec("DELETE FROM agent_queue WHERE agent_id=?1", [&id]);
+    for k in ["agent_error", "agent_seq", "agent.retry"] {
+        let _ = ctx.db.exec("DELETE FROM kv WHERE k=?1", [format!("{k}.{id}")]);
+    }
+    ctx.log_event("agent_removed", Some(&id), &report);
+    crate::attention::refresh(ctx);
+    ctx.emit("agents:changed", json!({ "id": id, "removed": true }));
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn finished_agents_go_in_one_step_helpers_first_and_working_ones_stay() {
+        let ctx = Ctx::test();
+        for (id, state, parent) in [("lead", "stopped", None), ("h1", "stopped", Some("lead")), ("h2", "running", Some("lead")), ("old", "failed", None), ("chat", "idle", None)] {
+            ctx.db.exec("INSERT INTO agents(id,name,model_ref,state,created_at,last_active_at,parent_id) VALUES(?1,?1,'p/m',?2,0,0,?3)", rusqlite::params![id, state, parent]).unwrap();
+        }
+        let names = |v: &Value, k: &str| v[k].as_array().unwrap().iter().map(|x| x.as_str().unwrap().to_string()).collect::<Vec<_>>();
+        let left = || ctx.db.query("SELECT id FROM agents ORDER BY id", []).unwrap().iter().map(|r| r["id"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+        // Every stopped or failed agent, in one go; a lead with a working helper stays.
+        let r = call(&ctx, "remove_many", json!({"scope": "finished"})).await.unwrap();
+        let mut removed = names(&r, "removed");
+        removed.sort();
+        assert_eq!(removed, vec!["h1", "old"]);
+        assert_eq!(names(&r, "kept"), vec!["lead"]);
+        assert_eq!(left(), vec!["chat", "h2", "lead"], "an idle chat agent is not 'finished'");
+        // A rerun clears the previous review's lead and helpers, unless one is still working.
+        let r = call(&ctx, "remove_many", json!({"scope": "tree", "root": "lead"})).await.unwrap();
+        assert!(names(&r, "removed").is_empty());
+        ctx.db.exec("UPDATE agents SET state='idle' WHERE id='h2'", []).unwrap();
+        let r = call(&ctx, "remove_many", json!({"scope": "tree", "root": "lead"})).await.unwrap();
+        assert_eq!(names(&r, "removed"), vec!["h2", "lead"], "helpers before their lead");
+        assert_eq!(left(), vec!["chat"]);
+        assert!(call(&ctx, "remove_many", json!({"scope": "everything"})).await.is_err());
+    }
 
     #[test]
     fn kind_admission_counts_external_clusters_and_reserves_managed_ports() {
