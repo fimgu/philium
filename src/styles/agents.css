@@ -421,3 +421,7 @@ details.msg summary { cursor: pointer; display: flex; align-items: center; gap: 
 }
 
 
+
+/* Agents picked with ⌘-click, removed together. */
+.agent-row.picked { background: var(--accent-dim); box-shadow: inset 2px 0 0 var(--accent); }
+.picked-bar { gap: 6px; padding: 6px 12px; border-bottom: 1px solid var(--line); background: var(--surface); position: sticky; top: 0; z-index: 1; }

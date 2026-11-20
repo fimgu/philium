@@ -1274,9 +1274,25 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
                     tree.retain(|id| rows.iter().any(|r| r["id"].as_str() == Some(id.as_str()) && !busy(r["state"].as_str().unwrap_or(""))));
                     tree
                 }
-                _ => return Err("scope is finished or tree".into()),
+                // What a person picked in the list, with each one's helpers: a lead goes
+                // with the agents it started. Picked agents go even if they are working.
+                Some("selected") => {
+                    let mut picked: Vec<String> = args["ids"].as_array().ok_or("ids lists the agents to remove")?.iter().filter_map(Value::as_str).filter(|id| rows.iter().any(|r| r["id"].as_str() == Some(*id))).map(str::to_string).collect();
+                    let mut i = 0;
+                    while i < picked.len() {
+                        let parent = picked[i].clone();
+                        for r in rows.iter().filter(|r| r["parent_id"].as_str() == Some(parent.as_str())) {
+                            if let Some(id) = r["id"].as_str().filter(|id| !picked.iter().any(|p| p == id)) {
+                                picked.push(id.to_string());
+                            }
+                        }
+                        i += 1;
+                    }
+                    picked
+                }
+                _ => return Err("scope is finished, tree or selected".into()),
             };
-            if let Some(only) = args["ids"].as_array() {
+            if let (Some(only), false) = (args["ids"].as_array(), args["scope"] == "selected") {
                 let only: Vec<&str> = only.iter().filter_map(Value::as_str).collect();
                 picked.retain(|id| only.contains(&id.as_str()));
             }
@@ -1673,6 +1689,13 @@ mod tests {
         let r = call(&ctx, "remove_many", json!({"scope": "tree", "root": "lead"})).await.unwrap();
         assert_eq!(names(&r, "removed"), vec!["h2", "lead"], "helpers before their lead");
         assert_eq!(left(), vec!["chat"]);
+        // Picked by hand: exactly those, each with its helpers, working or not.
+        for (id, parent, state) in [("p1", None, "running"), ("p1h", Some("p1"), "running"), ("p2", None, "stopped")] {
+            ctx.db.exec("INSERT INTO agents(id,name,model_ref,state,parent_id,created_at,last_active_at) VALUES(?1,?1,'m',?2,?3,0,0)", rusqlite::params![id, state, parent]).unwrap();
+        }
+        let r = call(&ctx, "remove_many", json!({"scope": "selected", "ids": ["p1", "nope"]})).await.unwrap();
+        assert_eq!(names(&r, "removed"), vec!["p1h", "p1"], "the picked lead with its helper, helper first");
+        assert_eq!(left(), vec!["chat", "p2"], "nothing that was not picked");
         assert!(call(&ctx, "remove_many", json!({"scope": "everything"})).await.is_err());
     }
 

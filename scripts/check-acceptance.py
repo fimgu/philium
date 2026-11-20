@@ -541,6 +541,25 @@ const exported = await until(() => { const t = all('p[role="status"]', pane()).m
 return { remembered, before, fallback, exported, window: txt(all('[aria-label="Observation window"]', ledger)[0]) };
 '''
 
+PICK = r'''
+await until(() => picker() && picker().options.length > 1, 'checkouts loaded', 15000);
+await workspace(P.checkout);
+await go('Agents');
+const rows = () => all('[role="listbox"][aria-label="Agents"] [data-agent]');
+await until(() => rows().length >= 2, 'agents listed', 20000);
+const before = rows().map((r) => r.dataset.agent);
+const want = before.filter((n) => P.pick.includes(n));
+for (const n of want) rows().find((r) => r.dataset.agent === n).dispatchEvent(new MouseEvent('click', { bubbles: true, metaKey: true }));
+const bar = await until(() => all('[role="toolbar"][aria-label="Picked agents"]')[0], 'picked bar', 5000);
+const picked = txt(bar);
+window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Delete', bubbles: true }));
+const m = await until(modal, 'confirm dialog', 5000);
+const asked = txt(m);
+await click('Remove', m);
+await until(() => !rows().some((r) => want.includes(r.dataset.agent)), 'picked agents gone', 60000);
+return { before, want, picked, asked, after: rows().map((r) => r.dataset.agent) };
+'''
+
 STORAGE = r'''
 await go('Settings');
 const sec = await until(() => all('section[aria-label="Storage"]')[0], 'storage section', 20000);
@@ -1070,6 +1089,13 @@ def main():
             run.check('C1', 'With no checks yet, an agent started from Review proposes them and they are listed in plain words', len(v.get('proposed') or []) == 2 and 'committed file' in ' '.join(v.get('proposed') or []) and 'Proposed by' in (v.get('by') or ''), {'started': v.get('started'), 'by': v.get('by'), 'proposed': v.get('proposed'), 'status': v.get('status'), 'error': r.get('error')})
             run.check('C1', 'The proposal counts only after the person accepts it and confirms the same checks', v.get('toConfirm') == v.get('proposed') and 'You confirmed its checks' in (v.get('pinned') or '') and 'No checks confirmed' in ((v.get('before') or {}).get('pinned') or '') and v.get('left') == 0, {'before': (v.get('before') or {}).get('pinned'), 'pinned': v.get('pinned'), 'left': v.get('left'), 'status': v.get('status'), 'alerts': v.get('alerts'), 'connected': v.get('connected'), 'redrawn': v.get('redrawn'), 'sections': v.get('sections'), 'buttons': v.get('buttons'), 'toasts': v.get('toasts')})
             run.check('C1', 'The checks are kept by Philium itself: no second checkout appears and the person names no folder', 'kept by Philium' in (v.get('pinned') or '') and 'kept by Philium' in (v.get('summary') or '') and sorted(v.get('labels') or []) == sorted(labels) and len(kept) == 1, {'summary': v.get('summary'), 'labels': v.get('labels'), 'kept': [str(k.relative_to(run.profile)) for k in kept]})
+
+        if want('coord') or want('pick'):
+            # Pick two agents with Command-click, press Delete, confirm: those two go, nothing else.
+            r = run.ui(PICK, {'checkout': 'alpha/same', 'pick': ['lead', 'wren']}, 150)
+            v = run.value(r)
+            others = [n for n in (v.get('before') or []) if n not in ('lead', 'wren')]
+            run.check('B4', 'Agents picked with Command-click are removed together after one confirmation, and only those', sorted(v.get('want') or []) == ['lead', 'wren'] and (v.get('picked') or '').startswith('2 picked') and 'lead' in (v.get('asked') or '') and sorted(v.get('after') or []) == sorted(others), {'picked': v.get('picked'), 'asked': (v.get('asked') or '')[:160], 'before': v.get('before'), 'after': v.get('after'), 'error': r.get('error')})
 
     finally:
         model.shutdown()

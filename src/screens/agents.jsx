@@ -202,7 +202,8 @@ export function SpawnModal(props) {
 function AgentRow(props) {
   const a = () => props.agent;
   return (
-    <div class={`list-item agent-row ${props.selected ? "on" : ""}`} style={{ "padding-left": `${12 + props.depth * 14}px` }} onClick={props.onClick}>
+    <div class={`list-item agent-row ${props.selected ? "on" : ""} ${props.picked ? "picked" : ""}`} style={{ "padding-left": `${12 + props.depth * 14}px` }} onClick={props.onClick}
+      role="option" aria-selected={props.picked ? "true" : "false"} data-agent={a().name} title="⌘-click to pick several, then Delete to remove them">
       <Dot state={stateDot(a().state)} title={stateLabel(a().state)} />
       <div class="grow" style={{ "min-width": 0 }}>
         <div class="row" style={{ gap: "6px" }}>
@@ -969,6 +970,60 @@ export default function Agents() {
     toast(`Removed ${removed} agent${removed === 1 ? "" : "s"}${r.kept?.length ? `; kept ${r.kept.join(", ")} (a helper is still working)` : ""}`, "good");
     refetch?.();
   }
+  // Picked in the list with ⌘-click (or Ctrl), a range with Shift: removed together.
+  const [picked, setPicked] = createSignal([]);
+  let anchor = null;
+  function pickRow(e, id) {
+    const order = tree().map((x) => x.a.id);
+    if (e.metaKey || e.ctrlKey) {
+      setPicked((p) => (p.includes(id) ? p.filter((x) => x !== id) : [...p, id]));
+      anchor = id;
+    } else if (e.shiftKey && anchor && order.includes(anchor)) {
+      const [i, j] = [order.indexOf(anchor), order.indexOf(id)].sort((x, y) => x - y);
+      setPicked((p) => [...new Set([...p, ...order.slice(i, j + 1)])]);
+    } else {
+      setPicked([]);
+      anchor = id;
+      go("agents", { id });
+    }
+  }
+  async function removePicked() {
+    const all = list() || [];
+    const ids = picked().filter((id) => all.some((a) => a.id === id));
+    if (!ids.length) return;
+    // Helpers go with their lead; say so before anything is removed.
+    const going = new Set(ids);
+    for (let grew = true; grew; ) {
+      grew = false;
+      for (const a of all) if (a.parent_id && going.has(a.parent_id) && !going.has(a.id)) { going.add(a.id); grew = true; }
+    }
+    const agents = all.filter((a) => going.has(a.id));
+    const working = agents.filter((a) => ["running", "provisioning", "waiting"].includes(a.state));
+    const helpers = agents.length - ids.length;
+    const what = `${agents.map((a) => a.name).join(", ")}.${helpers ? ` That includes ${helpers} helper${helpers === 1 ? "" : "s"} of the ones you picked.` : ""}${working.length ? ` ${working.map((a) => a.name).join(", ")} ${working.length === 1 ? "is" : "are"} working and will be stopped.` : ""} Their folders and saved history go; what they found stays in Review and Board.`;
+    if (!(await confirm(`Remove ${agents.length} agent${agents.length === 1 ? "" : "s"}?`, what, { danger: true, ok: "Remove" }))) return;
+    const r = await rpc("agents.remove_many", { scope: "selected", ids }, { action: true }).catch((e) => ({ error: String(e) }));
+    if (r.error) return toast(r.error, "bad");
+    let removed = r.removed?.length || 0;
+    if (r.unsaved?.length) {
+      const ok = await confirm(`${r.unsaved.length} of them have unsaved files`, `${r.unsaved.map((u) => u.name).join(", ")} still have changes in their folders that were never committed. Delete them anyway?`, { danger: true, ok: "Delete anyway" });
+      if (ok) {
+        const r2 = await rpc("agents.remove_many", { scope: "selected", force: true, ids: r.unsaved.map((u) => u.id) }, { action: true }).catch(() => ({}));
+        removed += r2.removed?.length || 0;
+      }
+    }
+    toast(`Removed ${removed} agent${removed === 1 ? "" : "s"}${r.kept?.length ? `; kept ${r.kept.join(", ")}` : ""}`, "good");
+    setPicked([]);
+    if (selected() && !(list() || []).some((a) => a.id === selected())) go("agents", {});
+    refetch?.();
+  }
+  const onKey = (e) => {
+    if (!picked().length || e.target.closest?.("input, textarea, select, [contenteditable=true]")) return;
+    if (e.key === "Delete" || e.key === "Backspace") { e.preventDefault(); removePicked(); }
+    else if (e.key === "Escape") setPicked([]);
+  };
+  window.addEventListener("keydown", onKey);
+  onCleanup(() => window.removeEventListener("keydown", onKey));
   const [filter, setFilter] = createSignal("all");
   const [search, setSearch] = createSignal("");
   const [viewMode, setViewModeRaw] = createSignal(localStorage.getItem("agents.viewMode") || "split");
@@ -1164,8 +1219,15 @@ export default function Agents() {
         </Empty>}>
         <Show when={viewMode() !== "split"} fallback={
           <div class="split" style={{ flex: "1", "min-width": "0" }}>
-            <div class="agent-list">
-              <For each={tree()}>{({ a, d }) => <AgentRow agent={a} depth={d} selected={a.id === selected()} onClick={() => go("agents", { id: a.id })} />}</For>
+            <div class="agent-list" role="listbox" aria-multiselectable="true" aria-label="Agents">
+              <Show when={picked().length}>
+                <div class="picked-bar row" role="toolbar" aria-label="Picked agents">
+                  <span class="grow small">{picked().length} picked</span>
+                  <Button size="sm" variant="danger" onClick={removePicked}>Remove</Button>
+                  <Button size="sm" variant="ghost" onClick={() => setPicked([])}>Clear</Button>
+                </div>
+              </Show>
+              <For each={tree()}>{({ a, d }) => <AgentRow agent={a} depth={d} selected={a.id === selected()} picked={picked().includes(a.id)} onClick={(e) => pickRow(e, a.id)} />}</For>
             </div>
             <Show when={selected()}>{(id) => (
               <Show when={filtered().some((a) => a.id === id())} fallback={
