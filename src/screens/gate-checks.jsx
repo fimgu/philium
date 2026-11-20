@@ -6,13 +6,14 @@ import { rpc, useEvent } from '../lib/rpc.js';
 const OUTCOME = {
   pass: ['ok', '✓', 'Passes'],
   introduced: ['bad', '✕', 'Fails on this pull request and passes on its base: this pull request caused it'],
-  pre_existing: ['unknown', '!', 'Fails on the base too: it was already broken'],
+  pre_existing: ['unknown', '!', 'Fails on the base too: this pull request did not cause it'],
   flaky: ['unknown', '~', 'Failed, then passed when run again: flaky'],
   not_run: ['unknown', '?', 'Did not run'],
   unverified: ['unknown', '?', 'Failed, and the base could not be checked'],
   pending: ['unknown', '…', 'Not finished'],
 };
 const HEAD = { pass: 'Checks pass', fail: 'A check fails because of this pull request', blocked: 'Checks are not done' };
+const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
 
 const seconds = ms => (ms == null ? '' : ms < 1000 ? `${ms} ms` : `${Math.round(ms / 1000)} s`);
 
@@ -62,6 +63,23 @@ export function GateChecks(props) {
       setError(String(e));
     }
   }
+  // Decisions only a person makes. The verdict waits for them and moves on once made,
+  // without running anything again.
+  const [note, setNote] = createSignal({});
+  const waitingFor = id => (res()?.verdict?.waiting || []).find(w => w.check === id);
+  const known = id => (res()?.decisions?.known_issues || []).find(k => k.check_id === id);
+  const quarantined = id => (res()?.decisions?.quarantined || []).find(q => q.check_id === id);
+  async function decide(check, kind, extra = {}) {
+    setError('');
+    try {
+      await rpc('pipeline.decide', { repo_id: props.repo, generation: props.generation, check, kind, ...extra }, { action: true });
+      setNote(n => ({ ...n, [check]: '' }));
+      refetch();
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+  const waitingCount = () => (res()?.verdict?.waiting || []).length;
   const outcomeOf = (v, id) => (v?.verdict?.outcomes || []).find(o => o[0] === id)?.[1]?.outcome || 'pending';
   const running = () => res()?.running || live();
   return (
@@ -71,7 +89,7 @@ export function GateChecks(props) {
           <span class="glyph" aria-hidden="true">{running() ? '…' : ({ pass: '✓', fail: '✕' })[res()?.verdict?.state] || '…'}</span>
           <div class="grow">
             <h3 title="Philium runs the repo's own checks on this pull request's head and on its base, so what it broke is told apart from what was already broken.">
-              {running() ? 'Checks are running' : res()?.configured === false ? 'No checks are set up for this repo' : HEAD[res()?.verdict?.state] || 'Checks have not run'}
+              {running() ? 'Checks are running' : res()?.configured === false ? 'No checks are set up for this repo' : res()?.verdict?.state === 'blocked' && waitingCount() ? `Waiting for you: ${plural(waitingCount(), 'decision', 'decisions')}` : HEAD[res()?.verdict?.state] || 'Checks have not run'}
             </h3>
             <p>
               <Show when={res()?.pr}>#{res().pr} · head {String(res().head).slice(0, 12)} · base {String(res().base).slice(0, 12)}</Show>
@@ -117,6 +135,24 @@ export function GateChecks(props) {
                         {o()[2]}
                         <Show when={c.candidate?.reason}> ({c.candidate.reason})</Show>
                         <Show when={c.candidate?.duration_ms != null}><small> · {seconds(c.candidate.duration_ms)}</small></Show>
+                        <Show when={waitingFor(c.id)?.kind === 'known_issue'}>
+                          <form class="row" aria-label={`Link the issue for ${c.id}`} onSubmit={e => { e.preventDefault(); decide(c.id, 'known_issue', { issue: note()[c.id] || '' }); }}>
+                            <input aria-label={`Issue that tracks ${c.id}`} placeholder="Issue link or #number" value={note()[c.id] || ''} onInput={e => setNote(n => ({ ...n, [c.id]: e.currentTarget.value }))} />
+                            <button type="submit" disabled={!(note()[c.id] || '').trim()}>Link issue</button>
+                          </form>
+                        </Show>
+                        <Show when={known(c.id)}>
+                          <p>Tracked in {known(c.id).issue}. <button type="button" class="link" onClick={() => decide(c.id, 'forget_issue')}>Unlink</button></p>
+                        </Show>
+                        <Show when={waitingFor(c.id)?.kind === 'quarantine'}>
+                          <form class="row" aria-label={`Set ${c.id} aside`} onSubmit={e => { e.preventDefault(); decide(c.id, 'quarantine', { reason: note()[c.id] || '' }); }}>
+                            <input aria-label={`Why ${c.id} is flaky`} placeholder="Why it is flaky" value={note()[c.id] || ''} onInput={e => setNote(n => ({ ...n, [c.id]: e.currentTarget.value }))} />
+                            <button type="submit" disabled={!(note()[c.id] || '').trim()}>Set aside as flaky</button>
+                          </form>
+                        </Show>
+                        <Show when={quarantined(c.id)}>
+                          <p>Set aside as flaky: {quarantined(c.id).reason}. <button type="button" class="link" onClick={() => decide(c.id, 'lift_quarantine')}>Count it again</button></p>
+                        </Show>
                         <Show when={c.output}>
                           <details>
                             <summary>Output on this pull request</summary>

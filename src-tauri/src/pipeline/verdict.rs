@@ -71,6 +71,18 @@ pub struct Verdict {
     pub outcomes: Vec<(String, Outcome)>,
     /// False when the gate came from a local file: an "unpinned config" verdict, never landed.
     pub pinned: bool,
+    /// What the gate is waiting on a person for. Each one names the check and the
+    /// decision; once it is made the verdict moves on without running anything again.
+    pub waiting: Vec<Waiting>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Waiting {
+    pub check: String,
+    /// `known_issue`: link the issue that tracks a failure the base has too.
+    /// `quarantine`: say why a flaky check may be set aside.
+    pub kind: &'static str,
+    pub text: String,
 }
 
 impl Verdict {
@@ -83,6 +95,7 @@ pub fn decide(i: &Inputs) -> Verdict {
     let mut fail: Vec<String> = vec![];
     let mut block: Vec<String> = vec![];
     let mut outcomes = vec![];
+    let mut waiting = vec![];
     let get = |c: &str, s: Side| i.results.iter().find(|(id, side, _)| id == c && *side == s).map(|x| &x.2);
     for c in &i.checks {
         let o = origin(get(c, Side::Candidate), get(c, Side::Rerun), get(c, Side::Base));
@@ -90,9 +103,15 @@ pub fn decide(i: &Inputs) -> Verdict {
             Outcome::Pass => {}
             Outcome::Introduced => fail.push(format!("{c} fails on this change and passes on the base")),
             Outcome::PreExisting if i.known_issues.contains(c) => {}
-            Outcome::PreExisting => block.push(format!("{c} fails on the base too; file it as an issue before landing")),
+            Outcome::PreExisting => {
+                block.push(format!("{c} fails on the base too, so this change did not cause it; link the issue that tracks it"));
+                waiting.push(Waiting { check: c.clone(), kind: "known_issue", text: format!("{c} fails on the base too, so this change did not cause it. Link the issue that tracks it to go on.") });
+            }
             Outcome::Flaky if i.quarantined.contains(c) => {}
-            Outcome::Flaky => block.push(format!("{c} is flaky (failed, then passed); a person must quarantine it")),
+            Outcome::Flaky => {
+                block.push(format!("{c} is flaky (failed, then passed); a person must quarantine it"));
+                waiting.push(Waiting { check: c.clone(), kind: "quarantine", text: format!("{c} failed, then passed when run again. Say why it is flaky to set it aside, or run the checks again.") });
+            }
             // Invariant 5: a check that could not run never counts as passed.
             Outcome::NotRun(why) => block.push(format!("{c} did not run: {why}")),
             Outcome::Unverified(why) => block.push(format!("{c} failed and its origin is unverified: {why}")),
@@ -141,7 +160,7 @@ pub fn decide(i: &Inputs) -> Verdict {
         block.push("the tier declares no checks".into());
     }
     fail.extend(block);
-    Verdict { state, reasons: fail, outcomes, pinned: i.pinned }
+    Verdict { state, reasons: fail, outcomes, pinned: i.pinned, waiting }
 }
 
 fn short(o: &Outcome) -> &'static str {
@@ -194,6 +213,23 @@ mod tests {
     }
     fn inputs(results: Vec<(String, Side, Res)>) -> Inputs {
         Inputs { checks: vec!["t".into()], results, ..Default::default() }
+    }
+
+    #[test]
+    fn the_gate_names_each_decision_it_waits_on_a_person_for_and_moves_on_once_made() {
+        let mut i = inputs(with("t", Status::Fail, Some(Status::Fail), Some(Status::Fail)));
+        i.checks = vec!["t".into(), "u".into()];
+        i.results.extend(with("u", Status::Fail, Some(Status::Pass), None));
+        let v = decide(&i);
+        assert_eq!(v.state, "blocked");
+        let w: Vec<(&str, &str)> = v.waiting.iter().map(|w| (w.check.as_str(), w.kind)).collect();
+        assert_eq!(w, vec![("t", "known_issue"), ("u", "quarantine")]);
+        assert!(v.waiting[0].text.contains("did not cause it"), "{}", v.waiting[0].text);
+        // Both decided: nothing runs again, and the verdict passes.
+        i.known_issues.insert("t".into());
+        i.quarantined.insert("u".into());
+        let v = decide(&i);
+        assert_eq!((v.state, v.waiting.len()), ("pass", 0), "{:?}", v.reasons);
     }
 
     #[test]

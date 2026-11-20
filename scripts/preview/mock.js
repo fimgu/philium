@@ -37,8 +37,13 @@
     'release_intake.followup': { mode: 'full', reason: 'No code review is recorded for this pull request yet.', commits: [] },
     'release_intake.drafter': q.get('review') === 'failed' ? { id: 'd1', name: 'otter', state: 'failed', started: false, error: 'Agents here start from release/v0.9.0, and this checkout has no such branch or commit, locally or from origin. Fetch it in the checkout (git fetch origin release/v0.9.0), or choose another starting branch for this checkout under Repos.' } : null,
     'pipeline.results': q.get('checks') === 'none' ? { configured: false, local_gate: '~/Philium Pilot/data/pipelines/example-org-example-repo/.philium/pipeline.yaml' } : { configured: true, pr: 5542, head: H, base: B, from: 'local pipeline.yaml', pinned_gate: false, running: false, lines: [],
-      verdict: { state: 'fail', pinned: false, reasons: ['go-test-touched fails on this change and passes on the base', 'migrations-postgres fails on the base too; file it as an issue before landing'],
-        outcomes: [['gofmt-changed', { outcome: 'pass' }], ['go-test-touched', { outcome: 'introduced' }], ['migrations-postgres', { outcome: 'pre_existing' }]] },
+      verdict: q.get('checks') === 'waiting'
+        ? { state: 'blocked', pinned: false, reasons: ['go-test-touched is flaky (failed, then passed); a person must quarantine it', 'migrations-postgres fails on the base too, so this change did not cause it; link the issue that tracks it'],
+          outcomes: [['gofmt-changed', { outcome: 'pass' }], ['go-test-touched', { outcome: 'flaky' }], ['migrations-postgres', { outcome: 'pre_existing' }]],
+          waiting: [{ check: 'go-test-touched', kind: 'quarantine', text: 'go-test-touched failed, then passed when run again.' }, { check: 'migrations-postgres', kind: 'known_issue', text: 'migrations-postgres fails on the base too.' }] }
+        : { state: 'fail', pinned: false, reasons: ['go-test-touched fails on this change and passes on the base'],
+          outcomes: [['gofmt-changed', { outcome: 'pass' }], ['go-test-touched', { outcome: 'introduced' }], ['migrations-postgres', { outcome: 'pre_existing' }]], waiting: [] },
+      decisions: q.get('checks') === 'waiting' ? { known_issues: [], quarantined: [] } : { known_issues: [{ check_id: 'migrations-postgres', issue: 'example-org/example-repo#5601', by: 'you', at: now - 600e3 }], quarantined: [] },
       checks: [
         { id: 'gofmt-changed', candidate: { status: 'pass', duration_ms: 420 }, output: '12 changed Go files are gofmt-clean' },
         { id: 'go-test-touched', candidate: { status: 'fail', duration_ms: 111000 }, base: { status: 'pass' }, output: '--- FAIL: TestHTTPServerHeaderValidation (0.02s)\nFAIL', base_output: 'ok  internal/handler 3.1s' },

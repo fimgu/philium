@@ -2,7 +2,12 @@
 //! started from the app next to the agents' review.
 //!
 //! rpc `pipeline.*`: `status {repo_id}`, `run {repo_id, generation, tier}`,
-//! `results {repo_id, generation, tier}`, `lend {repo_id, name, path}`.
+//! `results {repo_id, generation, tier}`, `lend {repo_id, name, path}`,
+//! `decide {repo_id, generation, check, kind, issue?, reason?}` (kind: `known_issue`,
+//! `quarantine`, `forget_issue`, `lift_quarantine`).
+//!
+//! A run that Philium did not see finish (the app quit or crashed) continues when Philium
+//! starts again, from the checks it has no result for yet.
 //! Events: `pipeline:progress {repo_id, line}`, `pipeline:done {repo_id, state}`.
 //!
 //! The person's checkout is only read. Pull request commits come into a mirror
@@ -67,7 +72,8 @@ fn host(ctx: &Ctx, origin: &str) -> runner::Host {
     let (o1, o2, o3) = (origin.to_string(), origin.to_string(), origin.to_string());
     let (p1, p2) = (path.clone(), path);
     runner::Host {
-        scratch: root().join("runs").join(format!("app-{}", std::process::id())),
+        // Each run its own folder: two checkouts' runs at once must not remove each other's.
+        scratch: root().join("runs").join(format!("app-{}", std::process::id())).join(format!("{}-{}", slug(origin), &crate::db::new_id()[..6])),
         caches: root().join("caches").join(slug(origin)),
         home: account_home(),
         tools_home: account_home(),
@@ -198,46 +204,32 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, a: Value) -> Result<Value, Strin
             let gen = a["generation"].as_i64().ok_or("Look the pull request up in Review first")?;
             let tier = Tier::parse(a["tier"].as_str().unwrap_or("fast"))?;
             let (pr, base, head) = generation(ctx, &repo_id, &origin, gen)?;
-            {
-                let mut m = runs().lock().map_err(|_| "busy")?;
-                if m.get(&repo_id).is_some_and(|s| s.running) {
-                    return Err("Checks are already running for this checkout".into());
-                }
-                m.insert(repo_id.clone(), RunState { running: true, generation: gen, tier: tier.as_str().into(), lines: vec![], error: None });
-            }
-            let (c, key) = (ctx.clone(), repo_id.clone());
-            tauri::async_runtime::spawn(async move {
-                let result = async {
-                    say(&c, &key, format!("getting #{pr} ({}) and its base ({})", &head[..12], &base[..12]));
-                    let m = mirror(&checkout, &origin, pr, &[&head, &base]).await?;
-                    let local = local_gate(&c, &origin);
-                    let g = config::load(&m, &base, Some(&local))?;
-                    say(&c, &key, format!("gate from {}{}", g.from, if g.pinned { "" } else { " (unpinned: a local file, not the base commit)" }));
-                    let d = db(&c)?;
-                    let h = host(&c, &origin);
-                    let t = gate::Target { key: &origin, path: &m, pr: Some(pr), head: &head, base: &base, candidate: &head };
-                    let (c2, k2) = (c.clone(), key.clone());
-                    let out = gate::run_tier(&d, &t, &g, tier, &h, &move |l| say(&c2, &k2, l)).await;
-                    std::fs::remove_dir_all(&h.scratch).ok();
-                    out
-                }
-                .await;
-                let state = match &result {
-                    Ok((_, v)) => v.state.to_string(),
-                    Err(_) => "error".into(),
-                };
-                if let Ok(mut m) = runs().lock() {
-                    if let Some(s) = m.get_mut(&key) {
-                        s.running = false;
-                        s.error = result.as_ref().err().cloned();
-                    }
-                }
-                if let Err(e) = &result {
-                    say(&c, &key, format!("stopped: {e}"));
-                }
-                c.emit("pipeline:done", json!({ "repo_id": key, "state": state }));
-            });
+            launch(ctx, &repo_id, checkout, origin, gen, pr, base, head, tier, false)?;
             Ok(json!({ "started": true, "pr": pr }))
+        }
+        "decide" => {
+            let gen = a["generation"].as_i64().ok_or("Look the pull request up in Review first")?;
+            let (_, base, _) = generation(ctx, &repo_id, &origin, gen)?;
+            let check = arg_str(&a, "check")?;
+            let d = db(ctx)?;
+            match a["kind"].as_str().unwrap_or("") {
+                "known_issue" => {
+                    let issue = a["issue"].as_str().map(str::trim).filter(|s| !s.is_empty()).ok_or("Link the issue that tracks this failure (a URL or #number)")?;
+                    records::file_known_issue(&d, &origin, &check, &base, issue, "you")?;
+                }
+                "forget_issue" => {
+                    d.exec("DELETE FROM pipeline_known_issues WHERE repo=?1 AND check_id=?2 AND base_sha=?3", params![origin, check, base])?;
+                }
+                "quarantine" => {
+                    let why = a["reason"].as_str().map(str::trim).filter(|s| !s.is_empty()).ok_or("Say why this check is flaky")?;
+                    records::quarantine(&d, &origin, &check, "you", why)?;
+                }
+                "lift_quarantine" => {
+                    d.exec("DELETE FROM pipeline_quarantine WHERE repo=?1 AND check_id=?2", params![origin, check])?;
+                }
+                k => return Err(format!("unknown decision {k}")),
+            }
+            Ok(json!({ "decided": check }))
         }
         "results" => {
             let gen = a["generation"].as_i64().ok_or("Look the pull request up in Review first")?;
@@ -268,9 +260,13 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, a: Value) -> Result<Value, Strin
                     json!({ "id": id, "candidate": side(records::Side::Candidate), "rerun": side(records::Side::Rerun), "base": side(records::Side::Base), "output": text("candidate"), "base_output": text("base") })
                 })
                 .collect();
+            let decisions = json!({
+                "known_issues": d.query("SELECT check_id, issue, by, at FROM pipeline_known_issues WHERE repo=?1 AND base_sha=?2", params![origin, base]).unwrap_or_default(),
+                "quarantined": d.query("SELECT check_id, reason, by, at FROM pipeline_quarantine WHERE repo=?1", params![origin]).unwrap_or_default(),
+            });
             Ok(json!({
                 "configured": true, "pr": pr, "head": head, "base": base, "from": g.from, "pinned_gate": g.pinned,
-                "verdict": v, "checks": outputs,
+                "verdict": v, "checks": outputs, "decisions": decisions,
                 "running": state.as_ref().is_some_and(|s| s.running),
                 "error": state.as_ref().and_then(|s| s.error.clone()),
                 "lines": state.map(|s| s.lines).unwrap_or_default(),
@@ -288,6 +284,87 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, a: Value) -> Result<Value, Strin
         }
         _ => Err(format!("unknown pipeline.{method}")),
     }
+}
+
+/// Start a tier on a pull request's exact head and base, in the background. `resume`
+/// keeps what an interrupted run already recorded for this candidate.
+#[allow(clippy::too_many_arguments)]
+fn launch(ctx: &Arc<Ctx>, repo_id: &str, checkout: PathBuf, origin: String, gen: i64, pr: i64, base: String, head: String, tier: Tier, resume: bool) -> Result<(), String> {
+    {
+        let mut m = runs().lock().map_err(|_| "busy")?;
+        if m.get(repo_id).is_some_and(|s| s.running) {
+            return Err("Checks are already running for this checkout".into());
+        }
+        m.insert(repo_id.to_string(), RunState { running: true, generation: gen, tier: tier.as_str().into(), lines: vec![], error: None });
+    }
+    let (c, key) = (ctx.clone(), repo_id.to_string());
+    tauri::async_runtime::spawn(async move {
+        let result = async {
+            say(&c, &key, format!("getting #{pr} ({}) and its base ({})", &head[..12], &base[..12]));
+            let m = mirror(&checkout, &origin, pr, &[&head, &base]).await?;
+            let local = local_gate(&c, &origin);
+            let g = config::load(&m, &base, Some(&local))?;
+            say(&c, &key, format!("gate from {}{}", g.from, if g.pinned { "" } else { " (unpinned: a local file, not the base commit)" }));
+            let d = db(&c)?;
+            let h = host(&c, &origin);
+            let t = gate::Target { key: &origin, path: &m, pr: Some(pr), head: &head, base: &base, candidate: &head };
+            let (c2, k2) = (c.clone(), key.clone());
+            let out = if resume { gate::resume_tier(&d, &t, &g, tier, &h, &move |l| say(&c2, &k2, l)).await } else { gate::run_tier(&d, &t, &g, tier, &h, &move |l| say(&c2, &k2, l)).await };
+            std::fs::remove_dir_all(&h.scratch).ok();
+            out
+        }
+        .await;
+        let state = match &result {
+            Ok((_, v)) => v.state.to_string(),
+            Err(_) => "error".into(),
+        };
+        if let Ok(mut m) = runs().lock() {
+            if let Some(s) = m.get_mut(&key) {
+                s.running = false;
+                s.error = result.as_ref().err().cloned();
+            }
+        }
+        if let Err(e) = &result {
+            say(&c, &key, format!("stopped: {e}"));
+        }
+        c.emit("pipeline:done", json!({ "repo_id": key, "state": state }));
+    });
+    Ok(())
+}
+
+/// Runs this app started and never saw finish: Philium quit or crashed while they ran.
+/// Each continues from the checks it has no result for yet. Runs older than two days
+/// are only closed: their pull request has likely moved on.
+pub fn init(ctx: &Arc<Ctx>) -> Result<(), String> {
+    if !ctx.data_dir.join("pipeline.db").exists() {
+        return Ok(());
+    }
+    let d = db(ctx)?;
+    let open = d.query("SELECT id, repo, pr, tier, head_sha, base_sha, candidate_sha, started FROM pipeline_runs WHERE finished IS NULL ORDER BY started DESC", [])?;
+    if open.is_empty() {
+        return Ok(());
+    }
+    d.exec("UPDATE pipeline_runs SET finished=?1 WHERE finished IS NULL", [crate::db::now()])?;
+    let mut seen = std::collections::HashSet::new();
+    for r in open {
+        let (origin, tier) = (r["repo"].as_str().unwrap_or("").to_string(), r["tier"].as_str().unwrap_or("fast").to_string());
+        let (Some(pr), Some(head), Some(base)) = (r["pr"].as_i64(), r["head_sha"].as_str(), r["base_sha"].as_str()) else { continue };
+        if r["candidate_sha"].as_str() != Some(head) || crate::db::now() - r["started"].as_i64().unwrap_or(0) > 2 * 86_400_000 {
+            continue;
+        }
+        // The checkout this origin belongs to, and the Review lookup that names this head.
+        let Some(repo_id) = ctx.db.query("SELECT id, remote_url FROM repos", [])?.into_iter().find(|x| crate::release_intake::origin_of(x["remote_url"].as_str().unwrap_or("")).ok().as_deref() == Some(origin.as_str())).and_then(|x| x["id"].as_str().map(str::to_string)) else { continue };
+        if !seen.insert(repo_id.clone()) {
+            continue;
+        }
+        let Some(gen) = ctx.db.query("SELECT max(seq) AS g FROM release_refs WHERE repo=?1 AND origin=?2 AND pr=?3 AND head=?4 AND base=?5", params![repo_id, origin, pr, head, base]).ok().and_then(|x| x.first().and_then(|y| y["g"].as_i64())) else { continue };
+        let Ok((checkout, _)) = checkout_and_origin(ctx, &repo_id) else { continue };
+        let Ok(tier) = Tier::parse(&tier) else { continue };
+        if launch(ctx, &repo_id, checkout, origin.clone(), gen, pr, base.to_string(), head.to_string(), tier, true).is_ok() {
+            ctx.log_event("checks_resumed", None, &json!({ "repo": origin, "pr": pr, "tier": tier.as_str() }));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -331,10 +408,56 @@ mod tests {
         assert_eq!(res["checks"][0]["candidate"]["sha"], head);
         assert_eq!(res["checks"][1]["base"]["sha"], base);
         assert!(res["lines"].as_array().unwrap().iter().any(|l| l.as_str().unwrap().contains("gate from")));
+        // b fails on the base too: the gate waits for a person to link the issue that tracks it.
+        assert_eq!(res["verdict"]["waiting"][0]["check"], "b", "{res}");
+        assert!(call(&ctx, "decide", json!({"repo_id": "w", "generation": 1, "check": "b", "kind": "known_issue", "issue": " "})).await.unwrap_err().contains("Link the issue"));
+        call(&ctx, "decide", json!({"repo_id": "w", "generation": 1, "check": "b", "kind": "known_issue", "issue": "https://github.com/acme-test/widget-test/issues/7"})).await.unwrap();
+        let after = call(&ctx, "results", json!({"repo_id": "w", "generation": 1, "tier": "fast"})).await.unwrap();
+        assert_eq!(after["verdict"]["waiting"], json!([]), "{after}");
+        assert_eq!(after["decisions"]["known_issues"][0]["issue"], "https://github.com/acme-test/widget-test/issues/7");
+        assert_eq!(after["verdict"]["state"], "fail", "a still fails because of this change");
+        call(&ctx, "decide", json!({"repo_id": "w", "generation": 1, "check": "b", "kind": "forget_issue"})).await.unwrap();
+        let again = call(&ctx, "results", json!({"repo_id": "w", "generation": 1, "tier": "fast"})).await.unwrap();
+        assert_eq!(again["verdict"]["waiting"][0]["check"], "b");
         // The person's checkout is untouched; the commits came from Philium's own mirror.
         let m = root().join("mirrors").join("acme-test-widget-test.git");
         assert!(m.join("HEAD").exists());
         std::fs::remove_dir_all(&m).ok();
+        std::fs::remove_dir_all(&scratch).ok();
+    }
+
+    #[tokio::test]
+    async fn checks_philium_quit_during_continue_when_it_starts_again() {
+        let scratch = tmp("app-resume");
+        let (r, base) = repo(&scratch);
+        let head = commit(&r, &["broken-a"], &[]);
+        let ctx = Ctx::test();
+        ctx.db.exec("INSERT INTO repos(id,name,path,default_branch,added_at,remote_url) VALUES('w2','w2',?1,'main',0,'https://github.com/acme-test/resume-test.git')", [r.display().to_string()]).unwrap();
+        ctx.db.with(|c| c.execute_batch("CREATE TABLE IF NOT EXISTS release_refs(seq INTEGER PRIMARY KEY,repo TEXT NOT NULL,origin TEXT NOT NULL,pr INTEGER NOT NULL,base TEXT NOT NULL,head TEXT NOT NULL,observed INTEGER NOT NULL)")).unwrap();
+        ctx.db.exec("INSERT INTO release_refs(seq,repo,origin,pr,base,head,observed) VALUES(1,'w2','acme-test/resume-test',42,?1,?2,0)", [&base, &head]).unwrap();
+        let gate = local_gate(&ctx, "acme-test/resume-test");
+        std::fs::create_dir_all(gate.parent().unwrap()).unwrap();
+        std::fs::write(&gate, format!("version: 1\nbranch: main\nplatforms: [{}]\ntiers: {{ fast: [ {{ id: a, run: sh check.sh a }}, {{ id: b, run: sh check.sh b }} ] }}\n", config::host_platform())).unwrap();
+        // The last app recorded b on the candidate, then quit before a ran.
+        let d = db(&ctx).unwrap();
+        let run = records::start_run(&d, &records::RunKey { repo: "acme-test/resume-test", pr: Some(42), tier: "fast", head: &head, base: &base, candidate: &head, pinned: false }, "local").unwrap();
+        records::record(&d, &run, "b", records::Side::Candidate, &head, records::Status::Pass, None, Some(0), Some(3), "ok").unwrap();
+        init(&ctx).unwrap();
+        let mut res = Value::Null;
+        for _ in 0..600 {
+            res = call(&ctx, "results", json!({"repo_id": "w2", "generation": 1, "tier": "fast"})).await.unwrap();
+            if res["running"] == false && res["verdict"]["outcomes"].as_array().is_some_and(|o| o.iter().all(|x| x[1]["outcome"] != "pending")) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let outcome = |i: usize| res["verdict"]["outcomes"][i][1]["outcome"].clone();
+        assert_eq!((outcome(0), outcome(1)), (json!("introduced"), json!("pass")), "{res}");
+        assert!(res["lines"].as_array().unwrap().iter().any(|l| l.as_str().unwrap().contains("1 of 2 checks already ran")), "{res}");
+        assert!(!res["lines"].as_array().unwrap().iter().any(|l| l.as_str().unwrap().starts_with("b on ")), "b did not run again: {res}");
+        // Started once: a second start finds nothing left open.
+        assert_eq!(d.query("SELECT count(*) AS n FROM pipeline_runs WHERE finished IS NULL", []).unwrap()[0]["n"], 0);
+        std::fs::remove_dir_all(root().join("mirrors").join("acme-test-resume-test.git")).ok();
         std::fs::remove_dir_all(&scratch).ok();
     }
 }

@@ -369,7 +369,7 @@ fn main() {
             });
 
             // Module init. Failures are logged, never fatal: the UI shows them.
-            let inits: [(&str, fn(&Arc<Ctx>) -> Result<(), String>); 16] = [
+            let inits: [(&str, fn(&Arc<Ctx>) -> Result<(), String>); 17] = [
                 ("workday", workday::init),
                 ("library", library::init),
                 ("providers", providers::init),
@@ -387,6 +387,8 @@ fn main() {
                 ("stats", stats::init),
                 ("reaper", reaper::init),
                 ("selfdev", selfdev::init),
+                // Last: check runs Philium quit during continue, with every module ready.
+                ("pipeline", pipeline::app::init),
             ];
             for (name, f) in inits {
                 if let Err(e) = f(&ctx) {

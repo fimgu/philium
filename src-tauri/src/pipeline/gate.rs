@@ -94,12 +94,25 @@ fn store(db: &Db, run: &str, side_: Side, sha: &str, outs: &[(String, runner::Ou
 }
 
 pub async fn run_tier(db: &Db, t: &Target<'_>, g: &Gate, tier: Tier, host: &Host, say: &(dyn Fn(String) + Sync)) -> Result<(String, Verdict), String> {
+    tier_run(db, t, g, tier, host, say, &[]).await
+}
+
+/// Pick up where an interrupted run of this tier stopped: what is already recorded
+/// for this exact candidate is kept, and only the rest runs.
+pub async fn resume_tier(db: &Db, t: &Target<'_>, g: &Gate, tier: Tier, host: &Host, say: &(dyn Fn(String) + Sync)) -> Result<(String, Verdict), String> {
+    let have = records::results(db, t.key, t.pr, tier.as_str(), t.candidate)?;
+    let done = g.pipeline.tier(tier).iter().filter(|c| have.iter().any(|(id, s, _)| id == &c.id && *s == Side::Candidate)).count();
+    say(format!("continuing where the last run stopped: {done} of {} checks already ran on {}", g.pipeline.tier(tier).len(), &t.candidate[..12]));
+    tier_run(db, t, g, tier, host, say, &have).await
+}
+
+async fn tier_run(db: &Db, t: &Target<'_>, g: &Gate, tier: Tier, host: &Host, say: &(dyn Fn(String) + Sync), have: &[(String, Side, records::Res)]) -> Result<(String, Verdict), String> {
     let (p, config_from) = (&g.pipeline, g.from.as_str());
     let checks: Vec<&super::config::Check> = p.tier(tier).iter().collect();
     let run = records::start_run(db, &RunKey { repo: t.key, pr: t.pr, tier: tier.as_str(), head: t.head, base: t.base, candidate: t.candidate, pinned: g.pinned }, config_from)?;
     let gate_root = host.scratch.join(format!("{}-gate", label()));
     let gate_dir = g.materialize(&gate_root)?;
-    let result = sides(db, t, p, &checks, &run, config_from, &gate_dir, host, say).await;
+    let result = sides(db, t, p, &checks, &run, config_from, &gate_dir, host, say, have).await;
     std::fs::remove_dir_all(&gate_root).ok();
     result?;
     records::finish_run(db, &run)?;
@@ -108,8 +121,13 @@ pub async fn run_tier(db: &Db, t: &Target<'_>, g: &Gate, tier: Tier, host: &Host
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn sides(db: &Db, t: &Target<'_>, p: &Pipeline, checks: &[&super::config::Check], run: &str, config_from: &str, gate_dir: &Path, host: &Host, say: &(dyn Fn(String) + Sync)) -> Result<(), String> {
+async fn sides(db: &Db, t: &Target<'_>, p: &Pipeline, checks: &[&super::config::Check], run: &str, config_from: &str, gate_dir: &Path, host: &Host, say: &(dyn Fn(String) + Sync), have: &[(String, Side, records::Res)]) -> Result<(), String> {
     let changed = changed_files(t.path, t.base, t.candidate)?;
+    // A side runs only the checks it has no result for yet; the earlier results count as they are.
+    let had = |id: &str, s: Side| have.iter().find(|(c, x, _)| c == id && *x == s).map(|(c, _, r)| (c.clone(), runner::Outcome { status: r.status, reason: r.reason.clone(), exit_code: r.exit_code, duration_ms: r.duration_ms.unwrap_or(0), output: String::new() }));
+    fn missing<'a>(list: &[&'a super::config::Check], have: &[(String, Side, records::Res)], s: Side) -> Vec<&'a super::config::Check> {
+        list.iter().copied().filter(|c| !have.iter().any(|(id, x, _)| id == &c.id && *x == s)).collect()
+    }
     let live = |s: Side, sha: &str| {
         let sha = sha.to_string();
         move |id: &str, o: &runner::Outcome| {
@@ -117,20 +135,27 @@ async fn sides(db: &Db, t: &Target<'_>, p: &Pipeline, checks: &[&super::config::
         }
     };
     let on_candidate = live(Side::Candidate, t.candidate);
-    let first = side(p, checks, t.path, t.candidate, t.base, &changed, gate_dir, None, host, say, Some(&on_candidate)).await?;
+    let todo = missing(checks, have, Side::Candidate);
+    let mut first = if todo.is_empty() { vec![] } else { side(p, &todo, t.path, t.candidate, t.base, &changed, gate_dir, None, host, say, Some(&on_candidate)).await? };
     store(db, run, Side::Candidate, t.candidate, &first)?;
+    first.extend(checks.iter().filter_map(|c| had(&c.id, Side::Candidate)));
     // A failure is run again on the same SHA: passing the second time is a flake, not a pass.
     let failed: Vec<&super::config::Check> = checks.iter().copied().filter(|c| first.iter().any(|(id, o)| id == &c.id && o.status.failed())).collect();
     if !failed.is_empty() {
         let on_rerun = live(Side::Rerun, t.candidate);
-        let again = side(p, &failed, t.path, t.candidate, t.base, &changed, gate_dir, None, host, say, Some(&on_rerun)).await?;
+        let todo = missing(&failed, have, Side::Rerun);
+        let mut again = if todo.is_empty() { vec![] } else { side(p, &todo, t.path, t.candidate, t.base, &changed, gate_dir, None, host, say, Some(&on_rerun)).await? };
         store(db, run, Side::Rerun, t.candidate, &again)?;
+        again.extend(failed.iter().filter_map(|c| had(&c.id, Side::Rerun)));
         // What failed twice runs on the base, same fixtures, to compute its origin.
         let twice: Vec<&super::config::Check> = failed.iter().copied().filter(|c| again.iter().any(|(id, o)| id == &c.id && o.status.failed())).collect();
         if !twice.is_empty() {
             let on_base = live(Side::Base, t.base);
-            let base = side(p, &twice, t.path, t.base, t.base, &changed, gate_dir, None, host, say, Some(&on_base)).await?;
-            store(db, run, Side::Base, t.base, &base)?;
+            let todo = missing(&twice, have, Side::Base);
+            if !todo.is_empty() {
+                let base = side(p, &todo, t.path, t.base, t.base, &changed, gate_dir, None, host, say, Some(&on_base)).await?;
+                store(db, run, Side::Base, t.base, &base)?;
+            }
         }
     }
     // A fix for an escaped bug: its check also runs on the SHA the bug shipped in.
@@ -211,6 +236,31 @@ pub(crate) mod tests {
             shared.display()
         ))
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_run_continues_from_the_checks_it_has_no_result_for() {
+        let root = tmp("resume");
+        let (r, base) = repo(&root);
+        let head = commit(&r, &["broken-a"], &[]);
+        let p = Pipeline::parse(&format!("version: 1\nbranch: main\nplatforms: [{}]\ntiers: {{ fast: [ {{ id: a, run: sh check.sh a }}, {{ id: b, run: sh check.sh b }} ] }}\n", crate::pipeline::config::host_platform())).unwrap();
+        let mut h = host(&root);
+        h.caches = root.join("caches");
+        let db = crate::pipeline::records::tests::db();
+        let g = Gate { pipeline: p, from: "t".into(), pinned: true, source: crate::pipeline::config::GateSource::Folder({ let f = root.join("gatefolder"); std::fs::create_dir_all(&f).unwrap(); f }) };
+        let t = Target { key: "r", path: &r, pr: Some(9), head: &head, base: &base, candidate: &head };
+        // The app quit after b had passed on the candidate and before a ran.
+        let run = records::start_run(&db, &RunKey { repo: "r", pr: Some(9), tier: "fast", head: &head, base: &base, candidate: &head, pinned: true }, "t").unwrap();
+        records::record(&db, &run, "b", Side::Candidate, &head, Status::Pass, None, Some(0), Some(5), "ok").unwrap();
+        let lines = std::sync::Mutex::new(vec![]);
+        let (_, v) = resume_tier(&db, &t, &g, Tier::Fast, &h, &|l| lines.lock().unwrap().push(l)).await.unwrap();
+        let lines = lines.into_inner().unwrap();
+        assert!(lines[0].contains("1 of 2 checks already ran"), "{lines:?}");
+        assert!(lines.iter().any(|l| l.starts_with("a on ")), "a runs: {lines:?}");
+        assert!(!lines.iter().any(|l| l.starts_with("b on ")), "b is not run again: {lines:?}");
+        let get = |c: &str| v.outcomes.iter().find(|(id, _)| id == c).map(|x| x.1.clone());
+        assert_eq!((get("a"), get("b")), (Some(verdict::Outcome::Introduced), Some(verdict::Outcome::Pass)), "{:?}", v.reasons);
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[tokio::test]
