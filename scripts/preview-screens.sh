@@ -27,6 +27,6 @@ for i in {1..30}; do curl -s -o /dev/null "http://127.0.0.1:$PORT/index.html" &&
 for q in "$@"; do
   name=$(print -r -- "$q" | tr -c 'A-Za-z0-9' '-' | sed 's/-*$//')
   "$CHROME" --headless=new --disable-gpu --hide-scrollbars --no-first-run --no-default-browser-check --user-data-dir="$WEB/.chrome" \
-    --window-size=1280,1300 --virtual-time-budget=9000 --screenshot="$OUT/$name.png" "http://127.0.0.1:$PORT/index.html?$q" >/dev/null 2>&1
+    --window-size=1280,${PREVIEW_HEIGHT:-1300} --virtual-time-budget=9000 --screenshot="$OUT/$name.png" "http://127.0.0.1:$PORT/index.html?$q" >/dev/null 2>&1
   echo "$OUT/$name.png"
 done

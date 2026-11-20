@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS pipeline_replays(
   check_id TEXT NOT NULL, buggy_status TEXT NOT NULL, fixed_status TEXT, caught INTEGER NOT NULL, at INTEGER NOT NULL,
   buggy_output TEXT, control_output TEXT);
 CREATE TABLE IF NOT EXISTS pipeline_replay_bar(repo TEXT PRIMARY KEY, rate REAL NOT NULL, caught INTEGER NOT NULL, total INTEGER NOT NULL, digest TEXT NOT NULL, at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS pipeline_replay_runs(id TEXT PRIMARY KEY, repo TEXT NOT NULL, digest TEXT NOT NULL, at INTEGER NOT NULL, caught INTEGER NOT NULL, total INTEGER NOT NULL, rate REAL NOT NULL, rejected_below REAL);
 ";
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -97,7 +98,7 @@ impl ReplaySet {
 
 fn init(db: &Db) -> Result<(), String> {
     db.with(|c| c.execute_batch(SCHEMA))?;
-    for col in ["buggy_output", "control_output"] {
+    for col in ["buggy_output", "control_output", "run_id", "reason"] {
         let _ = db.exec(&format!("ALTER TABLE pipeline_replays ADD COLUMN {col} TEXT"), []);
     }
     Ok(())
@@ -181,6 +182,9 @@ pub(crate) fn parent(repo: &Path, sha: &str) -> Result<String, String> {
 #[allow(clippy::too_many_arguments)]
 pub async fn run(db: &Db, repo_key: &str, repo: &Path, p: &Pipeline, set: &ReplaySet, digest: &str, gate_dir: &Path, host: &Host, say: &(dyn Fn(String) + Sync)) -> Result<Report, String> {
     init(db)?;
+    // One measurement: its bugs' results and its catch rate are kept together, so the
+    // gate's history can be read back run by run.
+    let run_id = crate::db::new_id();
     let mut bugs = vec![];
     for b in &set.bugs {
         say(format!("{}: {} on {}", b.id, b.check, &b.buggy[..12]));
@@ -218,10 +222,7 @@ pub async fn run(db: &Db, repo_key: &str, repo: &Path, p: &Pipeline, set: &Repla
             None
         };
         let caught = remember(db, repo_key, digest, &b.id, &b.buggy, b.fixed.as_deref(), &b.check, on_bug.status, on_fix.as_ref().map(|o| o.status), by.is_some())?;
-        db.exec(
-            "UPDATE pipeline_replays SET buggy_output=?1, control_output=?2 WHERE rowid=(SELECT max(rowid) FROM pipeline_replays WHERE repo=?3 AND bug=?4)",
-            params![on_bug.output, on_fix.as_ref().map(|o| o.output.clone()), repo_key, b.id],
-        )?;
+        let row = db.query("SELECT max(rowid) AS r FROM pipeline_replays WHERE repo=?1 AND bug=?2", params![repo_key, b.id])?.pop().and_then(|r| r["r"].as_i64());
         let reason = if caught {
             by.map(|b| format!("caught: {b}"))
         } else if on_bug.status == Status::NotRun {
@@ -236,6 +237,10 @@ pub async fn run(db: &Db, repo_key: &str, repo: &Path, p: &Pipeline, set: &Repla
                 None => format!("failed, but {control} on {place} too, so it does not single out this bug"),
             })
         };
+        db.exec(
+            "UPDATE pipeline_replays SET buggy_output=?1, control_output=?2, run_id=?3, reason=?4 WHERE rowid=?5",
+            params![on_bug.output, on_fix.as_ref().map(|o| o.output.clone()), run_id, reason, row],
+        )?;
         say(format!("{}: {}", b.id, if caught { "caught" } else { "missed" }));
         bugs.push(BugResult { id: b.id.clone(), check: b.check.clone(), buggy: on_bug.status, fixed: on_fix.map(|o| o.status), caught, reason });
     }
@@ -250,7 +255,34 @@ pub async fn run(db: &Db, repo_key: &str, repo: &Path, p: &Pipeline, set: &Repla
             params![repo_key, rate, caught as i64, total as i64, digest, now()],
         )?;
     }
+    db.exec(
+        "INSERT INTO pipeline_replay_runs(id,repo,digest,at,caught,total,rate,rejected_below) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+        params![run_id, repo_key, digest, now(), caught as i64, total as i64, rate, rejected_below],
+    )?;
     Ok(Report { caught, total, rate, bugs, rejected_below })
+}
+
+/// The gate's record against real bugs: every measurement, oldest first, and each bug's
+/// result in each one.
+pub fn history(db: &Db, repo: &str) -> Result<serde_json::Value, String> {
+    init(db)?;
+    let runs = db.query("SELECT id, digest, at, caught, total, rate, rejected_below FROM pipeline_replay_runs WHERE repo=?1 ORDER BY at DESC LIMIT 50", [repo])?;
+    let mut runs: Vec<serde_json::Value> = runs.into_iter().rev().collect();
+    let mut bugs: Vec<serde_json::Value> = vec![];
+    for r in &mut runs {
+        let id = r["id"].as_str().unwrap_or("").to_string();
+        let rows = db.query("SELECT bug, check_id, caught, buggy_status, fixed_status, reason FROM pipeline_replays WHERE repo=?1 AND run_id=?2 ORDER BY rowid", params![repo, id])?;
+        for b in rows {
+            let name = b["bug"].as_str().unwrap_or("").to_string();
+            let entry = serde_json::json!({ "run": id, "caught": b["caught"].as_i64() == Some(1), "buggy": b["buggy_status"], "control": b["fixed_status"], "reason": b["reason"] });
+            match bugs.iter_mut().find(|x| x["id"] == name.as_str()) {
+                Some(x) => x["results"].as_array_mut().map(|a| a.push(entry)).unwrap_or(()),
+                None => bugs.push(serde_json::json!({ "id": name, "check": b["check_id"], "results": [entry] })),
+            }
+        }
+    }
+    let bar = db.query("SELECT rate, caught, total, at FROM pipeline_replay_bar WHERE repo=?1", [repo])?.pop();
+    Ok(serde_json::json!({ "runs": runs, "bugs": bugs, "bar": bar }))
 }
 
 /// The replay set for a gate: the file at the same commit as the pipeline, else a local file.

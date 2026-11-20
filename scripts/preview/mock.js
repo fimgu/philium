@@ -67,6 +67,14 @@
     'release_intake.coverage': { check_files: 3, prs: [5519, 5523, 5527, 5531, 5536, 5540].map((pr, i) => ({ pr, files: 12 + i * 9, read: i < 2 ? ['docs/github-app-manifest.json'] : [] })), untouched: state === 'ready' ? [] : [5527, 5531, 5536, 5540] },
     'release_intake.members': { landed: [5519, 5523, 5527, 5531, 5536, 5540].map((pr, i) => ({ pr, oid: (i + 3).toString(16).repeat(40) })), edges: [{ outer: 5536, inner: 5527 }], missing: 0, unmapped: 1, ambiguous: 0 },
     'workspace.overview': { resources: [{ kind: 'worktree', handle: '~/Philium Pilot/workspace/worktrees/example-repo/lead-1a2b3c', state: 'live', agent_name: 'lead' }, { kind: 'port_block', handle: '41000-41019', state: 'live', agent_name: 'scribe' }], tasks: [], agents: [] },
+    'pipeline.replay_history': (() => {
+      const bugs = ['autoimages-gofmt', 'request-email-escape', 'mcp-token-client-credentials', 'request-type-edit-counts', 'migration-lock-connection', 'timed-request-approvers'];
+      const plan = [[3, 5], [4, 5], [4, 5], [5, 6]];
+      const runs = plan.map(([caught, total], i) => ({ id: 'r' + i, digest: ['3f9a01c2', '3f9a01c2', '77b0e4d1', 'c41d9e02'][i], at: now - (plan.length - i) * 26 * 3600e3, caught, total, rate: caught / total, rejected_below: null }));
+      return { runs, bar: { rate: 5 / 6 }, running: q.get('quality') === 'running', lines: q.get('quality') === 'running' ? ['measuring the checks from local pipeline.yaml against 6 real past bugs', 'autoimages-gofmt: gofmt-changed on aca60825a9d5', 'autoimages-gofmt: caught'] : [], error: null, list_path: '~/Philium Pilot/data/pipelines/example-org-example-repo/.philium/replay.yaml',
+        listed: bugs.map((id, i) => ({ id, check: i === 0 ? 'gofmt-changed' : i === 4 ? 'migrations-postgres' : 'go-test-touched', text: ['autoimages.go is not gofmt-clean', 'Custom request emails did not escape user-controlled text', 'The MCP token endpoint advertised client_credentials', 'Request type edits counted closed requests', 'The migration lock check could panic or create a stray table', 'Timed requests ignored the JIT endpoint approvers'][i] })),
+        bugs: bugs.map((id, i) => ({ id, check: '', results: runs.filter((r, j) => i < 5 || j === 3).map((r, j) => ({ run: r.id, caught: i === 4 ? false : i === 3 ? j > 0 : true, reason: i === 4 ? 'failed, but fail on the fix too and the failure does not show "FAIL: TestMigrationLockPostgres"' : 'caught: the control passed' })) })) };
+    })(),
     'reaper.ledger': [], 'reaper.proposals': [],
     'storage.status': { parts: [
         ['database', 'Records', 0.21e9, 'Agents, reviews, checks and the code index. Space is given back at start when much of it is free.'],

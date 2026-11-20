@@ -173,9 +173,7 @@ async fn reviewed_disposable_change() {
     assert_eq!(initial["decision"], "incomplete");
     server.abort();
     assert!(server.await.unwrap_err().is_cancelled());
-    assert!(tokio::net::TcpStream::connect(("127.0.0.1", port))
-        .await
-        .is_err());
+    assert!(nothing_answers(port).await, "the stand-in service still answers after it was stopped");
     let server = serve(
         tokio::net::TcpListener::bind(("127.0.0.1", port))
             .await
@@ -209,9 +207,7 @@ async fn reviewed_disposable_change() {
     assert_eq!(result(receipt, observe(&moved))["decision"], "superseded");
     server.abort();
     assert!(server.await.unwrap_err().is_cancelled());
-    assert!(tokio::net::TcpStream::connect(("127.0.0.1", port))
-        .await
-        .is_err());
+    assert!(nothing_answers(port).await, "the stand-in service still answers after it was stopped");
 }
 
 #[test]
@@ -358,4 +354,15 @@ async fn a_check_on_a_file_new_in_the_release_is_not_missing_evidence() {
     // A file the target already had is compared as before.
     assert_eq!(state(3), ("candidate_pass".to_owned(), false), "{}", r["cases"]);
     assert!(r["checks_confirmed_ms"].as_i64().is_some());
+}
+
+/// Nothing serves on this port: the connection is refused, or nothing replies. A child
+/// process another test spawned can briefly hold a copy of a closed listener, so a
+/// successful connect alone does not mean a server is there.
+async fn nothing_answers(port: u16) -> bool {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let Ok(mut s) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await else { return true };
+    let _ = s.write_all(b"GET /view HTTP/1.1\r\nHost: x\r\n\r\n").await;
+    let mut b = [0u8; 1];
+    !matches!(tokio::time::timeout(std::time::Duration::from_millis(500), s.read(&mut b)).await, Ok(Ok(n)) if n > 0)
 }

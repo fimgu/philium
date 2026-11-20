@@ -4,7 +4,9 @@
 //! rpc `pipeline.*`: `status {repo_id}`, `run {repo_id, generation, tier}`,
 //! `results {repo_id, generation, tier}`, `lend {repo_id, name, path}`,
 //! `decide {repo_id, generation, check, kind, issue?, reason?}` (kind: `known_issue`,
-//! `quarantine`, `forget_issue`, `lift_quarantine`).
+//! `quarantine`, `forget_issue`, `lift_quarantine`), `replay {repo_id}` (measure the
+//! checks against the repo's real past bugs, in the background), `replay_history {repo_id}`.
+//! Events: `pipeline:replay {repo_id, line?, done?}`.
 //!
 //! A run that Philium did not see finish (the app quit or crashed) continues when Philium
 //! starts again, from the checks it has no result for yet.
@@ -105,6 +107,13 @@ fn has(mirror: &Path, sha: &str) -> bool {
 
 /// A bare mirror Philium owns, with the pull request's head and base in it.
 async fn mirror(checkout: &Path, origin: &str, pr: i64, shas: &[&str]) -> Result<PathBuf, String> {
+    let m = mirror_checkout(checkout, origin)?;
+    ensure_commits(&m, origin, pr, shas).await?;
+    Ok(m)
+}
+
+/// Philium's own bare copy of the checkout's history, brought up to date from it.
+fn mirror_checkout(checkout: &Path, origin: &str) -> Result<PathBuf, String> {
     let m = root().join("mirrors").join(format!("{}.git", slug(origin)));
     std::fs::create_dir_all(m.parent().unwrap_or(Path::new("/"))).map_err(|e| e.to_string())?;
     if !m.join("HEAD").exists() {
@@ -116,7 +125,6 @@ async fn mirror(checkout: &Path, origin: &str, pr: i64, shas: &[&str]) -> Result
         // Pick up what the checkout fetched since; its own refs are only read.
         let _ = git(&m, &["fetch", "--quiet", "--no-tags", &checkout.display().to_string(), "+refs/heads/*:refs/heads/*", "+refs/remotes/origin/*:refs/remotes/origin/*"], &[]);
     }
-    ensure_commits(&m, origin, pr, shas).await?;
     Ok(m)
 }
 
@@ -206,6 +214,71 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, a: Value) -> Result<Value, Strin
             let (pr, base, head) = generation(ctx, &repo_id, &origin, gen)?;
             launch(ctx, &repo_id, checkout, origin, gen, pr, base, head, tier, false)?;
             Ok(json!({ "started": true, "pr": pr }))
+        }
+        "replay" => {
+            let key = format!("replay:{repo_id}");
+            {
+                let mut m = runs().lock().map_err(|_| "busy")?;
+                if m.get(&key).is_some_and(|s| s.running) {
+                    return Err("The checks are already being measured for this checkout".into());
+                }
+                m.insert(key.clone(), RunState { running: true, generation: 0, tier: String::new(), lines: vec![], error: None });
+            }
+            let c = ctx.clone();
+            tauri::async_runtime::spawn(async move {
+                let line = |c: &Arc<Ctx>, l: String| {
+                    if let Some(s) = runs().lock().ok().as_mut().and_then(|m| m.get_mut(&key)) {
+                        s.lines.push(l.clone());
+                    }
+                    c.emit("pipeline:replay", json!({ "repo_id": repo_id, "line": l }));
+                };
+                let result = async {
+                    let m = mirror_checkout(&checkout, &origin)?;
+                    let at = git(&m, &["rev-parse", "HEAD"], &[])?;
+                    let g = config::load(&m, &at, Some(&local_gate(&c, &origin)))?;
+                    let local = local_gate(&c, &origin).with_file_name("replay.yaml");
+                    let (set, text) = super::replay::load(&m, &at, Some(&local), &g.pipeline)?;
+                    let missing: Vec<String> = set.bugs.iter().flat_map(|b| [Some(b.buggy.clone()), b.fixed.clone(), b.base.clone()]).flatten().filter(|s| !has(&m, s)).map(|s| s[..12].to_string()).collect();
+                    if !missing.is_empty() {
+                        return Err(format!("the checkout does not have {}; fetch them there first", missing.join(", ")));
+                    }
+                    let digest = super::replay::digest(&[&serde_yaml::to_string(&g.pipeline).unwrap_or_default(), &text]);
+                    line(&c, format!("measuring the checks from {} against {} real past bugs", g.from, set.bugs.len()));
+                    let d = db(&c)?;
+                    let h = host(&c, &origin);
+                    let gate_dir = g.materialize(&h.scratch.join("gate"))?;
+                    let c2 = c.clone();
+                    let out = super::replay::run(&d, &origin, &m, &g.pipeline, &set, &digest, &gate_dir, &h, &move |l| line(&c2, l)).await;
+                    std::fs::remove_dir_all(&h.scratch).ok();
+                    out
+                }
+                .await;
+                if let Ok(mut map) = runs().lock() {
+                    if let Some(s) = map.get_mut(&key) {
+                        s.running = false;
+                        s.error = result.as_ref().err().cloned();
+                    }
+                }
+                match &result {
+                    Ok(r) => line(&c, format!("caught {} of {}", r.caught, r.total)),
+                    Err(e) => line(&c, format!("stopped: {e}")),
+                }
+                c.emit("pipeline:replay", json!({ "repo_id": repo_id, "done": true }));
+            });
+            Ok(json!({ "started": true }))
+        }
+        "replay_history" => {
+            let mut h = super::replay::history(&db(ctx)?, &origin)?;
+            let state = runs().lock().ok().and_then(|m| m.get(&format!("replay:{repo_id}")).cloned()).unwrap_or_default();
+            // The bugs the gate is measured against, from the local list, with what each one was.
+            let local = local_gate(ctx, &origin).with_file_name("replay.yaml");
+            let listed: Vec<Value> = std::fs::read_to_string(&local).ok().and_then(|t| serde_yaml::from_str::<super::replay::ReplaySet>(&t).ok()).map(|s| s.bugs.iter().map(|b| json!({ "id": b.id, "check": b.check, "text": b.text })).collect()).unwrap_or_default();
+            h["listed"] = json!(listed);
+            h["list_path"] = json!(local.display().to_string());
+            h["running"] = json!(state.running);
+            h["lines"] = json!(state.lines);
+            h["error"] = json!(state.error);
+            Ok(h)
         }
         "decide" => {
             let gen = a["generation"].as_i64().ok_or("Look the pull request up in Review first")?;
@@ -423,6 +496,37 @@ mod tests {
         let m = root().join("mirrors").join("acme-test-widget-test.git");
         assert!(m.join("HEAD").exists());
         std::fs::remove_dir_all(&m).ok();
+        std::fs::remove_dir_all(&scratch).ok();
+    }
+
+    #[tokio::test]
+    async fn the_checks_are_measured_against_real_past_bugs_and_the_history_is_kept() {
+        let scratch = tmp("app-replay");
+        let (r, _) = repo(&scratch);
+        let bug = commit(&r, &["broken-a"], &[]);
+        let fix = commit(&r, &[], &["broken-a"]);
+        let ctx = Ctx::test();
+        ctx.db.exec("INSERT INTO repos(id,name,path,default_branch,added_at,remote_url) VALUES('w3','w3',?1,'main',0,'https://github.com/acme-test/replay-test.git')", [r.display().to_string()]).unwrap();
+        let gate = local_gate(&ctx, "acme-test/replay-test");
+        std::fs::create_dir_all(gate.parent().unwrap()).unwrap();
+        std::fs::write(&gate, format!("version: 1\nbranch: main\nplatforms: [{}]\ntiers: {{ fast: [ {{ id: a, run: sh check.sh a }} ] }}\n", config::host_platform())).unwrap();
+        std::fs::write(gate.with_file_name("replay.yaml"), format!("version: 1\nbugs:\n  - {{ id: broke-a, buggy: {bug}, fixed: {fix}, check: a, text: a broke for a while }}\n")).unwrap();
+        let empty = call(&ctx, "replay_history", json!({"repo_id": "w3"})).await.unwrap();
+        assert_eq!((empty["runs"].clone(), empty["listed"][0]["text"].clone()), (json!([]), json!("a broke for a while")));
+        call(&ctx, "replay", json!({"repo_id": "w3"})).await.unwrap();
+        let mut h = Value::Null;
+        for _ in 0..600 {
+            h = call(&ctx, "replay_history", json!({"repo_id": "w3"})).await.unwrap();
+            if h["running"] == false && !h["runs"].as_array().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!((h["runs"][0]["caught"].clone(), h["runs"][0]["total"].clone()), (json!(1), json!(1)), "{h}");
+        assert_eq!(h["bugs"][0]["results"][0]["caught"], true, "{h}");
+        assert_eq!(h["bugs"][0]["results"][0]["reason"], "caught: the control passed");
+        assert!(h["lines"].as_array().unwrap().iter().any(|l| l == "caught 1 of 1"), "{h}");
+        std::fs::remove_dir_all(root().join("mirrors").join("acme-test-replay-test.git")).ok();
         std::fs::remove_dir_all(&scratch).ok();
     }
 

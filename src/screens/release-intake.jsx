@@ -4,6 +4,7 @@ import { plainError } from '../lib/plain-error.js';
 import { Markdown } from '../ui/markdown.jsx';
 import { readiness, summaryMarkdown, tone, HEADLINE } from '../lib/readiness.js';
 import { GateChecks } from './gate-checks.jsx';
+import { GateQuality } from './gate-quality.jsx';
 
 const MARK = { ok: '✓', bad: '✕', unknown: '?' }, STATE = { ok: 'Pass', bad: 'Fail', unknown: 'Unknown: not a pass' };
 
@@ -121,6 +122,7 @@ export function ReleaseIntake(props) {
     </details>
     </div>
     <GateChecks repo={props.repo} generation={decision()?.generation??graph()?.seq??null}/>
+    <GateQuality repo={props.repo}/>
     <Show when={review.latest&&(review.latest.items?.length||review.latest.run)?review.latest:null}>{v=><section aria-label="Agent review" class={`decision ${({do_not_ship:'bad',passed:'ok'})[v().headline]||'unknown'}`}>
       <div class="verdict"><span class="glyph" aria-hidden="true">{v().lead?.state==='failed'?'!':({do_not_ship:'✕',passed:'✓'})[v().headline]||'…'}</span><div class="grow"><h3 title="P0 and P1 decide: a failure this release introduced, or whose origin is unverified, means do not ship; a pre-existing one, or anything not passed, means not ready. P2 to P5 inform.">{reviewHead(v())}</h3><p>#{v().pr}{v().items.length?` · ${v().items.filter(i=>i.result).length} of ${v().items.length} items have a result`:''}{v().lead&&v().items.length?` · led by ${v().lead.name}`:''}</p></div></div>
       <Show when={v().lead?.state==='failed'}><p role="alert" aria-label="Review start failed">{v().lead.name} could not start: {plainError(v().lead.error||'no reason was recorded').plain.replace(/\.\s*$/,'')}. No model was asked anything.</p></Show>
