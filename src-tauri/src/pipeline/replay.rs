@@ -17,7 +17,8 @@ pub const FILE: &str = ".philium/replay.yaml";
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS pipeline_replays(
   repo TEXT NOT NULL, digest TEXT NOT NULL, bug TEXT NOT NULL, buggy_sha TEXT NOT NULL, fixed_sha TEXT,
-  check_id TEXT NOT NULL, buggy_status TEXT NOT NULL, fixed_status TEXT, caught INTEGER NOT NULL, at INTEGER NOT NULL);
+  check_id TEXT NOT NULL, buggy_status TEXT NOT NULL, fixed_status TEXT, caught INTEGER NOT NULL, at INTEGER NOT NULL,
+  buggy_output TEXT, control_output TEXT);
 CREATE TABLE IF NOT EXISTS pipeline_replay_bar(repo TEXT PRIMARY KEY, rate REAL NOT NULL, caught INTEGER NOT NULL, total INTEGER NOT NULL, digest TEXT NOT NULL, at INTEGER NOT NULL);
 ";
 
@@ -95,7 +96,11 @@ impl ReplaySet {
 }
 
 fn init(db: &Db) -> Result<(), String> {
-    db.with(|c| c.execute_batch(SCHEMA))
+    db.with(|c| c.execute_batch(SCHEMA))?;
+    for col in ["buggy_output", "control_output"] {
+        let _ = db.exec(&format!("ALTER TABLE pipeline_replays ADD COLUMN {col} TEXT"), []);
+    }
+    Ok(())
 }
 
 pub fn digest(parts: &[&str]) -> String {
@@ -202,8 +207,10 @@ pub async fn run(db: &Db, repo_key: &str, repo: &Path, p: &Pipeline, set: &Repla
         // With an expected text, the bug's own signature decides: it shows on the buggy
         // commit, and not on the control. Without one, the control must pass.
         let shows = |o: &runner::Outcome, t: &str| o.output.contains(t);
+        // The bug's signature gone from the control counts as the control passing,
+        // whether the control is the fix or the commit before the bug.
         let control_status = match (&b.expect, on_fix.as_ref()) {
-            (Some(t), Some(c)) if b.fixed.is_none() && !shows(c, t) && on_bug.status.failed() && shows(&on_bug, t) => Some(Status::Pass),
+            (Some(t), Some(c)) if c.status != Status::NotRun && !shows(c, t) && on_bug.status.failed() && shows(&on_bug, t) => Some(Status::Pass),
             _ => on_fix.as_ref().map(|o| o.status),
         };
         let bug_status = match &b.expect {
@@ -211,6 +218,10 @@ pub async fn run(db: &Db, repo_key: &str, repo: &Path, p: &Pipeline, set: &Repla
             _ => on_bug.status,
         };
         let caught = remember(db, repo_key, digest, &b.id, &b.buggy, b.fixed.as_deref(), &b.check, bug_status, control_status)?;
+        db.exec(
+            "UPDATE pipeline_replays SET buggy_output=?1, control_output=?2 WHERE rowid=(SELECT max(rowid) FROM pipeline_replays WHERE repo=?3 AND bug=?4)",
+            params![on_bug.output, on_fix.as_ref().map(|o| o.output.clone()), repo_key, b.id],
+        )?;
         let reason = if on_bug.status.failed() && bug_status == Status::Pass {
             Some(format!("failed on the buggy commit, but not with \"{}\": it failed for another reason", b.expect.as_deref().unwrap_or("")))
         } else if caught {
