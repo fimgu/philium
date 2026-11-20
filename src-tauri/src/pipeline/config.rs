@@ -31,6 +31,10 @@ pub struct Pipeline {
     /// Secret names only. Values come from the Keychain and never reach a log.
     #[serde(default)]
     pub secrets: Vec<String>,
+    /// Host folders a check may read, by name only (such as a dependency download
+    /// cache). A person lends each one on their machine; checks see it read-only.
+    #[serde(default)]
+    pub lends: Vec<String>,
     /// Environment variables for every check, as templates (`${port.db}`, `${run}`).
     #[serde(default)]
     pub fixtures: BTreeMap<String, String>,
@@ -165,6 +169,9 @@ pub struct Check {
     /// Declared secret names this check receives.
     #[serde(default)]
     pub secrets: Vec<String>,
+    /// Declared lends this check reads. Without them on this machine it is not_run.
+    #[serde(default)]
+    pub lends: Vec<String>,
     /// A read-only environment this check observes. It runs only while a person
     /// has that environment enrolled.
     #[serde(default)]
@@ -326,6 +333,11 @@ impl Pipeline {
                 return Err(format!("{FILE}: images maps a platform such as linux/amd64 to one image name"));
             }
         }
+        for l in &self.lends {
+            if !env_name_ok(l) {
+                return Err(format!("{FILE}: lend {l} must be an UPPER_CASE name"));
+            }
+        }
         for s in &self.secrets {
             if !env_name_ok(s) {
                 return Err(format!("{FILE}: secret {s} must be an UPPER_CASE name"));
@@ -375,6 +387,11 @@ impl Pipeline {
                         return Err(format!("{FILE}: check {} uses secret {s}, which is not declared", c.id));
                     }
                 }
+                for l in &c.lends {
+                    if !self.lends.contains(l) {
+                        return Err(format!("{FILE}: check {} reads lend {l}, which is not declared", c.id));
+                    }
+                }
                 if let Some(p) = &c.platform {
                     if !platform_ok(p) {
                         return Err(format!("{FILE}: check {}: platform {p} is not <os>/<arch>", c.id));
@@ -405,6 +422,7 @@ impl Pipeline {
                 Some(("port", s)) => matches!(self.services.get(s), Some(Service::Run { .. }) | Some(Service::Compose { port: Some(_), .. })),
                 Some(("kubeconfig" | "context", s)) => matches!(self.services.get(s), Some(Service::Kind { .. })),
                 Some(("fixture", k)) => self.fixtures.contains_key(k),
+                Some(("lend", l)) => self.lends.iter().any(|x| x == l),
                 _ => false,
             };
             if !ok {
@@ -438,7 +456,7 @@ fn relative(p: &str, what: &str) -> Result<(), String> {
 
 /// Philium's own template names. Any other `${...}` belongs to the shell and is left alone.
 pub fn is_philium_var(name: &str) -> bool {
-    matches!(name, "run" | "workdir" | "tmp" | "sha" | "base" | "gate" | "changed") || ["port.", "kubeconfig.", "context.", "fixture."].iter().any(|p| name.starts_with(p))
+    matches!(name, "run" | "workdir" | "tmp" | "sha" | "base" | "gate" | "changed") || ["port.", "kubeconfig.", "context.", "fixture.", "lend."].iter().any(|p| name.starts_with(p))
 }
 
 /// Philium names used as `${...}` in a template. `$${` is a literal `${`.

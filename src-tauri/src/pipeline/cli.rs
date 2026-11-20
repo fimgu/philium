@@ -116,6 +116,10 @@ pub fn host(db: &'static Db, repo: &str) -> Result<runner::Host, String> {
         home,
         secret: Box::new(move |n| crate::secrets::get(&format!("pipeline.{r1}.{n}"))),
         enrolled: Box::new(move |e| records::enrolled(db, &r2, e)),
+        lent: {
+            let r3 = repo.to_string();
+            Box::new(move |l| records::lent(db, &r3, l))
+        },
         platform: config::host_platform(),
     })
 }

@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS pipeline_findings(
   origin TEXT NOT NULL CHECK(origin IN ('introduced','pre_existing','unverified')), open INTEGER NOT NULL,
   text TEXT NOT NULL, by TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY(repo, pr, id));
 CREATE TABLE IF NOT EXISTS pipeline_enrolled(repo TEXT NOT NULL, environment TEXT NOT NULL, by TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY(repo, environment));
+CREATE TABLE IF NOT EXISTS pipeline_lends(repo TEXT NOT NULL, name TEXT NOT NULL, path TEXT NOT NULL, by TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY(repo, name));
 CREATE TABLE IF NOT EXISTS pipeline_escapes(
   repo TEXT NOT NULL, id TEXT NOT NULL, buggy_sha TEXT NOT NULL, fix_pr INTEGER, check_id TEXT,
   text TEXT NOT NULL, found INTEGER NOT NULL, PRIMARY KEY(repo, id), CHECK(length(buggy_sha)=40));
@@ -240,6 +241,34 @@ pub fn pinned(db: &Db, repo: &str, pr: Option<i64>, tier: &str, candidate: &str)
     .ok()
     .and_then(|r| r.first().cloned())
     .is_some_and(|r| r["n"].as_i64().unwrap_or(0) > 0 && r["p"].as_i64() == Some(1))
+}
+
+/// A person lends a host folder to a repo's checks, read-only. Never a home folder
+/// itself, a folder that contains it, or one of the places keys and logins live.
+pub fn lend(db: &Db, repo: &str, name: &str, path: &std::path::Path, by: &str, home: &std::path::Path) -> Result<(), String> {
+    if by.trim().is_empty() {
+        return Err("lending a folder names the person".into());
+    }
+    let real = std::fs::canonicalize(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if !real.is_dir() {
+        return Err(format!("{} is not a folder", path.display()));
+    }
+    let home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    if home.starts_with(&real) {
+        return Err("a home folder, or a folder that holds one, is never lent".into());
+    }
+    for private in [".ssh", ".gnupg", ".aws", ".config", ".docker", ".kube", ".netrc", "Library/Keychains", "Library/Application Support", "Library/Cookies", "Philium Pilot"] {
+        let p = home.join(private);
+        if real.starts_with(&p) || p.starts_with(&real) {
+            return Err(format!("{} holds or sits in {private}, where keys and logins live; it is never lent", path.display()));
+        }
+    }
+    init(db)?;
+    db.exec("INSERT OR REPLACE INTO pipeline_lends(repo,name,path,by,at) VALUES(?1,?2,?3,?4,?5)", params![repo, name, real.display().to_string(), by, now()]).map(|_| ())
+}
+pub fn lent(db: &Db, repo: &str, name: &str) -> Option<std::path::PathBuf> {
+    let _ = init(db);
+    db.query("SELECT path FROM pipeline_lends WHERE repo=?1 AND name=?2", params![repo, name]).ok()?.pop()?["path"].as_str().map(std::path::PathBuf::from)
 }
 
 /// People and agents add inputs; each is attributed.

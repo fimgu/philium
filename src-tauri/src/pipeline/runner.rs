@@ -26,6 +26,8 @@ pub struct Host {
     pub home: PathBuf,
     pub secret: Box<dyn Fn(&str) -> Option<String> + Send + Sync>,
     pub enrolled: Box<dyn Fn(&str) -> bool + Send + Sync>,
+    /// A lend's folder on this machine, when a person has lent it.
+    pub lent: Box<dyn Fn(&str) -> Option<PathBuf> + Send + Sync>,
     pub platform: String,
 }
 
@@ -143,6 +145,11 @@ pub async fn up(p: &Pipeline, needed: &BTreeSet<String>, label: &str, workdir: &
     let mut s = Services::none();
     s.vars = base_vars(label, workdir, rundir);
     s.vars.extend(extra.iter().map(|(k, v)| (k.clone(), v.clone())));
+    for l in &p.lends {
+        if let Some(path) = (host.lent)(l) {
+            s.vars.insert(format!("lend.{l}"), path.display().to_string());
+        }
+    }
     for name in needed {
         let Some(svc) = p.services.get(name) else {
             s.failed.insert(name.clone(), "not declared".into());
@@ -335,7 +342,7 @@ fn command(argv: &[&str], workdir: &Path, rundir: &Path, host: &Host, env: &Hash
     if !cfg!(target_os = "macos") || !Path::new("/usr/bin/sandbox-exec").exists() {
         return Err("this machine has no sandbox to keep checks away from the home folder".into());
     }
-    let read_only: Vec<PathBuf> = env.get("PHILIUM_GATE").map(PathBuf::from).into_iter().collect();
+    let read_only: Vec<PathBuf> = env.iter().filter(|(k, _)| *k == "PHILIUM_GATE" || k.starts_with("PHILIUM_LEND_")).map(|(_, v)| PathBuf::from(v)).collect();
     let prof = profile(&host.home, &[rundir.to_path_buf(), workdir.to_path_buf(), host.caches.clone()], &read_only);
     let mut c = tokio::process::Command::new("/usr/bin/sandbox-exec");
     c.arg("-p").arg(prof).args(argv);
@@ -385,6 +392,10 @@ fn container(platform: &str, image: &str, name: &str, script: &str, workdir: &Pa
     }
     if let Some(l) = env.get("PHILIUM_CHANGED") {
         c.arg("-v").arg(format!("{l}:/philium/changed.txt:ro"));
+    }
+    // A lent folder appears at the same path, read-only.
+    for v in env.iter().filter(|(k, _)| k.starts_with("PHILIUM_LEND_")).map(|(_, v)| v) {
+        c.arg("-v").arg(format!("{v}:{v}:ro"));
     }
     c.arg("-v").arg(format!("{}:/philium/home", home.display())).arg("-v").arg(format!("{}:/philium/tmp", tmp.display()));
     c.args(["-e", "HOME=/philium/home", "-e", "TMPDIR=/philium/tmp", "-e", "CI=true", "-e", "LANG=C.UTF-8"]);
@@ -452,6 +463,14 @@ pub async fn run_check(p: &Pipeline, c: &Check, workdir: &Path, rundir: &Path, s
     }
     let mut env: HashMap<String, String> = HashMap::new();
     let mut hidden: Vec<String> = vec![];
+    for l in &c.lends {
+        match services.vars.get(&format!("lend.{l}")) {
+            Some(path) => {
+                env.insert(format!("PHILIUM_LEND_{l}"), path.clone());
+            }
+            None => return not_run(format!("{l} is not lent on this machine; a person lends it read-only for this repo")),
+        }
+    }
     for s in &c.secrets {
         match (host.secret)(s) {
             Some(v) if !v.is_empty() => {
@@ -588,6 +607,7 @@ pub(crate) mod tests {
             home,
             secret: Box::new(|n| (n == "TOKEN").then(|| "s3cr3t-value".to_string())),
             enrolled: Box::new(|e| e == "enrolled"),
+            lent: Box::new(|_| None),
             platform: config::host_platform(),
         }
     }
@@ -726,6 +746,45 @@ pub(crate) mod tests {
         assert!(out.contains("pkg/sub") && out.contains("private") && !out.contains("LEAK"), "{out} {}", String::from_utf8_lossy(&o.stderr));
         // A gate the check cannot read is refused too, rather than failing every check.
         assert!(preflight(&work, &rundir, Some(&root.join("missing")), &h).await.unwrap_err().contains("gate folder is not readable"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn a_lent_folder_is_readable_never_writable_and_only_when_lent() {
+        let root = tmp("lend");
+        let shared = root.join("realhome/go-downloads");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::write(shared.join("module.zip"), "zip").unwrap();
+        let p = Pipeline::parse(&format!(
+            "version: 1\nbranch: main\nplatforms: [{}]\nlends: [DOWNLOADS]\nfixtures: {{ PROXY: \"file://${{lend.DOWNLOADS}}\" }}\ntiers: {{ fast: [ {{ id: read, run: \"cat ${{PROXY#file://}}/module.zip; touch ${{PROXY#file://}}/planted 2>/dev/null && echo WROTE; cat {} 2>/dev/null || echo private\", lends: [DOWNLOADS] }} ] }}\n",
+            config::host_platform(),
+            root.join("realhome/.ssh/id_test").display()
+        ))
+        .unwrap();
+        // Not lent on this machine: the check does not run at all.
+        let o = run(&p, "read", &root).await;
+        assert_eq!(o.status, Status::NotRun);
+        assert!(o.reason.unwrap().contains("DOWNLOADS is not lent"));
+        // Lent: readable, not writable, and the rest of the home folder stays private.
+        let mut h = host(&root);
+        let lent = shared.clone();
+        h.lent = Box::new(move |n| (n == "DOWNLOADS").then(|| lent.clone()));
+        let (work, rundir) = (root.join("work"), root.join("run"));
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::create_dir_all(&rundir).unwrap();
+        let s = up(&p, &BTreeSet::new(), "philium-t", &work, &rundir, &h, &HashMap::new()).await;
+        let o = run_check(&p, p.check("read").unwrap(), &work, &rundir, &s, &h).await;
+        assert!(o.output.starts_with("zip") && !o.output.contains("WROTE") && o.output.contains("private") && !o.output.contains("PRIVATE-KEY"), "{}", o.output);
+        assert!(!shared.join("planted").exists());
+        // What may never be lent.
+        let db = crate::pipeline::records::tests::db();
+        let home = root.join("realhome");
+        assert!(crate::pipeline::records::lend(&db, "r", "X", &home, "filip", &home).is_err());
+        assert!(crate::pipeline::records::lend(&db, "r", "X", &root, "filip", &home).is_err());
+        assert!(crate::pipeline::records::lend(&db, "r", "X", &home.join(".ssh"), "filip", &home).is_err());
+        assert!(crate::pipeline::records::lend(&db, "r", "X", &shared, "", &home).is_err());
+        crate::pipeline::records::lend(&db, "r", "X", &shared, "filip", &home).unwrap();
+        assert_eq!(crate::pipeline::records::lent(&db, "r", "X"), Some(std::fs::canonicalize(&shared).unwrap()));
         std::fs::remove_dir_all(&root).ok();
     }
 
