@@ -24,6 +24,8 @@ pub struct Host {
     pub caches: PathBuf,
     /// The real home folder the sandbox hides.
     pub home: PathBuf,
+    /// Where Docker, kind and kubectl keep their settings (the account's home).
+    pub tools_home: PathBuf,
     pub secret: Box<dyn Fn(&str) -> Option<String> + Send + Sync>,
     pub enrolled: Box<dyn Fn(&str) -> bool + Send + Sync>,
     /// A lend's folder on this machine, when a person has lent it.
@@ -84,6 +86,15 @@ pub struct Services {
     pub vars: HashMap<String, String>,
     pub failed: HashMap<String, String>,
     teardown: Vec<Teardown>,
+    home: PathBuf,
+}
+
+/// Docker, kind and kubectl read their settings from the account home, which
+/// inside the Pilot is not the process's HOME.
+fn tool(program: &str, account_home: &Path) -> tokio::process::Command {
+    let mut c = tokio::process::Command::new(program);
+    c.env("HOME", account_home);
+    c
 }
 
 enum Teardown {
@@ -94,14 +105,14 @@ enum Teardown {
 
 impl Services {
     pub fn none() -> Services {
-        Services { vars: HashMap::new(), failed: HashMap::new(), teardown: vec![] }
+        Services { vars: HashMap::new(), failed: HashMap::new(), teardown: vec![], home: PathBuf::new() }
     }
 
     pub async fn down(mut self) {
         for t in self.teardown.drain(..).rev() {
             match t {
                 Teardown::Compose { project, files, dir } => {
-                    let mut c = tokio::process::Command::new("docker");
+                    let mut c = tool("docker", &self.home);
                     c.arg("compose").arg("-p").arg(&project);
                     for f in &files {
                         c.arg("-f").arg(f);
@@ -110,7 +121,7 @@ impl Services {
                 }
                 Teardown::Process(pid) => kill_group(pid).await,
                 Teardown::Kind { name } => {
-                    let _ = tokio::process::Command::new("kind").args(["delete", "cluster", "--name", &name]).output().await;
+                    let _ = tool("kind", &self.home).args(["delete", "cluster", "--name", &name]).output().await;
                 }
             }
         }
@@ -143,6 +154,7 @@ pub fn base_vars(label: &str, workdir: &Path, rundir: &Path) -> HashMap<String, 
 /// Bring up what these checks need, each service once.
 pub async fn up(p: &Pipeline, needed: &BTreeSet<String>, label: &str, workdir: &Path, rundir: &Path, host: &Host, extra: &HashMap<String, String>) -> Services {
     let mut s = Services::none();
+    s.home = host.tools_home.clone();
     s.vars = base_vars(label, workdir, rundir);
     s.vars.extend(extra.iter().map(|(k, v)| (k.clone(), v.clone())));
     for l in &p.lends {
@@ -186,7 +198,7 @@ async fn up_compose(s: &mut Services, name: &str, file: &str, service: &str, por
         files.push(over);
     }
     let compose = |args: &[&str]| {
-        let mut c = tokio::process::Command::new("docker");
+        let mut c = tool("docker", &host.tools_home);
         c.arg("compose").arg("-p").arg(&proj);
         for f in &files {
             c.arg("-f").arg(f);
@@ -234,16 +246,16 @@ async fn up_kind(s: &mut Services, name: &str, manifests: &str, ready: Option<&s
     }
     let cluster = project(label, name);
     let kubeconfig = rundir.join(format!("kubeconfig-{name}"));
-    let o = tokio::process::Command::new("kind").args(["create", "cluster", "--name", &cluster, "--kubeconfig"]).arg(&kubeconfig).output().await.map_err(|e| format!("kind is not available: {e}"))?;
+    let o = tool("kind", &host.tools_home).args(["create", "cluster", "--name", &cluster, "--kubeconfig"]).arg(&kubeconfig).output().await.map_err(|e| format!("kind is not available: {e}"))?;
     if !o.status.success() {
         return Err(format!("kind create failed: {}", tail(&String::from_utf8_lossy(&o.stderr), 600)));
     }
     // Only a cluster this run created is ever deleted.
     s.teardown.push(Teardown::Kind { name: cluster.clone() });
-    let ctx = tokio::process::Command::new("kubectl").arg("--kubeconfig").arg(&kubeconfig).args(["config", "current-context"]).output().await.map_err(|e| format!("kubectl is not available: {e}"))?;
+    let ctx = tool("kubectl", &host.tools_home).arg("--kubeconfig").arg(&kubeconfig).args(["config", "current-context"]).output().await.map_err(|e| format!("kubectl is not available: {e}"))?;
     s.vars.insert(format!("kubeconfig.{name}"), kubeconfig.display().to_string());
     s.vars.insert(format!("context.{name}"), String::from_utf8_lossy(&ctx.stdout).trim().to_string());
-    let o = tokio::process::Command::new("kubectl").arg("--kubeconfig").arg(&kubeconfig).arg("apply").arg("-f").arg(&dir).arg("--recursive").output().await.map_err(|e| e.to_string())?;
+    let o = tool("kubectl", &host.tools_home).arg("--kubeconfig").arg(&kubeconfig).arg("apply").arg("-f").arg(&dir).arg("--recursive").output().await.map_err(|e| e.to_string())?;
     if !o.status.success() {
         return Err(format!("applying {manifests} failed: {}", tail(&String::from_utf8_lossy(&o.stderr), 600)));
     }
@@ -379,7 +391,7 @@ fn tail(s: &str, n: usize) -> String {
 /// clone, its own HOME and temp folder, Philium's caches and the declared
 /// variables. No home folder, no added privileges.
 #[allow(clippy::too_many_arguments)]
-fn container(platform: &str, image: &str, name: &str, script: &str, workdir: &Path, rundir: &Path, env: &HashMap<String, String>, caches: &[(String, PathBuf)]) -> Result<tokio::process::Command, String> {
+fn container(platform: &str, image: &str, name: &str, script: &str, workdir: &Path, rundir: &Path, env: &HashMap<String, String>, caches: &[(String, PathBuf)], account_home: &Path) -> Result<tokio::process::Command, String> {
     let home = rundir.join("home");
     let tmp = rundir.join("tmp");
     std::fs::create_dir_all(&home).map_err(|e| e.to_string())?;
@@ -406,11 +418,12 @@ fn container(platform: &str, image: &str, name: &str, script: &str, workdir: &Pa
     }
     // Values travel in the docker client's environment, never on its command line.
     c.env_clear();
-    for k in ["PATH", "HOME", "DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG"] {
+    for k in ["PATH", "DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG"] {
         if let Some(v) = std::env::var_os(k) {
             c.env(k, v);
         }
     }
+    c.env("HOME", account_home);
     if std::env::var_os("PATH").is_none() {
         c.env("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin");
     }
@@ -429,7 +442,7 @@ fn docker_refusal(exit: Option<i32>, text: &str) -> Option<String> {
     if let Some(m) = platform.iter().find(|m| low.contains(*m)) {
         return Some(format!("Docker cannot provide this platform ({m})"));
     }
-    if exit == Some(125) || low.contains("error response from daemon") || low.contains("cannot connect to the docker daemon") {
+    if exit == Some(125) || low.contains("error response from daemon") || low.contains("cannot connect to the docker daemon") || low.contains("failed to connect to the docker api") {
         let line = text.lines().find(|l| l.to_ascii_lowercase().contains("docker")).unwrap_or("").trim();
         return Some(format!("Docker could not start the check: {}", tail(line, 300)));
     }
@@ -517,7 +530,7 @@ pub async fn run_check(p: &Pipeline, c: &Check, workdir: &Path, rundir: &Path, s
     let built = match &image {
         Some(img) => {
             let caches: Vec<(String, PathBuf)> = p.caches.iter().map(|(k, d)| (k.clone(), host.caches.join(format!("{}-{}", d, platform.replace('/', "-"))))).collect();
-            container(&platform, img, &cname, argv.last().map(String::as_str).unwrap_or("true"), workdir, rundir, &env, &caches)
+            container(&platform, img, &cname, argv.last().map(String::as_str).unwrap_or("true"), workdir, rundir, &env, &caches, &host.tools_home)
         }
         None => {
             for (k, dir) in &p.caches {
@@ -565,7 +578,7 @@ pub async fn run_check(p: &Pipeline, c: &Check, workdir: &Path, rundir: &Path, s
         }
         Err(_) => {
             if image.is_some() {
-                let _ = tokio::process::Command::new("docker").args(["kill", &cname]).output().await;
+                let _ = tool("docker", &host.tools_home).args(["kill", &cname]).output().await;
             }
             if let Some(pid) = pid {
                 kill_group(pid).await;
@@ -605,6 +618,7 @@ pub(crate) mod tests {
             scratch: root.join("runs"),
             caches: root.join("caches"),
             home,
+            tools_home: std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default(),
             secret: Box::new(|n| (n == "TOKEN").then(|| "s3cr3t-value".to_string())),
             enrolled: Box::new(|e| e == "enrolled"),
             lent: Box::new(|_| None),
@@ -717,6 +731,7 @@ pub(crate) mod tests {
         assert!(docker_refusal(Some(1), "exec /bin/sh: exec format error").unwrap().contains("cannot provide this platform"));
         assert!(docker_refusal(Some(125), "docker: Error response from daemon: no matching manifest for linux/s390x").unwrap().contains("cannot provide"));
         assert!(docker_refusal(Some(125), "docker: Error response from daemon: pull access denied").unwrap().contains("could not start"));
+        assert!(docker_refusal(Some(1), "failed to connect to the docker API at unix:///var/run/docker.sock").unwrap().contains("could not start"));
         assert_eq!(docker_refusal(Some(127), "sh: make: not found"), None);
         assert_eq!(docker_refusal(Some(1), "--- FAIL: TestThing"), None);
     }

@@ -36,6 +36,14 @@
     'release_intake.graph': { head: H, target: B, merge_base: B, commits: Array.from({ length: 6 }, (_, i) => ({ oid: (i + 10).toString(16).repeat(20), parents: i % 3 ? ['x'] : ['x', 'y'] })) },
     'release_intake.followup': { mode: 'full', reason: 'No code review is recorded for this pull request yet.', commits: [] },
     'release_intake.drafter': q.get('review') === 'failed' ? { id: 'd1', name: 'otter', state: 'failed', started: false, error: 'Agents here start from release/v0.9.0, and this checkout has no such branch or commit, locally or from origin. Fetch it in the checkout (git fetch origin release/v0.9.0), or choose another starting branch for this checkout under Repos.' } : null,
+    'pipeline.results': q.get('checks') === 'none' ? { configured: false, local_gate: '~/Philium Pilot/data/pipelines/example-org-example-repo/.philium/pipeline.yaml' } : { configured: true, pr: 5542, head: H, base: B, from: 'local pipeline.yaml', pinned_gate: false, running: false, lines: [],
+      verdict: { state: 'fail', pinned: false, reasons: ['go-test-touched fails on this change and passes on the base', 'migrations-postgres fails on the base too; file it as an issue before landing'],
+        outcomes: [['gofmt-changed', { outcome: 'pass' }], ['go-test-touched', { outcome: 'introduced' }], ['migrations-postgres', { outcome: 'pre_existing' }]] },
+      checks: [
+        { id: 'gofmt-changed', candidate: { status: 'pass', duration_ms: 420 }, output: '12 changed Go files are gofmt-clean' },
+        { id: 'go-test-touched', candidate: { status: 'fail', duration_ms: 111000 }, base: { status: 'pass' }, output: '--- FAIL: TestHTTPServerHeaderValidation (0.02s)\nFAIL', base_output: 'ok  internal/handler 3.1s' },
+        { id: 'migrations-postgres', candidate: { status: 'fail', duration_ms: 64000 }, base: { status: 'fail' }, output: '--- FAIL: TestManualMigrationSchemaAndHistoryFailuresPostgres', base_output: '--- FAIL: TestManualMigrationSchemaAndHistoryFailuresPostgres' },
+      ] },
     'release_intake.review_items': q.get('review') === 'failed' ? { pr: 5542, headline: 'none', run: { pr: 5542 }, tiers: [], items: [], report: null,
       lead: { id: 'a1', name: 'falcon', state: 'failed', started: false, error: 'Agents here start from release/v0.9.0, and this checkout has no such branch or commit, locally or from origin. Fetch it in the checkout (git fetch origin release/v0.9.0), or choose another starting branch for this checkout under Repos.' } }
       : q.get('review') ? { pr: 5542, headline: q.get('review'), run: { pr: 5542 },

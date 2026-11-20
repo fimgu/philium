@@ -146,6 +146,14 @@ fn gh_logins() -> serde_json::Map<String, Value> {
 }
 /// What to present to GitHub for this request: a token the person saved, else the connected
 /// CLI account for that origin, else nothing (public repositories need nothing).
+/// The GitHub token Review reads this origin with, for other read-only uses (the checks' mirror).
+pub(crate) async fn origin_bearer(origin: &str) -> Option<String> {
+    bearer_for(origin).await
+}
+/// The `owner/name` a checkout's remote points at.
+pub(crate) fn origin_of(remote_url: &str) -> Result<String, String> {
+    origin(remote_url)
+}
 async fn bearer_for(path: &str) -> Option<String> {
     if let Some(token) = crate::secrets::get(ORIGIN_TOKEN) {
         return Some(token);

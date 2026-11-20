@@ -12,13 +12,14 @@ const USAGE: &str = "Usage:
   philium replay --repo PATH [--at SHA] [--config FILE] [--replay FILE] [--data DIR] [--json]
   philium simulate --prs N --fail-rate P [--batch-max N] [--seed N] [--json]
   philium land --repo PATH --remote NAME --base SHA --candidate SHA [--pr N] [--tier full] [--config FILE] [--data DIR] [--push]
-  philium enroll --repo PATH --environment NAME --by PERSON [--data DIR]";
+  philium enroll --repo PATH --environment NAME --by PERSON [--data DIR]
+  philium lend --repo PATH --name NAME --path FOLDER --by PERSON [--data DIR]";
 
 /// Some(exit code) when the arguments are a pipeline command.
 pub fn dispatch() -> Option<i32> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = args.first()?.clone();
-    if !matches!(cmd.as_str(), "run" | "replay" | "simulate" | "land" | "enroll") {
+    if !matches!(cmd.as_str(), "run" | "replay" | "simulate" | "land" | "enroll" | "lend") {
         return None;
     }
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().ok()?;
@@ -113,6 +114,7 @@ pub fn host(db: &'static Db, repo: &str) -> Result<runner::Host, String> {
     Ok(runner::Host {
         scratch,
         caches,
+        tools_home: home.clone(),
         home,
         secret: Box::new(move |n| crate::secrets::get(&format!("pipeline.{r1}.{n}"))),
         enrolled: Box::new(move |e| records::enrolled(db, &r2, e)),
@@ -152,6 +154,17 @@ async fn main(cmd: &str, rest: &[String]) -> Result<i32, String> {
     let repo = PathBuf::from(a.get("repo")?);
     let key = repo_key(&repo);
     let db: &'static Db = Box::leak(Box::new(data(&a)?));
+    if cmd == "lend" {
+        let home = std::env::var_os("HOME").map(PathBuf::from).ok_or("HOME is not set")?;
+        let raw = a.get("path")?;
+        let path = match raw.strip_prefix("~/") {
+            Some(rest) => home.join(rest),
+            None => PathBuf::from(raw),
+        };
+        records::lend(db, &key, a.get("name")?, &path, a.get("by")?, &home)?;
+        println!("{} is lent read-only to {key}'s checks", a.get("name")?);
+        return Ok(0);
+    }
     if cmd == "enroll" {
         records::enroll(db, &key, a.get("environment")?, a.get("by")?)?;
         println!("{} is enrolled read-only for {key}", a.get("environment")?);

@@ -190,6 +190,7 @@ async fn rpc_inner(app: &App, method: String, args: Option<Value>) -> Result<Val
         "selfdev" => selfdev::call(&ctx, m, args).await,
         "mcp" => mcp::call(&ctx, m, args).await,
         "workday" => workday::call(&ctx, m, args).await,
+        "pipeline" => pipeline::app::call(&ctx, m, args).await,
         _ => Err(format!("unknown module {module}")),
     }
 }

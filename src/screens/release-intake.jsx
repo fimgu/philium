@@ -3,6 +3,7 @@ import { rpc, useEvent } from '../lib/rpc.js';
 import { plainError } from '../lib/plain-error.js';
 import { Markdown } from '../ui/markdown.jsx';
 import { readiness, summaryMarkdown, tone, HEADLINE } from '../lib/readiness.js';
+import { GateChecks } from './gate-checks.jsx';
 
 const MARK = { ok: '✓', bad: '✕', unknown: '?' }, STATE = { ok: 'Pass', bad: 'Fail', unknown: 'Unknown: not a pass' };
 
@@ -91,7 +92,7 @@ export function ReleaseIntake(props) {
   async function reviewWithAgents(){if(busy())return;await resolve({preventDefault(){}});const d=decision();if(!d)return;setBusy(true);
     try{const r=await call('review_start',{generation:d.generation});if(!r?.brief)throw new Error('Philium did not prepare the review. Try again.');await tidy(r.previous_lead);
       // The orchestrator and its helpers start on the pull request's head, the revision under review.
-      const a=await rpc('agents.spawn',{role:'orchestrator',repo_id:props.repo,brief:r.brief,base:r.head},{action:true});await call('lead',{kind:'review',agent:a.id}).catch(()=>null);await reloadReview();setMessage(`${a?.name||'An orchestrator'} is organising the review of #${r.pr}. The plan appears below as it is written. You can leave this screen.`);}
+      rpc('pipeline.run',{repo_id:props.repo,generation:d.generation,tier:'fast'},{action:true}).catch(()=>null);const a=await rpc('agents.spawn',{role:'orchestrator',repo_id:props.repo,brief:r.brief,base:r.head},{action:true});await call('lead',{kind:'review',agent:a.id}).catch(()=>null);await reloadReview();setMessage(`${a?.name||'An orchestrator'} is organising the review of #${r.pr}. The plan appears below as it is written. You can leave this screen.`);}
     catch(e){setMessage(`Review not started: ${String(e)}`);}finally{setBusy(false);}}
   const reviewHead=v=>{const l=v.lead;if(l?.state==='failed')return 'The review could not start';if(v.items?.length)return AGENT_HEAD[v.headline]||v.headline;if(!l)return 'No orchestrator is working on this review';if(l.state==='provisioning')return `Starting ${l.name}`;if(l.state==='stopped')return `${l.name} is stopped`;if(l.rate_limited?.until&&l.state==='idle')return `${l.name} is waiting for the rate limit`;return `${l.name} is writing the plan`;};
   const ORIGIN={introduced:'introduced',pre_existing:'pre-existing',unverified:'origin unverified'};
@@ -119,6 +120,7 @@ export function ReleaseIntake(props) {
       <Show when={profile.latest} fallback={<p aria-label="Pinned verifier">No checks confirmed for this checkout yet.</p>}>{p=><><p aria-label="Pinned verifier">{p().driver===KEPT?<>Checks <strong>kept by Philium</strong></>:<>Verifier <strong>{p().driver_name || p().driver}</strong></>} pinned at <code>{p().pin}</code>. {p().confirmed ? `You confirmed its checks on ${new Date(p().confirmed).toLocaleString()}.` : 'Pinned before confirmations were recorded: read the checks and pin again.'} Deployment observer: {p().observer_port ? `loopback port ${p().observer_port}` : 'none'}.<For each={p().programs||[]}>{g=><> Program {g.name}: <code>{g.path}</code>.</>}</For></p><Show when={p().checks}><details aria-label="Pinned checks"><summary>Checks pinned for this checkout</summary><Checks label="Confirmed checks" checks={p().checks}/></details></Show></>}</Show>
     </details>
     </div>
+    <GateChecks repo={props.repo} generation={decision()?.generation??graph()?.seq??null}/>
     <Show when={review.latest&&(review.latest.items?.length||review.latest.run)?review.latest:null}>{v=><section aria-label="Agent review" class={`decision ${({do_not_ship:'bad',passed:'ok'})[v().headline]||'unknown'}`}>
       <div class="verdict"><span class="glyph" aria-hidden="true">{v().lead?.state==='failed'?'!':({do_not_ship:'✕',passed:'✓'})[v().headline]||'…'}</span><div class="grow"><h3 title="P0 and P1 decide: a failure this release introduced, or whose origin is unverified, means do not ship; a pre-existing one, or anything not passed, means not ready. P2 to P5 inform.">{reviewHead(v())}</h3><p>#{v().pr}{v().items.length?` · ${v().items.filter(i=>i.result).length} of ${v().items.length} items have a result`:''}{v().lead&&v().items.length?` · led by ${v().lead.name}`:''}</p></div></div>
       <Show when={v().lead?.state==='failed'}><p role="alert" aria-label="Review start failed">{v().lead.name} could not start: {plainError(v().lead.error||'no reason was recorded').plain.replace(/\.\s*$/,'')}. No model was asked anything.</p></Show>

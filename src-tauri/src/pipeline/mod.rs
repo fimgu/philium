@@ -1,5 +1,6 @@
 //! The generic agent-to-release pipeline (docs/PIPELINE.md). Nothing here names a repo,
 //! branch, service, port or namespace: each repo declares itself in `.philium/pipeline.yaml`.
+pub mod app;
 pub mod cli;
 pub mod config;
 pub mod gate;
