@@ -183,7 +183,8 @@ async fn main(cmd: &str, rest: &[String]) -> Result<i32, String> {
             let cfg_text = serde_yaml::to_string(p).unwrap_or_default();
             let digest = replay::digest(&[&cfg_text, &text]);
             eprintln!("{key}: replaying {} known bugs against the gate from {from}", set.bugs.len());
-            let r = replay::run(db, &key, &repo, p, &set, &digest, &host, &say(a.json())).await?;
+            let gate_dir = g.materialize(&host.scratch.join("gate"))?;
+            let r = replay::run(db, &key, &repo, p, &set, &digest, &gate_dir, &host, &say(a.json())).await?;
             if a.json() {
                 println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());
             } else {

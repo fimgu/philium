@@ -6,7 +6,7 @@ use super::records::{self, RunKey, Side};
 use super::runner::{self, Host};
 use super::verdict::{self, Verdict};
 use crate::db::Db;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 pub struct Target<'a> {
@@ -24,7 +24,7 @@ fn label() -> String {
 }
 
 /// Run `checks` on one SHA in a fresh checkout with fresh services.
-async fn side(p: &Pipeline, checks: &[&super::config::Check], repo: &Path, sha: &str, host: &Host, say: &(dyn Fn(String) + Sync)) -> Result<Vec<(String, runner::Outcome)>, String> {
+pub(crate) async fn side(p: &Pipeline, checks: &[&super::config::Check], repo: &Path, sha: &str, base: &str, gate_dir: &Path, overlay: Option<(&str, &[String])>, host: &Host, say: &(dyn Fn(String) + Sync)) -> Result<Vec<(String, runner::Outcome)>, String> {
     let label = label();
     let root = host.scratch.join(&label);
     let work = root.join("src");
@@ -32,11 +32,15 @@ async fn side(p: &Pipeline, checks: &[&super::config::Check], repo: &Path, sha: 
     std::fs::create_dir_all(&rundir).map_err(|e| e.to_string())?;
     let result = async {
         runner::checkout(repo, sha, &work)?;
+        if let Some((from, paths)) = overlay {
+            runner::overlay(&work, from, paths)?;
+        }
         let needed: BTreeSet<String> = checks.iter().flat_map(|c| c.needs.iter().cloned()).collect();
         if !needed.is_empty() {
             say(format!("starting {} on {}", needed.iter().cloned().collect::<Vec<_>>().join(", "), &sha[..12]));
         }
-        let services = runner::up(p, &needed, &label, &work, &rundir, host).await;
+        let extra: HashMap<String, String> = [("sha", sha.to_string()), ("base", base.to_string()), ("gate", gate_dir.display().to_string())].into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+        let services = runner::up(p, &needed, &label, &work, &rundir, host, &extra).await;
         let mut out = vec![];
         for c in checks {
             say(format!("{} on {}", c.id, &sha[..12]));
@@ -63,34 +67,44 @@ pub async fn run_tier(db: &Db, t: &Target<'_>, g: &Gate, tier: Tier, host: &Host
     let (p, config_from) = (&g.pipeline, g.from.as_str());
     let checks: Vec<&super::config::Check> = p.tier(tier).iter().collect();
     let run = records::start_run(db, &RunKey { repo: t.key, pr: t.pr, tier: tier.as_str(), head: t.head, base: t.base, candidate: t.candidate, pinned: g.pinned }, config_from)?;
-    let first = side(p, &checks, t.path, t.candidate, host, say).await?;
-    store(db, &run, Side::Candidate, t.candidate, &first)?;
+    let gate_root = host.scratch.join(format!("{}-gate", label()));
+    let gate_dir = g.materialize(&gate_root)?;
+    let result = sides(db, t, p, &checks, &run, config_from, &gate_dir, host, say).await;
+    std::fs::remove_dir_all(&gate_root).ok();
+    result?;
+    records::finish_run(db, &run)?;
+    let v = verdict::for_candidate(db, t.key, t.pr, tier.as_str(), checks.iter().map(|c| c.id.clone()).collect(), t.base, t.candidate)?;
+    Ok((run, v))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn sides(db: &Db, t: &Target<'_>, p: &Pipeline, checks: &[&super::config::Check], run: &str, config_from: &str, gate_dir: &Path, host: &Host, say: &(dyn Fn(String) + Sync)) -> Result<(), String> {
+    let first = side(p, checks, t.path, t.candidate, t.base, gate_dir, None, host, say).await?;
+    store(db, run, Side::Candidate, t.candidate, &first)?;
     // A failure is run again on the same SHA: passing the second time is a flake, not a pass.
     let failed: Vec<&super::config::Check> = checks.iter().copied().filter(|c| first.iter().any(|(id, o)| id == &c.id && o.status.failed())).collect();
     if !failed.is_empty() {
-        let again = side(p, &failed, t.path, t.candidate, host, say).await?;
-        store(db, &run, Side::Rerun, t.candidate, &again)?;
+        let again = side(p, &failed, t.path, t.candidate, t.base, gate_dir, None, host, say).await?;
+        store(db, run, Side::Rerun, t.candidate, &again)?;
         // What failed twice runs on the base, same fixtures, to compute its origin.
         let twice: Vec<&super::config::Check> = failed.iter().copied().filter(|c| again.iter().any(|(id, o)| id == &c.id && o.status.failed())).collect();
         if !twice.is_empty() {
-            let base = side(p, &twice, t.path, t.base, host, say).await?;
-            store(db, &run, Side::Base, t.base, &base)?;
+            let base = side(p, &twice, t.path, t.base, t.base, gate_dir, None, host, say).await?;
+            store(db, run, Side::Base, t.base, &base)?;
         }
     }
     // A fix for an escaped bug: its check also runs on the SHA the bug shipped in.
     if let Some(pr) = t.pr {
         for e in records::escapes_fixed_by(db, t.key, pr) {
             if let Some(c) = e.check_id.as_deref().and_then(|id| p.check(id)) {
-                let outs = side(p, &[c], t.path, &e.buggy_sha, host, say).await?;
+                let outs = side(p, &[c], t.path, &e.buggy_sha, t.base, gate_dir, None, host, say).await?;
                 if let Some((_, o)) = outs.first() {
                     super::replay::remember(db, t.key, config_from, &e.id, &e.buggy_sha, None, &c.id, o.status, None)?;
                 }
             }
         }
     }
-    records::finish_run(db, &run)?;
-    let v = verdict::for_candidate(db, t.key, t.pr, tier.as_str(), checks.iter().map(|c| c.id.clone()).collect(), t.base, t.candidate)?;
-    Ok((run, v))
+    Ok(())
 }
 
 /// Summary lines for a person: one per check, then the verdict and why.
@@ -174,7 +188,7 @@ pub(crate) mod tests {
         let p = pipeline(&shared);
         let db = crate::pipeline::records::tests::db();
         let t = Target { key: "r", path: &r, pr: Some(7), head: &head, base: &base, candidate: &head };
-        let g = Gate { pipeline: p, from: "test.yaml".into(), pinned: false };
+        let g = Gate { pipeline: p, from: "test.yaml".into(), pinned: false, source: crate::pipeline::config::GateSource::Folder(root.clone()) };
         let (_, v) = run_tier(&db, &t, &g, Tier::Fast, &h, &|_| {}).await.unwrap();
         assert!(!v.pinned && report(&v).contains("unpinned config"));
         let o: std::collections::HashMap<_, _> = v.outcomes.iter().cloned().collect();

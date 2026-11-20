@@ -401,7 +401,7 @@ impl Pipeline {
     fn check_template(&self, t: &str, what: &str) -> Result<(), String> {
         for var in template_vars(t)? {
             let ok = match var.split_once('.') {
-                None => matches!(var.as_str(), "run" | "workdir" | "tmp"),
+                None => matches!(var.as_str(), "run" | "workdir" | "tmp" | "sha" | "base" | "gate"),
                 Some(("port", s)) => matches!(self.services.get(s), Some(Service::Run { .. }) | Some(Service::Compose { port: Some(_), .. })),
                 Some(("kubeconfig" | "context", s)) => matches!(self.services.get(s), Some(Service::Kind { .. })),
                 Some(("fixture", k)) => self.fixtures.contains_key(k),
@@ -424,7 +424,7 @@ fn relative(p: &str, what: &str) -> Result<(), String> {
 
 /// Philium's own template names. Any other `${...}` belongs to the shell and is left alone.
 pub fn is_philium_var(name: &str) -> bool {
-    matches!(name, "run" | "workdir" | "tmp") || ["port.", "kubeconfig.", "context.", "fixture."].iter().any(|p| name.starts_with(p))
+    matches!(name, "run" | "workdir" | "tmp" | "sha" | "base" | "gate") || ["port.", "kubeconfig.", "context.", "fixture."].iter().any(|p| name.starts_with(p))
 }
 
 /// Philium names used as `${...}` in a template. `$${` is a literal `${`.
@@ -535,6 +535,39 @@ pub struct Gate {
     pub pipeline: Pipeline,
     pub from: String,
     pub pinned: bool,
+    /// Where the gate's own `.philium/` folder comes from: checks reach it as
+    /// `${gate}`, so scripts and regression tests belong to the gate, not to the
+    /// commit under test.
+    pub source: GateSource,
+}
+
+#[derive(Debug, Clone)]
+pub enum GateSource {
+    Commit { repo: std::path::PathBuf, sha: String },
+    Folder(std::path::PathBuf),
+}
+
+impl Gate {
+    /// A read-only copy of the gate's `.philium/` folder under `dest`.
+    pub fn materialize(&self, dest: &Path) -> Result<std::path::PathBuf, String> {
+        match &self.source {
+            GateSource::Folder(f) => Ok(f.clone()),
+            GateSource::Commit { repo, sha } => {
+                std::fs::create_dir_all(dest).map_err(|e| e.to_string())?;
+                let archive = std::process::Command::new("git").arg("-C").arg(repo).args(["archive", "--format=tar", sha, ".philium"]).output().map_err(|e| format!("git: {e}"))?;
+                if !archive.status.success() {
+                    return Err(format!("could not read .philium from {}", &sha[..sha.len().min(12)]));
+                }
+                let mut tar = std::process::Command::new("tar").arg("-x").arg("-C").arg(dest).stdin(std::process::Stdio::piped()).spawn().map_err(|e| format!("tar: {e}"))?;
+                use std::io::Write;
+                tar.stdin.take().ok_or("tar")?.write_all(&archive.stdout).map_err(|e| e.to_string())?;
+                if !tar.wait().map_err(|e| e.to_string())?.success() {
+                    return Err("could not unpack the gate folder".into());
+                }
+                Ok(dest.join(".philium"))
+            }
+        }
+    }
 }
 
 /// The gate definition for a change: the base commit's own file, else a file
@@ -548,12 +581,13 @@ pub fn load(repo: &Path, base_sha: &str, local: Option<&Path>) -> Result<Gate, S
         .map_err(|e| format!("git: {e}"))?;
     if out.status.success() {
         let text = String::from_utf8_lossy(&out.stdout).into_owned();
-        return Ok(Gate { pipeline: Pipeline::parse(&text)?, from: format!("{base_sha}:{FILE}"), pinned: true });
+        return Ok(Gate { pipeline: Pipeline::parse(&text)?, from: format!("{base_sha}:{FILE}"), pinned: true, source: GateSource::Commit { repo: repo.to_path_buf(), sha: base_sha.to_string() } });
     }
     match local {
         Some(p) => {
             let text = std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?;
-            Ok(Gate { pipeline: Pipeline::parse(&text)?, from: p.display().to_string(), pinned: false })
+            let folder = p.parent().map(Path::to_path_buf).unwrap_or_default();
+            Ok(Gate { pipeline: Pipeline::parse(&text)?, from: p.display().to_string(), pinned: false, source: GateSource::Folder(folder) })
         }
         None => Err(format!("the base {} has no {FILE}, and no local pipeline file is registered for this repo", &base_sha[..base_sha.len().min(12)])),
     }

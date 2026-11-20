@@ -42,6 +42,21 @@ pub struct Bug {
     pub text: String,
     #[serde(default)]
     pub source: Option<String>,
+    /// The commit before the bug, as the base of the change that shipped it.
+    /// Defaults to the buggy commit's first parent.
+    #[serde(default)]
+    pub base: Option<String>,
+    /// Files laid over both commits before the check runs, typically the
+    /// regression tests the fix added (the Defects4J way to replay a bug).
+    #[serde(default)]
+    pub overlay: Option<Overlay>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Overlay {
+    pub from: String,
+    pub paths: Vec<String>,
 }
 
 impl ReplaySet {
@@ -55,7 +70,12 @@ impl ReplaySet {
             if !ids.insert(&b.id) {
                 return Err(format!("{FILE}: bug {} appears twice", b.id));
             }
-            for (what, sha) in [("buggy", Some(&b.buggy)), ("fixed", b.fixed.as_ref())] {
+            if let Some(o) = &b.overlay {
+                if o.paths.is_empty() || o.paths.iter().any(|p| p.is_empty() || p.starts_with('/') || p.split('/').any(|x| x == "..")) {
+                    return Err(format!("{FILE}: bug {}: overlay.paths are paths inside the repo", b.id));
+                }
+            }
+            for (what, sha) in [("buggy", Some(&b.buggy)), ("fixed", b.fixed.as_ref()), ("base", b.base.as_ref()), ("overlay.from", b.overlay.as_ref().map(|o| &o.from))] {
                 if let Some(sha) = sha {
                     if !records::is_sha(sha) {
                         return Err(format!("{FILE}: bug {}: {what} must be a full 40-character SHA", b.id));
@@ -133,34 +153,36 @@ pub struct Report {
     pub rejected_below: Option<f64>,
 }
 
-async fn one(p: &Pipeline, repo: &Path, sha: &str, check: &str, host: &Host) -> Result<runner::Outcome, String> {
+#[allow(clippy::too_many_arguments)]
+async fn one(p: &Pipeline, repo: &Path, sha: &str, base: &str, check: &str, gate_dir: &Path, overlay: Option<&Overlay>, host: &Host) -> Result<runner::Outcome, String> {
     let c = p.check(check).ok_or_else(|| format!("no check {check}"))?;
-    let label = format!("philium-{}", &crate::db::new_id()[..8]).to_ascii_lowercase();
-    let root = host.scratch.join(&label);
-    let work = root.join("src");
-    let rundir = root.join("run");
-    std::fs::create_dir_all(&rundir).map_err(|e| e.to_string())?;
-    let out = async {
-        runner::checkout(repo, sha, &work)?;
-        let services = runner::up(p, &c.needs.iter().cloned().collect(), &label, &work, &rundir, host).await;
-        let o = runner::run_check(p, c, &work, &rundir, &services, host).await;
-        services.down().await;
-        Ok::<_, String>(o)
+    let ov = overlay.map(|o| (o.from.as_str(), o.paths.as_slice()));
+    let mut outs = super::gate::side(p, &[c], repo, sha, base, gate_dir, ov, host, &|_| {}).await?;
+    Ok(outs.pop().map(|x| x.1).ok_or("no result")?)
+}
+
+fn parent(repo: &Path, sha: &str) -> Result<String, String> {
+    let o = std::process::Command::new("git").arg("-C").arg(repo).args(["rev-parse", &format!("{sha}^")]).output().map_err(|e| format!("git: {e}"))?;
+    if !o.status.success() {
+        return Err(format!("{} has no parent; name the bug's base", &sha[..12]));
     }
-    .await;
-    std::fs::remove_dir_all(&root).ok();
-    out
+    Ok(String::from_utf8_lossy(&o.stdout).trim().to_string())
 }
 
 /// Run the gate's checks against every known bug and hold the catch rate to the bar.
-pub async fn run(db: &Db, repo_key: &str, repo: &Path, p: &Pipeline, set: &ReplaySet, digest: &str, host: &Host, say: &(dyn Fn(String) + Sync)) -> Result<Report, String> {
+#[allow(clippy::too_many_arguments)]
+pub async fn run(db: &Db, repo_key: &str, repo: &Path, p: &Pipeline, set: &ReplaySet, digest: &str, gate_dir: &Path, host: &Host, say: &(dyn Fn(String) + Sync)) -> Result<Report, String> {
     init(db)?;
     let mut bugs = vec![];
     for b in &set.bugs {
         say(format!("{}: {} on {}", b.id, b.check, &b.buggy[..12]));
-        let on_bug = one(p, repo, &b.buggy, &b.check, host).await?;
+        let base = match &b.base {
+            Some(x) => x.clone(),
+            None => parent(repo, &b.buggy)?,
+        };
+        let on_bug = one(p, repo, &b.buggy, &base, &b.check, gate_dir, b.overlay.as_ref(), host).await?;
         let on_fix = match &b.fixed {
-            Some(f) => Some(one(p, repo, f, &b.check, host).await?),
+            Some(f) => Some(one(p, repo, f, &b.buggy, &b.check, gate_dir, b.overlay.as_ref(), host).await?),
             None => None,
         };
         let caught = remember(db, repo_key, digest, &b.id, &b.buggy, b.fixed.as_deref(), &b.check, on_bug.status, on_fix.as_ref().map(|o| o.status))?;
@@ -209,6 +231,47 @@ mod tests {
     use crate::pipeline::runner::tests::{host, tmp};
 
     #[tokio::test]
+    async fn a_bug_the_commits_own_tests_miss_is_caught_by_the_fixs_tests_or_the_gates_own_script() {
+        use crate::pipeline::gate::tests::git as g;
+        let root = tmp("overlay");
+        let (r, _) = repo(&root);
+        std::fs::write(r.join("value"), "2").unwrap();
+        g(&r, &["add", "."]);
+        g(&r, &["commit", "-qm", "good"]);
+        // The bug ships with no test that notices it.
+        std::fs::write(r.join("value"), "1").unwrap();
+        g(&r, &["commit", "-qam", "bug"]);
+        let bug = g(&r, &["rev-parse", "HEAD"]);
+        // The fix adds the regression test.
+        std::fs::create_dir_all(r.join("tests")).unwrap();
+        std::fs::write(r.join("tests/value_test.sh"), "[ \"$(cat value)\" = 2 ]\n").unwrap();
+        std::fs::write(r.join("value"), "2").unwrap();
+        g(&r, &["add", "."]);
+        g(&r, &["commit", "-qm", "fix"]);
+        let fix = g(&r, &["rev-parse", "HEAD"]);
+        // The gate keeps its own script in its .philium folder.
+        let gate = root.join("gate");
+        std::fs::create_dir_all(gate.join("checks")).unwrap();
+        std::fs::write(gate.join("checks/value.sh"), "[ \"$(cat value)\" = 2 ]\n").unwrap();
+        let p = Pipeline::parse(&format!(
+            "version: 1\nbranch: main\nplatforms: [{}]\ntiers: {{ fast: [ {{ id: tests, run: \"for t in tests/*.sh; do [ -e \\\"$t\\\" ] || exit 0; sh \\\"$t\\\" || exit 1; done\" }}, {{ id: gate-script, run: \"sh ${{gate}}/checks/value.sh\" }} ] }}\n",
+            crate::pipeline::config::host_platform()
+        ))
+        .unwrap();
+        let mut h = host(&root);
+        h.caches = root.join("caches");
+        let db = crate::pipeline::records::tests::db();
+        let text = format!(
+            "version: 1\nbugs:\n  - {{ id: as-shipped, buggy: {bug}, fixed: {fix}, check: tests, text: the commit's own tests }}\n  - {{ id: with-fix-tests, buggy: {bug}, fixed: {fix}, check: tests, text: the fix's test laid over, overlay: {{ from: {fix}, paths: [tests/value_test.sh] }} }}\n  - {{ id: gate-owned, buggy: {bug}, fixed: {fix}, check: gate-script, text: the gate's own script }}\n"
+        );
+        let set = ReplaySet::parse(&text, &p).unwrap();
+        let rep = run(&db, "r", &r, &p, &set, "o1", &gate, &h, &|_| {}).await.unwrap();
+        let caught: Vec<(&str, bool)> = rep.bugs.iter().map(|b| (b.id.as_str(), b.caught)).collect();
+        assert_eq!(caught, vec![("as-shipped", false), ("with-fix-tests", true), ("gate-owned", true)], "{:?}", rep.bugs);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
     async fn the_gate_is_measured_against_real_bugs_and_a_weaker_gate_is_rejected() {
         let root = tmp("replay");
         let (r, _) = repo(&root);
@@ -227,7 +290,7 @@ mod tests {
             "version: 1\nbugs:\n  - {{ id: lost-rows, buggy: {bug_a}, fixed: {fix_a}, check: a, text: upgrade lost rows }}\n  - {{ id: b-broke, buggy: {bug_b}, check: b, text: b broke }}\n  - {{ id: wrong-check, buggy: {bug_b}, check: a, text: the wrong check misses it }}\n"
         );
         let set = ReplaySet::parse(&text, &p).unwrap();
-        let rep = run(&db, "r", &r, &p, &set, "g1", &h, &|_| {}).await.unwrap();
+        let rep = run(&db, "r", &r, &p, &set, "g1", &root, &h, &|_| {}).await.unwrap();
         assert_eq!((rep.caught, rep.total), (2, 3));
         assert!(rep.rejected_below.is_none());
         let missed = rep.bugs.iter().find(|b| b.id == "wrong-check").unwrap();
@@ -235,7 +298,7 @@ mod tests {
         // A gate whose check for b no longer catches anything is held to the old bar.
         let weaker = Pipeline::parse(&format!("version: 1\nbranch: main\nplatforms: [{}]\ntiers: {{ fast: [ {{ id: a, run: sh check.sh a }}, {{ id: b, run: \"true\" }} ] }}\n", crate::pipeline::config::host_platform())).unwrap();
         let set2 = ReplaySet::parse(&text, &weaker).unwrap();
-        let rep2 = run(&db, "r", &r, &weaker, &set2, "g2", &h, &|_| {}).await.unwrap();
+        let rep2 = run(&db, "r", &r, &weaker, &set2, "g2", &root, &h, &|_| {}).await.unwrap();
         assert_eq!(rep2.caught, 1);
         assert!(rep2.rejected_below.is_some_and(|b| (b - 2.0 / 3.0).abs() < 1e-9));
         // Invariant 8's proof needs the failure on the bug and a pass on the fix candidate.

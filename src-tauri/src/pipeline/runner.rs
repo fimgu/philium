@@ -64,6 +64,19 @@ pub fn checkout(repo: &Path, sha: &str, dest: &Path) -> Result<(), String> {
     git(&["checkout", "--quiet", "--detach", sha], Some(dest))
 }
 
+/// Lay files from another commit over a checkout, such as a fix's regression
+/// tests over the code that shipped the bug.
+pub fn overlay(work: &Path, from: &str, paths: &[String]) -> Result<(), String> {
+    if !super::records::is_sha(from) {
+        return Err(format!("an overlay comes from a full SHA, not {from}"));
+    }
+    let o = std::process::Command::new("git").arg("-C").arg(work).args(["-c", "core.hooksPath=/dev/null", "checkout", from, "--"]).args(paths).output().map_err(|e| format!("git: {e}"))?;
+    if !o.status.success() {
+        return Err(format!("overlay from {}: {}", &from[..12], String::from_utf8_lossy(&o.stderr).trim()));
+    }
+    Ok(())
+}
+
 /// Services brought up for one side of a run.
 pub struct Services {
     pub vars: HashMap<String, String>,
@@ -126,9 +139,10 @@ pub fn base_vars(label: &str, workdir: &Path, rundir: &Path) -> HashMap<String, 
 }
 
 /// Bring up what these checks need, each service once.
-pub async fn up(p: &Pipeline, needed: &BTreeSet<String>, label: &str, workdir: &Path, rundir: &Path, host: &Host) -> Services {
+pub async fn up(p: &Pipeline, needed: &BTreeSet<String>, label: &str, workdir: &Path, rundir: &Path, host: &Host, extra: &HashMap<String, String>) -> Services {
     let mut s = Services::none();
     s.vars = base_vars(label, workdir, rundir);
+    s.vars.extend(extra.iter().map(|(k, v)| (k.clone(), v.clone())));
     for name in needed {
         let Some(svc) = p.services.get(name) else {
             s.failed.insert(name.clone(), "not declared".into());
@@ -324,6 +338,9 @@ fn container(platform: &str, image: &str, name: &str, script: &str, workdir: &Pa
     let mut c = tokio::process::Command::new("docker");
     c.args(["run", "--rm", "--name", name, "--platform", platform, "--pull=missing", "--cap-drop=ALL", "--security-opt=no-new-privileges", "--network=bridge"]);
     c.arg("-v").arg(format!("{}:/philium/work", workdir.display())).args(["-w", "/philium/work"]);
+    if let Some(g) = env.get("PHILIUM_GATE") {
+        c.arg("-v").arg(format!("{g}:/philium/gate:ro"));
+    }
     c.arg("-v").arg(format!("{}:/philium/home", home.display())).arg("-v").arg(format!("{}:/philium/tmp", tmp.display()));
     c.args(["-e", "HOME=/philium/home", "-e", "TMPDIR=/philium/tmp", "-e", "CI=true", "-e", "LANG=C.UTF-8"]);
     for (var, dir) in caches {
@@ -413,6 +430,11 @@ pub async fn run_check(p: &Pipeline, c: &Check, workdir: &Path, rundir: &Path, s
         None => {
             // A fixture that points at a service this run did not start is simply absent;
             // a check that uses it then cannot run.
+            for (var, name) in [("sha", "PHILIUM_SHA"), ("base", "PHILIUM_BASE"), ("gate", "PHILIUM_GATE")] {
+                if let Some(v) = services.vars.get(var) {
+                    env.insert(name.into(), v.clone());
+                }
+            }
             let mut vars = services.vars.clone();
             for (k, t) in &p.fixtures {
                 if let Ok(v) = config::expand(t, &services.vars) {
@@ -541,7 +563,7 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&rundir).unwrap();
         let c = p.check(id).unwrap();
         let needed: BTreeSet<String> = c.needs.iter().cloned().collect();
-        let s = up(p, &needed, "philium-t", &work, &rundir, &h).await;
+        let s = up(p, &needed, "philium-t", &work, &rundir, &h, &HashMap::new()).await;
         let o = run_check(p, c, &work, &rundir, &s, &h).await;
         s.down().await;
         o
