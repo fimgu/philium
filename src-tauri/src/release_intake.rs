@@ -508,6 +508,9 @@ pub async fn call(ctx: &Ctx, method: &str, a: Value) -> Result<Value, String> {
         let nested:Vec<String>=m["edges"].as_array().into_iter().flatten().map(|e|format!("#{} contains #{}",e["outer"],e["inner"])).collect();
         if !nested.is_empty(){facts.push(format!("Nested: {}.",nested.join(", ")));}
     }
+    // The agents start on the pull request's head: bring it into the checkout read-only if it
+    // is not there yet (objects and refs/philium/pr/<n> only; no branch or working file changes).
+    crate::pipeline::app::ensure_commits(Path::new(r[0]["path"].as_str().ok_or("Checkout unavailable")?),&o,pr,&[head,base]).await.map_err(|e|format!("The agents start on #{pr}'s head, which this checkout does not have and Philium could not fetch: {e}"))?;
     let merge=mergeable(Path::new(r[0]["path"].as_str().ok_or("Checkout unavailable")?),base,head).await;
     match merge["state"].as_str(){
         Some("conflicts")=>facts.push(format!("It does not merge onto the target as it is now: conflicts in {}.",merge["files"].as_array().into_iter().flatten().filter_map(Value::as_str).collect::<Vec<_>>().join(", "))),

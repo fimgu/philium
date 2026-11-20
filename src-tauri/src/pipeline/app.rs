@@ -104,26 +104,39 @@ async fn mirror(checkout: &Path, origin: &str, pr: i64, shas: &[&str]) -> Result
         // Pick up what the checkout fetched since; its own refs are only read.
         let _ = git(&m, &["fetch", "--quiet", "--no-tags", &checkout.display().to_string(), "+refs/heads/*:refs/heads/*", "+refs/remotes/origin/*:refs/remotes/origin/*"], &[]);
     }
-    let missing: Vec<&str> = shas.iter().copied().filter(|s| !has(&m, s)).collect();
-    if !missing.is_empty() {
-        let mut env = vec![];
-        if let Some(token) = crate::release_intake::origin_bearer(origin).await {
-            use base64::Engine;
-            let basic = base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}"));
-            env = vec![("GIT_CONFIG_COUNT", "1".to_string()), ("GIT_CONFIG_KEY_0", "http.extraHeader".to_string()), ("GIT_CONFIG_VALUE_0", format!("Authorization: Basic {basic}"))];
-        }
-        let url = format!("https://github.com/{origin}.git");
-        let mut args: Vec<String> = vec!["fetch".into(), "--quiet".into(), "--no-tags".into(), url, format!("+refs/pull/{pr}/head:refs/philium/pr/{pr}")];
-        args.extend(missing.iter().map(|s| s.to_string()));
-        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        git(&m, &refs, &env.iter().map(|(k, v)| (*k, v.clone())).collect::<Vec<_>>()).map_err(|e| format!("could not fetch the pull request from GitHub: {e}"))?;
+    ensure_commits(&m, origin, pr, shas).await?;
+    Ok(m)
+}
+
+/// Make a pull request's commits present in `dir`, fetching them read-only from
+/// GitHub with Review's own access when they are missing. Only objects and one
+/// ref under `refs/philium/pr/` are added: no branch, HEAD or working file changes.
+pub async fn ensure_commits(dir: &Path, origin: &str, pr: i64, shas: &[&str]) -> Result<(), String> {
+    let missing: Vec<&str> = shas.iter().copied().filter(|s| !has(dir, s)).collect();
+    if missing.is_empty() {
+        return Ok(());
     }
+    let mut env = vec![];
+    if let Some(token) = crate::release_intake::origin_bearer(origin).await {
+        use base64::Engine;
+        let basic = base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}"));
+        env = vec![("GIT_CONFIG_COUNT", "1".to_string()), ("GIT_CONFIG_KEY_0", "http.extraHeader".to_string()), ("GIT_CONFIG_VALUE_0", format!("Authorization: Basic {basic}"))];
+    }
+    let url = format!("https://github.com/{origin}.git");
+    let mut args: Vec<String> = vec!["fetch".into(), "--quiet".into(), "--no-tags".into(), url, format!("+refs/pull/{pr}/head:refs/philium/pr/{pr}")];
+    args.extend(missing.iter().map(|s| s.to_string()));
+    let dir2 = dir.to_path_buf();
+    let env2: Vec<(&'static str, String)> = env;
+    tokio::task::spawn_blocking(move || git(&dir2, &args.iter().map(String::as_str).collect::<Vec<_>>(), &env2))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("could not fetch #{pr} from GitHub: {e}"))?;
     for s in shas {
-        if !has(&m, s) {
+        if !has(dir, s) {
             return Err(format!("{} is not on GitHub or not readable with this account", &s[..12]));
         }
     }
-    Ok(m)
+    Ok(())
 }
 
 fn checkout_and_origin(ctx: &Ctx, repo_id: &str) -> Result<(PathBuf, String), String> {

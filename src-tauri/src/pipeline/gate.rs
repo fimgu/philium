@@ -35,7 +35,7 @@ pub fn changed_files(repo: &Path, base: &str, candidate: &str) -> Result<Vec<Str
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn side(p: &Pipeline, checks: &[&super::config::Check], repo: &Path, sha: &str, base: &str, changed: &[String], gate_dir: &Path, overlay: Option<(&str, &[String])>, host: &Host, say: &(dyn Fn(String) + Sync)) -> Result<Vec<(String, runner::Outcome)>, String> {
+pub(crate) async fn side(p: &Pipeline, checks: &[&super::config::Check], repo: &Path, sha: &str, base: &str, changed: &[String], gate_dir: &Path, overlay: Option<(&str, &[String])>, host: &Host, say: &(dyn Fn(String) + Sync), each: Option<&(dyn Fn(&str, &runner::Outcome) + Sync)>) -> Result<Vec<(String, runner::Outcome)>, String> {
     let label = label();
     let root = host.scratch.join(&label);
     let work = root.join("src");
@@ -67,6 +67,9 @@ pub(crate) async fn side(p: &Pipeline, checks: &[&super::config::Check], repo: &
                 _ => runner::run_check(p, c, &work, &rundir, &services, host).await,
             };
             say(format!("{} on {}: {}{}", c.id, &sha[..12], o.status.as_str(), o.reason.as_deref().map(|r| format!(" ({r})")).unwrap_or_default()));
+            if let Some(f) = each {
+                f(&c.id, &o);
+            }
             out.push((c.id.clone(), o));
         }
         services.down().await;
@@ -101,17 +104,26 @@ pub async fn run_tier(db: &Db, t: &Target<'_>, g: &Gate, tier: Tier, host: &Host
 #[allow(clippy::too_many_arguments)]
 async fn sides(db: &Db, t: &Target<'_>, p: &Pipeline, checks: &[&super::config::Check], run: &str, config_from: &str, gate_dir: &Path, host: &Host, say: &(dyn Fn(String) + Sync)) -> Result<(), String> {
     let changed = changed_files(t.path, t.base, t.candidate)?;
-    let first = side(p, checks, t.path, t.candidate, t.base, &changed, gate_dir, None, host, say).await?;
+    let live = |s: Side, sha: &str| {
+        let sha = sha.to_string();
+        move |id: &str, o: &runner::Outcome| {
+            let _ = records::record(db, run, id, s, &sha, o.status, o.reason.as_deref(), o.exit_code, Some(o.duration_ms), &o.output);
+        }
+    };
+    let on_candidate = live(Side::Candidate, t.candidate);
+    let first = side(p, checks, t.path, t.candidate, t.base, &changed, gate_dir, None, host, say, Some(&on_candidate)).await?;
     store(db, run, Side::Candidate, t.candidate, &first)?;
     // A failure is run again on the same SHA: passing the second time is a flake, not a pass.
     let failed: Vec<&super::config::Check> = checks.iter().copied().filter(|c| first.iter().any(|(id, o)| id == &c.id && o.status.failed())).collect();
     if !failed.is_empty() {
-        let again = side(p, &failed, t.path, t.candidate, t.base, &changed, gate_dir, None, host, say).await?;
+        let on_rerun = live(Side::Rerun, t.candidate);
+        let again = side(p, &failed, t.path, t.candidate, t.base, &changed, gate_dir, None, host, say, Some(&on_rerun)).await?;
         store(db, run, Side::Rerun, t.candidate, &again)?;
         // What failed twice runs on the base, same fixtures, to compute its origin.
         let twice: Vec<&super::config::Check> = failed.iter().copied().filter(|c| again.iter().any(|(id, o)| id == &c.id && o.status.failed())).collect();
         if !twice.is_empty() {
-            let base = side(p, &twice, t.path, t.base, t.base, &changed, gate_dir, None, host, say).await?;
+            let on_base = live(Side::Base, t.base);
+            let base = side(p, &twice, t.path, t.base, t.base, &changed, gate_dir, None, host, say, Some(&on_base)).await?;
             store(db, run, Side::Base, t.base, &base)?;
         }
     }
@@ -119,7 +131,7 @@ async fn sides(db: &Db, t: &Target<'_>, p: &Pipeline, checks: &[&super::config::
     if let Some(pr) = t.pr {
         for e in records::escapes_fixed_by(db, t.key, pr) {
             if let Some(c) = e.check_id.as_deref().and_then(|id| p.check(id)) {
-                let outs = side(p, &[c], t.path, &e.buggy_sha, t.base, &changed, gate_dir, None, host, say).await?;
+                let outs = side(p, &[c], t.path, &e.buggy_sha, t.base, &changed, gate_dir, None, host, say, None).await?;
                 if let Some((_, o)) = outs.first() {
                     super::replay::remember(db, t.key, config_from, &e.id, &e.buggy_sha, None, &c.id, o.status, None, o.status.failed())?;
                 }

@@ -165,7 +165,7 @@ pub struct Report {
 async fn one(p: &Pipeline, repo: &Path, sha: &str, base: &str, changed: &[String], check: &str, gate_dir: &Path, overlay: Option<&Overlay>, host: &Host) -> Result<runner::Outcome, String> {
     let c = p.check(check).ok_or_else(|| format!("no check {check}"))?;
     let ov = overlay.map(|o| (o.from.as_str(), o.paths.as_slice()));
-    let mut outs = super::gate::side(p, &[c], repo, sha, base, changed, gate_dir, ov, host, &|_| {}).await?;
+    let mut outs = super::gate::side(p, &[c], repo, sha, base, changed, gate_dir, ov, host, &|_| {}, None).await?;
     Ok(outs.pop().map(|x| x.1).ok_or("no result")?)
 }
 

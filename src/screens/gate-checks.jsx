@@ -33,13 +33,24 @@ export function GateChecks(props) {
       setError(String(e));
     }
   }
+  // Follow a run live, whoever started it: each finished check shows up as it lands.
+  const [live, setLive] = createSignal(false);
+  let lastFetch = 0;
   useEvent('pipeline:progress', e => {
     const d = e?.payload ?? e;
-    if (d?.repo_id === props.repo) setLines(l => [...l.slice(-40), d.line]);
+    if (d?.repo_id !== props.repo) return;
+    setLive(true);
+    setLines(l => [...l.slice(-40), d.line]);
+    if (Date.now() - lastFetch > 2000) {
+      lastFetch = Date.now();
+      refetch();
+    }
   });
   useEvent('pipeline:done', e => {
     const d = e?.payload ?? e;
-    if (d?.repo_id === props.repo) refetch();
+    if (d?.repo_id !== props.repo) return;
+    setLive(false);
+    refetch();
   });
   async function run() {
     setError('');
@@ -52,7 +63,7 @@ export function GateChecks(props) {
     }
   }
   const outcomeOf = (v, id) => (v?.verdict?.outcomes || []).find(o => o[0] === id)?.[1]?.outcome || 'pending';
-  const running = () => res()?.running;
+  const running = () => res()?.running || live();
   return (
     <Show when={props.generation}>
       <section aria-label="Checks on this pull request" class={`decision ${({ pass: 'ok', fail: 'bad' })[res()?.verdict?.state] || 'unknown'}`}>
