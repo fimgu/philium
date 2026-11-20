@@ -415,6 +415,20 @@ impl Pipeline {
     }
 }
 
+fn copy_dir(from: &Path, to: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(to).map_err(|e| format!("{}: {e}", to.display()))?;
+    for e in std::fs::read_dir(from).map_err(|e| format!("{}: {e}", from.display()))? {
+        let e = e.map_err(|e| e.to_string())?;
+        let t = e.file_type().map_err(|e| e.to_string())?;
+        if t.is_dir() {
+            copy_dir(&e.path(), &to.join(e.file_name()))?;
+        } else if t.is_file() {
+            std::fs::copy(e.path(), to.join(e.file_name())).map_err(|x| format!("{}: {x}", e.path().display()))?;
+        }
+    }
+    Ok(())
+}
+
 fn relative(p: &str, what: &str) -> Result<(), String> {
     if p.is_empty() || p.starts_with('/') || p.starts_with('~') || p.split('/').any(|s| s == "..") {
         return Err(format!("{FILE}: {what} must be a path inside the repo"));
@@ -551,7 +565,12 @@ impl Gate {
     /// A read-only copy of the gate's `.philium/` folder under `dest`.
     pub fn materialize(&self, dest: &Path) -> Result<std::path::PathBuf, String> {
         match &self.source {
-            GateSource::Folder(f) => Ok(f.clone()),
+            // A snapshot, so the run sees one fixed gate and the sandbox can reach it.
+            GateSource::Folder(f) => {
+                let to = dest.join(".philium");
+                copy_dir(f, &to)?;
+                Ok(to)
+            }
             GateSource::Commit { repo, sha } => {
                 std::fs::create_dir_all(dest).map_err(|e| e.to_string())?;
                 let archive = std::process::Command::new("git").arg("-C").arg(repo).args(["archive", "--format=tar", sha, ".philium"]).output().map_err(|e| format!("git: {e}"))?;

@@ -188,7 +188,7 @@ pub(crate) mod tests {
         let p = pipeline(&shared);
         let db = crate::pipeline::records::tests::db();
         let t = Target { key: "r", path: &r, pr: Some(7), head: &head, base: &base, candidate: &head };
-        let g = Gate { pipeline: p, from: "test.yaml".into(), pinned: false, source: crate::pipeline::config::GateSource::Folder(root.clone()) };
+        let g = Gate { pipeline: p, from: "test.yaml".into(), pinned: false, source: crate::pipeline::config::GateSource::Folder({ let f = root.join("gatefolder"); std::fs::create_dir_all(&f).unwrap(); f }) };
         let (_, v) = run_tier(&db, &t, &g, Tier::Fast, &h, &|_| {}).await.unwrap();
         assert!(!v.pinned && report(&v).contains("unpinned config"));
         let o: std::collections::HashMap<_, _> = v.outcomes.iter().cloned().collect();
