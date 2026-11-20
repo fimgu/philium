@@ -33,11 +33,6 @@ struct RunState {
     error: Option<String>,
 }
 
-/// Whether a check run is in progress in this app.
-pub fn running() -> bool {
-    runs().lock().map(|m| m.values().any(|r| r.running)).unwrap_or(true)
-}
-
 fn runs() -> &'static Mutex<HashMap<String, RunState>> {
     static R: OnceLock<Mutex<HashMap<String, RunState>>> = OnceLock::new();
     R.get_or_init(Default::default)

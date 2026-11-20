@@ -186,10 +186,37 @@ fn alive(pid: i32) -> bool {
 fn remove(p: &Path, freed: &mut u64) -> Result<(), String> {
     let mut left = WALK_LIMIT;
     let n = size(p, &mut left);
-    let r = if std::fs::symlink_metadata(p).map(|m| m.is_dir()).unwrap_or(false) { std::fs::remove_dir_all(p) } else { std::fs::remove_file(p) };
-    r.map_err(|e| format!("{}: {e}", p.display()))?;
+    let dir = std::fs::symlink_metadata(p).map(|m| m.is_dir()).unwrap_or(false);
+    let r = if dir { std::fs::remove_dir_all(p) } else { std::fs::remove_file(p) };
+    if let Err(e) = r {
+        // Go's module cache and some test fixtures make their folders read-only. They are
+        // still ours to remove: make the folders writable, then try once more.
+        if !(dir && e.kind() == std::io::ErrorKind::PermissionDenied) {
+            return Err(format!("{}: {e}", p.display()));
+        }
+        writable(p);
+        std::fs::remove_dir_all(p).map_err(|e| format!("{}: {e}", p.display()))?;
+    }
     *freed += n;
     Ok(())
+}
+
+/// Give the owner write access to every folder under `p` (never following links).
+fn writable(p: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(md) = std::fs::symlink_metadata(p) else { return };
+        if !md.is_dir() {
+            return;
+        }
+        let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(md.permissions().mode() | 0o700));
+        if let Ok(rd) = std::fs::read_dir(p) {
+            for e in rd.flatten() {
+                writable(&e.path());
+            }
+        }
+    }
 }
 
 /// Folders of check runs whose process is gone: `<pid>` from the command line,
@@ -274,9 +301,14 @@ fn go_caches(root: &Path, depth: u8, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Go marks a cache entry as used at most once an hour, so an entry touched in the last
+/// two hours may belong to a build running right now: those are never removed.
+const RECENT: std::time::Duration = std::time::Duration::from_secs(2 * 3600);
+
 /// Hold Philium's Go build caches to the budget, oldest files first, down to 80% of it.
-/// Go treats a missing entry as a miss and rebuilds it, so this is safe while nothing
-/// builds; callers make sure of that.
+/// Go treats a missing entry as a miss and rebuilds it. Entries used in the last two
+/// hours are left alone, so a build running elsewhere (another app, the command line)
+/// never loses a file it is reading.
 fn trim_go_caches(roots: &[PathBuf], budget: u64, freed: &mut u64, steps: &mut Vec<String>) {
     let mut caches = vec![];
     for r in roots {
@@ -301,9 +333,10 @@ fn trim_go_caches(roots: &[PathBuf], budget: u64, freed: &mut u64, steps: &mut V
     }
     files.sort_by_key(|f| f.0);
     let goal = budget / 10 * 8;
+    let recent = std::time::SystemTime::now() - RECENT;
     let (mut now, mut n) = (total, 0u64);
-    for (_, bytes, path) in files {
-        if now <= goal {
+    for (at, bytes, path) in files {
+        if now <= goal || at > recent {
             break;
         }
         if std::fs::remove_file(&path).is_ok() {
@@ -325,12 +358,6 @@ fn cache_roots(ctx: &Ctx) -> Vec<PathBuf> {
     v
 }
 
-/// Anything building right now: an agent at work or a check run in progress.
-fn building(ctx: &Ctx) -> bool {
-    let working = ctx.db.query("SELECT id FROM agents WHERE state IN ('provisioning','running','waiting') LIMIT 1", []).map(|r| !r.is_empty()).unwrap_or(true);
-    working || crate::pipeline::app::running()
-}
-
 /// Apply every rule. `daily` limits the cache trim to once a day (at start).
 pub fn clean(ctx: &Ctx, daily: bool) -> Value {
     let (mut freed, mut steps) = (0u64, vec![]);
@@ -339,8 +366,6 @@ pub fn clean(ctx: &Ctx, daily: bool) -> Value {
     let last_trim = ctx.db.kv_get("storage.trimmed_at").and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
     if daily && crate::db::now() - last_trim < DAY_MS {
         // Trimmed today already.
-    } else if building(ctx) {
-        steps.push("Build caches were left as they are: something is building. They are trimmed when nothing is.".into());
     } else {
         trim_go_caches(&cache_roots(ctx), budget(ctx) << 30, &mut freed, &mut steps);
         let _ = ctx.db.kv_set("storage.trimmed_at", &crate::db::now().to_string());
@@ -352,10 +377,15 @@ pub fn clean(ctx: &Ctx, daily: bool) -> Value {
 }
 
 pub fn init(ctx: &Arc<Ctx>) -> Result<(), String> {
-    let out = clean(ctx, true);
-    if out["freed"].as_u64().unwrap_or(0) > 0 || out["steps"].as_array().is_some_and(|s| !s.is_empty()) {
-        ctx.log_event("storage_cleaned", None, &out);
-    }
+    // In the background: removing a hundred gigabytes of old cache takes minutes, and the
+    // window must not wait for it. Nothing it removes can be in use (see `RECENT`).
+    let c = ctx.clone();
+    std::thread::spawn(move || {
+        let out = clean(&c, true);
+        if out["freed"].as_u64().unwrap_or(0) > 0 || out["steps"].as_array().is_some_and(|s| !s.is_empty()) {
+            c.log_event("storage_cleaned", None, &out);
+        }
+    });
     Ok(())
 }
 
@@ -429,6 +459,12 @@ mod tests {
         }
         let agents = ctx.data_dir.join("agents");
         write(&agents.join("stopper/tmp/fakehome/big"), 50_000);
+        // A read-only folder, as Go's module cache leaves them.
+        write(&agents.join("stopper/tmp/gomod/pkg/x.go"), 10);
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(agents.join("stopper/tmp/gomod/pkg"), std::fs::Permissions::from_mode(0o555)).unwrap();
+        }
         write(&agents.join("stopper/scratch/keep"), 10);
         write(&agents.join("worker/tmp/in-use"), 10);
         write(&agents.join("long-gone/tmp/x"), 10);
@@ -460,11 +496,11 @@ mod tests {
         write(&npm, 3 << 20);
         set_mtime(&npm, 86_400 * 30);
         let (mut freed, mut steps) = (0, vec![]);
-        // A budget of 6 MB: down to 80% of it, so the oldest files go first.
+        // A budget of 6 MB: down to 80% of it, oldest first, but never an entry used in the
+        // last two hours, which a build running right now may be reading.
         trim_go_caches(&[root.clone()], 6 << 20, &mut freed, &mut steps);
         let left: Vec<usize> = (0..10).filter(|i| go.join(format!("{:02x}/entry{i}-d", i)).exists()).collect();
-        assert!(left.iter().all(|i| *i >= 4), "oldest first: {left:?}");
-        assert!(left.len() <= 4 && left.len() >= 3, "{left:?}");
+        assert_eq!(left, vec![5, 6, 7, 8, 9], "the old ones go, the recent ones stay");
         assert!(go.join("README").exists(), "Go's own marker stays");
         assert!(npm.exists(), "a cache that is not Go's is never trimmed");
         assert!(steps[0].contains("budget"), "{steps:?}");

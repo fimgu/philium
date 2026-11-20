@@ -481,6 +481,7 @@ fn flush(ctx: &Ctx, scope: &str, batch: &mut Vec<(String, String, Parsed)>) -> R
         c.execute_batch("COMMIT")
     })?;
     batch.clear();
+    breathe();
     Ok(())
 }
 
@@ -669,11 +670,19 @@ pub fn ensure_delta(ctx: &Ctx, repo_id: &str, base: &str, wt_id: &str, wt: &Path
         }
     }
     let stale: Vec<String> = existing.keys().filter(|p| !set.contains(p)).cloned().collect();
+    // In steps, so screens and agents get the database between them while a big delta is written.
+    for chunk in batch.chunks(100) {
+        ctx.db.with(|c| {
+            c.execute_batch("BEGIN")?;
+            for (p, st, parsed) in chunk {
+                store_file(c, &scope, p, st, Some(parsed))?;
+            }
+            c.execute_batch("COMMIT")
+        })?;
+        breathe();
+    }
     ctx.db.with(|c| {
         c.execute_batch("BEGIN")?;
-        for (p, st, parsed) in &batch {
-            store_file(c, &scope, p, st, Some(parsed))?;
-        }
         for p in &gone {
             store_file(c, &scope, p, "deleted", None)?;
         }
@@ -1504,9 +1513,23 @@ fn target_for_repo(ctx: &Ctx, repo_id: &str, wt: Option<Wt>) -> Result<Target, S
     Ok(Target {
         repo_id: repo_id.into(),
         repo_path: PathBuf::from(r["path"].as_str().unwrap_or("")),
-        branch: r["default_branch"].as_str().unwrap_or("main").into(),
+        branch: work_base(ctx, repo_id).unwrap_or_else(|| r["default_branch"].as_str().unwrap_or("main").into()),
         wt,
     })
+}
+
+/// The commit most of this repo's working agents started from, when agents are at work.
+/// The index is built on it, so each agent's own part is what it changed: a review that
+/// starts on a pull request far from the default branch does not index thousands of files.
+fn work_base(ctx: &Ctx, repo_id: &str) -> Option<String> {
+    ctx.db
+        .query(
+            "SELECT base_commit, count(*) AS n, max(created_at) AS latest FROM worktrees WHERE repo_id=?1 AND state='active' AND agent_id IS NOT NULL AND length(base_commit)=40 GROUP BY base_commit ORDER BY n DESC, latest DESC LIMIT 1",
+            [repo_id],
+        )
+        .ok()?
+        .first()
+        .and_then(|r| r["base_commit"].as_str().map(str::to_string))
 }
 
 pub fn resolve(ctx: &Ctx, args: &Value) -> Result<Target, String> {
@@ -2647,6 +2670,20 @@ mod tests {
         let w = |id: &str| WtChange { label: id.into(), wt_id: id.into(), files: ["same.rs".to_string()].into_iter().collect(), syms: Default::default(), used: Default::default() };
         assert!(clashes_from(&[w("ext:r:a"), w("local:r")]).is_empty());
         assert_eq!(clashes_from(&[w("ext:r:a"), w("agent1")]).len(), 1);
+    }
+
+    #[test]
+    fn the_index_is_built_where_the_agents_started() {
+        let ctx = fresh_ctx();
+        ctx.db.exec("INSERT INTO repos(id,name,path,added_at,default_branch) VALUES('r','r','/r',0,'release/v0.9.0')", []).unwrap();
+        let (c, d) = ("c".repeat(40), "d".repeat(40));
+        for (i, base) in [(1, &c), (2, &c), (3, &d)] {
+            ctx.db.exec("INSERT INTO agents(id,name,model_ref,state,created_at,last_active_at) VALUES(?1,?1,'m','running',0,0)", [format!("a{i}")]).unwrap();
+            ctx.db.exec("INSERT INTO worktrees(id,repo_id,agent_id,path,branch,base_commit,state,created_at) VALUES(?1,'r',?2,?3,'b',?4,'active',?5)", rusqlite::params![format!("w{i}"), format!("a{i}"), format!("/r/w{i}"), base, i]).unwrap();
+        }
+        assert_eq!(target_for_repo(&ctx, "r", None).unwrap().branch, c, "where most agents started");
+        ctx.db.exec("UPDATE worktrees SET state='removed'", []).unwrap();
+        assert_eq!(target_for_repo(&ctx, "r", None).unwrap().branch, "release/v0.9.0", "with no agent at work, the checkout's own branch");
     }
 
     #[test]
