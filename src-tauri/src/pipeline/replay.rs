@@ -50,6 +50,10 @@ pub struct Bug {
     /// regression tests the fix added (the Defects4J way to replay a bug).
     #[serde(default)]
     pub overlay: Option<Overlay>,
+    /// Text the failure on the buggy commit must show (a file, a test name),
+    /// so a check failing for another reason is never counted as a catch.
+    #[serde(default)]
+    pub expect: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -190,8 +194,23 @@ pub async fn run(db: &Db, repo_key: &str, repo: &Path, p: &Pipeline, set: &Repla
                 Some(one(p, repo, &base, &before, &b.check, gate_dir, b.overlay.as_ref(), host).await?)
             }
         };
-        let caught = remember(db, repo_key, digest, &b.id, &b.buggy, b.fixed.as_deref(), &b.check, on_bug.status, on_fix.as_ref().map(|o| o.status))?;
-        let reason = if on_bug.status == Status::NotRun {
+        // With an expected text, the bug's own signature decides: it shows on the buggy
+        // commit, and not on the control. Without one, the control must pass.
+        let shows = |o: &runner::Outcome, t: &str| o.output.contains(t);
+        let control_status = match (&b.expect, on_fix.as_ref()) {
+            (Some(t), Some(c)) if b.fixed.is_none() && !shows(c, t) && on_bug.status.failed() && shows(&on_bug, t) => Some(Status::Pass),
+            _ => on_fix.as_ref().map(|o| o.status),
+        };
+        let bug_status = match &b.expect {
+            Some(t) if on_bug.status.failed() && !shows(&on_bug, t) => Status::Pass,
+            _ => on_bug.status,
+        };
+        let caught = remember(db, repo_key, digest, &b.id, &b.buggy, b.fixed.as_deref(), &b.check, bug_status, control_status)?;
+        let reason = if on_bug.status.failed() && bug_status == Status::Pass {
+            Some(format!("failed on the buggy commit, but not with \"{}\": it failed for another reason", b.expect.as_deref().unwrap_or("")))
+        } else if caught {
+            None
+        } else if on_bug.status == Status::NotRun {
             Some(format!("did not run on the buggy commit: {}", on_bug.reason.clone().unwrap_or_default()))
         } else if !on_bug.status.failed() {
             Some("passed on the buggy commit: the gate misses this bug".into())
@@ -272,6 +291,15 @@ mod tests {
         );
         let set = ReplaySet::parse(&text, &p).unwrap();
         let rep = run(&db, "r", &r, &p, &set, "o1", &gate, &h, &|_| {}).await.unwrap();
+        // No fix known: the bug's own text must show on the buggy commit and not before it.
+        let sig = format!(
+            "version: 1\nbugs:\n  - {{ id: right-reason, buggy: {bug}, check: gate-script, expect: value, text: t }}\n  - {{ id: wrong-reason, buggy: {bug}, check: gate-script, expect: something-else, text: t }}\n"
+        );
+        std::fs::write(gate.join("checks/value.sh"), "[ \"$(cat value)\" = 2 ] || { echo 'bad value'; exit 1; }\n").unwrap();
+        let rs = run(&db, "r", &r, &p, &ReplaySet::parse(&sig, &p).unwrap(), "o2", &gate, &h, &|_| {}).await.unwrap();
+        let got: Vec<(&str, bool)> = rs.bugs.iter().map(|b| (b.id.as_str(), b.caught)).collect();
+        assert_eq!(got, vec![("right-reason", true), ("wrong-reason", false)], "{:?}", rs.bugs);
+        assert!(rs.bugs[1].reason.as_deref().unwrap().contains("for another reason"));
         let caught: Vec<(&str, bool)> = rep.bugs.iter().map(|b| (b.id.as_str(), b.caught)).collect();
         assert_eq!(caught, vec![("as-shipped", false), ("with-fix-tests", true), ("gate-owned", true)], "{:?}", rep.bugs);
         std::fs::remove_dir_all(&root).ok();
