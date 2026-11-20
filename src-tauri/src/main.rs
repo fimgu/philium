@@ -41,6 +41,7 @@ mod hal;
 mod library;
 mod mcp;
 mod oauth;
+mod pipeline;
 mod providers;
 mod reaper;
 mod sandbox;
@@ -309,6 +310,10 @@ fn philium_root() -> std::path::PathBuf {
 }
 
 fn main() {
+    // `philium run|replay|simulate|land|enroll`: the pipeline, without the window.
+    if let Some(code) = pipeline::cli::dispatch() {
+        std::process::exit(code);
+    }
     if std::env::args().nth(1).as_deref()==Some("--observe-sql-contract") {std::process::exit(if release_sql::worker().is_some(){0}else{2});}
     let mut config = tauri::generate_context!();
     let first_arg=std::env::args().nth(1);
