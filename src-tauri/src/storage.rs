@@ -489,3 +489,18 @@ mod tests {
         std::fs::remove_dir_all(ctx.data_dir.parent().unwrap()).ok();
     }
 }
+
+/// Trim a copy of a real Go build cache to see how long it takes:
+/// `PHILIUM_TRIM_COPY=/path/to/copy cargo test trim_a_copy -- --ignored --nocapture`.
+#[cfg(test)]
+mod trim_copy {
+    #[test]
+    #[ignore]
+    fn trim_a_copy() {
+        let Some(p) = std::env::var_os("PHILIUM_TRIM_COPY").map(std::path::PathBuf::from) else { return };
+        let t = std::time::Instant::now();
+        let (mut freed, mut steps) = (0, vec![]);
+        super::trim_go_caches(&[p], super::DEFAULT_BUDGET_GB << 30, &mut freed, &mut steps);
+        println!("trim: {steps:?}, freed {} in {:.1} s", super::gb(freed), t.elapsed().as_secs_f64());
+    }
+}

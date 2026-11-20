@@ -428,11 +428,13 @@ CREATE INDEX IF NOT EXISTS ci_refs_scope_path ON ci_refs(scope,path);
 
 pub fn init(ctx: &Arc<Ctx>) -> Result<(), String> {
     ctx.db.with(|c| c.execute_batch(SCHEMA))?;
-    match tidy(ctx) {
-        Ok(Some(said)) => ctx.log_event("database_tidied", None, &json!({ "text": said })),
+    // In the background: a database grown by an earlier version takes a minute or two.
+    let t = ctx.clone();
+    std::thread::spawn(move || match tidy(&t) {
+        Ok(Some(said)) => t.log_event("database_tidied", None, &json!({ "text": said })),
         Ok(None) => {}
-        Err(e) => ctx.log_event("init_error", None, &json!({ "module": "codeindex tidy", "error": e })),
-    }
+        Err(e) => t.log_event("init_error", None, &json!({ "module": "codeindex tidy", "error": e })),
+    });
     let c = ctx.clone();
     std::thread::spawn(move || watcher(c));
     Ok(())
@@ -1716,33 +1718,44 @@ fn publish(ctx: &Ctx, cl: &[Clash]) {
 pub fn tidy(ctx: &Ctx) -> Result<Option<String>, String> {
     let size = |c: &Connection| -> rusqlite::Result<i64> { c.query_row("SELECT (SELECT page_count FROM pragma_page_count())*(SELECT page_size FROM pragma_page_size())", [], |r| r.get(0)) };
     let before = ctx.db.with(|c| size(c))?;
-    ctx.db.with(|c| {
-        let files: i64 = c.query_row("SELECT count(*) FROM ci_files", [], |r| r.get(0))?;
-        if files > TIDY_MAX_FILES {
-            c.execute_batch("DROP TABLE IF EXISTS ci_refs; DROP TABLE IF EXISTS ci_syms; DROP TABLE IF EXISTS ci_files; DROP TABLE IF EXISTS ci_wt; DROP TABLE IF EXISTS ci_snap;")?;
-            c.execute_batch(SCHEMA)?;
-        } else {
-            // Kept: each repo's base snapshot, and the worktrees Philium still runs.
-            let keep = "scope LIKE 'b:%' OR scope IN (SELECT 'w:'||id FROM worktrees WHERE state='active')";
-            for t in ["ci_refs", "ci_syms", "ci_files"] {
-                c.execute(&format!("DELETE FROM {t} WHERE NOT ({keep})"), [])?;
-            }
-            c.execute("DELETE FROM ci_wt WHERE wt_id NOT IN (SELECT id FROM worktrees WHERE state='active')", [])?;
+    // Small steps, each its own statement, so the app stays usable while a large
+    // database is tidied in the background.
+    // No index is built while its rows are removed, or a build could lose rows to this.
+    let index = index_lock().lk();
+    let files: i64 = ctx.db.with(|c| c.query_row("SELECT count(*) FROM ci_files", [], |r| r.get(0)))?;
+    let all = files > TIDY_MAX_FILES;
+    // Kept, unless the whole index goes: each repo's base snapshot, and the worktrees Philium still runs.
+    let gone = if all { "1".to_string() } else { "NOT (scope LIKE 'b:%' OR scope IN (SELECT 'w:'||id FROM worktrees WHERE state='active'))".to_string() };
+    for t in ["ci_refs", "ci_syms", "ci_files"] {
+        while ctx.db.with(|c| c.execute(&format!("DELETE FROM {t} WHERE rowid IN (SELECT rowid FROM {t} WHERE {gone} LIMIT {TIDY_STEP})"), []))? > 0 {
+            breathe();
         }
-        Ok(())
-    })?;
-    let long: Vec<i64> = ctx.db.query("SELECT id FROM events WHERE kind='code_clash' AND length(CAST(body AS BLOB)) > 8192", [])?.iter().filter_map(|r| r["id"].as_i64()).collect();
-    for id in &long {
-        ctx.db.with(|c| {
-            let body: String = c.query_row("SELECT body FROM events WHERE id=?1", [id], |r| r.get(0))?;
-            let mut v: Value = serde_json::from_str(&body).unwrap_or_else(|_| json!({}));
-            if let Some(d) = v["detail"].as_array().cloned() {
-                v["detail"] = json!(d.iter().take(CLASH_DETAIL).collect::<Vec<_>>());
-                v["more"] = json!(d.len().saturating_sub(CLASH_DETAIL));
-            }
-            c.execute("UPDATE events SET body=?1 WHERE id=?2", params![v.to_string(), id])?;
-            Ok(())
-        })?;
+    }
+    if all {
+        ctx.db.with(|c| c.execute_batch("DELETE FROM ci_wt; DELETE FROM ci_snap;"))?;
+    } else {
+        ctx.db.exec("DELETE FROM ci_wt WHERE wt_id NOT IN (SELECT id FROM worktrees WHERE state='active')", [])?;
+    }
+    drop(index);
+    let mut after_id = 0i64;
+    loop {
+        let rows = ctx.db.query("SELECT id, length(CAST(body AS BLOB)) AS n FROM events WHERE kind='code_clash' AND id > ?1 ORDER BY id LIMIT 50", [after_id])?;
+        let Some(last) = rows.last().and_then(|r| r["id"].as_i64()) else { break };
+        after_id = last;
+        for id in rows.iter().filter(|r| r["n"].as_i64().unwrap_or(0) > 8192).filter_map(|r| r["id"].as_i64()) {
+            ctx.db.with(|c| {
+                let body: String = c.query_row("SELECT body FROM events WHERE id=?1", [id], |r| r.get(0))?;
+                let mut v: Value = serde_json::from_str(&body).unwrap_or_else(|_| json!({}));
+                if let Some(d) = v["detail"].as_array().cloned() {
+                    v["detail"] = json!(d.iter().take(CLASH_DETAIL).collect::<Vec<_>>());
+                    v["more"] = json!(d.len().saturating_sub(CLASH_DETAIL));
+                }
+                c.execute("UPDATE events SET body=?1 WHERE id=?2", params![v.to_string(), id])?;
+                Ok(())
+            })?;
+            breathe();
+        }
+        breathe();
     }
     let free = ctx.db.with(|c| c.query_row("SELECT (SELECT freelist_count FROM pragma_freelist_count())*(SELECT page_size FROM pragma_page_size())", [], |r| r.get::<_, i64>(0)))?;
     if free < TIDY_MIN_FREED {
@@ -1759,6 +1772,13 @@ pub fn tidy(ctx: &Ctx) -> Result<Option<String>, String> {
 }
 
 const TIDY_MAX_FILES: i64 = 60_000;
+const TIDY_STEP: i64 = 20_000;
+
+/// Let a waiting screen or agent have the database between two steps: the lock is not
+/// fair, so a loop that takes it straight back would keep everyone else waiting.
+fn breathe() {
+    std::thread::sleep(Duration::from_millis(2));
+}
 const TIDY_MIN_FREED: i64 = 256 * 1024 * 1024;
 
 fn gb(bytes: i64) -> String {
@@ -2747,3 +2767,36 @@ mod bench {
 
 #[allow(unused_imports)]
 use crate::ctx::{LockExt, RwExt};
+
+/// Run the start-up tidy on a copy of a real database, to see what it does and how long
+/// it takes: `PHILIUM_TIDY_COPY=/path/to/copy.db cargo test tidy_a_copy -- --ignored --nocapture`.
+#[cfg(test)]
+mod tidy_copy {
+    #[test]
+    #[ignore]
+    fn tidy_a_copy() {
+        let Some(p) = std::env::var_os("PHILIUM_TIDY_COPY").map(std::path::PathBuf::from) else { return };
+        let db = crate::db::Db::open(&p).unwrap();
+        let dir = p.parent().unwrap().to_path_buf();
+        let ctx = crate::ctx::Ctx::new(db, dir.clone(), dir.join("root"), crate::gateway::Gateway::new("t".into(), None), "http://127.0.0.1:9".into());
+        let t = std::time::Instant::now();
+        // How long the app would wait for the database at worst while this runs.
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (c2, d2) = (ctx.clone(), done.clone());
+        let probe = std::thread::spawn(move || {
+            let mut worst = std::time::Duration::ZERO;
+            while !d2.load(std::sync::atomic::Ordering::Relaxed) {
+                let s = std::time::Instant::now();
+                let _ = c2.db.query("SELECT count(*) AS n FROM agents", []);
+                worst = worst.max(s.elapsed());
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            worst
+        });
+        let out = super::tidy(&ctx);
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        println!("tidy: {out:?} in {:.1} s; the longest wait for the database was {:.1} s", t.elapsed().as_secs_f64(), probe.join().unwrap().as_secs_f64());
+        let n = ctx.db.query("SELECT count(*) AS n, max(length(body)) AS m FROM events WHERE kind='code_clash'", []).unwrap();
+        println!("code_clash events: {}", n[0]);
+    }
+}
