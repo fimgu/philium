@@ -26,6 +26,11 @@ struct RunState {
     error: Option<String>,
 }
 
+/// Whether a check run is in progress in this app.
+pub fn running() -> bool {
+    runs().lock().map(|m| m.values().any(|r| r.running)).unwrap_or(true)
+}
+
 fn runs() -> &'static Mutex<HashMap<String, RunState>> {
     static R: OnceLock<Mutex<HashMap<String, RunState>>> = OnceLock::new();
     R.get_or_init(Default::default)
@@ -70,6 +75,7 @@ fn host(ctx: &Ctx, origin: &str) -> runner::Host {
         enrolled: Box::new(move |e| Db::open(&p1).ok().is_some_and(|db| records::enrolled(&db, &o2, e))),
         lent: Box::new(move |l| Db::open(&p2).ok().and_then(|db| records::lent(&db, &o3, l))),
         platform: config::host_platform(),
+        min_free: crate::storage::MIN_FREE_FOR_CHECKS,
     }
 }
 

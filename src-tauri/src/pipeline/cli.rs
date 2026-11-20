@@ -123,6 +123,7 @@ pub fn host(db: &'static Db, repo: &str) -> Result<runner::Host, String> {
             Box::new(move |l| records::lent(db, &r3, l))
         },
         platform: config::host_platform(),
+        min_free: crate::storage::MIN_FREE_FOR_CHECKS,
     })
 }
 

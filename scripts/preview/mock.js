@@ -62,6 +62,18 @@
     'release_intake.coverage': { check_files: 3, prs: [5519, 5523, 5527, 5531, 5536, 5540].map((pr, i) => ({ pr, files: 12 + i * 9, read: i < 2 ? ['docs/github-app-manifest.json'] : [] })), untouched: state === 'ready' ? [] : [5527, 5531, 5536, 5540] },
     'release_intake.members': { landed: [5519, 5523, 5527, 5531, 5536, 5540].map((pr, i) => ({ pr, oid: (i + 3).toString(16).repeat(40) })), edges: [{ outer: 5536, inner: 5527 }], missing: 0, unmapped: 1, ambiguous: 0 },
     'workspace.overview': { resources: [{ kind: 'worktree', handle: '~/Philium Pilot/workspace/worktrees/example-repo/lead-1a2b3c', state: 'live', agent_name: 'lead' }, { kind: 'port_block', handle: '41000-41019', state: 'live', agent_name: 'scribe' }], tasks: [], agents: [] },
+    'reaper.ledger': [], 'reaper.proposals': [],
+    'storage.status': { parts: [
+        ['database', 'Records', 0.21e9, 'Agents, reviews, checks and the code index. Space is given back at start when much of it is free.'],
+        ['worktrees', 'Agent worktrees', 6.78e9, 'One per agent, removed with the agent (Agents, Remove finished).'],
+        ['agents', 'Agent folders', 0.39e9, "Each agent's own folder. Its temp folder is emptied when Philium starts; the folder goes with the agent."],
+        ['check_runs', 'Check runs', 0, "Each run's own copy of the repo, deleted when the run ends."],
+        ['check_caches', 'Check caches', 2.4e9, "Build caches for repo checks. Go's are kept under the budget, oldest files first."],
+        ['mirrors', 'Repo mirrors', 1.1e9, "One copy of each repo's history for checks, fetched as needed."],
+        ['agent_caches', 'Agent build caches', 8.1e9, "Shared by every agent. Go's are kept under the budget, oldest files first."],
+      ].map(([key, label, bytes, rule]) => ({ key, label, bytes, rule, partial: false })),
+      disk: { free: q.get('disk') === 'low' ? 6.2e9 : 145e9, total: 994e9, min_free_for_checks: 10737418240 }, budget_gb: 10,
+      last: { at: now - 3 * 60e3, text: 'Freed 12.9 GB', steps: ['Removed 1 folder left by check runs that ended without cleaning up', 'Emptied the temp folder of 1 stopped agent', 'Trimmed Go build caches from 17.1 GB to 8.0 GB (budget 10.0 GB)'] } },
     'environments.profiles': ['default'],
     'environments.containers': [{ id: 'abc123def4567890', name: 'kind-control-plane', status: 'Up 3 hours', image: 'kindest/node:v1.31.0', cluster: 'dev' }, { id: 'bcd234efa5678901', name: 'pg-test', status: 'Up 3 hours', image: 'postgres:16', project: 'example-repo' }, { id: 'cde345fab6789012', name: 'redis-test', status: 'Exited (0) 2 days ago', image: 'redis:7', project: 'example-repo' }],
   };

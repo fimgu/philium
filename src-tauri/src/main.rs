@@ -51,6 +51,7 @@ mod capture;
 mod selfdev;
 mod pilot;
 mod stats;
+mod storage;
 mod terminals;
 mod workday;
 mod workspace;
@@ -185,6 +186,7 @@ async fn rpc_inner(app: &App, method: String, args: Option<Value>) -> Result<Val
         "codeindex" => codeindex::call(&ctx, m, args).await,
         "sandbox" => sandbox::call(&ctx, m, args).await,
         "stats" => stats::call(&ctx, m, args).await,
+        "storage" => storage::call(&ctx, m, args).await,
         "reaper" => reaper::call(&ctx, m, args).await,
         "library" => library::call(&ctx, m, args).await,
         "selfdev" => selfdev::call(&ctx, m, args).await,
@@ -255,36 +257,16 @@ async fn app_call(app: &App, m: &str, args: Value) -> Result<Value, String> {
             .await
             .map_err(|e| e.to_string())?
         }
-        // Disk used by Philium, by area. Bounded walk so it stays fast.
+        // Disk used by Philium, by area, with the same measure as Settings, Storage.
         "disk" => {
-            let (root, data) = (ctx.root.clone(), ctx.data_dir.clone());
+            let c = ctx.clone();
             tokio::task::spawn_blocking(move || {
-                fn size(p: &std::path::Path, budget: &mut u32) -> u64 {
-                    let Ok(md) = std::fs::symlink_metadata(p) else { return 0 };
-                    if !md.is_dir() {
-                        return md.len();
-                    }
-                    let Ok(rd) = std::fs::read_dir(p) else { return 0 };
-                    let mut n = 0;
-                    for e in rd.flatten() {
-                        if *budget == 0 {
-                            break;
-                        }
-                        *budget -= 1;
-                        n += size(&e.path(), budget);
-                    }
-                    n
-                }
+                let st = storage::status(&c);
                 let mut out = serde_json::Map::new();
-                for (k, p) in [
-                    ("worktrees", root.join("worktrees")),
-                    ("scratch", data.join("agents")),
-                    ("previews", data.join("previews")),
-                    ("data", data.join("philium.db")),
-                    ("logs", data.join("activity.jsonl")),
-                ] {
-                    let mut budget = 200_000;
-                    out.insert(k.into(), json!({ "bytes": size(&p, &mut budget), "partial": budget == 0 }));
+                for p in st["parts"].as_array().cloned().unwrap_or_default() {
+                    if p["bytes"].as_u64().unwrap_or(0) > 0 {
+                        out.insert(p["label"].as_str().unwrap_or("").to_string(), json!({ "bytes": p["bytes"], "partial": p["partial"] }));
+                    }
                 }
                 Ok(Value::Object(out))
             })
@@ -387,7 +369,7 @@ fn main() {
             });
 
             // Module init. Failures are logged, never fatal: the UI shows them.
-            let inits: [(&str, fn(&Arc<Ctx>) -> Result<(), String>); 15] = [
+            let inits: [(&str, fn(&Arc<Ctx>) -> Result<(), String>); 16] = [
                 ("workday", workday::init),
                 ("library", library::init),
                 ("providers", providers::init),
@@ -396,6 +378,8 @@ fn main() {
                 ("terminals", terminals::init),
                 ("workspace", workspace::init),
                 ("agents", agents::init),
+                // After agents: every agent is stopped now, so nothing builds while caches are trimmed.
+                ("storage", storage::init),
                 ("board", board::init),
                 ("browser", browser::init),
                 ("graph", graph::init),

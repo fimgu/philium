@@ -36,6 +36,11 @@ pub fn changed_files(repo: &Path, base: &str, candidate: &str) -> Result<Vec<Str
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn side(p: &Pipeline, checks: &[&super::config::Check], repo: &Path, sha: &str, base: &str, changed: &[String], gate_dir: &Path, overlay: Option<(&str, &[String])>, host: &Host, say: &(dyn Fn(String) + Sync), each: Option<&(dyn Fn(&str, &runner::Outcome) + Sync)>) -> Result<Vec<(String, runner::Outcome)>, String> {
+    if let Some(free) = crate::storage::disk_free(&host.scratch).filter(|f| *f < host.min_free) {
+        let why = format!("only {} free on this Mac; checks start with {} free, so a full disk is never read as a failure", crate::storage::gb(free), crate::storage::gb(host.min_free));
+        say(why.clone());
+        return Ok(checks.iter().map(|c| (c.id.clone(), runner::Outcome { status: super::records::Status::NotRun, reason: Some(why.clone()), exit_code: None, duration_ms: 0, output: String::new() })).collect());
+    }
     let label = label();
     let root = host.scratch.join(&label);
     let work = root.join("src");
@@ -66,6 +71,7 @@ pub(crate) async fn side(p: &Pipeline, checks: &[&super::config::Check], repo: &
                 (Err(e), true) => runner::Outcome { status: super::records::Status::NotRun, reason: Some(e.clone()), exit_code: None, duration_ms: 0, output: String::new() },
                 _ => runner::run_check(p, c, &work, &rundir, &services, host).await,
             };
+            let o = runner::disk_full(o);
             say(format!("{} on {}: {}{}", c.id, &sha[..12], o.status.as_str(), o.reason.as_deref().map(|r| format!(" ({r})")).unwrap_or_default()));
             if let Some(f) = each {
                 f(&c.id, &o);
@@ -205,6 +211,33 @@ pub(crate) mod tests {
             shared.display()
         ))
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_low_disk_or_a_disk_that_fills_up_is_never_a_failure() {
+        let root = tmp("lowdisk");
+        let (r, base) = repo(&root);
+        let head = commit(&r, &["broken-a"], &[]);
+        let p = pipeline(&root.join("shared"));
+        let a = p.check("a").unwrap();
+        let mut h = host(&root);
+        h.min_free = u64::MAX;
+        let gate_dir = root.join("gatefolder");
+        std::fs::create_dir_all(&gate_dir).unwrap();
+        let lines = std::sync::Mutex::new(vec![]);
+        let outs = side(&p, &[a], &r, &head, &base, &[], &gate_dir, None, &h, &|l| lines.lock().unwrap().push(l), None).await.unwrap();
+        assert_eq!(outs[0].1.status, Status::NotRun);
+        assert!(outs[0].1.reason.as_deref().unwrap().contains("free on this Mac"), "{:?}", outs[0].1.reason);
+        assert!(!h.scratch.exists() || std::fs::read_dir(&h.scratch).unwrap().next().is_none(), "nothing was checked out");
+        // With room, the same check fails for real.
+        h.min_free = 0;
+        let outs = side(&p, &[a], &r, &head, &base, &[], &gate_dir, None, &h, &|_| {}, None).await.unwrap();
+        assert_eq!(outs[0].1.status, Status::Fail, "{:?}", outs[0].1.reason);
+        // A check that fails because the disk filled up did not run.
+        let full = runner::Outcome { status: Status::Fail, reason: None, exit_code: Some(1), duration_ms: 5, output: "write /tmp/x: No space left on device\n".into() };
+        let o = runner::disk_full(full);
+        assert_eq!((o.status, o.reason.as_deref()), (Status::NotRun, Some("the disk filled up during this check")));
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[tokio::test]

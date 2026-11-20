@@ -31,6 +31,9 @@ pub struct Host {
     /// A lend's folder on this machine, when a person has lent it.
     pub lent: Box<dyn Fn(&str) -> Option<PathBuf> + Send + Sync>,
     pub platform: String,
+    /// Checks do not start with less free disk than this, so a full disk is never
+    /// read as a failing check.
+    pub min_free: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -450,6 +453,14 @@ fn docker_refusal(exit: Option<i32>, text: &str) -> Option<String> {
 }
 
 /// Run one check in a prepared checkout with its services up.
+/// A check that failed because the disk filled up did not run; it says nothing about the code.
+pub fn disk_full(o: Outcome) -> Outcome {
+    if o.status.failed() && o.output.to_ascii_lowercase().contains("no space left on device") {
+        return Outcome { status: Status::NotRun, reason: Some("the disk filled up during this check".into()), ..o };
+    }
+    o
+}
+
 pub async fn run_check(p: &Pipeline, c: &Check, workdir: &Path, rundir: &Path, services: &Services, host: &Host) -> Outcome {
     let platform = p.platform_for(c, &host.platform);
     if !p.platforms.contains(&platform) {
@@ -623,6 +634,7 @@ pub(crate) mod tests {
             enrolled: Box::new(|e| e == "enrolled"),
             lent: Box::new(|_| None),
             platform: config::host_platform(),
+            min_free: 0,
         }
     }
 

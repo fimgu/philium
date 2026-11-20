@@ -22,6 +22,9 @@ use tauri::Emitter;
 use crate::db::Db;
 use crate::gateway::Gateway;
 
+/// The largest event body kept whole, in bytes.
+pub const EVENT_MAX: usize = 64 * 1024;
+
 pub struct Ctx {
     pub db: Db,
     /// Platform app data dir, e.g. ~/Library/Application Support/dev.gunnarsson.philium
@@ -97,10 +100,22 @@ impl Ctx {
     }
 
     /// Append to the audit/event log shown on Home and in Activity.
+    /// An entry is a record, not a dump: one larger than `EVENT_MAX` keeps its start and size.
     pub fn log_event(&self, kind: &str, agent_id: Option<&str>, body: &Value) {
+        let text = body.to_string();
+        let (text, body) = if text.len() > EVENT_MAX {
+            let mut cut = 4096;
+            while !text.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            let short = serde_json::json!({ "truncated": true, "bytes": text.len(), "start": &text[..cut] });
+            (short.to_string(), short)
+        } else {
+            (text, body.clone())
+        };
         let _ = self.db.exec(
             "INSERT INTO events(ts,kind,agent_id,body) VALUES(?1,?2,?3,?4)",
-            rusqlite::params![crate::db::now(), kind, agent_id, body.to_string()],
+            rusqlite::params![crate::db::now(), kind, agent_id, text],
         );
         self.emit("event", serde_json::json!({ "kind": kind, "agent_id": agent_id, "body": body }));
     }
@@ -180,5 +195,23 @@ mod lock_tests {
         assert_eq!(*r.rd(), 2);
         *r.wr() = 3;
         assert_eq!(*r.rd(), 3);
+    }
+}
+
+#[cfg(test)]
+mod event_tests {
+    use super::*;
+    #[test]
+    fn an_event_is_a_record_not_a_dump() {
+        let ctx = Ctx::test();
+        ctx.log_event("small", None, &serde_json::json!({ "a": 1 }));
+        ctx.log_event("huge", None, &serde_json::json!({ "detail": "é".repeat(EVENT_MAX) }));
+        let rows = ctx.db.query("SELECT kind, body FROM events ORDER BY id", []).unwrap();
+        assert_eq!(rows[0]["body"], "{\"a\":1}");
+        let huge: Value = serde_json::from_str(rows[1]["body"].as_str().unwrap()).unwrap();
+        assert_eq!(huge["truncated"], true);
+        assert!(huge["bytes"].as_u64().unwrap() > EVENT_MAX as u64);
+        assert!(rows[1]["body"].as_str().unwrap().len() < 10_000);
+        std::fs::remove_dir_all(ctx.data_dir.parent().unwrap()).ok();
     }
 }

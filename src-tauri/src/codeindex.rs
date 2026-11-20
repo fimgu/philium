@@ -1750,7 +1750,7 @@ pub fn tidy(ctx: &Ctx) -> Result<Option<String>, String> {
     }
     // Rewriting the file needs room for the part that stays; never fill the disk to do it.
     let kept = before - free;
-    if disk_free(&ctx.data_dir).is_some_and(|d| d < (kept as u64).saturating_mul(2)) {
+    if crate::storage::disk_free(&ctx.data_dir).is_some_and(|d| d < (kept as u64).saturating_mul(2)) {
         return Ok(Some(format!("Philium freed {} inside its database, but the disk is too full to give it back yet", gb(free))));
     }
     ctx.db.with(|c| c.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM; PRAGMA wal_checkpoint(TRUNCATE);"))?;
@@ -1762,26 +1762,7 @@ const TIDY_MAX_FILES: i64 = 60_000;
 const TIDY_MIN_FREED: i64 = 256 * 1024 * 1024;
 
 fn gb(bytes: i64) -> String {
-    if bytes >= 1 << 30 {
-        format!("{:.1} GB", bytes as f64 / (1u64 << 30) as f64)
-    } else {
-        format!("{} MB", bytes / (1 << 20))
-    }
-}
-
-/// Bytes free on the disk holding `dir`, when the system says.
-#[cfg(not(unix))]
-fn disk_free(_dir: &Path) -> Option<u64> {
-    None
-}
-
-/// Bytes free on the disk holding `dir`, when the system says.
-#[cfg(unix)]
-fn disk_free(dir: &Path) -> Option<u64> {
-    use std::os::unix::ffi::OsStrExt;
-    let p = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
-    let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
-    (unsafe { libc::statvfs(p.as_ptr(), &mut s) } == 0).then(|| s.f_bavail as u64 * s.f_frsize as u64)
+    crate::storage::gb(bytes.max(0) as u64)
 }
 
 fn watcher(ctx: Arc<Ctx>) {
