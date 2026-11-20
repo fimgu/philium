@@ -276,6 +276,21 @@ pub fn profile(home: &Path, allow: &[PathBuf], read_only: &[PathBuf]) -> String 
             s.push_str(&format!("(allow file-read* (subpath \"{}\"))\n", sbpl(&h.join(d))));
         }
     }
+    // Shells stat every parent folder on `cd`: allow the metadata of each parent of an
+    // allowed folder (no listing, no reading), or `cd` fails with "Not a directory".
+    let mut parents = std::collections::BTreeSet::new();
+    for a in allow.iter().chain(read_only) {
+        for v in [a.clone(), std::fs::canonicalize(a).unwrap_or_else(|_| a.clone())] {
+            let mut d = v.parent();
+            while let Some(x) = d {
+                parents.insert(x.to_path_buf());
+                d = x.parent();
+            }
+        }
+    }
+    for d in &parents {
+        s.push_str(&format!("(allow file-read-metadata (literal \"{}\"))\n", sbpl(d)));
+    }
     // Read-only areas first, so a writable run folder is never shadowed by them.
     for a in read_only {
         for v in [a.clone(), std::fs::canonicalize(a).unwrap_or_else(|_| a.clone())] {
@@ -694,6 +709,18 @@ pub(crate) mod tests {
         assert_eq!(preflight(&work, &rundir, Some(&gate), &h).await, Ok(()));
         // A "gate" that contains the home folder would open it up: refused.
         assert!(preflight(&work, &rundir, Some(&root), &h).await.unwrap_err().contains("home folder is readable"));
+        // Run folders inside the hidden home (as on a real machine): `cd` into the clone works,
+        // and the home folder's other contents stay out of reach.
+        let mut inside = host(&root);
+        inside.home = root.clone();
+        let deep = root.join("Library/Caches/runs/1/src");
+        let deep_run = root.join("Library/Caches/runs/1/run");
+        std::fs::create_dir_all(deep.join("pkg/sub")).unwrap();
+        std::fs::create_dir_all(&deep_run).unwrap();
+        let mut c = command(&["/bin/sh", "-c", "cd pkg/sub && pwd && ls ../../../../../../realhome >/dev/null 2>&1 && echo LEAK || echo private"], &deep, &deep_run, &inside, &HashMap::new()).unwrap();
+        let o = c.output().await.unwrap();
+        let out = String::from_utf8_lossy(&o.stdout);
+        assert!(out.contains("pkg/sub") && out.contains("private") && !out.contains("LEAK"), "{out} {}", String::from_utf8_lossy(&o.stderr));
         // A gate the check cannot read is refused too, rather than failing every check.
         assert!(preflight(&work, &rundir, Some(&root.join("missing")), &h).await.unwrap_err().contains("gate folder is not readable"));
         std::fs::remove_dir_all(&root).ok();
