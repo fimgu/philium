@@ -121,7 +121,7 @@ async fn sides(db: &Db, t: &Target<'_>, p: &Pipeline, checks: &[&super::config::
             if let Some(c) = e.check_id.as_deref().and_then(|id| p.check(id)) {
                 let outs = side(p, &[c], t.path, &e.buggy_sha, t.base, &changed, gate_dir, None, host, say).await?;
                 if let Some((_, o)) = outs.first() {
-                    super::replay::remember(db, t.key, config_from, &e.id, &e.buggy_sha, None, &c.id, o.status, None)?;
+                    super::replay::remember(db, t.key, config_from, &e.id, &e.buggy_sha, None, &c.id, o.status, None, o.status.failed())?;
                 }
             }
         }

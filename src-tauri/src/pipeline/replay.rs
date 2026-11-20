@@ -113,9 +113,8 @@ pub fn digest(parts: &[&str]) -> String {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn remember(db: &Db, repo: &str, digest: &str, bug: &str, buggy: &str, fixed: Option<&str>, check: &str, buggy_status: Status, fixed_status: Option<Status>) -> Result<bool, String> {
+pub fn remember(db: &Db, repo: &str, digest: &str, bug: &str, buggy: &str, fixed: Option<&str>, check: &str, buggy_status: Status, fixed_status: Option<Status>, caught: bool) -> Result<bool, String> {
     init(db)?;
-    let caught = buggy_status.failed() && fixed_status.is_none_or(|s| s == Status::Pass);
     db.exec(
         "INSERT INTO pipeline_replays(repo,digest,bug,buggy_sha,fixed_sha,check_id,buggy_status,fixed_status,caught,at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
         params![repo, digest, bug, buggy, fixed, check, buggy_status.as_str(), fixed_status.map(|s| s.as_str()), caught, now()],
@@ -204,37 +203,38 @@ pub async fn run(db: &Db, repo_key: &str, repo: &Path, p: &Pipeline, set: &Repla
             Some(f) => Some(one(p, repo, f, &b.buggy, &changed, &b.check, gate_dir, b.overlay.as_ref(), host).await?),
             None => Some(one(p, repo, &base, &base, &changed, &b.check, gate_dir, b.overlay.as_ref(), host).await?),
         };
-        // With an expected text, the bug's own signature decides: it shows on the buggy
-        // commit, and not on the control. Without one, the control must pass.
-        let shows = |o: &runner::Outcome, t: &str| o.output.contains(t);
-        // The bug's signature gone from the control counts as the control passing,
-        // whether the control is the fix or the commit before the bug.
-        let control_status = match (&b.expect, on_fix.as_ref()) {
-            (Some(t), Some(c)) if c.status != Status::NotRun && !shows(c, t) && on_bug.status.failed() && shows(&on_bug, t) => Some(Status::Pass),
-            _ => on_fix.as_ref().map(|o| o.status),
+        // A catch counts only when the check fails on the buggy commit and either the
+        // control passes or the failure shows the bug's own text. Nothing else counts.
+        let failed = on_bug.status.failed();
+        let control_passed = on_fix.as_ref().is_some_and(|c| c.status == Status::Pass);
+        let text_matches = b.expect.as_deref().is_some_and(|t| on_bug.output.contains(t));
+        let by = if !failed {
+            None
+        } else if control_passed {
+            Some("the control passed")
+        } else if text_matches {
+            Some("the failure shows the bug's text")
+        } else {
+            None
         };
-        let bug_status = match &b.expect {
-            Some(t) if on_bug.status.failed() && !shows(&on_bug, t) => Status::Pass,
-            _ => on_bug.status,
-        };
-        let caught = remember(db, repo_key, digest, &b.id, &b.buggy, b.fixed.as_deref(), &b.check, bug_status, control_status)?;
+        let caught = remember(db, repo_key, digest, &b.id, &b.buggy, b.fixed.as_deref(), &b.check, on_bug.status, on_fix.as_ref().map(|o| o.status), by.is_some())?;
         db.exec(
             "UPDATE pipeline_replays SET buggy_output=?1, control_output=?2 WHERE rowid=(SELECT max(rowid) FROM pipeline_replays WHERE repo=?3 AND bug=?4)",
             params![on_bug.output, on_fix.as_ref().map(|o| o.output.clone()), repo_key, b.id],
         )?;
-        let reason = if on_bug.status.failed() && bug_status == Status::Pass {
-            Some(format!("failed on the buggy commit, but not with \"{}\": it failed for another reason", b.expect.as_deref().unwrap_or("")))
-        } else if caught {
-            None
+        let reason = if caught {
+            by.map(|b| format!("caught: {b}"))
         } else if on_bug.status == Status::NotRun {
             Some(format!("did not run on the buggy commit: {}", on_bug.reason.clone().unwrap_or_default()))
-        } else if !on_bug.status.failed() {
+        } else if !failed {
             Some("passed on the buggy commit: the gate misses this bug".into())
-        } else if let Some(f) = on_fix.as_ref().filter(|f| f.status != Status::Pass) {
-            let place = if b.fixed.is_some() { "the fix" } else { "the commit before the bug" };
-            Some(format!("{} on {place} too, so it does not single out this bug{}", f.status.as_str(), f.reason.as_deref().map(|r| format!(": {r}")).unwrap_or_default()))
         } else {
-            None
+            let place = if b.fixed.is_some() { "the fix" } else { "the commit before the bug" };
+            let control = on_fix.as_ref().map(|c| c.status.as_str()).unwrap_or("not run");
+            Some(match &b.expect {
+                Some(t) => format!("failed, but {control} on {place} too and the failure does not show \"{t}\""),
+                None => format!("failed, but {control} on {place} too, so it does not single out this bug"),
+            })
         };
         say(format!("{}: {}", b.id, if caught { "caught" } else { "missed" }));
         bugs.push(BugResult { id: b.id.clone(), check: b.check.clone(), buggy: on_bug.status, fixed: on_fix.map(|o| o.status), caught, reason });
@@ -307,15 +307,22 @@ mod tests {
         );
         let set = ReplaySet::parse(&text, &p).unwrap();
         let rep = run(&db, "r", &r, &p, &set, "o1", &gate, &h, &|_| {}).await.unwrap();
-        // No fix known: the bug's own text must show on the buggy commit and not before it.
+        // A catch needs the control to pass, or the failure to show the bug's text. A
+        // check that fails everywhere counts only when its failure names the bug.
         let sig = format!(
-            "version: 1\nbugs:\n  - {{ id: right-reason, buggy: {bug}, check: gate-script, expect: value, text: t }}\n  - {{ id: wrong-reason, buggy: {bug}, check: gate-script, expect: something-else, text: t }}\n"
+            "version: 1\nbugs:\n  - {{ id: control-passes, buggy: {bug}, check: gate-script, text: t }}\n  - {{ id: text-matches, buggy: {bug}, check: always-red, expect: \"value is 1\", text: t }}\n  - {{ id: neither, buggy: {bug}, check: always-red, expect: \"value is 9\", text: t }}\n  - {{ id: no-text-no-control, buggy: {bug}, check: always-red, text: t }}\n"
         );
-        std::fs::write(gate.join("checks/value.sh"), "[ \"$(cat value)\" = 2 ] || { echo 'bad value'; exit 1; }\n").unwrap();
-        let rs = run(&db, "r", &r, &p, &ReplaySet::parse(&sig, &p).unwrap(), "o2", &gate, &h, &|_| {}).await.unwrap();
+        let p2 = Pipeline::parse(&format!(
+            "version: 1\nbranch: main\nplatforms: [{}]\ntiers: {{ fast: [ {{ id: gate-script, run: \"sh ${{gate}}/checks/value.sh\" }}, {{ id: always-red, run: \"echo value is $(cat value); exit 1\" }} ] }}\n",
+            crate::pipeline::config::host_platform()
+        ))
+        .unwrap();
+        let rs = run(&db, "r", &r, &p2, &ReplaySet::parse(&sig, &p2).unwrap(), "o2", &gate, &h, &|_| {}).await.unwrap();
         let got: Vec<(&str, bool)> = rs.bugs.iter().map(|b| (b.id.as_str(), b.caught)).collect();
-        assert_eq!(got, vec![("right-reason", true), ("wrong-reason", false)], "{:?}", rs.bugs);
-        assert!(rs.bugs[1].reason.as_deref().unwrap().contains("for another reason"));
+        assert_eq!(got, vec![("control-passes", true), ("text-matches", true), ("neither", false), ("no-text-no-control", false)], "{:?}", rs.bugs);
+        assert_eq!(rs.bugs[0].reason.as_deref(), Some("caught: the control passed"));
+        assert_eq!(rs.bugs[1].reason.as_deref(), Some("caught: the failure shows the bug's text"));
+        assert!(rs.bugs[2].reason.as_deref().unwrap().contains("does not show \"value is 9\""));
         let caught: Vec<(&str, bool)> = rep.bugs.iter().map(|b| (b.id.as_str(), b.caught)).collect();
         assert_eq!(caught, vec![("as-shipped", false), ("with-fix-tests", true), ("gate-owned", true)], "{:?}", rep.bugs);
         std::fs::remove_dir_all(&root).ok();
