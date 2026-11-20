@@ -24,6 +24,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
 
+pub(crate) mod gemini;
 pub(crate) mod translate;
 
 use crate::guard::{self, GuardMode};
@@ -98,6 +99,10 @@ pub struct Gateway {
     log_file: Option<PathBuf>,
     /// Source of OAuth access tokens for subscription routes.
     pub tokens: TokenSource,
+    /// Antigravity: the thought signature of each tool call, sent back on later
+    /// turns, and schema keywords the backend refused by name.
+    signatures: Mutex<HashMap<String, String>>,
+    rejected: Mutex<std::collections::HashSet<String>>,
 }
 
 type TokenFn = dyn Fn(String, Kind) -> futures_util::future::BoxFuture<'static, Result<crate::oauth::Creds, String>> + Send + Sync;
@@ -156,6 +161,8 @@ impl Gateway {
             events: broadcast::channel(256).0,
             log_file,
             tokens: TokenSource::new(),
+            signatures: Mutex::new(HashMap::new()),
+            rejected: Mutex::new(Default::default()),
         })
     }
 
@@ -664,6 +671,18 @@ async fn proxy(
                 return error_response(StatusCode::UNAUTHORIZED, "philium_signin", e);
             }
         }
+        if p.kind == Kind::AntigravityOauth {
+            let permit = if method == Method::POST {
+                match gw.slot(&p.id, !p.trusted) {
+                    Some(sem) => sem.acquire_owned().await.ok(),
+                    None => None,
+                }
+            } else {
+                None
+            };
+            let creds = oauth.take().unwrap_or_default();
+            return antigravity(&gw, p, &rest, id, started, &outgoing, stream, creds, permit).await;
+        }
         // Shape after the guard so redaction still covers user content.
         if let Ok(mut v) = serde_json::from_slice::<Value>(&outgoing) {
             if p.kind == Kind::ClaudeOauth {
@@ -868,6 +887,140 @@ async fn proxy(
     if let Some(v) = retry_after {
         h.insert("retry-after", v);
     }
+    out
+}
+
+/// Antigravity answers one whole turn per call. Translate, retry what its
+/// refusals ask for, keep each call's signature, and answer as chat.completions.
+#[allow(clippy::too_many_arguments)]
+async fn antigravity(
+    gw: &Arc<Gateway>,
+    p: &crate::providers::Provider,
+    rest: &str,
+    id: u64,
+    started: Instant,
+    outgoing: &Bytes,
+    stream: bool,
+    creds: crate::oauth::Creds,
+    mut permit: Option<tokio::sync::OwnedSemaphorePermit>,
+) -> Response {
+    let fail = |status: StatusCode, kind: &str, msg: String| {
+        gw.update(id, |r| {
+            r.summary.state = "error";
+            r.summary.status = Some(status.as_u16());
+            r.summary.error = Some(msg.clone());
+            r.summary.duration_ms = Some(started.elapsed().as_millis() as u64);
+        });
+        error_response(status, kind, msg)
+    };
+    if rest != "chat/completions" {
+        return fail(StatusCode::NOT_FOUND, "philium_route", "Antigravity answers chat requests only".into());
+    }
+    let body: Value = match serde_json::from_slice(outgoing) {
+        Ok(v) => v,
+        Err(e) => return fail(StatusCode::BAD_REQUEST, "philium_request", format!("invalid chat.completions body: {e}")),
+    };
+    let Some(project) = creds.account_id.clone().filter(|p| !p.is_empty()) else {
+        return fail(StatusCode::UNAUTHORIZED, "philium_signin", "No Antigravity project for this Google account. Sign in again on the Providers screen".into());
+    };
+    let model = gemini::resolve_model(body["model"].as_str().unwrap_or(""));
+    let url = format!("{}/v1internal:generateContent", p.base_url.trim_end_matches('/'));
+    let mut shaping = gemini::Shaping { rejected: gw.rejected.lk().clone(), ..Default::default() };
+    let (mut schema_fixed, mut forced) = (false, 0);
+    let mut attempt = 0;
+    let answer = loop {
+        attempt += 1;
+        if attempt > 8 {
+            return fail(StatusCode::BAD_GATEWAY, "philium_upstream", "Antigravity kept refusing this turn; start a new turn or choose another model".into());
+        }
+        let wrapped = {
+            let sigs = gw.signatures.lk();
+            gemini::request(&body, &project, &crate::oauth::random_string(32), &|k| sigs.get(k).cloned(), &shaping)
+        };
+        let sent = gw
+            .client
+            .post(&url)
+            .bearer_auth(&creds.access)
+            .header("content-type", "application/json")
+            .header("user-agent", gemini::user_agent())
+            .header("x-goog-api-client", gemini::API_CLIENT)
+            .header("x-goog-request-params", format!("project={project}"))
+            .header("x-goog-client-metadata", gemini::CLIENT_METADATA)
+            .body(wrapped.to_string())
+            .send()
+            .await;
+        let resp = match sent {
+            Ok(r) => r,
+            Err(e) => return fail(StatusCode::BAD_GATEWAY, "philium_upstream", format!("upstream unreachable: {e}")),
+        };
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            match gemini::fix_for(status.as_u16(), &text) {
+                Some(gemini::Fix::ToolsAsText) if !shaping.tools_as_text => {
+                    shaping.tools_as_text = true;
+                    continue;
+                }
+                Some(gemini::Fix::NoCombiners) if !shaping.no_combiners => {
+                    shaping.no_combiners = true;
+                    continue;
+                }
+                Some(gemini::Fix::DropKeywords(k)) if !schema_fixed => {
+                    schema_fixed = true;
+                    gw.rejected.lk().extend(k.iter().cloned());
+                    shaping.rejected.extend(k);
+                    continue;
+                }
+                _ => {}
+            }
+            gw.update(id, |r| r.summary.status = Some(status.as_u16()));
+            let mut fin = Finalizer { gw: gw.clone(), id, started, first: None, head: Vec::new(), tail: VecDeque::new(), total: 0, error: None, _permit: permit.take() };
+            fin.feed(text.as_bytes());
+            let msg = serde_json::from_str::<Value>(&text).ok().and_then(|v| v.pointer("/error/message").and_then(Value::as_str).map(str::to_string)).unwrap_or_else(|| cap(&text, 500));
+            let hint = if matches!(status.as_u16(), 401 | 403) { " (sign in again on the Providers screen)" } else { "" };
+            let mut out = Response::new(Body::from(json!({"error": {"type": "antigravity", "code": status.as_u16(), "message": format!("Antigravity: {msg}{hint}")}}).to_string()));
+            *out.status_mut() = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            out.headers_mut().insert("content-type", HeaderValue::from_static("application/json"));
+            if let Some(secs) = gemini::retry_after(&text) {
+                if let Ok(v) = HeaderValue::from_str(&secs.to_string()) {
+                    out.headers_mut().insert("retry-after", v);
+                }
+            }
+            return out;
+        }
+        let v: Value = match serde_json::from_str(&text) {
+            Ok(v) => v,
+            Err(e) => return fail(StatusCode::BAD_GATEWAY, "philium_upstream", format!("Antigravity sent an unreadable answer: {e}")),
+        };
+        let a = match gemini::response(&v, &model, &mut || format!("call_{}", crate::oauth::random_string(16))) {
+            Ok(a) => a,
+            Err(e) => return fail(StatusCode::BAD_GATEWAY, "philium_upstream", e),
+        };
+        // Gemini 3 sometimes writes a call as code or text: ask again for a native call.
+        if (a.empty || a.pseudo_call) && forced < 2 {
+            forced += 1;
+            shaping.force_call = true;
+            continue;
+        }
+        if a.empty {
+            return fail(StatusCode::BAD_GATEWAY, "philium_upstream", format!("Antigravity returned no usable output: {}", a.finish_message));
+        }
+        break a;
+    };
+    {
+        let mut sigs = gw.signatures.lk();
+        if sigs.len() > 20_000 {
+            sigs.clear();
+        }
+        sigs.extend(answer.signatures.iter().cloned());
+    }
+    gw.update(id, |r| r.summary.status = Some(200));
+    let bytes = if stream { gemini::to_sse(&answer.completion) } else { answer.completion.to_string() };
+    let mut fin = Finalizer { gw: gw.clone(), id, started, first: None, head: Vec::new(), tail: VecDeque::new(), total: 0, error: None, _permit: permit.take() };
+    fin.feed(bytes.as_bytes());
+    drop(fin);
+    let mut out = Response::new(Body::from(bytes));
+    out.headers_mut().insert("content-type", HeaderValue::from_static(if stream { "text/event-stream" } else { "application/json" }));
     out
 }
 
@@ -1107,6 +1260,114 @@ mod tests {
         assert_eq!(headers["x-api-key"], "REAL-UPSTREAM-KEY");
         assert_eq!(headers["anthropic-version"], "2023-06-01");
         assert!(headers.get("authorization").is_none());
+    }
+
+    /// Fake Cloud Code: a first turn calls a tool with a signature; a later turn
+    /// needs that signature back (or the history as text); "RATE" hits a quota.
+    async fn antigravity_upstream() -> (String, Seen) {
+        let seen: Seen = Default::default();
+        let s = seen.clone();
+        let app = Router::new().route(
+            "/{*rest}",
+            any(move |headers: HeaderMap, body: String| {
+                let s = s.clone();
+                async move {
+                    s.lk().push((headers, body.clone()));
+                    let ok = |v: Value| (StatusCode::OK, [("content-type", "application/json")], v.to_string());
+                    if body.contains("RATE") {
+                        let e = json!({"error": {"code": 429, "message": "Resource has been exhausted", "status": "RESOURCE_EXHAUSTED",
+                            "details": [{"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "6.2s"}]}});
+                        return (StatusCode::TOO_MANY_REQUESTS, [("content-type", "application/json")], e.to_string());
+                    }
+                    if body.contains("functionResponse") && !body.contains("thoughtSignature") {
+                        return (StatusCode::BAD_REQUEST, [("content-type", "application/json")], json!({"error": {"message": "Function call is missing a thought_signature in functionCall parts"}}).to_string());
+                    }
+                    if body.contains("functionResponse") || body.contains("[previous tool result]") {
+                        return ok(json!({"traceId": "t2", "response": {"candidates": [{"content": {"role": "model", "parts": [{"text": "done"}]}, "finishReason": "STOP"}],
+                            "usageMetadata": {"promptTokenCount": 30, "candidatesTokenCount": 2}}}));
+                    }
+                    ok(json!({"traceId": "t1", "response": {"candidates": [{"content": {"role": "model", "parts": [
+                        {"functionCall": {"name": "read", "args": {"path": "a"}, "id": "call.1"}, "thoughtSignature": "SIG-A"}]}, "finishReason": "STOP"}],
+                        "usageMetadata": {"promptTokenCount": 20, "candidatesTokenCount": 5}}}))
+                }
+            }),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        (format!("http://{addr}"), seen)
+    }
+
+    async fn signed_in(gw: &Gateway, project: Option<&'static str>) {
+        gw.tokens.set(Arc::new(move |_, _| {
+            Box::pin(async move { Ok(crate::oauth::Creds { access: "GOOGLE-ACCESS".into(), account_id: project.map(str::to_string), ..Default::default() }) })
+        }));
+    }
+
+    #[tokio::test]
+    async fn antigravity_turns_go_out_as_cloud_code_calls_and_keep_their_signatures() {
+        let (base, seen) = antigravity_upstream().await;
+        let (gw, url) = gateway(&base, Kind::AntigravityOauth, GuardMode::Redact).await;
+        signed_in(&gw, Some("proj-7")).await;
+        let c = reqwest::Client::new();
+        let tools = json!([{"type": "function", "function": {"name": "read", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "$schema": "x"}}}]);
+        let first = json!({"model": "default", "stream": true, "tools": tools, "messages": [{"role": "user", "content": "read a, key AKIAABCDEFGHIJKLMNOP"}]});
+        let r = c.post(format!("{url}/chat/completions")).bearer_auth("t".repeat(48)).json(&first).send().await.unwrap();
+        assert_eq!(r.status(), 200);
+        assert_eq!(r.headers()["content-type"], "text/event-stream");
+        let sse = r.text().await.unwrap();
+        assert!(sse.contains("\"id\":\"call_1\"") && sse.contains("\"finish_reason\":\"tool_calls\"") && sse.ends_with("data: [DONE]\n\n"), "{sse}");
+        {
+            let (h, sent) = seen.lk()[0].clone();
+            assert_eq!(h["authorization"], "Bearer GOOGLE-ACCESS");
+            assert!(h["user-agent"].to_str().unwrap().starts_with("antigravity/cli/1.5.6 "));
+            assert_eq!(h["x-goog-request-params"], "project=proj-7");
+            assert!(h["x-goog-client-metadata"].to_str().unwrap().contains("PLATFORM_UNSPECIFIED"));
+            assert!(!format!("{h:?}").contains(&"t".repeat(48)), "gateway token never forwarded");
+            let v: Value = serde_json::from_str(&sent).unwrap();
+            assert_eq!((v["model"].as_str(), v["project"].as_str()), (Some("gemini-3-flash"), Some("proj-7")));
+            assert!(!sent.contains("AKIAABCDEFGHIJKLMNOP"), "guard still applies");
+            assert!(!sent.contains("$schema"));
+        }
+        let a = settle(&gw).await;
+        assert_eq!((a.state, a.status), ("done", Some(200)));
+        // The next turn sends the call's signature back.
+        let second = json!({"model": "gemini-3-flash", "tools": tools, "messages": [
+            {"role": "user", "content": "read a"},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "read", "arguments": "{\"path\":\"a\"}"}}]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "A"}]});
+        let r = c.post(format!("{url}/chat/completions")).bearer_auth("t".repeat(48)).json(&second).send().await.unwrap();
+        assert_eq!(r.status(), 200);
+        let v: Value = r.json().await.unwrap();
+        assert_eq!(v["choices"][0]["message"]["content"], "done");
+        assert_eq!(v["usage"]["prompt_tokens"], 30);
+        assert!(seen.lk()[1].1.contains("SIG-A"));
+        assert_eq!(seen.lk().len(), 2);
+        // After a restart the signature is gone: the refusal is answered by sending the history as text.
+        let (gw2, url2) = gateway(&base, Kind::AntigravityOauth, GuardMode::Redact).await;
+        signed_in(&gw2, Some("proj-7")).await;
+        let r = c.post(format!("{url2}/chat/completions")).bearer_auth("t".repeat(48)).json(&second).send().await.unwrap();
+        assert_eq!(r.status(), 200);
+        assert_eq!(r.json::<Value>().await.unwrap()["choices"][0]["message"]["content"], "done");
+        assert_eq!(seen.lk().len(), 4);
+        assert!(seen.lk()[3].1.contains("[previous tool result] read: A"));
+        // A quota refusal passes through with when to try again.
+        let rate = json!({"model": "gemini-3-flash", "messages": [{"role": "user", "content": "RATE"}]});
+        let r = c.post(format!("{url}/chat/completions")).bearer_auth("t".repeat(48)).json(&rate).send().await.unwrap();
+        assert_eq!(r.status(), 429);
+        assert_eq!(r.headers()["retry-after"], "7");
+        assert!(r.text().await.unwrap().contains("Antigravity: Resource has been exhausted"));
+    }
+
+    #[tokio::test]
+    async fn antigravity_without_a_project_asks_to_sign_in_again_and_sends_nothing() {
+        let (base, seen) = antigravity_upstream().await;
+        let (gw, url) = gateway(&base, Kind::AntigravityOauth, GuardMode::Redact).await;
+        signed_in(&gw, None).await;
+        let r = post(&url).send().await.unwrap();
+        assert_eq!(r.status(), 401);
+        assert!(r.text().await.unwrap().contains("Sign in again"));
+        assert!(seen.lk().is_empty());
     }
 
     #[tokio::test]

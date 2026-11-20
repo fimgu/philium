@@ -123,7 +123,7 @@ export function SpawnModal(props) {
   const chosen = () => model() || def() || "";
   const chosenProvider = () => provById()[(chosen() || "").split("/")[0]];
   const forcedStrict = () => chosenProvider() && !chosenProvider().trusted;
-  const isSub = () => ["chatgpt_oauth", "claude_oauth"].includes(chosenProvider()?.kind);
+  const isSub = () => ["chatgpt_oauth", "claude_oauth", "antigravity_oauth"].includes(chosenProvider()?.kind);
 
   createEffect(on(task, (t) => {
     const tk = (tasks() ?? []).find((x) => x.id === t);

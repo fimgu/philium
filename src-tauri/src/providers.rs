@@ -27,6 +27,7 @@ use crate::guard::GuardMode;
 
 pub const CLAUDE_UPSTREAM: &str = "https://api.anthropic.com/v1";
 pub const CHATGPT_UPSTREAM: &str = "https://chatgpt.com/backend-api/codex";
+pub const ANTIGRAVITY_UPSTREAM: &str = crate::gateway::gemini::ENDPOINT;
 pub const RESERVED_CLAUDE: &str = "claude-code";
 const RESERVED: [&str; 5] = [RESERVED_CLAUDE, "none", "default", "chatgpt", "endpoint"];
 
@@ -45,6 +46,8 @@ pub enum Kind {
     /// Claude subscription, signed in through Philium.
     #[serde(alias = "claude_code")]
     ClaudeOauth,
+    /// Google Antigravity subscription (Gemini, and Claude through Google), signed in through Philium.
+    AntigravityOauth,
 }
 
 impl Kind {
@@ -58,10 +61,11 @@ impl Kind {
             Kind::Anthropic => "anthropic",
             Kind::ChatgptOauth => "chatgpt_oauth",
             Kind::ClaudeOauth => "claude_oauth",
+            Kind::AntigravityOauth => "antigravity_oauth",
         }
     }
     pub fn is_subscription(self) -> bool {
-        matches!(self, Kind::ChatgptOauth | Kind::ClaudeOauth)
+        matches!(self, Kind::ChatgptOauth | Kind::ClaudeOauth | Kind::AntigravityOauth)
     }
 }
 
@@ -556,6 +560,8 @@ pub fn model_effort_details(kind: Kind, _model_id: &str, discovered: Option<&[Ef
             ("medium", "Medium"),
             ("high", "High"),
         ],
+        // Antigravity takes no effort setting; the model id picks the thinking level.
+        Kind::AntigravityOauth => &[("default", "Auto")],
     };
     levels
         .iter()
@@ -668,6 +674,9 @@ async fn discover(_ctx: &Arc<Ctx>, p: &Provider) -> Result<Vec<Discovered>, Stri
         .build()
         .map_err(|e| e.to_string())?;
     let base = p.base_url.trim_end_matches('/');
+    if p.kind == Kind::AntigravityOauth {
+        return discover_antigravity(&client, p, base).await;
+    }
     let mut url = format!("{base}/models");
     let mut req;
     if p.kind.is_subscription() {
@@ -707,6 +716,43 @@ async fn discover(_ctx: &Arc<Ctx>, p: &Provider) -> Result<Vec<Discovered>, Stri
     }
     if list.is_empty() {
         return Err("provider returned no models".into());
+    }
+    Ok(list)
+}
+
+/// Antigravity lists the account's models, with quota, from `fetchAvailableModels`.
+async fn discover_antigravity(client: &reqwest::Client, p: &Provider, base: &str) -> Result<Vec<Discovered>, String> {
+    use crate::gateway::gemini;
+    let c = crate::oauth::access(&p.id, p.kind).await?;
+    let url = format!("{base}/v1internal:fetchAvailableModels");
+    let body = c.account_id.as_ref().map(|proj| json!({ "project": proj })).unwrap_or_else(|| json!({}));
+    let resp = client
+        .post(&url)
+        .bearer_auth(&c.access)
+        .header("user-agent", gemini::user_agent())
+        .header("x-goog-api-client", gemini::API_CLIENT)
+        .header("client-metadata", gemini::CLIENT_METADATA)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("{url}: {}", e.without_url()))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        let hint = if matches!(status.as_u16(), 401 | 403) { " (sign in again)" } else { "" };
+        return Err(format!("HTTP {status} from {url}{hint}: {}", text.chars().take(300).collect::<String>()));
+    }
+    let v: Value = resp.json().await.map_err(|e| format!("bad model list: {e}"))?;
+    let list: Vec<Discovered> = gemini::models(&v)
+        .into_iter()
+        .map(|(id, display, _)| {
+            let l = id.to_ascii_lowercase();
+            let context_window = Some(if l.starts_with("gemini") { 1_000_000 } else if l.contains("claude") { 200_000 } else { 131_072 });
+            Discovered { id, display, context_window, price_in: None, price_out: None, efforts: Some(vec![]) }
+        })
+        .collect();
+    if list.is_empty() {
+        return Err("Antigravity listed no models for this account".into());
     }
     Ok(list)
 }
@@ -804,14 +850,28 @@ pub fn models(ctx: &Ctx, provider: Option<&str>) -> Result<Vec<Value>, String> {
 // ---------- module ----------
 
 /// Create or fix the provider row for a signed-in subscription.
+/// The fixed upstream of a subscription kind.
+pub fn upstream(kind: Kind) -> Option<&'static str> {
+    match kind {
+        Kind::ClaudeOauth => Some(CLAUDE_UPSTREAM),
+        Kind::ChatgptOauth => Some(CHATGPT_UPSTREAM),
+        Kind::AntigravityOauth => Some(ANTIGRAVITY_UPSTREAM),
+        _ => None,
+    }
+}
+
 pub fn ensure_oauth_provider(ctx: &Ctx, id: &str, kind: Kind) -> Result<(), String> {
     let existing = get(ctx, id);
-    let claude = kind == Kind::ClaudeOauth;
+    let label = match kind {
+        Kind::ClaudeOauth => "Claude",
+        Kind::AntigravityOauth => "Google (Antigravity)",
+        _ => "ChatGPT",
+    };
     let p = Provider {
         id: id.into(),
-        name: existing.as_ref().map(|e| e.name.clone()).unwrap_or_else(|| if claude { "Claude".into() } else { "ChatGPT".into() }),
+        name: existing.as_ref().map(|e| e.name.clone()).unwrap_or_else(|| label.into()),
         kind,
-        base_url: if claude { CLAUDE_UPSTREAM } else { CHATGPT_UPSTREAM }.into(),
+        base_url: upstream(kind).unwrap_or(CHATGPT_UPSTREAM).into(),
         trusted: true,
         guard: existing.as_ref().map(|e| e.guard).unwrap_or_default(),
         enabled: true,
@@ -896,7 +956,7 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
             let p = Provider {
                 name: arg_str(&args, "name")?,
                 kind,
-                base_url: if kind == Kind::ClaudeOauth { CLAUDE_UPSTREAM.into() } else if kind == Kind::ChatgptOauth { CHATGPT_UPSTREAM.into() } else { arg_str(&args, "base_url")?.trim().to_string() },
+                base_url: if let Some(u) = upstream(kind) { u.into() } else { arg_str(&args, "base_url")?.trim().to_string() },
                 trusted: args["trusted"].as_bool().unwrap_or(kind.is_subscription()),
                 guard: serde_json::from_value(args["guard"].clone()).unwrap_or(existing.as_ref().map(|e| e.guard).unwrap_or_default()),
                 enabled: args["enabled"].as_bool().unwrap_or(true),

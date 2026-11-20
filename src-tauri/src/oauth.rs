@@ -1,4 +1,4 @@
-//! Subscription sign-in owned by Philium (Claude and ChatGPT), modeled on
+//! Subscription sign-in owned by Philium (Claude, ChatGPT and Google Antigravity), modeled on
 //! jcode and HAL. Tokens live only in the OS keychain entry `oauth:<id>`;
 //! the gateway asks for a fresh access token per request and swaps it in, so
 //! HAL, its config and its environment never see them.
@@ -36,6 +36,25 @@ pub const OPENAI_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const OPENAI_ISSUER: &str = "https://auth.openai.com";
 pub const OPENAI_VERIFY_URL: &str = "https://auth.openai.com/codex/device";
 pub const CHATGPT_ORIGINATOR: &str = "codex_cli_rs";
+
+pub const GOOGLE_AUTHORIZE_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
+pub const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+const GOOGLE_USERINFO_URL: &str = "https://www.googleapis.com/oauth2/v1/userinfo?alt=json";
+const GOOGLE_USER_AGENT: &str = "google-api-nodejs-client/9.15.1";
+/// Antigravity's public desktop-app client (Google lets desktop apps embed the
+/// secret). It only accepts this fixed loopback address.
+pub const ANTIGRAVITY_CLIENT_ID: &str = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
+const ANTIGRAVITY_CLIENT_SECRET: &str = "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";
+pub const ANTIGRAVITY_PORT: u16 = 51121;
+pub const ANTIGRAVITY_REDIRECT: &str = "http://127.0.0.1:51121/oauth-callback";
+pub const ANTIGRAVITY_SCOPES: &str = "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/cclog https://www.googleapis.com/auth/experimentsandconfigs";
+/// Where an account's Antigravity project is looked up, the inference host first.
+const ANTIGRAVITY_LOAD_HOSTS: [&str; 4] = [
+    "https://daily-cloudcode-pa.googleapis.com",
+    "https://cloudcode-pa.googleapis.com",
+    "https://daily-cloudcode-pa.sandbox.googleapis.com",
+    "https://autopush-cloudcode-pa.sandbox.googleapis.com",
+];
 
 /// Refresh this long before expiry.
 const SKEW_MS: i64 = 5 * 60 * 1000;
@@ -233,6 +252,114 @@ fn chatgpt_creds(t: TokenResp, prev: Option<&Creds>) -> Result<Creds, String> {
     Ok(Creds { access, refresh, expires_at, account_id: Some(account_id), email, plan, scopes: vec![] })
 }
 
+pub fn antigravity_auth_url(challenge: &str, state: &str) -> String {
+    let mut u = reqwest::Url::parse(GOOGLE_AUTHORIZE_URL).unwrap();
+    u.query_pairs_mut()
+        .append_pair("response_type", "code")
+        .append_pair("client_id", ANTIGRAVITY_CLIENT_ID)
+        .append_pair("redirect_uri", ANTIGRAVITY_REDIRECT)
+        .append_pair("scope", ANTIGRAVITY_SCOPES)
+        .append_pair("code_challenge", challenge)
+        .append_pair("code_challenge_method", "S256")
+        .append_pair("state", state)
+        .append_pair("access_type", "offline")
+        .append_pair("prompt", "consent");
+    u.to_string()
+}
+
+fn google_creds(t: TokenResp, prev: Option<&Creds>) -> Result<Creds, String> {
+    let access = t.access_token.filter(|s| !s.is_empty()).ok_or("no access token returned")?;
+    let refresh = t.refresh_token.filter(|s| !s.is_empty()).or_else(|| prev.map(|p| p.refresh.clone())).ok_or(
+        "Google sent no refresh token. Remove Antigravity's access at https://myaccount.google.com/permissions, then sign in again",
+    )?;
+    Ok(Creds {
+        access,
+        refresh,
+        expires_at: now_ms() + t.expires_in.unwrap_or(3600) * 1000,
+        account_id: prev.and_then(|p| p.account_id.clone()),
+        email: prev.and_then(|p| p.email.clone()),
+        plan: Some("Antigravity".into()),
+        scopes: if t.scope.is_some() { scopes_of(t.scope.as_deref()) } else { prev.map(|p| p.scopes.clone()).unwrap_or_default() },
+    })
+}
+
+/// The account's Antigravity project, from the first host that names one.
+pub async fn antigravity_project(access: &str) -> Result<String, String> {
+    use crate::gateway::gemini;
+    let c = client()?;
+    let mut errors = vec![];
+    let meta: Value = serde_json::from_str(gemini::CLIENT_METADATA).unwrap_or_default();
+    for host in ANTIGRAVITY_LOAD_HOSTS {
+        let r = c
+            .post(format!("{host}/v1internal:loadCodeAssist"))
+            .bearer_auth(access)
+            .header("user-agent", gemini::user_agent())
+            .header("x-goog-api-client", gemini::API_CLIENT)
+            .header("client-metadata", gemini::CLIENT_METADATA)
+            .json(&json!({ "metadata": meta }))
+            .send()
+            .await;
+        match r {
+            Ok(r) if r.status().is_success() => match r.json::<Value>().await.ok().and_then(|v| project_of(&v)) {
+                Some(p) => return Ok(p),
+                None => errors.push(format!("{host}: no project")),
+            },
+            Ok(r) => errors.push(format!("{host}: HTTP {}", r.status())),
+            Err(e) => errors.push(format!("{host}: {}", e.without_url())),
+        }
+    }
+    Err(format!(
+        "your Google account has no Antigravity project yet. Open Antigravity once and sign in there, then sign in here again ({})",
+        errors.join("; ")
+    ))
+}
+
+/// `cloudaicompanionProject` is either the id or `{ "id": ... }`.
+pub fn project_of(v: &Value) -> Option<String> {
+    let p = &v["cloudaicompanionProject"];
+    p.as_str().or_else(|| p["id"].as_str()).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string)
+}
+
+async fn google_email(access: &str) -> Option<String> {
+    let r = client().ok()?.get(GOOGLE_USERINFO_URL).bearer_auth(access).header("user-agent", GOOGLE_USER_AGENT).send().await.ok()?;
+    r.json::<Value>().await.ok()?["email"].as_str().map(str::to_string)
+}
+
+/// Fill in what a Google sign-in still lacks: the email and the project.
+async fn complete_google(mut c: Creds) -> Result<Creds, String> {
+    if c.email.is_none() {
+        c.email = google_email(&c.access).await;
+    }
+    if c.account_id.is_none() {
+        c.account_id = Some(antigravity_project(&c.access).await?);
+    }
+    Ok(c)
+}
+
+pub async fn antigravity_exchange(token_url: &str, verifier: &str, code: &str) -> Result<Creds, String> {
+    let form = [
+        ("grant_type", "authorization_code"),
+        ("client_id", ANTIGRAVITY_CLIENT_ID),
+        ("client_secret", ANTIGRAVITY_CLIENT_SECRET),
+        ("code", code.trim()),
+        ("code_verifier", verifier),
+        ("redirect_uri", ANTIGRAVITY_REDIRECT),
+    ];
+    let t = post_token(client()?.post(token_url).header("user-agent", GOOGLE_USER_AGENT).form(&form)).await?;
+    complete_google(google_creds(t, None)?).await
+}
+
+pub async fn antigravity_refresh(token_url: &str, c: &Creds) -> Result<Creds, String> {
+    let form = [
+        ("grant_type", "refresh_token"),
+        ("client_id", ANTIGRAVITY_CLIENT_ID),
+        ("client_secret", ANTIGRAVITY_CLIENT_SECRET),
+        ("refresh_token", c.refresh.as_str()),
+    ];
+    let t = post_token(client()?.post(token_url).header("user-agent", GOOGLE_USER_AGENT).form(&form)).await?;
+    complete_google(google_creds(t, Some(c))?).await
+}
+
 pub async fn chatgpt_refresh(issuer: &str, c: &Creds) -> Result<Creds, String> {
     let body = json!({ "client_id": OPENAI_CLIENT_ID, "grant_type": "refresh_token",
         "refresh_token": c.refresh, "scope": "openid profile email" });
@@ -263,6 +390,7 @@ pub async fn fresh(store: &dyn Store, id: &str, kind: Kind, claude_token_url: &s
     let n = match kind {
         Kind::ClaudeOauth => claude_refresh(claude_token_url, &c).await,
         Kind::ChatgptOauth => chatgpt_refresh(openai_issuer, &c).await,
+        Kind::AntigravityOauth => antigravity_refresh(GOOGLE_TOKEN_URL, &c).await,
         _ => return Err("not a subscription provider".into()),
     }
     .map_err(|e| format!("{e}. Sign in again on the Providers screen"))?;
@@ -328,6 +456,7 @@ async fn claude_profile(access: &str, url: &str) -> (Option<String>, Option<Stri
 // ---------- login flows ----------
 
 struct Pending {
+    kind: Kind,
     verifier: String,
     state: String,
     cancel: tokio::sync::watch::Sender<bool>,
@@ -339,7 +468,11 @@ fn pending() -> &'static Mutex<HashMap<String, Pending>> {
 }
 
 fn default_id(kind: Kind) -> &'static str {
-    if kind == Kind::ClaudeOauth { "claude" } else { "gpt" }
+    match kind {
+        Kind::ClaudeOauth => "claude",
+        Kind::AntigravityOauth => "google",
+        _ => "gpt",
+    }
 }
 
 /// Existing provider of this kind, else the default slug.
@@ -384,8 +517,8 @@ fn done(ctx: &Ctx, id: &str, r: Result<(), String>) {
 }
 
 /// Read one HTTP request line from a callback connection, answer it, and
-/// return the query string of `GET /callback?...`.
-async fn accept_callback(l: &tokio::net::TcpListener) -> Option<String> {
+/// return the query string of `GET <path>?...`.
+async fn accept_callback(l: &tokio::net::TcpListener, path: &str) -> Option<String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     loop {
         let (mut s, _) = l.accept().await.ok()?;
@@ -393,7 +526,7 @@ async fn accept_callback(l: &tokio::net::TcpListener) -> Option<String> {
         let n = tokio::time::timeout(std::time::Duration::from_secs(5), s.read(&mut buf)).await.ok()?.ok()?;
         let line = String::from_utf8_lossy(&buf[..n]).lines().next().unwrap_or("").to_string();
         let target = line.split_whitespace().nth(1).unwrap_or("").to_string();
-        let ok = target.starts_with("/callback?");
+        let ok = target.starts_with(&format!("{path}?"));
         let body = if ok { "<html><body style=\"font-family:sans-serif\"><h3>Signed in</h3>You can close this tab and return to Philium.</body></html>" } else { "Not found" };
         let _ = s.write_all(format!("HTTP/1.1 {} X\r\ncontent-type: text/html\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", if ok { 200 } else { 404 }, body.len()).as_bytes()).await;
         if ok {
@@ -412,14 +545,14 @@ async fn start_claude(ctx: &Arc<Ctx>) -> Result<Value, String> {
     let auto_url = claude_auth_url(&local, &challenge, &state);
     let manual_url = claude_auth_url(CLAUDE_MANUAL_REDIRECT, &challenge, &state);
     let (tx, mut rx) = tokio::sync::watch::channel(false);
-    if let Some(old) = pending().lk().insert(id.clone(), Pending { verifier: verifier.clone(), state: state.clone(), cancel: tx }) {
+    if let Some(old) = pending().lk().insert(id.clone(), Pending { kind: Kind::ClaudeOauth, verifier: verifier.clone(), state: state.clone(), cancel: tx }) {
         let _ = old.cancel.send(true);
     }
     open_browser(&auto_url);
     let (c, id2) = (ctx.clone(), id.clone());
     tauri::async_runtime::spawn(async move {
         let q = tokio::select! {
-            q = accept_callback(&listener) => q,
+            q = accept_callback(&listener, "/callback") => q,
             _ = rx.changed() => None,
             _ = tokio::time::sleep(std::time::Duration::from_secs(600)) => None,
         };
@@ -439,23 +572,83 @@ async fn start_claude(ctx: &Arc<Ctx>) -> Result<Value, String> {
     Ok(json!({ "id": id, "kind": "claude_oauth", "auto_url": auto_url, "manual_url": manual_url }))
 }
 
-async fn paste_claude(ctx: &Arc<Ctx>, id: &str, input: &str) -> Result<Value, String> {
-    let (verifier, state) = {
+/// Finish a sign-in from a pasted code or callback address.
+async fn paste(ctx: &Arc<Ctx>, id: &str, input: &str) -> Result<Value, String> {
+    let (kind, verifier, state) = {
         let p = pending().lk();
-        let p = p.get(id).ok_or("no sign-in in progress. Press Sign in with Claude first")?;
-        (p.verifier.clone(), p.state.clone())
+        let p = p.get(id).ok_or("no sign-in in progress. Press Sign in first")?;
+        (p.kind, p.verifier.clone(), p.state.clone())
     };
+    if input.contains("error=") {
+        return Err("the sign-in was cancelled or refused in the browser; start again".into());
+    }
     let (code, st) = parse_code_input(input)?;
     if st.as_deref().is_some_and(|s| s != state) {
         return Err("that code belongs to a different sign-in attempt; start again".into());
     }
-    let creds = claude_exchange(CLAUDE_TOKEN_URL, &verifier, &code, &state, CLAUDE_MANUAL_REDIRECT).await?;
+    let creds = match kind {
+        Kind::AntigravityOauth => antigravity_exchange(GOOGLE_TOKEN_URL, &verifier, &code).await?,
+        _ => claude_exchange(CLAUDE_TOKEN_URL, &verifier, &code, &state, CLAUDE_MANUAL_REDIRECT).await?,
+    };
     if let Some(p) = pending().lk().remove(id) {
         let _ = p.cancel.send(true);
     }
-    finish(ctx, id, Kind::ClaudeOauth, creds).await?;
+    finish(ctx, id, kind, creds).await?;
     done(ctx, id, Ok(()));
     Ok(Value::Null)
+}
+
+/// Google only returns to Antigravity's fixed loopback port. If something else
+/// holds it, the person pastes the address the browser ends on instead.
+async fn start_antigravity(ctx: &Arc<Ctx>) -> Result<Value, String> {
+    let id = target_id(ctx, Kind::AntigravityOauth);
+    let (verifier, challenge) = pkce();
+    let state = random_string(32);
+    let url = antigravity_auth_url(&challenge, &state);
+    let (tx, mut rx) = tokio::sync::watch::channel(false);
+    if let Some(old) = pending().lk().insert(id.clone(), Pending { kind: Kind::AntigravityOauth, verifier: verifier.clone(), state: state.clone(), cancel: tx }) {
+        let _ = old.cancel.send(true);
+    }
+    // An earlier attempt may still be letting go of the port.
+    let mut listener = None;
+    for _ in 0..10 {
+        match tokio::net::TcpListener::bind(("127.0.0.1", ANTIGRAVITY_PORT)).await {
+            Ok(l) => {
+                listener = Some(l);
+                break;
+            }
+            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+        }
+    }
+    let listening = listener.is_some();
+    open_browser(&url);
+    if let Some(listener) = listener {
+        let (c, id2) = (ctx.clone(), id.clone());
+        tauri::async_runtime::spawn(async move {
+            let q = tokio::select! {
+                q = accept_callback(&listener, "/oauth-callback") => q,
+                _ = rx.changed() => None,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(600)) => None,
+            };
+            drop(listener);
+            let Some(q) = q else { return };
+            let r = async {
+                if q.contains("error=") {
+                    return Err("the sign-in was cancelled or refused in the browser; start again".to_string());
+                }
+                let (code, st) = parse_code_input(&format!("?{q}"))?;
+                if st.as_deref() != Some(state.as_str()) {
+                    return Err("sign-in state mismatch; start again".to_string());
+                }
+                let creds = antigravity_exchange(GOOGLE_TOKEN_URL, &verifier, &code).await?;
+                finish(&c, &id2, Kind::AntigravityOauth, creds).await
+            }
+            .await;
+            pending().lk().remove(&id2);
+            done(&c, &id2, r);
+        });
+    }
+    Ok(json!({ "id": id, "kind": "antigravity_oauth", "auto_url": url, "manual_url": url, "listening": listening }))
 }
 
 fn valid_user_code(c: &str) -> bool {
@@ -474,7 +667,7 @@ async fn start_chatgpt(ctx: &Arc<Ctx>) -> Result<Value, String> {
     }
     let interval = v["interval"].as_u64().or_else(|| v["interval"].as_str().and_then(|s| s.trim().parse().ok())).unwrap_or(5).clamp(1, 60);
     let (tx, mut rx) = tokio::sync::watch::channel(false);
-    if let Some(old) = pending().lk().insert(id.clone(), Pending { verifier: String::new(), state: String::new(), cancel: tx }) {
+    if let Some(old) = pending().lk().insert(id.clone(), Pending { kind: Kind::ChatgptOauth, verifier: String::new(), state: String::new(), cancel: tx }) {
         let _ = old.cancel.send(true);
     }
     open_browser(OPENAI_VERIFY_URL);
@@ -562,9 +755,10 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
         "oauth_start" => match Kind::parse(&arg_str(&args, "kind")?)? {
             Kind::ClaudeOauth => start_claude(ctx).await,
             Kind::ChatgptOauth => start_chatgpt(ctx).await,
+            Kind::AntigravityOauth => start_antigravity(ctx).await,
             _ => Err("not a subscription kind".into()),
         },
-        "oauth_paste" => paste_claude(ctx, &arg_str(&args, "id")?, &arg_str(&args, "input")?).await,
+        "oauth_paste" => paste(ctx, &arg_str(&args, "id")?, &arg_str(&args, "input")?).await,
         "oauth_cancel" => {
             let id = target_id(ctx, Kind::parse(&arg_str(&args, "kind")?)?);
             if let Some(p) = pending().lk().remove(&id) {
@@ -628,6 +822,51 @@ mod tests {
         assert_eq!(q["redirect_uri"], "http://localhost:5/callback");
         assert!(q["scope"].contains("user:inference"));
         assert_eq!(u.host_str(), Some("claude.com"));
+    }
+
+    #[test]
+    fn google_sign_in_asks_for_offline_access_on_antigravitys_fixed_address() {
+        let u = reqwest::Url::parse(&antigravity_auth_url("CH", "ST")).unwrap();
+        let q: HashMap<_, _> = u.query_pairs().into_owned().collect();
+        assert_eq!(u.host_str(), Some("accounts.google.com"));
+        assert_eq!(q["client_id"], ANTIGRAVITY_CLIENT_ID);
+        assert_eq!(q["redirect_uri"], "http://127.0.0.1:51121/oauth-callback");
+        assert_eq!((q["access_type"].as_str(), q["prompt"].as_str(), q["state"].as_str()), ("offline", "consent", "ST"));
+        assert_eq!((q["code_challenge"].as_str(), q["code_challenge_method"].as_str()), ("CH", "S256"));
+        assert!(q["scope"].contains("auth/cloud-platform") && q["scope"].contains("auth/cclog"));
+        assert_eq!(project_of(&json!({"cloudaicompanionProject": " p1 "})).as_deref(), Some("p1"));
+        assert_eq!(project_of(&json!({"cloudaicompanionProject": {"id": "p2"}})).as_deref(), Some("p2"));
+        assert_eq!(project_of(&json!({"cloudaicompanionProject": ""})), None);
+        let t = |r: Option<&str>| TokenResp { access_token: Some("A".into()), refresh_token: r.map(Into::into), expires_in: Some(60), id_token: None, scope: None };
+        assert!(google_creds(t(None), None).unwrap_err().contains("myaccount.google.com/permissions"));
+        let prev = Creds { refresh: "OLD".into(), account_id: Some("p".into()), email: Some("e".into()), ..Default::default() };
+        let c = google_creds(t(None), Some(&prev)).unwrap();
+        assert_eq!((c.refresh.as_str(), c.account_id.as_deref(), c.email.as_deref()), ("OLD", Some("p"), Some("e")));
+    }
+
+    #[tokio::test]
+    async fn google_refresh_sends_the_client_secret_and_keeps_the_old_refresh_token() {
+        let got: Arc<Mutex<Vec<String>>> = Default::default();
+        let g = got.clone();
+        let app = Router::new().route(
+            "/token",
+            post(move |body: String| {
+                let g = g.clone();
+                async move {
+                    g.lk().push(body);
+                    Json(json!({ "access_token": "FRESH", "expires_in": 3599 }))
+                }
+            }),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        let prev = Creds { access: "OLD-A".into(), refresh: "OLD-R".into(), account_id: Some("proj".into()), email: Some("me@x".into()), ..Default::default() };
+        let c = antigravity_refresh(&format!("http://{a}/token"), &prev).await.unwrap();
+        assert_eq!((c.access.as_str(), c.refresh.as_str(), c.account_id.as_deref()), ("FRESH", "OLD-R", Some("proj")));
+        assert!(c.expires_at > now_ms() + 3_500_000);
+        let sent = got.lk()[0].clone();
+        assert!(sent.contains("grant_type=refresh_token") && sent.contains("refresh_token=OLD-R") && sent.contains("client_secret=GOCSPX"), "{sent}");
     }
 
     #[test]

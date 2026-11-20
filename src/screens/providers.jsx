@@ -9,7 +9,8 @@ const KINDS = [
   { value: "openai_responses", label: "OpenAI Responses API", url: "https://api.openai.com/v1" },
   { value: "anthropic", label: "Anthropic Messages API", url: "https://api.anthropic.com/v1" },
 ];
-const SUB_LABEL = { chatgpt_oauth: "ChatGPT subscription (signed in through Philium)", claude_oauth: "Claude subscription (signed in through Philium)" };
+const SUB_LABEL = { chatgpt_oauth: "ChatGPT subscription (signed in through Philium)", claude_oauth: "Claude subscription (signed in through Philium)", antigravity_oauth: "Google Antigravity subscription (signed in through Philium)" };
+const SUBSCRIPTIONS = [["claude_oauth", "Claude"], ["chatgpt_oauth", "ChatGPT"], ["antigravity_oauth", "Google Antigravity"]];
 const kindLabel = (k) => SUB_LABEL[k] ?? KINDS.find((x) => x.value === k)?.label ?? k;
 const isSub = (k) => k in SUB_LABEL;
 
@@ -105,6 +106,7 @@ function ModelList(props) {
 
 function SignIn(props) {
   const claude = props.kind === "claude_oauth";
+  const google = props.kind === "antigravity_oauth";
   const [st, setSt] = createSignal(null);
   const [paste, setPaste] = createSignal("");
   const [err, setErr] = createSignal("");
@@ -133,13 +135,16 @@ function SignIn(props) {
     <div class="col" style={{ gap: "8px" }}>
       <Show when={!st()} fallback={
         <div class="col" style={{ gap: "8px" }}>
-          <Show when={claude}>
-            <div class="small">Finish in your browser. It completes here by itself. If it does not, paste the code or the full callback URL:</div>
-            <div class="row"><Input mono value={paste()} onValue={setPaste} placeholder="code#state or callback URL" />
+          <Show when={claude || google}>
+            <Show when={google && st().listening === false}><Shield tone="strict">Another app is using the sign-in port Google returns to. When the browser says it cannot connect, copy that page's address and paste it here.</Shield></Show>
+            <div class="small">{google
+              ? "Finish in your browser. It completes here by itself. If it does not, copy the address the browser ends on (it starts with http://127.0.0.1:51121) and paste it here:"
+              : "Finish in your browser. It completes here by itself. If it does not, paste the code or the full callback URL:"}</div>
+            <div class="row"><Input mono value={paste()} onValue={setPaste} placeholder={google ? "http://127.0.0.1:51121/oauth-callback?..." : "code#state or callback URL"} />
               <Button variant="primary" onClick={submit} disabled={!paste().trim()}>Submit</Button></div>
             <div class="xs faint">Different browser? <a href="#" onClick={(e) => { e.preventDefault(); navigator.clipboard?.writeText(st().manual_url); toast("Link copied", "good"); }}>Copy the sign-in link</a>, finish there, then paste the code above.</div>
           </Show>
-          <Show when={!claude}>
+          <Show when={!claude && !google}>
             <div class="small">Open <span class="mono">{st().verify_url}</span> and enter this code:</div>
             <div class="mono" style={{ "font-size": "28px", "letter-spacing": "4px" }}>{st().user_code}</div>
             <div class="xs faint">Waiting for you to approve. This page updates automatically.</div>
@@ -147,7 +152,7 @@ function SignIn(props) {
           <div><Button size="sm" onClick={cancel}>Cancel</Button></div>
         </div>}>
         <div class="row">
-          <Button variant="primary" onClick={start}>{claude ? "Sign in with Claude" : "Sign in with ChatGPT"}</Button>
+          <Button variant="primary" onClick={start}>{claude ? "Sign in with Claude" : google ? "Sign in with Google" : "Sign in with ChatGPT"}</Button>
           <Show when={claude && importable()}><Button onClick={doImport}>Import existing Claude Code login</Button></Show>
         </div>
       </Show>
@@ -184,17 +189,20 @@ export default function Providers() {
       <Show when={list() && list().length === 0}>
         <Empty icon={<Icon name="key" size={32} />} title="No providers yet"
           action={<Button variant="primary" onClick={() => setForm({})}>Add an API provider</Button>}>
-          Add an API key for any provider, or sign in with a Claude or ChatGPT subscription below. Models are discovered live.
+          Add an API key for any provider, or sign in with a Claude, ChatGPT or Google Antigravity subscription below. Models are discovered live.
         </Empty>
       </Show>
       <div class="col" style={{ gap: "12px" }}>
-        <For each={[["claude_oauth", "Claude"], ["chatgpt_oauth", "ChatGPT"]].filter(([k]) => !(list() ?? []).some((p) => p.kind === k && p.signed_in))}>
+        <For each={SUBSCRIPTIONS.filter(([k]) => !(list() ?? []).some((p) => p.kind === k && p.signed_in))}>
           {([k, label]) => (
             <Card>
               <div class="card-head"><h2>{label} subscription</h2>
                 <Show when={(list() ?? []).some((p) => p.kind === k)}><Badge tone="danger">Sign in again</Badge></Show></div>
               <Show when={k === "claude_oauth"}>
                 <div class="small dim" style={{ "margin-bottom": "8px" }}>Using a Claude subscription outside Anthropic's own apps may be billed separately or flagged by Anthropic. An Anthropic API key (add it as a provider) is the risk-free alternative.</div>
+              </Show>
+              <Show when={k === "antigravity_oauth"}>
+                <div class="small dim" style={{ "margin-bottom": "8px" }}>Gives agents Gemini, and Claude through Google, on your Antigravity plan. Using Antigravity's sign-in outside Google's own apps breaks Google's terms, and Google has suspended accounts for it. A Gemini API key, added as a provider, carries no such risk.</div>
               </Show>
               <SignIn kind={k} onDone={() => { refetch(); bump(); }} />
             </Card>
