@@ -1022,8 +1022,10 @@ export default function Agents() {
     if (e.key === "Delete" || e.key === "Backspace") { e.preventDefault(); removePicked(); }
     else if (e.key === "Escape") setPicked([]);
   };
-  window.addEventListener("keydown", onKey);
-  onCleanup(() => window.removeEventListener("keydown", onKey));
+  if (typeof window !== "undefined") {
+    window.addEventListener("keydown", onKey);
+    onCleanup(() => window.removeEventListener("keydown", onKey));
+  }
   const [filter, setFilter] = createSignal("all");
   const [search, setSearch] = createSignal("");
   const [viewMode, setViewModeRaw] = createSignal(localStorage.getItem("agents.viewMode") || "split");
