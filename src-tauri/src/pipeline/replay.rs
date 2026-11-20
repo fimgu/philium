@@ -181,9 +181,14 @@ pub async fn run(db: &Db, repo_key: &str, repo: &Path, p: &Pipeline, set: &Repla
             None => parent(repo, &b.buggy)?,
         };
         let on_bug = one(p, repo, &b.buggy, &base, &b.check, gate_dir, b.overlay.as_ref(), host).await?;
+        // The control: the fix when known, else the commit before the bug. A check
+        // that also fails there proves nothing about this bug.
         let on_fix = match &b.fixed {
             Some(f) => Some(one(p, repo, f, &b.buggy, &b.check, gate_dir, b.overlay.as_ref(), host).await?),
-            None => None,
+            None => {
+                let before = parent(repo, &base).unwrap_or_else(|_| base.clone());
+                Some(one(p, repo, &base, &before, &b.check, gate_dir, b.overlay.as_ref(), host).await?)
+            }
         };
         let caught = remember(db, repo_key, digest, &b.id, &b.buggy, b.fixed.as_deref(), &b.check, on_bug.status, on_fix.as_ref().map(|o| o.status))?;
         let reason = if on_bug.status == Status::NotRun {
@@ -191,7 +196,8 @@ pub async fn run(db: &Db, repo_key: &str, repo: &Path, p: &Pipeline, set: &Repla
         } else if !on_bug.status.failed() {
             Some("passed on the buggy commit: the gate misses this bug".into())
         } else if let Some(f) = on_fix.as_ref().filter(|f| f.status != Status::Pass) {
-            Some(format!("also {} on the fix, so it does not single out this bug", f.status.as_str()))
+            let place = if b.fixed.is_some() { "the fix" } else { "the commit before the bug" };
+            Some(format!("{} on {place} too, so it does not single out this bug{}", f.status.as_str(), f.reason.as_deref().map(|r| format!(": {r}")).unwrap_or_default()))
         } else {
             None
         };
@@ -290,7 +296,9 @@ mod tests {
             "version: 1\nbugs:\n  - {{ id: lost-rows, buggy: {bug_a}, fixed: {fix_a}, check: a, text: upgrade lost rows }}\n  - {{ id: b-broke, buggy: {bug_b}, check: b, text: b broke }}\n  - {{ id: wrong-check, buggy: {bug_b}, check: a, text: the wrong check misses it }}\n"
         );
         let set = ReplaySet::parse(&text, &p).unwrap();
-        let rep = run(&db, "r", &r, &p, &set, "g1", &root, &h, &|_| {}).await.unwrap();
+        let gate = root.join("gate");
+        std::fs::create_dir_all(&gate).unwrap();
+        let rep = run(&db, "r", &r, &p, &set, "g1", &gate, &h, &|_| {}).await.unwrap();
         assert_eq!((rep.caught, rep.total), (2, 3));
         assert!(rep.rejected_below.is_none());
         let missed = rep.bugs.iter().find(|b| b.id == "wrong-check").unwrap();
@@ -298,7 +306,7 @@ mod tests {
         // A gate whose check for b no longer catches anything is held to the old bar.
         let weaker = Pipeline::parse(&format!("version: 1\nbranch: main\nplatforms: [{}]\ntiers: {{ fast: [ {{ id: a, run: sh check.sh a }}, {{ id: b, run: \"true\" }} ] }}\n", crate::pipeline::config::host_platform())).unwrap();
         let set2 = ReplaySet::parse(&text, &weaker).unwrap();
-        let rep2 = run(&db, "r", &r, &weaker, &set2, "g2", &root, &h, &|_| {}).await.unwrap();
+        let rep2 = run(&db, "r", &r, &weaker, &set2, "g2", &gate, &h, &|_| {}).await.unwrap();
         assert_eq!(rep2.caught, 1);
         assert!(rep2.rejected_below.is_some_and(|b| (b - 2.0 / 3.0).abs() < 1e-9));
         // Invariant 8's proof needs the failure on the bug and a pass on the fix candidate.

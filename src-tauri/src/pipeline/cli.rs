@@ -189,7 +189,7 @@ async fn main(cmd: &str, rest: &[String]) -> Result<i32, String> {
                 println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());
             } else {
                 for b in &r.bugs {
-                    println!("{} {}: {} on the bug{}{}", if b.caught { "✅" } else { "❌" }, b.id, b.buggy.as_str(), b.fixed.map(|f| format!(", {} on the fix", f.as_str())).unwrap_or_default(), b.reason.as_deref().map(|x| format!(" ({x})")).unwrap_or_default());
+                    println!("{} {}: {} on the bug{}{}", if b.caught { "✅" } else { "❌" }, b.id, b.buggy.as_str(), b.fixed.map(|f| format!(", {} on the control", f.as_str())).unwrap_or_default(), b.reason.as_deref().map(|x| format!(" ({x})")).unwrap_or_default());
                 }
                 println!("catch rate: {}/{} ({:.0}%)", r.caught, r.total, r.rate * 100.0);
                 if let Some(b) = r.rejected_below {

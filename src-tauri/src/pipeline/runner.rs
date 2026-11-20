@@ -265,7 +265,7 @@ fn sbpl(p: &Path) -> String {
 
 /// The sandbox for one check: everything else as usual, but the real home folder
 /// is out of reach except toolchains and Philium's own caches.
-pub fn profile(home: &Path, allow: &[PathBuf]) -> String {
+pub fn profile(home: &Path, allow: &[PathBuf], read_only: &[PathBuf]) -> String {
     let mut s = String::from("(version 1)\n(allow default)\n");
     let homes = [home.to_path_buf(), std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf())];
     for h in &homes {
@@ -276,12 +276,38 @@ pub fn profile(home: &Path, allow: &[PathBuf]) -> String {
             s.push_str(&format!("(allow file-read* (subpath \"{}\"))\n", sbpl(&h.join(d))));
         }
     }
+    // Read-only areas first, so a writable run folder is never shadowed by them.
+    for a in read_only {
+        for v in [a.clone(), std::fs::canonicalize(a).unwrap_or_else(|_| a.clone())] {
+            s.push_str(&format!("(allow file-read* (subpath \"{}\"))\n(deny file-write* (subpath \"{}\"))\n", sbpl(&v), sbpl(&v)));
+        }
+    }
     for a in allow {
         for v in [a.clone(), std::fs::canonicalize(a).unwrap_or_else(|_| a.clone())] {
             s.push_str(&format!("(allow file-read* file-write* (subpath \"{}\"))\n", sbpl(&v)));
         }
     }
     s
+}
+
+/// Before any check on a side runs: inside the sandbox, the clone is writable,
+/// the gate readable and the home folder unreadable. Otherwise a check would
+/// fail for the sandbox's reasons and be taken for a real failure.
+pub async fn preflight(workdir: &Path, rundir: &Path, gate: Option<&Path>, host: &Host) -> Result<(), String> {
+    let mut env = HashMap::new();
+    if let Some(g) = gate {
+        env.insert("PHILIUM_GATE".to_string(), g.display().to_string());
+    }
+    let script = "touch .philium-preflight && rm .philium-preflight || { echo 'the clone is not writable'; exit 1; }; \
+        if [ -n \"${PHILIUM_GATE:-}\" ]; then ls \"$PHILIUM_GATE\" >/dev/null 2>&1 || { echo 'the gate folder is not readable'; exit 1; }; fi; \
+        if ls \"$1/\" >/dev/null 2>&1; then echo 'the home folder is readable'; exit 1; fi";
+    let home = host.home.display().to_string();
+    let out = command(&["/bin/sh", "-c", script, "preflight", &home], workdir, rundir, host, &env)?.output().await.map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!("sandbox preflight: {}", String::from_utf8_lossy(&out.stdout).trim()))
+    }
 }
 
 /// A process with nothing inherited: its own HOME and temp folder, a fixed
@@ -294,7 +320,8 @@ fn command(argv: &[&str], workdir: &Path, rundir: &Path, host: &Host, env: &Hash
     if !cfg!(target_os = "macos") || !Path::new("/usr/bin/sandbox-exec").exists() {
         return Err("this machine has no sandbox to keep checks away from the home folder".into());
     }
-    let prof = profile(&host.home, &[rundir.to_path_buf(), workdir.to_path_buf(), host.caches.clone()]);
+    let read_only: Vec<PathBuf> = env.get("PHILIUM_GATE").map(PathBuf::from).into_iter().collect();
+    let prof = profile(&host.home, &[rundir.to_path_buf(), workdir.to_path_buf(), host.caches.clone()], &read_only);
     let mut c = tokio::process::Command::new("/usr/bin/sandbox-exec");
     c.arg("-p").arg(prof).args(argv);
     let tools: Vec<String> = [".cargo/bin", "go/bin", ".local/bin"].iter().map(|d| host.home.join(d).display().to_string()).collect();
@@ -654,6 +681,22 @@ pub(crate) mod tests {
         assert!(docker_refusal(Some(125), "docker: Error response from daemon: pull access denied").unwrap().contains("could not start"));
         assert_eq!(docker_refusal(Some(127), "sh: make: not found"), None);
         assert_eq!(docker_refusal(Some(1), "--- FAIL: TestThing"), None);
+    }
+
+    #[tokio::test]
+    async fn the_preflight_refuses_a_sandbox_that_could_read_the_home_folder() {
+        let root = tmp("pre");
+        let h = host(&root);
+        let (work, rundir, gate) = (root.join("work"), root.join("run"), root.join("gate"));
+        for d in [&work, &rundir, &gate] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        assert_eq!(preflight(&work, &rundir, Some(&gate), &h).await, Ok(()));
+        // A "gate" that contains the home folder would open it up: refused.
+        assert!(preflight(&work, &rundir, Some(&root), &h).await.unwrap_err().contains("home folder is readable"));
+        // A gate the check cannot read is refused too, rather than failing every check.
+        assert!(preflight(&work, &rundir, Some(&root.join("missing")), &h).await.unwrap_err().contains("gate folder is not readable"));
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[tokio::test]

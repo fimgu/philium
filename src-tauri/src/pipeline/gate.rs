@@ -41,10 +41,18 @@ pub(crate) async fn side(p: &Pipeline, checks: &[&super::config::Check], repo: &
         }
         let extra: HashMap<String, String> = [("sha", sha.to_string()), ("base", base.to_string()), ("gate", gate_dir.display().to_string())].into_iter().map(|(k, v)| (k.to_string(), v)).collect();
         let services = runner::up(p, &needed, &label, &work, &rundir, host, &extra).await;
+        let pre = runner::preflight(&work, &rundir, Some(gate_dir), host).await;
+        if let Err(e) = &pre {
+            say(e.clone());
+        }
         let mut out = vec![];
         for c in checks {
             say(format!("{} on {}", c.id, &sha[..12]));
-            let o = runner::run_check(p, c, &work, &rundir, &services, host).await;
+            let on_host = p.platform_for(c, &host.platform) == host.platform;
+            let o = match (&pre, on_host) {
+                (Err(e), true) => runner::Outcome { status: super::records::Status::NotRun, reason: Some(e.clone()), exit_code: None, duration_ms: 0, output: String::new() },
+                _ => runner::run_check(p, c, &work, &rundir, &services, host).await,
+            };
             say(format!("{} on {}: {}{}", c.id, &sha[..12], o.status.as_str(), o.reason.as_deref().map(|r| format!(" ({r})")).unwrap_or_default()));
             out.push((c.id.clone(), o));
         }
