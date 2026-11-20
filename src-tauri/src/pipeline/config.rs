@@ -22,6 +22,10 @@ pub struct Pipeline {
     /// Where checks may run, as `<os>/<arch>`. A check that would run anywhere else is `not_run`.
     #[serde(default = "host_only")]
     pub platforms: Vec<String>,
+    /// The container image for each platform other than this machine's
+    /// (for example linux/amd64: golang:1.26). A check may name its own.
+    #[serde(default)]
+    pub images: BTreeMap<String, String>,
     #[serde(default)]
     pub services: BTreeMap<String, Service>,
     /// Secret names only. Values come from the Keychain and never reach a log.
@@ -155,6 +159,9 @@ pub struct Check {
     pub timeout: Option<Timeout>,
     #[serde(default)]
     pub platform: Option<String>,
+    /// The container image when the check runs on another platform than this machine.
+    #[serde(default)]
+    pub image: Option<String>,
     /// Declared secret names this check receives.
     #[serde(default)]
     pub secrets: Vec<String>,
@@ -270,6 +277,20 @@ impl Pipeline {
         [Tier::Fast, Tier::Full, Tier::Release].iter().flat_map(|t| self.tier(*t)).find(|c| c.id == id)
     }
 
+    /// Where a check runs: its own platform, else this machine when it is declared,
+    /// else the first declared platform (in a container).
+    pub fn platform_for(&self, c: &Check, host: &str) -> String {
+        match &c.platform {
+            Some(p) => p.clone(),
+            None if self.platforms.iter().any(|p| p == host) => host.to_string(),
+            None => self.platforms[0].clone(),
+        }
+    }
+
+    pub fn image_for(&self, c: &Check, platform: &str) -> Option<String> {
+        c.image.clone().or_else(|| self.images.get(platform).cloned())
+    }
+
     /// Every reference resolves, before anything runs.
     pub fn validate(&self) -> Result<(), String> {
         if self.version != 1 {
@@ -298,6 +319,11 @@ impl Pipeline {
             }
             if let Service::Kind { kind } = s {
                 relative(&kind.manifests, &format!("service {name}: kind.manifests"))?;
+            }
+        }
+        for (pl, img) in &self.images {
+            if !platform_ok(pl) || img.trim().is_empty() || img.contains(char::is_whitespace) {
+                return Err(format!("{FILE}: images maps a platform such as linux/amd64 to one image name"));
             }
         }
         for s in &self.secrets {
@@ -502,9 +528,18 @@ pub fn split_words(s: &str) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
+/// A gate definition and where it came from. Only a gate read from the base
+/// commit is pinned; a local file is for trying a gate out and never lands.
+#[derive(Debug, Clone)]
+pub struct Gate {
+    pub pipeline: Pipeline,
+    pub from: String,
+    pub pinned: bool,
+}
+
 /// The gate definition for a change: the base commit's own file, else a file
 /// a person registered for the repo. Never the head's copy.
-pub fn load(repo: &Path, base_sha: &str, local: Option<&Path>) -> Result<(Pipeline, String), String> {
+pub fn load(repo: &Path, base_sha: &str, local: Option<&Path>) -> Result<Gate, String> {
     let out = std::process::Command::new("git")
         .arg("-C")
         .arg(repo)
@@ -513,12 +548,12 @@ pub fn load(repo: &Path, base_sha: &str, local: Option<&Path>) -> Result<(Pipeli
         .map_err(|e| format!("git: {e}"))?;
     if out.status.success() {
         let text = String::from_utf8_lossy(&out.stdout).into_owned();
-        return Ok((Pipeline::parse(&text)?, format!("{base_sha}:{FILE}")));
+        return Ok(Gate { pipeline: Pipeline::parse(&text)?, from: format!("{base_sha}:{FILE}"), pinned: true });
     }
     match local {
         Some(p) => {
             let text = std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?;
-            Ok((Pipeline::parse(&text)?, p.display().to_string()))
+            Ok(Gate { pipeline: Pipeline::parse(&text)?, from: p.display().to_string(), pinned: false })
         }
         None => Err(format!("the base {} has no {FILE}, and no local pipeline file is registered for this repo", &base_sha[..base_sha.len().min(12)])),
     }
@@ -617,6 +652,18 @@ environments:
     }
 
     #[test]
+    fn a_check_runs_on_its_platform_and_the_image_comes_from_the_file() {
+        let p = Pipeline::parse("version: 1\nbranch: main\nplatforms: [darwin/arm64, linux/amd64]\nimages: { linux/amd64: 'alpine:3.20' }\ntiers: { fast: [ { id: a, run: x }, { id: b, run: x, platform: linux/amd64 }, { id: c, run: x, platform: linux/amd64, image: 'debian:12' } ] }").unwrap();
+        let (a, b, c) = (p.check("a").unwrap(), p.check("b").unwrap(), p.check("c").unwrap());
+        assert_eq!(p.platform_for(a, "darwin/arm64"), "darwin/arm64");
+        assert_eq!(p.platform_for(a, "linux/arm64"), "darwin/arm64", "a machine outside the list runs the first declared platform");
+        assert_eq!(p.platform_for(b, "darwin/arm64"), "linux/amd64");
+        assert_eq!(p.image_for(b, "linux/amd64").as_deref(), Some("alpine:3.20"));
+        assert_eq!(p.image_for(c, "linux/amd64").as_deref(), Some("debian:12"));
+        assert!(Pipeline::parse("version: 1\nbranch: main\nimages: { linux: x }\ntiers: { fast: [ { id: a, run: x } ] }").is_err());
+    }
+
+    #[test]
     fn templates_fill_only_known_names() {
         let vars: HashMap<String, String> = [("port.db".to_string(), "5501".to_string()), ("run".to_string(), "r1".to_string())].into();
         assert_eq!(expand("pg://h:${port.db}/t_${run} costs $${run}", &vars).unwrap(), "pg://h:5501/t_r1 costs ${run}");
@@ -642,9 +689,16 @@ environments:
         // The change rewrites its own gate to something that always passes.
         std::fs::write(dir.join(FILE), "version: 1\nbranch: main\ntiers: { fast: [ { id: strict, run: \"true\" } ] }\n").unwrap();
         git(&["commit", "-qam", "weaken"]);
-        let (p, from) = load(&dir, &base, None).unwrap();
-        assert_eq!(p.check("strict").unwrap().run, "make test");
-        assert!(from.starts_with(&base));
+        let g = load(&dir, &base, None).unwrap();
+        assert_eq!(g.pipeline.check("strict").unwrap().run, "make test");
+        assert!(g.from.starts_with(&base) && g.pinned);
+        // A local file is accepted only where the base has none, and is never pinned.
+        let local = dir.join("local.yaml");
+        std::fs::write(&local, "version: 1\nbranch: main\ntiers: { fast: [ { id: t, run: x } ] }\n").unwrap();
+        let g = load(&dir, &base, Some(&local)).unwrap();
+        assert!(g.pinned, "the base's own file wins over a local one");
+        let g = load(&dir, "4b825dc642cb6eb9a060e54bf8d69288fbee4904", Some(&local)).unwrap();
+        assert!(!g.pinned && g.from.ends_with("local.yaml"));
         // A base without the file falls back to the person's registered file, else refuses.
         let e = load(&dir, "4b825dc642cb6eb9a060e54bf8d69288fbee4904", None).unwrap_err();
         assert!(e.contains("no local pipeline file"), "{e}");

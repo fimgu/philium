@@ -59,6 +59,8 @@ pub struct Inputs {
     pub escapes: Vec<Escape>,
     /// Escape id -> the check failed on the buggy SHA and passed on this candidate.
     pub escape_proofs: HashMap<String, bool>,
+    /// Every run behind the results read its gate from the base commit.
+    pub pinned: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -67,6 +69,8 @@ pub struct Verdict {
     pub state: &'static str,
     pub reasons: Vec<String>,
     pub outcomes: Vec<(String, Outcome)>,
+    /// False when the gate came from a local file: an "unpinned config" verdict, never landed.
+    pub pinned: bool,
 }
 
 impl Verdict {
@@ -137,7 +141,7 @@ pub fn decide(i: &Inputs) -> Verdict {
         block.push("the tier declares no checks".into());
     }
     fail.extend(block);
-    Verdict { state, reasons: fail, outcomes }
+    Verdict { state, reasons: fail, outcomes, pinned: i.pinned }
 }
 
 fn short(o: &Outcome) -> &'static str {
@@ -166,6 +170,7 @@ pub fn for_candidate(db: &Db, repo: &str, pr: Option<i64>, tier: &str, checks: V
         findings: pr.map(|p| records::findings(db, repo, p)).unwrap_or_default(),
         escapes,
         escape_proofs,
+        pinned: records::pinned(db, repo, pr, tier, candidate),
     };
     Ok(decide(&i))
 }

@@ -17,7 +17,8 @@ const TOOL_DIRS: [&str; 11] = [".rustup", ".cargo/bin", "go/bin", "go/pkg/mod", 
 /// What the machine provides to a run. Production reads the Keychain and the
 /// enrolment table; tests pass their own.
 pub struct Host {
-    /// Where run folders go. Must not be inside `home`.
+    /// Where run folders go. Docker must be able to mount it (Colima shares the
+    /// home folder), so it may sit under `home`: the sandbox re-allows only the run's own folders.
     pub scratch: PathBuf,
     /// Philium's own caches, kept between runs.
     pub caches: PathBuf,
@@ -311,14 +312,77 @@ fn tail(s: &str, n: usize) -> String {
     format!("…{}", &s[i..])
 }
 
+/// A check on another platform runs in `docker run --platform`, with only its
+/// clone, its own HOME and temp folder, Philium's caches and the declared
+/// variables. No home folder, no added privileges.
+#[allow(clippy::too_many_arguments)]
+fn container(platform: &str, image: &str, name: &str, script: &str, workdir: &Path, rundir: &Path, env: &HashMap<String, String>, caches: &[(String, PathBuf)]) -> Result<tokio::process::Command, String> {
+    let home = rundir.join("home");
+    let tmp = rundir.join("tmp");
+    std::fs::create_dir_all(&home).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&tmp).map_err(|e| e.to_string())?;
+    let mut c = tokio::process::Command::new("docker");
+    c.args(["run", "--rm", "--name", name, "--platform", platform, "--pull=missing", "--cap-drop=ALL", "--security-opt=no-new-privileges", "--network=bridge"]);
+    c.arg("-v").arg(format!("{}:/philium/work", workdir.display())).args(["-w", "/philium/work"]);
+    c.arg("-v").arg(format!("{}:/philium/home", home.display())).arg("-v").arg(format!("{}:/philium/tmp", tmp.display()));
+    c.args(["-e", "HOME=/philium/home", "-e", "TMPDIR=/philium/tmp", "-e", "CI=true", "-e", "LANG=C.UTF-8"]);
+    for (var, dir) in caches {
+        let _ = std::fs::create_dir_all(dir);
+        let inside = format!("/philium/cache/{}", dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+        c.arg("-v").arg(format!("{}:{inside}", dir.display())).arg("-e").arg(format!("{var}={inside}"));
+    }
+    // Values travel in the docker client's environment, never on its command line.
+    c.env_clear();
+    for k in ["PATH", "HOME", "DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG"] {
+        if let Some(v) = std::env::var_os(k) {
+            c.env(k, v);
+        }
+    }
+    if std::env::var_os("PATH").is_none() {
+        c.env("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin");
+    }
+    for (k, v) in env {
+        c.arg("-e").arg(k);
+        c.env(k, v);
+    }
+    c.args(["--entrypoint", "/bin/sh", image, "-c", script]).stdin(std::process::Stdio::null()).kill_on_drop(true);
+    Ok(c)
+}
+
+/// Docker could not give the check its platform or start it at all: not the check's failure.
+fn docker_refusal(exit: Option<i32>, text: &str) -> Option<String> {
+    let low = text.to_ascii_lowercase();
+    let platform = ["exec format error", "no matching manifest", "does not match the specified platform", "requested image's platform"];
+    if let Some(m) = platform.iter().find(|m| low.contains(*m)) {
+        return Some(format!("Docker cannot provide this platform ({m})"));
+    }
+    if exit == Some(125) || low.contains("error response from daemon") || low.contains("cannot connect to the docker daemon") {
+        let line = text.lines().find(|l| l.to_ascii_lowercase().contains("docker")).unwrap_or("").trim();
+        return Some(format!("Docker could not start the check: {}", tail(line, 300)));
+    }
+    None
+}
+
 /// Run one check in a prepared checkout with its services up.
 pub async fn run_check(p: &Pipeline, c: &Check, workdir: &Path, rundir: &Path, services: &Services, host: &Host) -> Outcome {
-    if !p.platforms.contains(&host.platform) {
-        return not_run(format!("this machine is {}, which is not one of the declared platforms ({})", host.platform, p.platforms.join(", ")));
+    let platform = p.platform_for(c, &host.platform);
+    if !p.platforms.contains(&platform) {
+        return not_run(format!("{platform} is not one of the declared platforms ({})", p.platforms.join(", ")));
     }
-    if let Some(pl) = c.platform.as_ref().filter(|pl| **pl != host.platform) {
-        return not_run(format!("needs {pl}; this machine is {}", host.platform));
-    }
+    let image = if platform != host.platform {
+        if c.environment.is_some() {
+            return not_run(format!("needs {platform}, and an environment check runs only on this machine ({})", host.platform));
+        }
+        if !c.needs.is_empty() {
+            return not_run(format!("needs {platform}; a check in a container cannot use services yet"));
+        }
+        match p.image_for(c, &platform) {
+            Some(i) => Some(i),
+            None => return not_run(format!("needs {platform}, and no image is declared for it")),
+        }
+    } else {
+        None
+    };
     for n in &c.needs {
         if let Some(why) = services.failed.get(n) {
             return not_run(format!("service {n}: {why}"));
@@ -362,14 +426,24 @@ pub async fn run_check(p: &Pipeline, c: &Check, workdir: &Path, rundir: &Path, s
             }
         }
     };
-    for (k, dir) in &p.caches {
-        let path = host.caches.join(dir);
-        let _ = std::fs::create_dir_all(&path);
-        env.insert(k.clone(), path.display().to_string());
-    }
     let timeout = c.timeout_secs().unwrap_or(600);
-    let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-    let mut cmd = match command(&refs, workdir, rundir, host, &env) {
+    let cname = format!("philium-check-{}", &crate::db::new_id()[..12]).to_ascii_lowercase();
+    let built = match &image {
+        Some(img) => {
+            let caches: Vec<(String, PathBuf)> = p.caches.iter().map(|(k, d)| (k.clone(), host.caches.join(format!("{}-{}", d, platform.replace('/', "-"))))).collect();
+            container(&platform, img, &cname, argv.last().map(String::as_str).unwrap_or("true"), workdir, rundir, &env, &caches)
+        }
+        None => {
+            for (k, dir) in &p.caches {
+                let path = host.caches.join(dir);
+                let _ = std::fs::create_dir_all(&path);
+                env.insert(k.clone(), path.display().to_string());
+            }
+            let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+            command(&refs, workdir, rundir, host, &env)
+        }
+    };
+    let mut cmd = match built {
         Ok(cmd) => cmd,
         Err(m) => return not_run(m),
     };
@@ -404,12 +478,20 @@ pub async fn run_check(p: &Pipeline, c: &Check, workdir: &Path, rundir: &Path, s
             (if code == Some(0) { Status::Pass } else { Status::Fail }, code.map(i64::from), text)
         }
         Err(_) => {
+            if image.is_some() {
+                let _ = tokio::process::Command::new("docker").args(["kill", &cname]).output().await;
+            }
             if let Some(pid) = pid {
                 kill_group(pid).await;
             }
             (Status::Timeout, None, format!("timed out after {timeout} s"))
         }
     };
+    if image.is_some() && status != Status::Pass {
+        if let Some(why) = docker_refusal(exit.map(|e| e as i32), &text) {
+            return Outcome { status: Status::NotRun, reason: Some(why), exit_code: exit, duration_ms: started.elapsed().as_millis() as i64, output: tail(&text, OUTPUT_CAP) };
+        }
+    }
     let mut text = tail(&text, OUTPUT_CAP);
     for h in hidden {
         text = text.replace(&h, "***");
@@ -422,7 +504,8 @@ pub(crate) mod tests {
     use super::*;
 
     pub fn tmp(tag: &str) -> PathBuf {
-        let d = PathBuf::from("/private/tmp").join(format!("philium-{tag}-{}", crate::db::new_id()));
+        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/private/tmp"));
+        let d = home.join("Library/Caches/philium-tests").join(format!("{tag}-{}", crate::db::new_id()));
         std::fs::create_dir_all(&d).unwrap();
         d
     }
@@ -493,7 +576,7 @@ pub(crate) mod tests {
         let p = pipeline(&format!(
             "{{ id: plat, run: \"true\", platform: {other} }}, {{ id: sec, run: \"true\", secrets: [MISSING] }}, {{ id: svc, run: \"true\", needs: [gone] }}, {{ id: env, run: \"echo status\", environment: other }}, {{ id: envok, run: \"echo status ok\", environment: enrolled }}"
         ));
-        for (id, why) in [("plat", "needs"), ("sec", "secret MISSING is not in the Keychain"), ("svc", "service gone: nope.yaml is not in this commit"), ("env", "not enrolled")] {
+        for (id, why) in [("plat", "is not one of the declared platforms"), ("sec", "secret MISSING is not in the Keychain"), ("svc", "service gone: nope.yaml is not in this commit"), ("env", "not enrolled")] {
             let o = run(&p, id, &root).await;
             assert_eq!(o.status, Status::NotRun, "{id}");
             assert!(o.reason.as_deref().unwrap_or("").contains(why), "{id}: {:?}", o.reason);
@@ -505,6 +588,50 @@ pub(crate) mod tests {
         q.platforms = vec![other.into()];
         assert_eq!(run(&q, "envok", &root).await.status, Status::NotRun);
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    fn docker_has(image: &str) -> bool {
+        std::process::Command::new("docker").args(["image", "inspect", image]).output().is_ok_and(|o| o.status.success())
+    }
+
+    #[tokio::test]
+    async fn a_check_for_another_platform_runs_in_docker_with_the_same_isolation() {
+        if !docker_has("alpine:3.20") {
+            eprintln!("skipped: Docker or the alpine:3.20 image is not available here");
+            return;
+        }
+        let root = tmp("ctr");
+        std::env::set_var("PHILIUM_LEAK_TEST", "leaked");
+        let p = Pipeline::parse(&format!(
+            "version: 1\nbranch: main\nplatforms: [{}, linux/amd64]\nimages: {{ linux/amd64: 'alpine:3.20' }}\nsecrets: [TOKEN]\ncaches: {{ GOCACHE: go-build }}\ntiers: {{ fast: [ {{ id: arch, run: \"uname -m; echo HOME=$HOME; echo LEAK=${{PHILIUM_LEAK_TEST:-none}}; echo tok=$TOKEN; echo cache=$GOCACHE; ls {} 2>&1 | head -1; touch made-inside\", platform: linux/amd64, secrets: [TOKEN] }}, {{ id: fails, run: \"exit 4\", platform: linux/amd64 }}, {{ id: noimg, run: \"true\", platform: linux/amd64, image: 'philium-no-such-image:0' }}, {{ id: svc, run: \"true\", platform: linux/amd64, needs: [x] }} ] }}\nservices: {{ x: {{ run: \"sleep 60\", ready: \"true\" }} }}\n",
+            config::host_platform(),
+            root.join("realhome").display()
+        ))
+        .unwrap();
+        let o = run(&p, "arch", &root).await;
+        assert_eq!(o.status, Status::Pass, "{} {:?}", o.output, o.reason);
+        assert!(o.output.starts_with("x86_64"), "{}", o.output);
+        assert!(o.output.contains("HOME=/philium/home") && o.output.contains("LEAK=none"), "{}", o.output);
+        assert!(o.output.contains("tok=***") && !o.output.contains("s3cr3t"), "{}", o.output);
+        assert!(o.output.contains("cache=/philium/cache/go-build-linux-amd64"), "{}", o.output);
+        assert!(o.output.contains("No such file"), "the home folder is not in the container: {}", o.output);
+        assert!(root.join("work/made-inside").exists(), "the clone is the container's working folder");
+        let o = run(&p, "fails", &root).await;
+        assert_eq!((o.status, o.exit_code), (Status::Fail, Some(4)));
+        let o = run(&p, "noimg", &root).await;
+        assert_eq!(o.status, Status::NotRun, "{} {:?}", o.output, o.reason);
+        assert!(o.reason.as_deref().unwrap().contains("Docker"), "{:?}", o.reason);
+        assert!(run(&p, "svc", &root).await.reason.unwrap().contains("cannot use services yet"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn docker_refusals_are_not_run_and_check_failures_are_failures() {
+        assert!(docker_refusal(Some(1), "exec /bin/sh: exec format error").unwrap().contains("cannot provide this platform"));
+        assert!(docker_refusal(Some(125), "docker: Error response from daemon: no matching manifest for linux/s390x").unwrap().contains("cannot provide"));
+        assert!(docker_refusal(Some(125), "docker: Error response from daemon: pull access denied").unwrap().contains("could not start"));
+        assert_eq!(docker_refusal(Some(127), "sh: make: not found"), None);
+        assert_eq!(docker_refusal(Some(1), "--- FAIL: TestThing"), None);
     }
 
     #[tokio::test]

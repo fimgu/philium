@@ -104,8 +104,11 @@ fn data(a: &Args) -> Result<Db, String> {
 
 pub fn host(db: &'static Db, repo: &str) -> Result<runner::Host, String> {
     let home = std::env::var_os("HOME").map(PathBuf::from).ok_or("HOME is not set")?;
-    let scratch = PathBuf::from("/private/tmp").join(format!("philium-pipeline-{}", std::process::id()));
-    let caches = home.join("Library/Caches/philium-pipeline").join(repo.replace('/', "-"));
+    // Under the home folder so Docker (Colima shares home) can mount run folders;
+    // the sandbox still hides the rest of home from checks.
+    let root = home.join("Library/Caches/philium-pipeline");
+    let scratch = root.join("runs").join(format!("{}", std::process::id()));
+    let caches = root.join("caches").join(repo.replace('/', "-"));
     let (r1, r2) = (repo.to_string(), repo.to_string());
     Ok(runner::Host {
         scratch,
@@ -161,10 +164,10 @@ async fn main(cmd: &str, rest: &[String]) -> Result<i32, String> {
                 None => head.clone(),
             };
             let pr = a.opts.get("pr").map(|v| v.parse::<i64>()).transpose().map_err(|_| "--pr is a number")?;
-            let (p, from) = config::load(&repo, &base, a.path("config").as_deref())?;
-            eprintln!("{key}: tier {} on {} (base {}), gate from {from}", tier.as_str(), &candidate[..12], &base[..12]);
+            let g = config::load(&repo, &base, a.path("config").as_deref())?;
+            eprintln!("{key}: tier {} on {} (base {}), gate from {}{}", tier.as_str(), &candidate[..12], &base[..12], g.from, if g.pinned { "" } else { " (unpinned config)" });
             let t = gate::Target { key: &key, path: &repo, pr, head: &head, base: &base, candidate: &candidate };
-            let (run, v) = gate::run_tier(db, &t, &p, &from, tier, &host, &say(a.json())).await?;
+            let (run, v) = gate::run_tier(db, &t, &g, tier, &host, &say(a.json())).await?;
             if a.json() {
                 println!("{}", serde_json::json!({"run": run, "verdict": v}));
             } else {
@@ -174,12 +177,13 @@ async fn main(cmd: &str, rest: &[String]) -> Result<i32, String> {
         }
         "replay" => {
             let at = sha(&repo, a.opts.get("at").map(String::as_str).unwrap_or("HEAD"))?;
-            let (p, from) = config::load(&repo, &at, a.path("config").as_deref())?;
-            let (set, text) = replay::load(&repo, &at, a.path("replay").as_deref(), &p)?;
-            let cfg_text = serde_yaml::to_string(&p).unwrap_or_default();
+            let g = config::load(&repo, &at, a.path("config").as_deref())?;
+            let (p, from) = (&g.pipeline, &g.from);
+            let (set, text) = replay::load(&repo, &at, a.path("replay").as_deref(), p)?;
+            let cfg_text = serde_yaml::to_string(p).unwrap_or_default();
             let digest = replay::digest(&[&cfg_text, &text]);
             eprintln!("{key}: replaying {} known bugs against the gate from {from}", set.bugs.len());
-            let r = replay::run(db, &key, &repo, &p, &set, &digest, &host, &say(a.json())).await?;
+            let r = replay::run(db, &key, &repo, p, &set, &digest, &host, &say(a.json())).await?;
             if a.json() {
                 println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());
             } else {
@@ -201,7 +205,8 @@ async fn main(cmd: &str, rest: &[String]) -> Result<i32, String> {
             let base = sha(&repo, a.get("base")?)?;
             let candidate = sha(&repo, a.get("candidate")?)?;
             let pr = a.opts.get("pr").map(|v| v.parse::<i64>()).transpose().map_err(|_| "--pr is a number")?;
-            let (p, _) = config::load(&repo, &base, a.path("config").as_deref())?;
+            let g = config::load(&repo, &base, a.path("config").as_deref())?;
+            let p = &g.pipeline;
             let tier = Tier::parse(a.opts.get("tier").map(String::as_str).unwrap_or("full"))?;
             let v = verdict::for_candidate(db, &key, pr, tier.as_str(), p.tier(tier).iter().map(|c| c.id.clone()).collect(), &base, &candidate)?;
             let plan = land::land(db, &key, &repo, a.get("remote")?, &p.branch, &base, &candidate, &v, a.flags.iter().any(|f| f == "push"))?;

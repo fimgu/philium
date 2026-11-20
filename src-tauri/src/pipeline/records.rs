@@ -14,7 +14,7 @@ const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS pipeline_runs(
   id TEXT PRIMARY KEY, repo TEXT NOT NULL, pr INTEGER, tier TEXT NOT NULL,
   head_sha TEXT NOT NULL, base_sha TEXT NOT NULL, candidate_sha TEXT NOT NULL,
-  config_from TEXT NOT NULL, started INTEGER NOT NULL, finished INTEGER,
+  config_from TEXT NOT NULL, pinned INTEGER NOT NULL DEFAULT 0, started INTEGER NOT NULL, finished INTEGER,
   CHECK(length(head_sha)=40 AND length(base_sha)=40 AND length(candidate_sha)=40));
 CREATE TABLE IF NOT EXISTS pipeline_results(
   run_id TEXT NOT NULL REFERENCES pipeline_runs(id) ON DELETE CASCADE,
@@ -112,6 +112,8 @@ pub struct RunKey<'a> {
     pub head: &'a str,
     pub base: &'a str,
     pub candidate: &'a str,
+    /// The gate came from the base commit, not a local file.
+    pub pinned: bool,
 }
 
 pub fn start_run(db: &Db, k: &RunKey, config_from: &str) -> Result<String, String> {
@@ -123,8 +125,8 @@ pub fn start_run(db: &Db, k: &RunKey, config_from: &str) -> Result<String, Strin
     init(db)?;
     let id = new_id();
     db.exec(
-        "INSERT INTO pipeline_runs(id,repo,pr,tier,head_sha,base_sha,candidate_sha,config_from,started) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-        params![id, k.repo, k.pr, k.tier, k.head, k.base, k.candidate, config_from, now()],
+        "INSERT INTO pipeline_runs(id,repo,pr,tier,head_sha,base_sha,candidate_sha,config_from,pinned,started) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+        params![id, k.repo, k.pr, k.tier, k.head, k.base, k.candidate, config_from, k.pinned, now()],
     )?;
     if let Some(pr) = k.pr {
         see_head(db, k.repo, pr, k.head)?;
@@ -219,6 +221,25 @@ pub fn enroll(db: &Db, repo: &str, env: &str, by: &str) -> Result<(), String> {
 pub fn enrolled(db: &Db, repo: &str, env: &str) -> bool {
     let _ = init(db);
     db.query("SELECT 1 FROM pipeline_enrolled WHERE repo=?1 AND environment=?2", params![repo, env]).map(|r| !r.is_empty()).unwrap_or(false)
+}
+
+/// Every run behind this candidate's results read its gate from the base commit.
+pub fn pinned(db: &Db, repo: &str, pr: Option<i64>, tier: &str, candidate: &str) -> bool {
+    let head = match pr {
+        Some(p) => match current_head(db, repo, p) {
+            Some(h) => Some(h),
+            None => return false,
+        },
+        None => None,
+    };
+    db.query(
+        "SELECT min(u.pinned) AS p, count(*) AS n FROM pipeline_runs u WHERE u.repo=?1 AND u.tier=?2 AND u.candidate_sha=?3 AND (?4 IS NULL OR (u.pr=?5 AND u.head_sha=?4))
+         AND EXISTS(SELECT 1 FROM pipeline_results r WHERE r.run_id=u.id)",
+        params![repo, tier, candidate, head, pr],
+    )
+    .ok()
+    .and_then(|r| r.first().cloned())
+    .is_some_and(|r| r["n"].as_i64().unwrap_or(0) > 0 && r["p"].as_i64() == Some(1))
 }
 
 /// People and agents add inputs; each is attributed.
@@ -357,8 +378,8 @@ pub(crate) mod tests {
     fn invariant_1_every_result_is_tied_to_exact_shas_and_a_new_head_makes_old_results_stale() {
         let db = db();
         // Short or abbreviated SHAs are refused outright.
-        assert!(start_run(&db, &RunKey { repo: "r", pr: Some(1), tier: "fast", head: "abc123", base: B, candidate: A }, "f").is_err());
-        let run = start_run(&db, &RunKey { repo: "r", pr: Some(1), tier: "fast", head: A, base: B, candidate: A }, "f").unwrap();
+        assert!(start_run(&db, &RunKey { repo: "r", pr: Some(1), tier: "fast", head: "abc123", base: B, candidate: A, pinned: true }, "f").is_err());
+        let run = start_run(&db, &RunKey { repo: "r", pr: Some(1), tier: "fast", head: A, base: B, candidate: A, pinned: true }, "f").unwrap();
         // A result must be for the SHA its side is about.
         assert!(record(&db, &run, "unit", Side::Candidate, B, Status::Pass, None, Some(0), None, "").is_err());
         assert!(record(&db, &run, "unit", Side::Base, A, Status::Pass, None, Some(0), None, "").is_err());

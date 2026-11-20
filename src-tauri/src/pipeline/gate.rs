@@ -1,7 +1,7 @@
 //! One tier on one candidate: run every check, rerun failures, run what still
 //! fails on the base with identical fixtures, record it all, then compute the
 //! verdict from the records.
-use super::config::{Pipeline, Tier};
+use super::config::{Gate, Pipeline, Tier};
 use super::records::{self, RunKey, Side};
 use super::runner::{self, Host};
 use super::verdict::{self, Verdict};
@@ -59,9 +59,10 @@ fn store(db: &Db, run: &str, side_: Side, sha: &str, outs: &[(String, runner::Ou
     Ok(())
 }
 
-pub async fn run_tier(db: &Db, t: &Target<'_>, p: &Pipeline, config_from: &str, tier: Tier, host: &Host, say: &(dyn Fn(String) + Sync)) -> Result<(String, Verdict), String> {
+pub async fn run_tier(db: &Db, t: &Target<'_>, g: &Gate, tier: Tier, host: &Host, say: &(dyn Fn(String) + Sync)) -> Result<(String, Verdict), String> {
+    let (p, config_from) = (&g.pipeline, g.from.as_str());
     let checks: Vec<&super::config::Check> = p.tier(tier).iter().collect();
-    let run = records::start_run(db, &RunKey { repo: t.key, pr: t.pr, tier: tier.as_str(), head: t.head, base: t.base, candidate: t.candidate }, config_from)?;
+    let run = records::start_run(db, &RunKey { repo: t.key, pr: t.pr, tier: tier.as_str(), head: t.head, base: t.base, candidate: t.candidate, pinned: g.pinned }, config_from)?;
     let first = side(p, &checks, t.path, t.candidate, host, say).await?;
     store(db, &run, Side::Candidate, t.candidate, &first)?;
     // A failure is run again on the same SHA: passing the second time is a flake, not a pass.
@@ -103,7 +104,7 @@ pub fn report(v: &Verdict) -> String {
         };
         s.push_str(&format!("{mark} {id}: {}\n", serde_json::to_value(o).ok().and_then(|x| x["outcome"].as_str().map(str::to_string)).unwrap_or_default()));
     }
-    s.push_str(&format!("gate: {}\n", v.state));
+    s.push_str(&format!("gate: {}{}\n", v.state, if v.pinned { "" } else { " (unpinned config: read from a local file, not the base commit; it can never land)" }));
     for r in &v.reasons {
         s.push_str(&format!("  - {r}\n"));
     }
@@ -173,7 +174,9 @@ pub(crate) mod tests {
         let p = pipeline(&shared);
         let db = crate::pipeline::records::tests::db();
         let t = Target { key: "r", path: &r, pr: Some(7), head: &head, base: &base, candidate: &head };
-        let (_, v) = run_tier(&db, &t, &p, "test", Tier::Fast, &h, &|_| {}).await.unwrap();
+        let g = Gate { pipeline: p, from: "test.yaml".into(), pinned: false };
+        let (_, v) = run_tier(&db, &t, &g, Tier::Fast, &h, &|_| {}).await.unwrap();
+        assert!(!v.pinned && report(&v).contains("unpinned config"));
         let o: std::collections::HashMap<_, _> = v.outcomes.iter().cloned().collect();
         assert_eq!(o["a"], verdict::Outcome::Introduced);
         assert_eq!(o["b"], verdict::Outcome::PreExisting);

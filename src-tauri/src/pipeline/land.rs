@@ -39,6 +39,9 @@ pub fn land(db: &Db, repo_key: &str, repo: &Path, remote: &str, branch: &str, ba
     if !verdict.pass() {
         return Err(format!("not landing {}: the gate is {} ({})", &candidate[..12], verdict.state, verdict.reasons.join("; ")));
     }
+    if push && !verdict.pinned {
+        return Err("unpinned config: this gate was read from a local file, not the base commit, so it can never land. Commit .philium/pipeline.yaml to the base first".into());
+    }
     // The candidate must contain the base: landing is a fast-forward, never a rewrite.
     git(repo, &["merge-base", "--is-ancestor", base, candidate]).map_err(|_| format!("{} does not contain the base {}; rebuild the candidate", &candidate[..12], &base[..12]))?;
     let argv: Vec<String> = ["git", "push", "--porcelain", remote, &format!("{candidate}:refs/heads/{branch}"), &format!("--force-with-lease=refs/heads/{branch}:{base}")].iter().map(|s| s.to_string()).collect();
@@ -76,10 +79,18 @@ mod tests {
         // No passing record for the candidate: nothing moves.
         assert!(land(&db, "r", &r, "up", "main", &base, &candidate, &decide(&candidate), true).unwrap_err().contains("gate is blocked"));
         assert_eq!(tip(), base);
-        let run = start_run(&db, &RunKey { repo: "r", pr: Some(1), tier: "full", head: &other, base: &base, candidate: &candidate }, "t").unwrap();
+        let run = start_run(&db, &RunKey { repo: "r", pr: Some(1), tier: "full", head: &other, base: &base, candidate: &candidate, pinned: true }, "t").unwrap();
         record(&db, &run, "unit", Side::Candidate, &candidate, Status::Pass, None, Some(0), None, "").unwrap();
         // A pass on the candidate says nothing about another SHA.
         assert!(land(&db, "r", &r, "up", "main", &base, &other, &decide(&other), true).is_err());
+        // A gate read from a local file says what it would do, but never pushes.
+        let run_local = start_run(&db, &RunKey { repo: "r", pr: None, tier: "full", head: &candidate, base: &base, candidate: &candidate, pinned: false }, "local.yaml").unwrap();
+        record(&db, &run_local, "unit", Side::Candidate, &candidate, Status::Pass, None, Some(0), None, "").unwrap();
+        let unpinned = verdict::for_candidate(&db, "r", None, "full", vec!["unit".into()], &base, &candidate).unwrap();
+        assert!(unpinned.pass() && !unpinned.pinned);
+        assert!(land(&db, "r", &r, "up", "main", &base, &candidate, &unpinned, false).is_ok());
+        assert!(land(&db, "r", &r, "up", "main", &base, &candidate, &unpinned, true).unwrap_err().contains("unpinned config"));
+        assert_eq!(tip(), base);
         // Without asking to push, it only says what it would do.
         let plan = land(&db, "r", &r, "up", "main", &base, &candidate, &decide(&candidate), false).unwrap();
         assert!(!plan.pushed && plan.argv.contains(&format!("--force-with-lease=refs/heads/main:{base}")));
@@ -103,7 +114,7 @@ mod tests {
         assert_eq!(tip(), candidate);
         // A candidate that does not contain the base is never pushed.
         let fresh = g(&r, &["commit-tree", "-m", "orphan", &g(&r, &["rev-parse", "HEAD^{tree}"])]);
-        let run2 = start_run(&db, &RunKey { repo: "r", pr: None, tier: "full", head: &fresh, base: &candidate, candidate: &fresh }, "t").unwrap();
+        let run2 = start_run(&db, &RunKey { repo: "r", pr: None, tier: "full", head: &fresh, base: &candidate, candidate: &fresh, pinned: true }, "t").unwrap();
         record(&db, &run2, "unit", Side::Candidate, &fresh, Status::Pass, None, Some(0), None, "").unwrap();
         let v = verdict::for_candidate(&db, "r", None, "full", vec!["unit".into()], &candidate, &fresh).unwrap();
         assert!(land(&db, "r", &r, "up", "main", &candidate, &fresh, &v, true).unwrap_err().contains("does not contain the base"));
