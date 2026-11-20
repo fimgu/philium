@@ -55,6 +55,12 @@ const SKIP_DIRS: &[&str] = &["node_modules", "target", "dist", "build", "vendor"
 /// Safety limit only (pathological cases); answers are compact by design, not budgeted.
 const DEFAULT_TOKENS: usize = 60000;
 const DEBOUNCE: Duration = Duration::from_secs(1);
+/// A clash names at most this many symbols or files; the rest are only counted.
+const CLASH_DETAIL: usize = 20;
+/// A worktree with more changed files than this is too far from its start, or from the
+/// indexed base, for a symbol-level clash to mean anything. It is compared by file
+/// names only, and never indexed for it: indexing it would store thousands of files.
+const MAX_CLASH_DELTA: usize = 400;
 const STOP_METHODS: &[&str] = &["new", "default", "main", "init", "from", "get", "set", "run", "call", "len", "clone", "fmt", "test", "drop", "next", "build", "close", "open", "read", "write"];
 
 // ---------------------------------------------------------------- parsing
@@ -422,6 +428,11 @@ CREATE INDEX IF NOT EXISTS ci_refs_scope_path ON ci_refs(scope,path);
 
 pub fn init(ctx: &Arc<Ctx>) -> Result<(), String> {
     ctx.db.with(|c| c.execute_batch(SCHEMA))?;
+    match tidy(ctx) {
+        Ok(Some(said)) => ctx.log_event("database_tidied", None, &json!({ "text": said })),
+        Ok(None) => {}
+        Err(e) => ctx.log_event("init_error", None, &json!({ "module": "codeindex tidy", "error": e })),
+    }
     let c = ctx.clone();
     std::thread::spawn(move || watcher(c));
     Ok(())
@@ -1413,6 +1424,11 @@ pub fn clashes_from(w: &[WtChange]) -> Vec<Clash> {
     for i in 0..w.len() {
         for j in i + 1..w.len() {
             let (a, b) = (&w[i], &w[j]);
+            // Two worktrees Philium did not make (the checkout, or ones a person or another
+            // tool added) are not Philium's to compare; a clash needs one of its agents.
+            if a.wt_id.contains(':') && b.wt_id.contains(':') {
+                continue;
+            }
             let same: Vec<String> = a.syms.intersection(&b.syms).map(|(p, n)| format!("{p}: {n}")).collect();
             let mut dep = vec![];
             for (x, y) in [(a, b), (b, a)] {
@@ -1443,7 +1459,8 @@ pub fn clashes_from(w: &[WtChange]) -> Vec<Clash> {
 }
 
 fn clash_json(c: &Clash) -> Value {
-    json!({ "a": c.a, "b": c.b, "severity": c.severity, "detail": c.detail })
+    let more = c.detail.len().saturating_sub(CLASH_DETAIL);
+    json!({ "a": c.a, "b": c.b, "severity": c.severity, "detail": &c.detail[..c.detail.len().min(CLASH_DETAIL)], "more": more })
 }
 
 pub fn render_clashes(cl: &[Clash], cap: usize) -> String {
@@ -1589,12 +1606,12 @@ fn changed_worktrees(ctx: &Ctx, repo_id: Option<&str>) -> Result<Vec<(String, Wt
         }
         let Ok(t) = target_for_repo(ctx, w["repo_id"].as_str().unwrap_or(""), Some(wt.clone())) else { continue };
         let Ok(base) = ensure_base(ctx, &t.repo_id, &t.repo_path, &t.branch) else { continue };
-        let cs = change_set(&wt.path, &base);
-        if cs.is_empty() || ensure_delta(ctx, &t.repo_id, &base, &wt.id, &wt.path, false).is_err() {
-            continue;
-        }
-        if let Ok(v) = load_view(ctx, &t.repo_id, &base, Some(&wt.id)) {
-            out.push((t.repo_id.clone(), wt, cs, v));
+        // What the agent changed is measured from where its worktree started, not from
+        // the checkout's usual branch, which can be months behind a release.
+        let start = w["base_commit"].as_str().filter(|s| !s.is_empty()).unwrap_or(&base);
+        let cs = change_set(&wt.path, start);
+        if let Some(found) = compared(ctx, &t.repo_id, &base, &wt, cs) {
+            out.push(found);
         }
     }
     // Also include the main checkout and any pre-existing external git worktrees so
@@ -1624,14 +1641,27 @@ fn changed_worktrees(ctx: &Ctx, repo_id: Option<&str>) -> Result<Vec<(String, Wt
                 (format!("ext:{rid}:{d}"), format!("worktree:{d}({branch})"))
             };
             let wt = Wt { id, path: p, label };
-            if ensure_delta(ctx, &t.repo_id, &base, &wt.id, &wt.path, false).is_ok() {
-                if let Ok(v) = load_view(ctx, &t.repo_id, &base, Some(&wt.id)) {
-                    out.push((t.repo_id.clone(), wt, cs, v));
-                }
+            if let Some(found) = compared(ctx, &t.repo_id, &base, &wt, cs) {
+                out.push(found);
             }
         }
     }
     Ok(out)
+}
+
+/// One worktree ready to compare: by symbol when its difference from the indexed base
+/// is small enough to index, else by file name only (an empty view). A worktree that
+/// changed more than `MAX_CLASH_DELTA` files is left out: its list would be noise.
+fn compared(ctx: &Ctx, repo_id: &str, base: &str, wt: &Wt, cs: ChangeSet) -> Option<(String, Wt, ChangeSet, View)> {
+    if cs.is_empty() || cs.len() > MAX_CLASH_DELTA {
+        return None;
+    }
+    let v = if delta_files(&wt.path, base).len() <= MAX_CLASH_DELTA && ensure_delta(ctx, repo_id, base, &wt.id, &wt.path, false).is_ok() {
+        load_view(ctx, repo_id, base, Some(&wt.id)).unwrap_or_default()
+    } else {
+        View::default()
+    };
+    Some((repo_id.to_string(), wt.clone(), cs, v))
 }
 
 fn clash_changes(ctx: &Ctx, repo_id: Option<&str>) -> Result<Vec<Clash>, String> {
@@ -1647,8 +1677,10 @@ fn announced() -> &'static Mutex<HashSet<String>> {
     L.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
+/// A clash is news when a pair of worktrees starts clashing or clashes more seriously,
+/// not each time one more file or symbol joins its list.
 fn clash_key(c: &Clash) -> String {
-    format!("{}|{}|{}|{}", c.a, c.b, c.severity, c.detail.join(","))
+    format!("{}|{}|{}", c.a, c.b, c.severity)
 }
 
 fn latest_clashes() -> &'static Mutex<Vec<Value>> {
@@ -1663,19 +1695,93 @@ pub fn cached_clashes() -> Vec<Value> {
 /// Emit `codeindex:clashes` and log `code_clash` for clashes not announced before.
 fn publish(ctx: &Ctx, cl: &[Clash]) {
     let js: Vec<Value> = cl.iter().map(clash_json).collect();
-    *latest_clashes().lk() = js.clone();
+    let changed = std::mem::replace(&mut *latest_clashes().lk(), js.clone()) != js;
     let keys: HashSet<String> = cl.iter().map(clash_key).collect();
     let mut prev = announced().lk();
-    if *prev == keys {
-        return;
-    }
     for c in cl {
         if !prev.contains(&clash_key(c)) {
             ctx.log_event("code_clash", None, &clash_json(c));
         }
     }
     *prev = keys;
-    ctx.emit("codeindex:clashes", js);
+    if changed {
+        ctx.emit("codeindex:clashes", js);
+    }
+}
+
+/// Bring a database grown by earlier versions back to size, once, at start: drop an
+/// index that holds far more than any one checkout (it is a cache and rebuilds on
+/// use), drop index rows of worktrees that are gone, cut old clash entries to the
+/// short form, and give the space back to the disk.
+pub fn tidy(ctx: &Ctx) -> Result<Option<String>, String> {
+    let size = |c: &Connection| -> rusqlite::Result<i64> { c.query_row("SELECT (SELECT page_count FROM pragma_page_count())*(SELECT page_size FROM pragma_page_size())", [], |r| r.get(0)) };
+    let before = ctx.db.with(|c| size(c))?;
+    ctx.db.with(|c| {
+        let files: i64 = c.query_row("SELECT count(*) FROM ci_files", [], |r| r.get(0))?;
+        if files > TIDY_MAX_FILES {
+            c.execute_batch("DROP TABLE IF EXISTS ci_refs; DROP TABLE IF EXISTS ci_syms; DROP TABLE IF EXISTS ci_files; DROP TABLE IF EXISTS ci_wt; DROP TABLE IF EXISTS ci_snap;")?;
+            c.execute_batch(SCHEMA)?;
+        } else {
+            // Kept: each repo's base snapshot, and the worktrees Philium still runs.
+            let keep = "scope LIKE 'b:%' OR scope IN (SELECT 'w:'||id FROM worktrees WHERE state='active')";
+            for t in ["ci_refs", "ci_syms", "ci_files"] {
+                c.execute(&format!("DELETE FROM {t} WHERE NOT ({keep})"), [])?;
+            }
+            c.execute("DELETE FROM ci_wt WHERE wt_id NOT IN (SELECT id FROM worktrees WHERE state='active')", [])?;
+        }
+        Ok(())
+    })?;
+    let long: Vec<i64> = ctx.db.query("SELECT id FROM events WHERE kind='code_clash' AND length(CAST(body AS BLOB)) > 8192", [])?.iter().filter_map(|r| r["id"].as_i64()).collect();
+    for id in &long {
+        ctx.db.with(|c| {
+            let body: String = c.query_row("SELECT body FROM events WHERE id=?1", [id], |r| r.get(0))?;
+            let mut v: Value = serde_json::from_str(&body).unwrap_or_else(|_| json!({}));
+            if let Some(d) = v["detail"].as_array().cloned() {
+                v["detail"] = json!(d.iter().take(CLASH_DETAIL).collect::<Vec<_>>());
+                v["more"] = json!(d.len().saturating_sub(CLASH_DETAIL));
+            }
+            c.execute("UPDATE events SET body=?1 WHERE id=?2", params![v.to_string(), id])?;
+            Ok(())
+        })?;
+    }
+    let free = ctx.db.with(|c| c.query_row("SELECT (SELECT freelist_count FROM pragma_freelist_count())*(SELECT page_size FROM pragma_page_size())", [], |r| r.get::<_, i64>(0)))?;
+    if free < TIDY_MIN_FREED {
+        return Ok(None);
+    }
+    // Rewriting the file needs room for the part that stays; never fill the disk to do it.
+    let kept = before - free;
+    if disk_free(&ctx.data_dir).is_some_and(|d| d < (kept as u64).saturating_mul(2)) {
+        return Ok(Some(format!("Philium freed {} inside its database, but the disk is too full to give it back yet", gb(free))));
+    }
+    ctx.db.with(|c| c.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM; PRAGMA wal_checkpoint(TRUNCATE);"))?;
+    let after = ctx.db.with(|c| size(c))?;
+    Ok(Some(format!("Philium shrank its database from {} to {}", gb(before), gb(after))))
+}
+
+const TIDY_MAX_FILES: i64 = 60_000;
+const TIDY_MIN_FREED: i64 = 256 * 1024 * 1024;
+
+fn gb(bytes: i64) -> String {
+    if bytes >= 1 << 30 {
+        format!("{:.1} GB", bytes as f64 / (1u64 << 30) as f64)
+    } else {
+        format!("{} MB", bytes / (1 << 20))
+    }
+}
+
+/// Bytes free on the disk holding `dir`, when the system says.
+#[cfg(not(unix))]
+fn disk_free(_dir: &Path) -> Option<u64> {
+    None
+}
+
+/// Bytes free on the disk holding `dir`, when the system says.
+#[cfg(unix)]
+fn disk_free(dir: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let p = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+    let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
+    (unsafe { libc::statvfs(p.as_ptr(), &mut s) } == 0).then(|| s.f_bavail as u64 * s.f_frsize as u64)
 }
 
 fn watcher(ctx: Arc<Ctx>) {
@@ -2483,6 +2589,63 @@ mod tests {
         assert_eq!(e["weight"], 1);
         let c = g["nodes"].as_array().unwrap().iter().find(|n| n["id"] == "src/b.rs:caller").unwrap();
         assert!(c["refs_in"].as_u64().unwrap() >= 1 && c["refs_out"].as_u64().unwrap() >= 1, "{c}");
+    }
+
+    #[test]
+    fn a_grown_database_is_tidied_and_clashes_are_logged_once_per_pair() {
+        let ctx = fresh_ctx();
+        ctx.db.exec("INSERT INTO repos(id,name,path,added_at) VALUES('r','r','/r',0)", []).unwrap();
+        ctx.db.exec("INSERT INTO worktrees(id,repo_id,path,branch,base_commit,state,created_at) VALUES('live','r','/r/live','b','c','active',0)", []).unwrap();
+        ctx.db.exec("INSERT INTO worktrees(id,repo_id,path,branch,base_commit,state,created_at) VALUES('done','r','/r/done','b','c','removed',0)", []).unwrap();
+        let fill = |scope: &str| {
+            ctx.db.exec("INSERT INTO ci_files(scope,path,stamp) VALUES(?1,'a.rs','s')", [scope]).unwrap();
+            ctx.db.exec("INSERT INTO ci_refs(scope,path,name,kind,line,text,from_name,from_line) VALUES(?1,'a.rs','n','call',1,'t','f',1)", [scope]).unwrap();
+            ctx.db.exec("INSERT INTO ci_wt(wt_id,repo_id,base_commit,indexed_at) VALUES(?1,'r','c',0) ON CONFLICT DO NOTHING", [scope.trim_start_matches("w:")]).unwrap();
+        };
+        for s in ["b:r:c", "w:live", "w:done", "w:gone", "w:ext:r:mine", "w:local:r"] {
+            fill(s);
+        }
+        let detail: Vec<String> = (0..500).map(|i| format!("example-repo-app/internal/service/file{i}.go: Symbol{i}")).collect();
+        ctx.log_event("code_clash", None, &json!({ "a": "x", "b": "y", "severity": "same_file", "detail": detail }));
+        assert_eq!(tidy(&ctx).unwrap(), None, "nothing worth giving back to the disk");
+        let scopes: Vec<String> = ctx.db.query("SELECT DISTINCT scope FROM ci_refs ORDER BY scope", []).unwrap().iter().map(|r| r["scope"].as_str().unwrap().to_string()).collect();
+        assert_eq!(scopes, vec!["b:r:c", "w:live"], "only the base and the worktree still running stay");
+        let wts: Vec<String> = ctx.db.query("SELECT wt_id FROM ci_wt", []).unwrap().iter().map(|r| r["wt_id"].as_str().unwrap().to_string()).collect();
+        assert_eq!(wts, vec!["live"]);
+        let ev = ctx.db.query("SELECT body FROM events WHERE kind='code_clash'", []).unwrap();
+        let body: Value = serde_json::from_str(ev[0]["body"].as_str().unwrap()).unwrap();
+        assert_eq!((body["detail"].as_array().unwrap().len(), body["more"].as_u64()), (CLASH_DETAIL, Some(480)));
+
+        // An index far larger than any one checkout is a cache: it goes, and rebuilds on use.
+        ctx.db
+            .with(|c| {
+                c.execute_batch("BEGIN")?;
+                for i in 0..=TIDY_MAX_FILES {
+                    c.execute("INSERT INTO ci_files(scope,path,stamp) VALUES('w:live',?1,'s')", [format!("p{i}")])?;
+                }
+                c.execute_batch("COMMIT")
+            })
+            .unwrap();
+        tidy(&ctx).unwrap();
+        let n = ctx.db.query("SELECT (SELECT count(*) FROM ci_files)+(SELECT count(*) FROM ci_refs) AS n", []).unwrap()[0]["n"].as_i64();
+        assert_eq!(n, Some(0));
+
+        // A pair's list growing by one file is not news; a pair clashing harder is.
+        let clash = |sev: &'static str, n: usize| Clash { a: "lynx".into(), b: "worktree:p2(main)".into(), severity: sev, detail: (0..n).map(|i| format!("f{i}")).collect() };
+        let logged = || ctx.db.query("SELECT count(*) AS n FROM events WHERE kind='code_clash' AND body LIKE '%lynx%'", []).unwrap()[0]["n"].as_i64().unwrap();
+        publish(&ctx, &[clash("same_file", 30)]);
+        publish(&ctx, &[clash("same_file", 31)]);
+        publish(&ctx, &[clash("same_file", 31)]);
+        assert_eq!(logged(), 1);
+        publish(&ctx, &[clash("same_symbol", 2)]);
+        assert_eq!(logged(), 2);
+        let ev = ctx.db.query("SELECT body FROM events WHERE kind='code_clash' AND body LIKE '%lynx%' ORDER BY id LIMIT 1", []).unwrap();
+        assert!(ev[0]["body"].as_str().unwrap().len() < 1000, "a clash entry stays short");
+
+        // Two worktrees Philium did not make are not compared with each other.
+        let w = |id: &str| WtChange { label: id.into(), wt_id: id.into(), files: ["same.rs".to_string()].into_iter().collect(), syms: Default::default(), used: Default::default() };
+        assert!(clashes_from(&[w("ext:r:a"), w("local:r")]).is_empty());
+        assert_eq!(clashes_from(&[w("ext:r:a"), w("agent1")]).len(), 1);
     }
 
     #[test]
