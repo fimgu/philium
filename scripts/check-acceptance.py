@@ -549,7 +549,8 @@ const rows = () => all('[role="listbox"][aria-label="Agents"] [data-agent]');
 await until(() => rows().length >= 2, 'agents listed', 20000);
 const before = rows().map((r) => r.dataset.agent);
 const want = before.filter((n) => P.pick.includes(n));
-for (const n of want) rows().find((r) => r.dataset.agent === n).dispatchEvent(new MouseEvent('click', { bubbles: true, metaKey: true }));
+// One by its tick box, the other with Command-click: both ways pick.
+want.forEach((n, i) => { const r = rows().find((x) => x.dataset.agent === n); if (i === 0) r.querySelector('input.pick').click(); else r.dispatchEvent(new MouseEvent('click', { bubbles: true, metaKey: true })); });
 const bar = await until(() => all('[role="toolbar"][aria-label="Picked agents"]')[0], 'picked bar', 5000);
 const picked = txt(bar);
 window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Delete', bubbles: true }));

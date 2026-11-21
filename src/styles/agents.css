@@ -425,3 +425,5 @@ details.msg summary { cursor: pointer; display: flex; align-items: center; gap: 
 /* Agents picked with ⌘-click, removed together. */
 .agent-row.picked { background: var(--accent-dim); box-shadow: inset 2px 0 0 var(--accent); }
 .picked-bar { gap: 6px; padding: 6px 12px; border-bottom: 1px solid var(--line); background: var(--surface); position: sticky; top: 0; z-index: 1; }
+.agent-row .pick { margin: 0; flex: none; opacity: 0; transition: opacity 120ms var(--ease); accent-color: var(--accent); cursor: pointer; }
+.agent-row:hover .pick, .agent-row .pick:focus-visible, .agent-list.picking .pick { opacity: 1; }

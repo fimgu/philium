@@ -203,7 +203,8 @@ function AgentRow(props) {
   const a = () => props.agent;
   return (
     <div class={`list-item agent-row ${props.selected ? "on" : ""} ${props.picked ? "picked" : ""}`} style={{ "padding-left": `${12 + props.depth * 14}px` }} onClick={props.onClick}
-      role="option" aria-selected={props.picked ? "true" : "false"} data-agent={a().name} title="⌘-click to pick several, then Delete to remove them">
+      role="option" aria-selected={props.picked ? "true" : "false"} data-agent={a().name} title="Tick, or ⌘-click, to pick several; then Delete removes them">
+      <input type="checkbox" class="pick" checked={!!props.picked} aria-label={`Pick ${a().name}`} onClick={(e) => { e.stopPropagation(); props.onPick?.(); }} />
       <Dot state={stateDot(a().state)} title={stateLabel(a().state)} />
       <div class="grow" style={{ "min-width": 0 }}>
         <div class="row" style={{ gap: "6px" }}>
@@ -1221,15 +1222,18 @@ export default function Agents() {
         </Empty>}>
         <Show when={viewMode() !== "split"} fallback={
           <div class="split" style={{ flex: "1", "min-width": "0" }}>
-            <div class="agent-list" role="listbox" aria-multiselectable="true" aria-label="Agents">
+            <div class={`agent-list ${picked().length ? "picking" : ""}`} role="listbox" aria-multiselectable="true" aria-label="Agents">
               <Show when={picked().length}>
                 <div class="picked-bar row" role="toolbar" aria-label="Picked agents">
                   <span class="grow small">{picked().length} picked</span>
+                  <Show when={picked().length < tree().length}>
+                    <Button size="sm" variant="ghost" onClick={() => setPicked(tree().map((x) => x.a.id))}>All {tree().length}</Button>
+                  </Show>
                   <Button size="sm" variant="danger" onClick={removePicked}>Remove</Button>
                   <Button size="sm" variant="ghost" onClick={() => setPicked([])}>Clear</Button>
                 </div>
               </Show>
-              <For each={tree()}>{({ a, d }) => <AgentRow agent={a} depth={d} selected={a.id === selected()} picked={picked().includes(a.id)} onClick={(e) => pickRow(e, a.id)} />}</For>
+              <For each={tree()}>{({ a, d }) => <AgentRow agent={a} depth={d} selected={a.id === selected()} picked={picked().includes(a.id)} onPick={() => pickRow({ metaKey: true }, a.id)} onClick={(e) => pickRow(e, a.id)} />}</For>
             </div>
             <Show when={selected()}>{(id) => (
               <Show when={filtered().some((a) => a.id === id())} fallback={

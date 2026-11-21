@@ -572,13 +572,7 @@ pub fn teardown_agent(ctx: &Arc<Ctx>, agent_id: &str, force: bool) -> Result<Val
             match r["kind"].as_str() {
                 Some("worktree" | "scratch_dir" | "tmpdir" | "port" | "port_block") => own.push(r),
                 Some("process" | "terminal") => {
-                    #[cfg(unix)]
-                    let running = handle.parse::<i32>().is_ok_and(|pid| pid > 1 && unsafe { libc::kill(pid, 0) } == 0);
-                    #[cfg(not(unix))]
-                    let running = true;
-                    if running {
-                        return Err("A command recorded for this agent is still running. Stop it, then remove the agent.".into());
-                    }
+                    end_agent_process(&r)?;
                     if let Some(id) = r["id"].as_str() {
                         release(ctx, id);
                     }
@@ -593,6 +587,34 @@ pub fn teardown_agent(ctx: &Arc<Ctx>, agent_id: &str, force: bool) -> Result<Val
     }
     process_rows(ctx, list, true, force)
 }
+/// In the Pilot, a command an agent left running when the person removes the agent.
+/// The agent was just stopped, so its commands are usually exiting: give them a few
+/// seconds. One still running is stopped only when it is provably the same process
+/// the agent started (its recorded identity); a PID now used by another program is
+/// left alone and the record is simply closed.
+fn end_agent_process(r: &Value) -> Result<(), String> {
+    let m = meta(r);
+    let Some(pid) = m["pid"].as_i64().or_else(|| r["handle"].as_str()?.trim().parse().ok()) else { return Ok(()) };
+    if pid <= 1 || pid == std::process::id() as i64 {
+        return Ok(());
+    }
+    for _ in 0..30 {
+        if identity(pid).is_none() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    match (identity(pid), m["process_identity"].as_str()) {
+        (None, _) => Ok(()),
+        (Some(now), Some(then)) if now == then => stop_process(r).map_err(|e| {
+            let what = m["command"].as_str().or_else(|| m["what"].as_str()).unwrap_or("a command");
+            format!("{what} (process {pid}) that this agent started is still running and could not be stopped: {e}")
+        }),
+        // Another program has this PID now, or the start was never recorded with an identity.
+        _ => Ok(()),
+    }
+}
+
 /// Startup hook: stop processes a crashed previous run left behind. Identity
 /// checks in `stop_process` make a reused PID safe (it is never signalled).
 pub fn reap_stale_processes(ctx: &Arc<Ctx>) -> Value {
@@ -1073,6 +1095,35 @@ mod tests {
         assert!(rows(&ctx, None, None).unwrap().iter().all(|r| r["state"] == "released"));
         let _ = std::fs::remove_dir_all(ctx.root.parent().unwrap());
     }
+    #[cfg(unix)]
+    #[test]
+    fn removing_an_agent_ends_its_own_leftover_command_and_nothing_else() {
+        let row = |pid: u32, ident: Option<String>| json!({ "handle": pid.to_string(), "meta": json!({ "pid": pid, "process_identity": ident, "command": "a dev server" }).to_string() });
+        // Children are reaped as they exit, as the agent's runtime does for its own commands.
+        let reaped = |mut c: std::process::Child| -> u32 {
+            let id = c.id();
+            std::thread::spawn(move || { let _ = c.wait(); });
+            id
+        };
+        // The agent's own command, still running: stopped.
+        let own = reaped(std::process::Command::new("sleep").arg("30").spawn().unwrap());
+        let ident = identity(own as i64);
+        assert!(end_agent_process(&row(own, ident)).is_ok());
+        assert!(identity(own as i64).is_none(), "the agent's command is gone");
+        // A command already exiting: no refusal, and nothing to signal.
+        let quick = reaped(std::process::Command::new("sleep").arg("0.5").spawn().unwrap());
+        let qi = identity(quick as i64);
+        let t = std::time::Instant::now();
+        assert!(end_agent_process(&row(quick, qi)).is_ok());
+        assert!(t.elapsed() < std::time::Duration::from_secs(3), "{:?}", t.elapsed());
+        // A PID another program holds now (identity differs): left alone.
+        let mut other = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        assert!(end_agent_process(&row(other.id(), Some("Mon Jan  1 00:00:00 2001".into()))).is_ok());
+        assert!(identity(other.id() as i64).is_some(), "another program's process is never signalled");
+        let _ = other.kill();
+        let _ = other.wait();
+    }
+
     #[cfg(unix)]
     #[test]
     fn process_identity_guard_and_term_escalation() {
