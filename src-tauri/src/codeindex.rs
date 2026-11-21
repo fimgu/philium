@@ -460,19 +460,27 @@ CREATE INDEX IF NOT EXISTS ci_refs_scope_path ON ci_refs(scope,path);
 /// 2: JSX the JavaScript grammar cannot read goes through the TSX grammar.
 const PARSER_REV: &str = "2";
 
+/// Makes the next look at each repo rebuild its index when the parser changed since the
+/// index was built. Returns whether it did.
+fn reindex_if_parser_changed(ctx: &Ctx) -> Result<bool, String> {
+    if ctx.db.kv_get("codeindex.parser_rev").as_deref() == Some(PARSER_REV) {
+        return Ok(false);
+    }
+    // Forgetting which commit each snapshot holds makes the next look rebuild it.
+    // Worktree deltas are small and go whole, so none outlives its file stamp.
+    ctx.db.with(|c| {
+        c.execute_batch(
+            "DELETE FROM ci_snap; DELETE FROM ci_wt;
+             DELETE FROM ci_syms WHERE scope LIKE 'w:%'; DELETE FROM ci_refs WHERE scope LIKE 'w:%'; DELETE FROM ci_files WHERE scope LIKE 'w:%';",
+        )
+    })?;
+    ctx.db.kv_set("codeindex.parser_rev", PARSER_REV)?;
+    Ok(true)
+}
+
 pub fn init(ctx: &Arc<Ctx>) -> Result<(), String> {
     ctx.db.with(|c| c.execute_batch(SCHEMA))?;
-    if ctx.db.kv_get("codeindex.parser_rev").as_deref() != Some(PARSER_REV) {
-        // Forgetting which commit each snapshot holds makes the next look rebuild it.
-        // Worktree deltas are small and go whole, so none outlives its file stamp.
-        ctx.db.with(|c| {
-            c.execute_batch(
-                "DELETE FROM ci_snap; DELETE FROM ci_wt;
-                 DELETE FROM ci_syms WHERE scope LIKE 'w:%'; DELETE FROM ci_refs WHERE scope LIKE 'w:%'; DELETE FROM ci_files WHERE scope LIKE 'w:%';",
-            )
-        })?;
-        ctx.db.kv_set("codeindex.parser_rev", PARSER_REV)?;
-    }
+    reindex_if_parser_changed(ctx)?;
     // In the background: a database grown by an earlier version takes a minute or two.
     let t = ctx.clone();
     std::thread::spawn(move || match tidy(&t) {
@@ -902,6 +910,7 @@ fn rank_names(v: &View) -> HashMap<&str, f64> {
 struct FileEntry {
     rel: String,
     rank: f64,
+    test: bool,
     syms: Vec<(String, String, u32, u32)>,
 }
 
@@ -910,7 +919,7 @@ fn render_dir(entries: Vec<FileEntry>, indent: usize, depth: usize, out: &mut Ou
     let mut dirs: BTreeMap<String, Vec<FileEntry>> = BTreeMap::new();
     for e in entries {
         match e.rel.split_once('/') {
-            Some((d, rest)) => dirs.entry(d.to_string()).or_default().push(FileEntry { rel: rest.to_string(), rank: e.rank, syms: e.syms }),
+            Some((d, rest)) => dirs.entry(d.to_string()).or_default().push(FileEntry { rel: rest.to_string(), rank: e.rank, test: e.test, syms: e.syms }),
             None => files.push(e),
         }
     }
@@ -932,6 +941,10 @@ fn render_dir(entries: Vec<FileEntry>, indent: usize, depth: usize, out: &mut Ou
     for it in items {
         match it {
             Item::F(f) => {
+                if f.syms.is_empty() {
+                    out.line(format!("{pad}{}  {}", f.rel, if f.test { "(tests)" } else { "(no named symbols)" }));
+                    continue;
+                }
                 let shown: Vec<String> = f.syms.iter().take(8).map(|(k, n, l, e)| {
                     if *e > *l { format!("{k} {n}:{l}-{e}") } else { format!("{k} {n}:{l}") }
                 }).collect();
@@ -1028,7 +1041,7 @@ pub fn render_map(v: &View, path: Option<&str>, depth: usize, cap: usize) -> Str
     if !prefix.is_empty() && v.syms.iter().any(|s| s.path == prefix) && !v.syms.iter().any(|s| s.path.starts_with(&format!("{prefix}/"))) {
         return render_outline(v, &prefix, cap);
     }
-    let rank = rank_names(v);
+    let uses = Use::new(v);
     let mut by_file: BTreeMap<&str, Vec<&Sym>> = BTreeMap::new();
     for s in &v.syms {
         by_file.entry(&s.path).or_default().push(s);
@@ -1045,11 +1058,9 @@ pub fn render_map(v: &View, path: Option<&str>, depth: usize, cap: usize) -> Str
         } else {
             continue;
         };
-        let mut top: Vec<&&Sym> = ss.iter().filter(|s| s.parent.is_empty()).collect();
-        top.sort_by(|a, b| rank.get(b.name.as_str()).unwrap_or(&0.0).partial_cmp(rank.get(a.name.as_str()).unwrap_or(&0.0)).unwrap_or(std::cmp::Ordering::Equal));
+        let (r, top) = uses.file(p, &ss);
         nsyms += ss.len();
-        let r = ss.iter().map(|s| rank.get(s.name.as_str()).copied().unwrap_or(0.0)).sum();
-        entries.push(FileEntry { rel, rank: r, syms: top.iter().map(|s| (s.kind.clone(), s.name.clone(), s.line, s.end)).collect() });
+        entries.push(FileEntry { rel, rank: r, test: is_test(p, ""), syms: top.iter().map(|s| (s.kind.clone(), s.name.clone(), s.line, s.end)).collect() });
     }
     let mut out = Out::new(cap);
     out.line(format!("map {}: {} files, {} symbols, ranked by use", if prefix.is_empty() { "." } else { &prefix }, entries.len(), nsyms));
@@ -1096,39 +1107,71 @@ fn own_syms<'a>(ss: &[&'a Sym]) -> Vec<&'a Sym> {
 /// symbols and their line spans, then a count of what the list leaves out per
 /// directory. A tree of directory names alone does not tell an agent where to look:
 /// agents given one asked for a deeper map or grepped and read whole files anyway.
-pub fn render_brief_map(v: &View, tokens: usize) -> String {
-    // A symbol counts by how many other files use its name, split among the places that
-    // define that name. Uses inside its own file say little about where to look, and a
-    // name like `id` or `new`, defined everywhere, says nothing about any one definition.
-    // A use counts only from code in the same language. A bare lowercase word read as a
-    // value (`url`, `args`) is mostly some local of that name, so it counts only when
-    // called, imported or used as a type.
-    let family = |p: &str| match lang_of(p) {
-        Some(Lang::Ts | Lang::Tsx | Lang::Js) => 1,
-        Some(Lang::Rust) => 2,
-        Some(Lang::Py) => 3,
-        Some(Lang::Go) => 4,
-        None => 0,
-    };
-    let mut defs: HashMap<&str, usize> = HashMap::new();
-    let mut fams: HashMap<&str, HashSet<u8>> = HashMap::new();
-    for s in &v.syms {
-        *defs.entry(&s.name).or_default() += 1;
-        fams.entry(&s.name).or_default().insert(family(&s.path));
-    }
-    let plain = |n: &str| n.chars().all(|c| c.is_ascii_lowercase());
-    let mut users: HashMap<(&str, u8), HashSet<&str>> = HashMap::new();
-    for r in &v.refs {
-        let f = family(&r.path);
-        if !fams.get(r.name.as_str()).is_some_and(|x| x.contains(&f)) || (r.kind == "use" && plain(&r.name)) {
-            continue;
+/// How much the rest of the code uses each symbol, which is where an agent should look
+/// first. A symbol counts by how many other files use its name, split among the places
+/// that define that name. Uses inside its own file say little about where to look, and
+/// a name like `id` or `new`, defined everywhere, says nothing about any one definition.
+/// A use counts only from code in the same language. A bare lowercase word read as a
+/// value (`url`, `args`) is mostly some local of that name, so it counts only when
+/// called, imported or used as a type.
+struct Use<'a> {
+    defs: HashMap<&'a str, usize>,
+    users: HashMap<(&'a str, u8), HashSet<&'a str>>,
+}
+
+impl<'a> Use<'a> {
+    fn family(p: &str) -> u8 {
+        match lang_of(p) {
+            Some(Lang::Ts | Lang::Tsx | Lang::Js) => 1,
+            Some(Lang::Rust) => 2,
+            Some(Lang::Py) => 3,
+            Some(Lang::Go) => 4,
+            None => 0,
         }
-        users.entry((&r.name, f)).or_default().insert(&r.path);
     }
-    let score = |s: &Sym| -> f64 {
-        let n = users.get(&(s.name.as_str(), family(&s.path))).map(|u| u.len() - u.contains(s.path.as_str()) as usize).unwrap_or(0);
-        n as f64 / defs.get(s.name.as_str()).copied().unwrap_or(1) as f64
-    };
+
+    fn new(v: &'a View) -> Self {
+        let mut defs: HashMap<&str, usize> = HashMap::new();
+        let mut fams: HashMap<&str, HashSet<u8>> = HashMap::new();
+        for s in &v.syms {
+            *defs.entry(&s.name).or_default() += 1;
+            fams.entry(&s.name).or_default().insert(Self::family(&s.path));
+        }
+        let plain = |n: &str| n.chars().all(|c| c.is_ascii_lowercase());
+        let mut users: HashMap<(&str, u8), HashSet<&str>> = HashMap::new();
+        for r in &v.refs {
+            let f = Self::family(&r.path);
+            if !fams.get(r.name.as_str()).is_some_and(|x| x.contains(&f)) || (r.kind == "use" && plain(&r.name)) {
+                continue;
+            }
+            users.entry((&r.name, f)).or_default().insert(&r.path);
+        }
+        Use { defs, users }
+    }
+
+    fn of(&self, s: &Sym) -> f64 {
+        let n = self.users.get(&(s.name.as_str(), Self::family(&s.path))).map(|u| u.len() - u.contains(s.path.as_str()) as usize).unwrap_or(0);
+        n as f64 / self.defs.get(s.name.as_str()).copied().unwrap_or(1) as f64
+    }
+
+    /// A file's score and the symbols worth naming for it, most used first. Test files
+    /// score nothing and name none: an agent looks for the code before its tests, and
+    /// test helpers named `setup` or `start` would borrow the use of real ones.
+    fn file<'s>(&self, path: &str, ss: &[&'s Sym]) -> (f64, Vec<&'s Sym>) {
+        if is_test(path, "") {
+            return (0.0, vec![]);
+        }
+        // A `mod` line names another file, which is listed under its own name.
+        let own: Vec<&Sym> = own_syms(ss).into_iter().filter(|s| s.kind != "mod").collect();
+        let r = own.iter().map(|s| self.of(s)).sum::<f64>();
+        let mut top: Vec<&Sym> = own.into_iter().filter(|s| s.parent.is_empty()).collect();
+        top.sort_by(|a, b| self.of(b).partial_cmp(&self.of(a)).unwrap_or(std::cmp::Ordering::Equal).then(a.line.cmp(&b.line)));
+        (r, top)
+    }
+}
+
+pub fn render_brief_map(v: &View, tokens: usize) -> String {
+    let uses = Use::new(v);
     let mut by_file: BTreeMap<&str, Vec<&Sym>> = BTreeMap::new();
     for s in &v.syms {
         by_file.entry(&s.path).or_default().push(s);
@@ -1137,11 +1180,7 @@ pub fn render_brief_map(v: &View, tokens: usize) -> String {
     let mut files: Vec<(&str, f64, Vec<&Sym>)> = by_file
         .into_iter()
         .map(|(p, ss)| {
-            // A `mod` line names another file, which is listed under its own name.
-            let own: Vec<&Sym> = own_syms(&ss).into_iter().filter(|s| s.kind != "mod").collect();
-            let r = own.iter().map(|s| score(s)).sum::<f64>() * if is_test(p, "") { 0.2 } else { 1.0 };
-            let mut top: Vec<&Sym> = if is_test(p, "") { vec![] } else { own.into_iter().filter(|s| s.parent.is_empty()).collect() };
-            top.sort_by(|a, b| score(b).partial_cmp(&score(a)).unwrap_or(std::cmp::Ordering::Equal).then(a.line.cmp(&b.line)));
+            let (r, top) = uses.file(p, &ss);
             (p, r, top)
         })
         .collect();
@@ -3166,6 +3205,30 @@ mod tests {
     }
 
     #[test]
+    fn a_new_parser_rebuilds_old_indexes_once() {
+        let ctx = fresh_ctx();
+        let r = repo();
+        let w = worktree(&r, "pr");
+        std::fs::write(w.join("src/c.rs"), "pub fn fresh() {}\n").unwrap();
+        index_target(&ctx, "r1", &r, "main", Some(("w1", &w)), true).unwrap();
+        let count = |q: &str| ctx.db.with(|c| c.query_row(q, [], |r| r.get::<_, i64>(0))).unwrap();
+        assert_eq!(count("SELECT count(*) FROM ci_snap"), 1);
+        assert!(count("SELECT count(*) FROM ci_syms WHERE scope LIKE 'w:%'") > 0);
+        // An index from before the revision existed is rebuilt: the base forgets its
+        // commit, and the worktree delta goes with its stamps.
+        assert!(reindex_if_parser_changed(&ctx).unwrap());
+        assert_eq!(count("SELECT count(*) FROM ci_snap") + count("SELECT count(*) FROM ci_wt"), 0);
+        assert_eq!(count("SELECT count(*) FROM ci_files WHERE scope LIKE 'w:%'") + count("SELECT count(*) FROM ci_syms WHERE scope LIKE 'w:%'"), 0);
+        // The next look rebuilds both, and a second start leaves them alone.
+        let (v, _) = index_target(&ctx, "r1", &r, "main", Some(("w1", &w)), false).unwrap();
+        assert!(v.syms.iter().any(|s| s.name == "fresh") && v.syms.iter().any(|s| s.name == "helper"));
+        assert!(!reindex_if_parser_changed(&ctx).unwrap());
+        assert_eq!(count("SELECT count(*) FROM ci_snap"), 1);
+        let _ = std::fs::remove_dir_all(&w);
+        let _ = std::fs::remove_dir_all(&r);
+    }
+
+    #[test]
     fn the_prompt_map_ranks_files_and_stays_in_budget() {
         let ctx = fresh_ctx();
         let r = repo();
@@ -3186,6 +3249,11 @@ mod tests {
         assert!(m.contains("helper 7-9") && m.contains("Not listed:") && m.contains("src ("), "{m}");
         // Test files and a function's locals are not what an agent looks for first.
         assert!(!m.contains("a_test.rs") && !m.contains("id 2") && !m.contains("path 3"), "{m}");
+        // code_map ranks the same way and marks test files instead of listing their helpers.
+        let cm = render_map(&v, Some("src"), 1, 4000);
+        let a = cm.find("a.rs ").expect("a.rs in code_map");
+        assert!(cm.find("m1.rs").is_some_and(|i| i > a) && cm.contains("a_test.rs  (tests)"), "{cm}");
+        assert!(cm.contains("view.js  fn View:1-5") && !cm.contains("const id"), "{cm}");
         assert_eq!(map_tokens(None), 1200);
         assert_eq!(map_tokens(Some(32_000)), 600);
         assert_eq!(map_tokens(Some(128_000)), 1280);
@@ -3270,6 +3338,12 @@ mod bench {
         }
         if let Ok(p) = std::env::var("BENCH_OUTLINE") {
             println!("=== OUTLINE\n{}", render_outline(&v, &p, 4000));
+        }
+        // `BENCH_MAP=path:depth`, an empty path for the root, as `code_map` answers it.
+        if let Ok(m) = std::env::var("BENCH_MAP") {
+            let (p, d) = m.rsplit_once(':').unwrap_or((&m, "2"));
+            let out = render_map(&v, (!p.is_empty()).then_some(p), d.parse().unwrap_or(2), 4000);
+            println!("=== CODE_MAP {m:?} {} tokens\n{out}", out.len() / 4);
         }
     }
 
