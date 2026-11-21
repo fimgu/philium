@@ -19,8 +19,21 @@
 //! - `set_budget {gb}` -> `{budget_gb}`
 use crate::ctx::Ctx;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+static STATUS_CACHE: OnceLock<Mutex<HashMap<PathBuf, (Instant, Value)>>> = OnceLock::new();
+const STATUS_TTL: Duration = Duration::from_secs(60);
+
+fn invalidate_status_cache(data_dir: &Path) {
+    if let Some(c) = STATUS_CACHE.get() {
+        if let Ok(mut g) = c.lock() {
+            g.remove(data_dir);
+        }
+    }
+}
 
 /// Check runs refuse to start below this much free disk, so a full disk is never read
 /// as a failing check.
@@ -157,6 +170,26 @@ fn budget(ctx: &Ctx) -> u64 {
 }
 
 pub fn status(ctx: &Ctx) -> Value {
+    status_with(ctx, false)
+}
+
+fn status_with(ctx: &Ctx, fresh: bool) -> Value {
+    let cache = STATUS_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if !fresh {
+        if let Ok(g) = cache.lock() {
+            if let Some((t, mut cached)) = g.get(&ctx.data_dir).cloned() {
+                if t.elapsed() < STATUS_TTL {
+                    cached["budget_gb"] = json!(budget(ctx));
+                    cached["last"] = ctx
+                        .db
+                        .kv_get("storage.last")
+                        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                        .unwrap_or(Value::Null);
+                    return cached;
+                }
+            }
+        }
+    }
     let parts: Vec<Value> = parts(ctx)
         .into_iter()
         .map(|p| {
@@ -167,7 +200,11 @@ pub fn status(ctx: &Ctx) -> Value {
         .collect();
     let (free, total) = disk(&ctx.data_dir).unwrap_or((0, 0));
     let last = ctx.db.kv_get("storage.last").and_then(|s| serde_json::from_str::<Value>(&s).ok()).unwrap_or(Value::Null);
-    json!({ "parts": parts, "disk": { "free": free, "total": total, "min_free_for_checks": MIN_FREE_FOR_CHECKS }, "budget_gb": budget(ctx), "last": last })
+    let val = json!({ "parts": parts, "disk": { "free": free, "total": total, "min_free_for_checks": MIN_FREE_FOR_CHECKS }, "budget_gb": budget(ctx), "last": last });
+    if let Ok(mut g) = cache.lock() {
+        g.insert(ctx.data_dir.clone(), (Instant::now(), val.clone()));
+    }
+    val
 }
 
 /// Is a process with this id alive (or alive but not ours to signal)?
@@ -373,6 +410,7 @@ pub fn clean(ctx: &Ctx, daily: bool) -> Value {
     let text = if freed == 0 && steps.is_empty() { "Nothing to clean up".to_string() } else { format!("Freed {}", gb(freed)) };
     let out = json!({ "at": crate::db::now(), "text": text, "freed": freed, "steps": steps });
     let _ = ctx.db.kv_set("storage.last", &out.to_string());
+    invalidate_status_cache(&ctx.data_dir);
     out
 }
 
@@ -393,7 +431,8 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
     match method {
         "status" => {
             let c = ctx.clone();
-            tokio::task::spawn_blocking(move || status(&c)).await.map_err(|e| e.to_string())
+            let fresh = args["fresh"].as_bool() == Some(true);
+            tokio::task::spawn_blocking(move || status_with(&c, fresh)).await.map_err(|e| e.to_string())
         }
         "clean" => {
             let c = ctx.clone();
@@ -405,12 +444,15 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
                     s.push(json!(said));
                 }
             }
+            let _ = ctx.db.kv_set("storage.last", &out.to_string());
+            invalidate_status_cache(&ctx.data_dir);
             ctx.log_event("storage_cleaned", None, &out);
             Ok(out)
         }
         "set_budget" => {
             let g = args["gb"].as_u64().filter(|g| (1..=1000).contains(g)).ok_or("budget_gb is a whole number of GB from 1 to 1000")?;
             ctx.db.kv_set("setting.storage.budget_gb", &g.to_string())?;
+            invalidate_status_cache(&ctx.data_dir);
             Ok(json!({ "budget_gb": g }))
         }
         _ => Err(format!("unknown storage.{method}")),

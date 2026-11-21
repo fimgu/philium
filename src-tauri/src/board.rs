@@ -7,8 +7,10 @@ use crate::{
 };
 use serde_json::{json, Value};
 use std::{
-    path::Path,
-    sync::{Arc, Mutex},
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock},
+    time::SystemTime,
 };
 static WRITE: Mutex<()> = Mutex::new(());
 pub const JOBS: [&str; 7] = [
@@ -214,28 +216,101 @@ pub fn get(ctx: &Arc<Ctx>, id: &str) -> Result<Value, String> {
     decorate(ctx, raw(ctx, id)?, true)
 }
 pub fn list(ctx: &Arc<Ctx>, filter: &Value) -> Result<Value, String> {
-    let _lock = WRITE.lk();
-    expire(ctx)?;
-    let rows = ctx
-        .db
-        .query("SELECT * FROM tasks ORDER BY created_at DESC,id", [])?;
-    let mut out = vec![];
-    for t in rows {
-        if ["status", "owner", "repo_id"]
-            .iter()
-            .any(|k| filter.get(*k).is_some_and(|v| !v.is_null() && v != &t[*k]))
-        {
-            continue;
-        }
-        if let Some(q) = filter["q"].as_str() {
-            if !format!("{} {}", t["title"], t["detail"])
-                .to_lowercase()
-                .contains(&q.to_lowercase())
-            {
-                continue;
+    let status = filter.get("status").and_then(Value::as_str);
+    let owner = filter.get("owner").and_then(Value::as_str);
+    let repo_id = filter.get("repo_id").and_then(Value::as_str);
+    let rows = ctx.db.query(
+        "SELECT * FROM tasks
+         WHERE (?1 IS NULL OR status = ?1)
+           AND (?2 IS NULL OR owner = ?2)
+           AND (?3 IS NULL OR repo_id = ?3)
+         ORDER BY created_at DESC, id",
+        rusqlite::params![status, owner, repo_id],
+    )?;
+    if rows.is_empty() {
+        return Ok(json!([]));
+    }
+    let q_low = filter["q"].as_str().map(str::to_lowercase);
+    let filtered: Vec<Value> = rows
+        .into_iter()
+        .filter(|t| {
+            if let Some(q) = &q_low {
+                let title = t["title"].as_str().unwrap_or("");
+                let detail = t["detail"].as_str().unwrap_or("");
+                if !title.to_lowercase().contains(q) && !detail.to_lowercase().contains(q) {
+                    return false;
+                }
             }
+            true
+        })
+        .collect();
+    if filtered.is_empty() {
+        return Ok(json!([]));
+    }
+
+    // Batch-load dependencies, repo paths, and agent states once to avoid per-task N+1 queries.
+    let mut deps_map: HashMap<String, Vec<Value>> = HashMap::new();
+    for r in ctx.db.query(
+        "SELECT d.task_id, t.id, t.title, t.status FROM task_deps d JOIN tasks t ON t.id = d.depends_on",
+        [],
+    )? {
+        if let Some(tid) = r["task_id"].as_str() {
+            deps_map.entry(tid.to_string()).or_default().push(json!({
+                "id": r["id"],
+                "title": r["title"],
+                "status": r["status"],
+            }));
         }
-        out.push(decorate(ctx, t, false)?);
+    }
+
+    let need_repos = filtered.iter().any(|t| !t["playbook"].is_null() && !t["repo_id"].is_null());
+    let repos_map: HashMap<String, PathBuf> = if need_repos {
+        ctx.db
+            .query("SELECT id, path FROM repos", [])?
+            .into_iter()
+            .filter_map(|r| Some((r["id"].as_str()?.to_string(), PathBuf::from(r["path"].as_str()?))))
+            .collect()
+    } else {
+        HashMap::new()
+    };
+
+    let need_agents = filtered.iter().any(|t| !t["assigned_agent_id"].is_null());
+    let agents_map: HashMap<String, Value> = if need_agents {
+        ctx.db
+            .query("SELECT id, state FROM agents", [])?
+            .into_iter()
+            .filter_map(|r| Some((r["id"].as_str()?.to_string(), r["state"].clone())))
+            .collect()
+    } else {
+        HashMap::new()
+    };
+
+    let mut pb_local_cache: HashMap<(String, Option<PathBuf>), Value> = HashMap::new();
+    let mut out = Vec::with_capacity(filtered.len());
+    for mut t in filtered {
+        let id = t["id"].as_str().unwrap_or("").to_owned();
+        let ds = deps_map.remove(&id).unwrap_or_default();
+        t["blocked"] = json!(ds.iter().any(|d| d["status"] != "done"));
+        t["depends_on"] = json!(ds.iter().map(|d| d["id"].clone()).collect::<Vec<_>>());
+        t["dependencies"] = json!(ds);
+        t["check_results"] =
+            serde_json::from_str(t["check_results"].as_str().unwrap_or("[]")).unwrap_or(json!([]));
+        if let Some(job) = t["playbook"].as_str() {
+            let rpath = t["repo_id"].as_str().and_then(|rid| repos_map.get(rid).cloned());
+            let key = (job.to_string(), rpath.clone());
+            let pb = if let Some(cached) = pb_local_cache.get(&key) {
+                cached.clone()
+            } else {
+                let loaded = playbook(ctx, job, rpath.as_deref())?;
+                pb_local_cache.insert(key, loaded.clone());
+                loaded
+            };
+            t["playbook_progress"] = pb;
+        }
+        if let Some(agent) = t["assigned_agent_id"].as_str() {
+            t["assigned_state"] = agents_map.get(agent).cloned().unwrap_or_else(|| json!("removed"));
+        }
+        out.push(t);
     }
     Ok(json!(out))
 }
@@ -582,8 +657,16 @@ pub fn thread(ctx: &Arc<Ctx>, a: &str, b: &str, limit: i64) -> Result<Value, Str
 
 pub(crate) const REVIEW_POLICY: &str = include_str!("../playbooks/review_pr.md");
 pub(crate) fn review_policy_digest() -> String {
-    use sha2::{Digest, Sha256};
-    Sha256::digest(REVIEW_POLICY.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
+    static DIGEST: OnceLock<String> = OnceLock::new();
+    DIGEST
+        .get_or_init(|| {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(REVIEW_POLICY.as_bytes())
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        })
+        .clone()
 }
 fn builtin(job: &str) -> Result<&'static str, String> {
     Ok(match job {
@@ -643,17 +726,45 @@ fn parse(job: &str, body: &str, source: &str) -> Result<Value, String> {
     }
     Ok(json!({"job":job,"steps":steps,"checks":checks,"body":body,"source":source}))
 }
+
+type RepoPlaybookCache = HashMap<PathBuf, ((Option<SystemTime>, u64), Value)>;
+static REPO_PLAYBOOK_CACHE: OnceLock<Mutex<RepoPlaybookCache>> = OnceLock::new();
+static BUILTIN_PLAYBOOK_CACHE: OnceLock<Mutex<HashMap<String, Value>>> = OnceLock::new();
+
+fn cached_builtin_playbook(job: &str, default: &str) -> Result<Value, String> {
+    let cache = BUILTIN_PLAYBOOK_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(v) = cache.lk().get(job).cloned() {
+        return Ok(v);
+    }
+    let mut p = parse(job, default, "builtin")?;
+    if job == "review_pr" {
+        p["policy_sha256"] = json!(review_policy_digest());
+    }
+    cache.lk().insert(job.to_string(), p.clone());
+    Ok(p)
+}
+
 pub fn playbook(ctx: &Arc<Ctx>, job: &str, repo_path: Option<&Path>) -> Result<Value, String> {
     let default = builtin(job)?;
     if job == "review_pr" {
-        let mut p = parse(job, default, "builtin")?;
-        p["policy_sha256"] = json!(review_policy_digest());
-        return Ok(p);
+        return cached_builtin_playbook(job, default);
     }
     if let Some(repo) = repo_path {
         let p = repo.join(".philium/playbooks").join(format!("{job}.md"));
-        match std::fs::read_to_string(p) {
-            Ok(body) => return parse(job, &body, "repo"),
+        match std::fs::metadata(&p) {
+            Ok(md) => {
+                let stamp = (md.modified().ok(), md.len());
+                let cache = REPO_PLAYBOOK_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+                if let Some((cached_stamp, cached_val)) = cache.lk().get(&p) {
+                    if *cached_stamp == stamp {
+                        return Ok(cached_val.clone());
+                    }
+                }
+                let body = std::fs::read_to_string(&p).map_err(|e| e.to_string())?;
+                let parsed = parse(job, &body, "repo")?;
+                cache.lk().insert(p, (stamp, parsed.clone()));
+                return Ok(parsed);
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.to_string()),
         }
@@ -661,12 +772,16 @@ pub fn playbook(ctx: &Arc<Ctx>, job: &str, repo_path: Option<&Path>) -> Result<V
     if let Some(body) = ctx.db.kv_get(&format!("playbook.{job}")) {
         return parse(job, &body, "user");
     }
-    parse(job, default, "builtin")
+    cached_builtin_playbook(job, default)
 }
 pub fn check_text(check: &str, text: &str) -> Result<(), String> {
+    static COAUTHOR_RE: OnceLock<regex::Regex> = OnceLock::new();
     let lower = text.to_lowercase();
     match check {
         "no_coauthor" => {
+            let re = COAUTHOR_RE.get_or_init(|| {
+                regex::Regex::new(r"(?im)^\s*(?:(?:signed(?:-off)?(?:-by| by)|authored by|written by|powered by)\s*:?\s*|[-~]{1,2}\s*)(?:claude|chatgpt|jcode|codex|gemini|copilot|an? ai|agent)\b").unwrap()
+            });
             if [
                 "co-authored-by",
                 "generated with",
@@ -680,7 +795,7 @@ pub fn check_text(check: &str, text: &str) -> Result<(), String> {
             ]
             .iter()
             .any(|s| lower.contains(s))
-                || regex::Regex::new(r"(?im)^\s*(?:(?:signed(?:-off)?(?:-by| by)|authored by|written by|powered by)\s*:?\s*|[-~]{1,2}\s*)(?:claude|chatgpt|jcode|codex|gemini|copilot|an? ai|agent)\b").unwrap().is_match(text)
+                || re.is_match(text)
             {
                 Err("Remove co-author trailers and agent signatures".into())
             } else {
@@ -986,6 +1101,7 @@ mod tests {
         assert!(claim(&c, "alice", &id, 0).is_err());
         c.db.exec("UPDATE tasks SET lease_expires_at=0 WHERE id=?1", [&id])
             .unwrap();
+        expire(&c).unwrap();
         assert_eq!(list(&c, &json!({})).unwrap()[0]["status"], "open");
         assert_eq!(get(&c, &id).unwrap()["owner"], Value::Null);
         assert!(c

@@ -366,6 +366,17 @@ pub fn env(ctx: &Arc<Ctx>, agent: &str) -> Vec<(String, String)> {
 
 // ---------------------------------------------------------------- allowlist
 
+type AllowCache = HashMap<(PathBuf, Option<String>), (Vec<String>, bool)>;
+
+fn allowlist_cache() -> &'static std::sync::RwLock<AllowCache> {
+    static C: OnceLock<std::sync::RwLock<AllowCache>> = OnceLock::new();
+    C.get_or_init(Default::default)
+}
+
+pub fn invalidate_allowlist_cache() {
+    allowlist_cache().wr().clear();
+}
+
 fn parse_hosts(s: &str) -> Vec<String> {
     s.split(|c: char| c == ',' || c.is_whitespace())
         .map(|h| h.trim().trim_start_matches("*.").to_lowercase())
@@ -374,15 +385,23 @@ fn parse_hosts(s: &str) -> Vec<String> {
 }
 
 pub fn allowlist(ctx: &Ctx, agent: Option<&str>) -> (Vec<String>, bool) {
-    if let Some(a) = agent {
-        if let Some(v) = ctx.db.kv_get(&format!("setting.{ALLOW_KEY}.{a}")) {
-            return (parse_hosts(&v), true);
+    let key = (ctx.data_dir.clone(), agent.map(str::to_string));
+    if let Some(hit) = allowlist_cache().rd().get(&key).cloned() {
+        return hit;
+    }
+    let val = 'compute: {
+        if let Some(a) = agent {
+            if let Some(v) = ctx.db.kv_get(&format!("setting.{ALLOW_KEY}.{a}")) {
+                break 'compute (parse_hosts(&v), true);
+            }
         }
-    }
-    match ctx.db.kv_get(&format!("setting.{ALLOW_KEY}")) {
-        Some(v) => (parse_hosts(&v), false),
-        None => (DEFAULT_ALLOW.iter().map(|s| s.to_string()).collect(), false),
-    }
+        match ctx.db.kv_get(&format!("setting.{ALLOW_KEY}")) {
+            Some(v) => (parse_hosts(&v), false),
+            None => (DEFAULT_ALLOW.iter().map(|s| s.to_string()).collect(), false),
+        }
+    };
+    allowlist_cache().wr().insert(key, val.clone());
+    val
 }
 
 /// Exact host or any subdomain of an entry.
@@ -601,6 +620,7 @@ async fn test_profile(ctx: &Arc<Ctx>) -> Result<Value, String> {
     });
     let agent = "__probe__";
     ctx.db.kv_set(&format!("setting.{ALLOW_KEY}.{agent}"), "127.0.0.1")?;
+    invalidate_allowlist_cache();
     let mut penv = env(ctx, agent);
     penv.retain(|(k, _)| k.to_lowercase().ends_with("_proxy") && k != "NO_PROXY");
     let h = home();
@@ -628,6 +648,7 @@ async fn test_profile(ctx: &Arc<Ctx>) -> Result<Value, String> {
     let _ = std::fs::remove_file(&outside);
     let _ = std::fs::remove_dir_all(&probe);
     let _ = ctx.db.exec("DELETE FROM kv WHERE k=?1", [format!("setting.{ALLOW_KEY}.{agent}")]);
+    invalidate_allowlist_cache();
     revoke(agent);
     Ok(json!({"ok": all, "probes": out}))
 }
@@ -672,6 +693,7 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
                 None => format!("setting.{ALLOW_KEY}"),
             };
             ctx.db.kv_set(&key, &hosts.join(","))?;
+            invalidate_allowlist_cache();
             Ok(json!({"hosts": hosts}))
         }
         "test_profile" => test_profile(ctx).await,
@@ -756,6 +778,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn allowlist_cache_invalidates_on_set() {
+        let ctx = Ctx::test();
+        let (hosts, custom) = allowlist(&ctx, Some("lion"));
+        assert!(!custom);
+        assert!(hosts.contains(&"github.com".to_string()));
+        call(&ctx, "allowlist_set", json!({"hosts": "custom.example.org", "agent": "lion"}))
+            .await
+            .unwrap();
+        let (hosts2, custom2) = allowlist(&ctx, Some("lion"));
+        assert!(custom2);
+        assert_eq!(hosts2, vec!["custom.example.org".to_string()]);
+    }
+
+    #[tokio::test]
     async fn env_and_proxy_allow_deny() {
         let ctx = Ctx::test();
         setup_db(&ctx).unwrap();
@@ -802,6 +838,7 @@ mod tests {
         assert!(go(req("127.0.0.1", up_port, false)).await.starts_with("HTTP/1.1 407"));
         // allowed
         ctx.db.kv_set(&format!("setting.{ALLOW_KEY}"), "127.0.0.1").unwrap();
+        invalidate_allowlist_cache();
         let r = go(req("127.0.0.1", up_port, true)).await;
         assert!(r.starts_with("HTTP/1.1 200") && r.ends_with("hi"), "{r}");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;

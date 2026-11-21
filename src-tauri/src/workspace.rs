@@ -14,12 +14,115 @@ use rusqlite::params;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
+    time::{Duration, Instant, SystemTime},
 };
 
-static GIT_QUEUE: Mutex<()> = Mutex::new(());
+static REPO_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+const STATUS_CACHE_TTL: Duration = Duration::from_secs(3);
+
+type StatusCacheMap = HashMap<(PathBuf, String), (Instant, Vec<u64>, Value)>;
+static STATUS_CACHE: OnceLock<Mutex<StatusCacheMap>> = OnceLock::new();
+
+fn repo_lock(key: &str) -> Arc<Mutex<()>> {
+    let map = REPO_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut g = map.lock().unwrap_or_else(|e| e.into_inner());
+    g.entry(key.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+fn invalidate_status_cache() {
+    if let Some(c) = STATUS_CACHE.get() {
+        if let Ok(mut g) = c.lock() {
+            g.clear();
+        }
+    }
+}
+
+fn mtime_ns(path: &Path) -> u64 {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+fn paths_fingerprint<'a>(paths: impl IntoIterator<Item = &'a str>) -> Vec<u64> {
+    let mut out = Vec::new();
+    for ps in paths {
+        let p = Path::new(ps);
+        let dir_exists = p.is_dir() as u64;
+        out.push(dir_exists);
+        if dir_exists != 0 {
+            let git_dir = p.join(".git");
+            out.push(mtime_ns(&git_dir.join("HEAD")));
+            out.push(mtime_ns(&git_dir.join("index")));
+        }
+    }
+    out
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct PorcelainV2 {
+    branch: String,
+    upstream: Option<String>,
+    ahead: Option<u64>,
+    behind: Option<u64>,
+    dirty_files: Vec<String>,
+}
+
+fn parse_porcelain_v2(out: &str) -> PorcelainV2 {
+    let mut res = PorcelainV2::default();
+    for line in out.lines().filter(|l| !l.is_empty()) {
+        if let Some(rest) = line.strip_prefix("# ") {
+            if let Some(head) = rest.strip_prefix("branch.head ") {
+                let head = head.trim();
+                if head != "(detached)" {
+                    res.branch = head.to_string();
+                }
+            } else if let Some(up) = rest.strip_prefix("branch.upstream ") {
+                let up = up.trim();
+                if !up.is_empty() {
+                    res.upstream = Some(up.to_string());
+                }
+            } else if let Some(ab) = rest.strip_prefix("branch.ab ") {
+                for tok in ab.split_whitespace() {
+                    if let Some(a) = tok.strip_prefix('+') {
+                        res.ahead = a.parse::<u64>().ok();
+                    } else if let Some(b) = tok.strip_prefix('-') {
+                        res.behind = b.parse::<u64>().ok();
+                    }
+                }
+            }
+        } else if let Some(rest) = line.strip_prefix("? ") {
+            res.dirty_files.push(format!("?? {rest}"));
+        } else if let Some(rest) = line.strip_prefix("1 ") {
+            let mut it = rest.splitn(8, ' ');
+            let xy = it.next().unwrap_or("M.");
+            let path = it.nth(6).unwrap_or(rest);
+            res.dirty_files.push(format!("{} {path}", xy.replace('.', " ")));
+        } else if let Some(rest) = line.strip_prefix("2 ") {
+            let mut it = rest.splitn(9, ' ');
+            let xy = it.next().unwrap_or("R.");
+            let path = it.nth(7).unwrap_or(rest).split('\t').next().unwrap_or(rest);
+            res.dirty_files.push(format!("{} {path}", xy.replace('.', " ")));
+        } else if let Some(rest) = line.strip_prefix("u ") {
+            let mut it = rest.splitn(10, ' ');
+            let xy = it.next().unwrap_or("UU");
+            let path = it.nth(8).unwrap_or(rest);
+            res.dirty_files.push(format!("{xy} {path}"));
+        } else {
+            res.dirty_files.push(line.to_string());
+        }
+    }
+    res
+}
+
 const DIFF_CAP: usize = 256 * 1024;
 #[derive(Debug, Clone, Serialize)]
 pub struct Worktree {
@@ -60,6 +163,7 @@ pub(crate) fn git(path: &Path, args: &[&str]) -> Result<String, String> {
         .to_string())
 }
 fn changed(ctx: &Arc<Ctx>) {
+    invalidate_status_cache();
     ctx.emit("workspace:changed", json!({}));
     ctx.notify("workspace");
 }
@@ -126,6 +230,7 @@ fn relocate(ctx: &Arc<Ctx>, id: &str, path: &str) -> Result<Value, String> {
         params![id, ds, remote, roots.join(",")],
     )?;
     ctx.log_event("repo_relocated", None, &json!({"id":id,"from":old_path,"to":ds}));
+    invalidate_status_cache();
     ctx.emit("workspace:changed", json!({"repo_id":id}));
     ctx.notify("workspace");
     repo(ctx, id).ok_or_else(|| "Unknown repository".into())
@@ -202,7 +307,8 @@ pub fn create_worktree(
     agent_name: &str,
     base: Option<&str>,
 ) -> Result<Worktree, String> {
-    let _queue = GIT_QUEUE.lock().map_err(|e| e.to_string())?;
+    let lock = repo_lock(repo_id);
+    let _queue = lock.lock().map_err(|e| e.to_string())?;
     safe_name(agent_name)?;
     if let Some(agent) = agent_id {
         if ctx
@@ -304,40 +410,46 @@ pub fn create_worktree(
 pub fn worktree_status(ctx: &Arc<Ctx>, id: &str) -> Result<Value, String> {
     let w = worktree(ctx, id)?;
     let path = Path::new(text(&w, "path")?);
-    let dirty = git(
+    let st = parse_porcelain_v2(&git(
         path,
-        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
-    )?;
-    let upstream = git(
-        path,
-        &[
-            "rev-parse",
-            "--abbrev-ref",
-            "--symbolic-full-name",
-            "@{upstream}",
-        ],
-    )
-    .ok();
+        &["status", "--porcelain=v2", "--branch", "--untracked-files=all"],
+    )?);
     let r = repo(ctx, text(&w, "repo_id")?).ok_or("Unknown repository")?;
     let target = r["integration_branch"]
         .as_str()
         .or(r["default_branch"].as_str())
         .unwrap_or("main");
-    let comparison = upstream.as_deref().unwrap_or(target);
-    let counts = git(
-        path,
-        &[
-            "rev-list",
-            "--left-right",
-            "--count",
-            &format!("{comparison}...HEAD"),
-        ],
-    )?;
-    let mut n = counts
-        .split_whitespace()
-        .filter_map(|v| v.parse::<u64>().ok());
-    let behind = n.next().unwrap_or(0);
-    let ahead = n.next().unwrap_or(0);
+    let upstream = st.upstream;
+    let (ahead, behind, unmerged) = if let (Some(a), Some(b)) = (st.ahead, st.behind) {
+        let unm = git(path, &["rev-list", "--count", &format!("{target}..HEAD")])?
+            .parse::<u64>()
+            .unwrap_or(0);
+        (a, b, unm)
+    } else {
+        let comparison = upstream.as_deref().unwrap_or(target);
+        let counts = git(
+            path,
+            &[
+                "rev-list",
+                "--left-right",
+                "--count",
+                &format!("{comparison}...HEAD"),
+            ],
+        )?;
+        let mut n = counts
+            .split_whitespace()
+            .filter_map(|v| v.parse::<u64>().ok());
+        let b = n.next().unwrap_or(0);
+        let a = n.next().unwrap_or(0);
+        let unm = if comparison == target {
+            a
+        } else {
+            git(path, &["rev-list", "--count", &format!("{target}..HEAD")])?
+                .parse::<u64>()
+                .unwrap_or(0)
+        };
+        (a, b, unm)
+    };
     let unpushed = git(
         path,
         &[
@@ -351,18 +463,17 @@ pub fn worktree_status(ctx: &Arc<Ctx>, id: &str) -> Result<Value, String> {
     )?
     .parse::<u64>()
     .unwrap_or(0);
-    let unmerged = git(path, &["rev-list", "--count", &format!("{target}..HEAD")])?
-        .parse::<u64>()
-        .unwrap_or(0);
     let last = git(path, &["log", "-1", "--format=%H%n%s%n%an%n%ct"])?;
     let mut last = last.lines();
+    let is_dirty = !st.dirty_files.is_empty();
     Ok(
-        json!({"id":id,"dirty":!dirty.is_empty(),"dirty_files":dirty.split('\0').filter(|s| !s.is_empty()).collect::<Vec<_>>(),"unpushed_commits":unpushed,"unmerged_commits":unmerged,"ahead":ahead,"behind":behind,"upstream":upstream,"unsaved":!dirty.is_empty() || unpushed>0 || unmerged>0,"last_commit":{"hash":last.next(),"subject":last.next(),"author":last.next(),"timestamp":last.next()}}),
+        json!({"id":id,"dirty":is_dirty,"dirty_files":st.dirty_files,"unpushed_commits":unpushed,"unmerged_commits":unmerged,"ahead":ahead,"behind":behind,"upstream":upstream,"unsaved":is_dirty || unpushed>0 || unmerged>0,"last_commit":{"hash":last.next(),"subject":last.next(),"author":last.next(),"timestamp":last.next()}}),
     )
 }
 pub fn remove_worktree(ctx: &Arc<Ctx>, id: &str, force: bool) -> Result<(), String> {
-    let _queue = GIT_QUEUE.lock().map_err(|e| e.to_string())?;
     let w = worktree(ctx, id)?;
+    let lock = repo_lock(text(&w, "repo_id")?);
+    let _queue = lock.lock().map_err(|e| e.to_string())?;
     let path = Path::new(text(&w, "path")?);
     let root = std::fs::canonicalize(ctx.root.join("worktrees")).map_err(|e| e.to_string())?;
     if !path.starts_with(ctx.root.join("worktrees")) {
@@ -444,15 +555,30 @@ pub fn remove_worktree(ctx: &Arc<Ctx>, id: &str, force: bool) -> Result<(), Stri
 }
 fn list_worktrees(ctx: &Arc<Ctx>, repo_id: Option<&str>) -> Result<Value, String> {
     let mut rows = ctx.db.query("SELECT w.*,a.name AS agent_name FROM worktrees w LEFT JOIN agents a ON w.agent_id=a.id WHERE (?1 IS NULL OR w.repo_id=?1) ORDER BY w.created_at DESC",params![repo_id])?;
+    let cache_key = (ctx.root.clone(), format!("worktrees:{}", repo_id.unwrap_or("*")));
+    let fp = paths_fingerprint(rows.iter().filter_map(|r| r["path"].as_str()));
+    let cache = STATUS_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(g) = cache.lock() {
+        if let Some((t, cached_fp, val)) = g.get(&cache_key) {
+            if t.elapsed() < STATUS_CACHE_TTL && *cached_fp == fp {
+                return Ok(val.clone());
+            }
+        }
+    }
     for row in &mut rows {
         row["status"] = worktree_status(ctx, text(row, "id")?)
             .unwrap_or_else(|e| json!({"error":e,"unsaved":true}));
     }
-    Ok(json!(rows))
+    let out = json!(rows);
+    if let Ok(mut g) = cache.lock() {
+        g.insert(cache_key, (Instant::now(), fp, out.clone()));
+    }
+    Ok(out)
 }
 /// Reconcile a lost ledger row only when Git proves the checkout belongs to a registered repo.
 pub(crate) fn recover_worktree(ctx: &Arc<Ctx>, path: &Path) -> Result<String, String> {
-    let _q = GIT_QUEUE.lock().map_err(|e| e.to_string())?;
+    let lock = repo_lock(&format!("recover:{}", path.to_string_lossy()));
+    let _q = lock.lock().map_err(|e| e.to_string())?;
     if let Some(row) = ctx
         .db
         .query(
@@ -567,7 +693,17 @@ fn dispatch(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, String> 
             Ok(json!({"repo_id":id,"path":r["path"],"tasks":tasks,"agents":agents,"worktrees":worktrees,"resources":resources,"pilot":crate::pilot::active()}))
         }
         "repos_list" => {
-            let mut rows=ctx.db.query("SELECT r.*,(SELECT count(*) FROM worktrees w WHERE w.repo_id=r.id) AS worktree_count FROM repos r ORDER BY name",[])?;
+            let mut rows = ctx.db.query("SELECT r.*,(SELECT count(*) FROM worktrees w WHERE w.repo_id=r.id) AS worktree_count FROM repos r ORDER BY name", [])?;
+            let cache_key = (ctx.root.clone(), "repos_list".to_string());
+            let fp = paths_fingerprint(rows.iter().filter_map(|r| r["path"].as_str()));
+            let cache = STATUS_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+            if let Ok(g) = cache.lock() {
+                if let Some((t, cached_fp, val)) = g.get(&cache_key) {
+                    if t.elapsed() < STATUS_CACHE_TTL && *cached_fp == fp {
+                        return Ok(val.clone());
+                    }
+                }
+            }
             for r in &mut rows {
                 let p = match repo_dir(r) {
                     Ok(p) => p,
@@ -579,8 +715,10 @@ fn dispatch(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, String> 
                     }
                 };
                 let p = p.as_path();
-                if let Ok(u) = git(p, &["remote", "get-url", "origin"]) {
-                    r["remote_url"] = json!(u);
+                if r["remote_url"].is_null() {
+                    if let Ok(u) = git(p, &["remote", "get-url", "origin"]) {
+                        r["remote_url"] = json!(u);
+                    }
                 }
                 if r["root_commits"].is_null() {
                     let roots = repo_identity(p).0.join(",");
@@ -588,23 +726,33 @@ fn dispatch(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, String> 
                         let _ = ctx.db.exec("UPDATE repos SET root_commits=?2 WHERE id=?1", params![text(r, "id")?, roots]);
                     }
                 }
-                let branch = git(p, &["branch", "--show-current"]);
-                let dirty = git(p, &["status", "--porcelain", "-uno"]);
-                r["branch"] = json!(branch.unwrap_or_default());
                 // -uno: skip the untracked-file walk; cheap even on big repos.
-                r["dirty"] = json!(dirty.as_ref().map(|s| !s.is_empty()).unwrap_or(true));
-                if let Err(e) = dirty {
-                    r["error"] = json!(e);
+                match git(p, &["status", "--porcelain=v2", "--branch", "-uno"]) {
+                    Ok(out) => {
+                        let st = parse_porcelain_v2(&out);
+                        r["branch"] = json!(st.branch);
+                        r["dirty"] = json!(!st.dirty_files.is_empty());
+                    }
+                    Err(e) => {
+                        r["branch"] = json!("");
+                        r["dirty"] = json!(true);
+                        r["error"] = json!(e);
+                    }
                 }
             }
-            Ok(json!(rows))
+            let out = json!(rows);
+            if let Ok(mut g) = cache.lock() {
+                g.insert(cache_key, (Instant::now(), fp, out.clone()));
+            }
+            Ok(out)
         }
         "repo_add" => {
-            let _q = GIT_QUEUE.lock().map_err(|e| e.to_string())?;
-            add_repo(ctx, &arg_str(&args, "path")?)
+            let path = arg_str(&args, "path")?;
+            let lock = repo_lock(&format!("add:{path}"));
+            let _q = lock.lock().map_err(|e| e.to_string())?;
+            add_repo(ctx, &path)
         }
         "repo_clone" => {
-            let _q = GIT_QUEUE.lock().map_err(|e| e.to_string())?;
             let url = arg_str(&args, "url")?;
             if url.starts_with('-') || url.trim().is_empty() || url.starts_with("ext::") {
                 return Err("Invalid clone URL".into());
@@ -622,15 +770,20 @@ fn dispatch(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, String> 
                 return Err("Clone destination already exists".into());
             }
             std::fs::create_dir_all(ctx.root.join("repos")).map_err(|e| e.to_string())?;
+            // Network git clone runs without holding any repository lock.
             git(
                 &ctx.root.join("repos"),
                 &["clone", "--", &url, &path.to_string_lossy()],
             )?;
-            add_repo(ctx, &path.to_string_lossy())
+            let ps = path.to_string_lossy().to_string();
+            let lock = repo_lock(&format!("add:{ps}"));
+            let _q = lock.lock().map_err(|e| e.to_string())?;
+            add_repo(ctx, &ps)
         }
         "repo_remove" => {
-            let _q = GIT_QUEUE.lock().map_err(|e| e.to_string())?;
             let id = arg_str(&args, "id")?;
+            let lock = repo_lock(&id);
+            let _q = lock.lock().map_err(|e| e.to_string())?;
             if !ctx
                 .db
                 .query("SELECT id FROM worktrees WHERE repo_id=?1", [&id])?
@@ -643,8 +796,9 @@ fn dispatch(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, String> 
             Ok(Value::Null)
         }
         "repo_set" => {
-            let _q = GIT_QUEUE.lock().map_err(|e| e.to_string())?;
             let id = arg_str(&args, "id")?;
+            let lock = repo_lock(&id);
+            let _q = lock.lock().map_err(|e| e.to_string())?;
             let r = repo(ctx, &id).ok_or("Unknown repository")?;
             for key in ["default_branch", "integration_branch"] {
                 if let Some(v) = args.get(key) {
@@ -819,18 +973,20 @@ pub fn git_worktrees(repo_path: &Path) -> Vec<(PathBuf, String, String)> {
 }
 
 fn path_status(path: &Path, target: &str) -> Value {
-    let dirty = git(path, &["status", "--porcelain=v1", "-z", "--untracked-files=all"]).unwrap_or_default();
-    let dirty_files: Vec<&str> = dirty.split('\0').filter(|s| !s.is_empty()).collect();
+    let st = git(path, &["status", "--porcelain=v2", "--branch", "--untracked-files=all"])
+        .map(|s| parse_porcelain_v2(&s))
+        .unwrap_or_default();
     let counts = git(path, &["rev-list", "--left-right", "--count", &format!("{target}...HEAD")]).unwrap_or_default();
     let mut n = counts.split_whitespace().filter_map(|v| v.parse::<u64>().ok());
     let behind = n.next().unwrap_or(0);
     let ahead = n.next().unwrap_or(0);
     let last = git(path, &["log", "-1", "--format=%H%n%s%n%an%n%ct"]).unwrap_or_default();
     let mut l = last.lines();
+    let dirty_count = st.dirty_files.len();
     json!({
-        "dirty": !dirty_files.is_empty(),
-        "dirty_count": dirty_files.len(),
-        "dirty_files": dirty_files.into_iter().take(40).collect::<Vec<_>>(),
+        "dirty": dirty_count > 0,
+        "dirty_count": dirty_count,
+        "dirty_files": st.dirty_files.into_iter().take(40).collect::<Vec<_>>(),
         "ahead": ahead,
         "behind": behind,
         "last_commit": {
@@ -1008,6 +1164,46 @@ pub fn github_pr_view(repo_path: &Path, pr_number: u64) -> Option<Value> {
     )
 }
 
+fn parse_branches_with_ab(out: &str, target: &str) -> Vec<Value> {
+    let origin_target = format!("origin/{target}");
+    out.lines()
+        .filter_map(|l| {
+            let p: Vec<&str> = l.splitn(8, '\t').collect();
+            let full = *p.first()?;
+            let remote = full.starts_with("refs/remotes/");
+            if remote && full.ends_with("/HEAD") {
+                return None;
+            }
+            let name = p.get(1).copied().unwrap_or("");
+            let (ahead, behind) = if name == target || name == origin_target {
+                (0u64, 0u64)
+            } else {
+                let mut it = p
+                    .get(6)
+                    .copied()
+                    .unwrap_or("")
+                    .split_whitespace()
+                    .filter_map(|x| x.parse::<u64>().ok());
+                let a = it.next().unwrap_or(0);
+                let b = it.next().unwrap_or(0);
+                (a, b)
+            };
+            Some(json!({
+                "name": p.get(1),
+                "commit": p.get(2),
+                "upstream": p.get(3).filter(|s| !s.is_empty()),
+                "current": p.get(4) == Some(&"*"),
+                "date": p.get(5).and_then(|s| s.parse::<i64>().ok()).map(|s| s * 1000),
+                "subject": p.get(7).copied().unwrap_or(""),
+                "remote": remote,
+                "ahead": ahead,
+                "behind": behind,
+            }))
+        })
+        .take(35)
+        .collect()
+}
+
 /// Complete local + remote + GitHub landscape for a repository.
 pub fn repo_landscape(ctx: &Ctx, repo_id: &str, include_prs: bool) -> Result<Value, String> {
     let r = ctx.db.query("SELECT * FROM repos WHERE id=?1", [repo_id])?.into_iter().next().ok_or("Unknown repository")?;
@@ -1017,34 +1213,54 @@ pub fn repo_landscape(ctx: &Ctx, repo_id: &str, include_prs: bool) -> Result<Val
         .or(r["default_branch"].as_str())
         .unwrap_or("main");
     let wts = discover_worktrees(ctx, repo_id).unwrap_or_default();
-    let raw_branches = git(
+    let base_ref = start_point(&p, target)
+        .map(|(_, name)| name)
+        .unwrap_or_else(|_| target.to_string());
+    let ab_format = format!(
+        "--format=%(refname)%09%(refname:short)%09%(objectname)%09%(upstream:short)%09%(HEAD)%09%(committerdate:unix)%09%(ahead-behind:{base_ref})%09%(contents:subject)"
+    );
+    let branches = if let Ok(out) = git(
         &p,
         &[
             "for-each-ref",
             "--sort=-committerdate",
-            "--format=%(refname)%09%(refname:short)%09%(objectname)%09%(upstream:short)%09%(HEAD)%09%(committerdate:unix)%09%(contents:subject)",
+            &ab_format,
             "refs/heads",
             "refs/remotes",
         ],
-    )
-    .map(|s| parse_branches(&s))
-    .unwrap_or_default();
-    let mut branches = vec![];
-    for mut b in raw_branches.into_iter().take(35) {
-        if let Some(name) = b["name"].as_str() {
-            if name != target && name != format!("origin/{target}") {
-                if let Ok(c) = git(&p, &["rev-list", "--left-right", "--count", &format!("{target}...{name}")]) {
-                    let mut it = c.split_whitespace().filter_map(|x| x.parse::<u64>().ok());
-                    b["behind"] = json!(it.next().unwrap_or(0));
-                    b["ahead"] = json!(it.next().unwrap_or(0));
+    ) {
+        parse_branches_with_ab(&out, target)
+    } else {
+        let raw_branches = git(
+            &p,
+            &[
+                "for-each-ref",
+                "--sort=-committerdate",
+                "--format=%(refname)%09%(refname:short)%09%(objectname)%09%(upstream:short)%09%(HEAD)%09%(committerdate:unix)%09%(contents:subject)",
+                "refs/heads",
+                "refs/remotes",
+            ],
+        )
+        .map(|s| parse_branches(&s))
+        .unwrap_or_default();
+        let mut fallback = vec![];
+        for mut b in raw_branches.into_iter().take(35) {
+            if let Some(name) = b["name"].as_str() {
+                if name != target && name != format!("origin/{target}") {
+                    if let Ok(c) = git(&p, &["rev-list", "--left-right", "--count", &format!("{base_ref}...{name}")]) {
+                        let mut it = c.split_whitespace().filter_map(|x| x.parse::<u64>().ok());
+                        b["behind"] = json!(it.next().unwrap_or(0));
+                        b["ahead"] = json!(it.next().unwrap_or(0));
+                    }
+                } else {
+                    b["behind"] = json!(0);
+                    b["ahead"] = json!(0);
                 }
-            } else {
-                b["behind"] = json!(0);
-                b["ahead"] = json!(0);
             }
+            fallback.push(b);
         }
-        branches.push(b);
-    }
+        fallback
+    };
     let prs = if include_prs {
         github_prs(&p)
     } else {
@@ -1324,5 +1540,35 @@ mod tests {
         assert!(truncated);
         assert!(s.len() <= DIFF_CAP);
         assert!(s.ends_with('🦁'));
+    }
+    #[test]
+    fn porcelain_v2_and_landscape_ahead_behind() {
+        let sample = "# branch.oid 0123456789abcdef\n\
+                      # branch.head feat/perf\n\
+                      # branch.upstream origin/feat/perf\n\
+                      # branch.ab +3 -2\n\
+                      1 .M N... 100644 100644 100644 abc def src/lib.rs\n\
+                      ? untracked.txt\n";
+        let st = parse_porcelain_v2(sample);
+        assert_eq!(st.branch, "feat/perf");
+        assert_eq!(st.upstream.as_deref(), Some("origin/feat/perf"));
+        assert_eq!((st.ahead, st.behind), (Some(3), Some(2)));
+        assert_eq!(st.dirty_files, vec![" M src/lib.rs", "?? untracked.txt"]);
+
+        let detached = parse_porcelain_v2("# branch.oid abc\n# branch.head (detached)\n");
+        assert_eq!(detached.branch, "");
+        assert!(detached.upstream.is_none());
+
+        let (ctx, id) = setup();
+        let w = create_worktree(&ctx, &id, None, "lion", None).unwrap();
+        std::fs::write(w.path.join("feat.txt"), "hello").unwrap();
+        git(&w.path, &["add", "."]).unwrap();
+        git(&w.path, &["commit", "-m", "feat commit"]).unwrap();
+        let land = repo_landscape(&ctx, &id, false).unwrap();
+        let brs = land["branches"].as_array().unwrap();
+        let feat = brs.iter().find(|b| b["name"] == w.branch).expect("worktree branch in landscape");
+        assert_eq!((feat["ahead"].as_u64(), feat["behind"].as_u64()), (Some(1), Some(0)));
+        remove_worktree(&ctx, &w.id, true).unwrap();
+        std::fs::remove_dir_all(ctx.root.parent().unwrap()).unwrap();
     }
 }

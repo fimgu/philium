@@ -96,7 +96,7 @@ pub struct Gateway {
     slots: Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
     next_id: AtomicU64,
     pub events: broadcast::Sender<Activity>,
-    log_file: Option<PathBuf>,
+    log_tx: Option<std::sync::mpsc::SyncSender<Activity>>,
     /// Source of OAuth access tokens for subscription routes.
     pub tokens: TokenSource,
     /// Antigravity: the thought signature of each tool call, sent back on later
@@ -142,6 +142,20 @@ fn cap(s: &str, n: usize) -> String {
 
 impl Gateway {
     pub fn new(token: String, log_file: Option<PathBuf>) -> Arc<Self> {
+        let log_tx = log_file.map(|path| {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<Activity>(512);
+            std::thread::Builder::new()
+                .name("philium-gateway-log".into())
+                .spawn(move || {
+                    while let Ok(s) = rx.recv() {
+                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                            let _ = writeln!(f, "{}", serde_json::to_string(&s).unwrap_or_default());
+                        }
+                    }
+                })
+                .ok();
+            tx
+        });
         Arc::new(Self {
             token,
             client: reqwest::Client::builder()
@@ -159,7 +173,7 @@ impl Gateway {
             slots: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             events: broadcast::channel(256).0,
-            log_file,
+            log_tx,
             tokens: TokenSource::new(),
             signatures: Mutex::new(HashMap::new()),
             rejected: Mutex::new(Default::default()),
@@ -352,9 +366,8 @@ impl Gateway {
 
     /// Metadata only. Bodies stay in memory and are never written to disk.
     fn persist(&self, s: &Activity) {
-        let Some(path) = &self.log_file else { return };
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-            let _ = writeln!(f, "{}", serde_json::to_string(s).unwrap_or_default());
+        if let Some(tx) = &self.log_tx {
+            let _ = tx.try_send(s.clone());
         }
     }
 
@@ -482,14 +495,23 @@ fn extract_usage(head: &str, tail: &str) -> (Option<u64>, Option<u64>, Option<u6
         });
     };
     for text in [head, tail] {
-        if let Ok(v) = serde_json::from_str::<Value>(text.trim()) {
-            visit(&v);
+        if !text.contains("usage") {
             continue;
+        }
+        let trimmed = text.trim();
+        if trimmed.starts_with('{') || trimmed.starts_with('[') {
+            if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
+                visit(&v);
+                continue;
+            }
         }
         for line in text.lines() {
             if let Some(data) = line.strip_prefix("data:") {
-                if let Ok(v) = serde_json::from_str::<Value>(data.trim()) {
-                    visit(&v);
+                let data = data.trim();
+                if data.contains("usage") {
+                    if let Ok(v) = serde_json::from_str::<Value>(data) {
+                        visit(&v);
+                    }
                 }
             }
         }
@@ -539,24 +561,41 @@ async fn proxy(
     let started = Instant::now();
 
     // Guard: scan the exact bytes about to leave.
-    let mode = p.guard;
+    // Defense-in-depth (SPEC.md:546): untrusted providers can never disable secret redaction.
+    let mode = if !p.trusted && p.guard == GuardMode::Off {
+        GuardMode::Redact
+    } else {
+        p.guard
+    };
     let mut findings = guard::Findings::new();
     let mut parsed: Option<Value> = None;
-    let outgoing: Bytes = if body.is_empty() {
+    let mut parse_err: Option<String> = None;
+    let mut dirty = false;
+    let mut redacted = false;
+    let mut outgoing: Bytes = if body.is_empty() {
         body
-    } else if let Ok(mut v) = serde_json::from_slice::<Value>(&body) {
-        guard::scan_json(&mut v, mode == GuardMode::Redact, &mut findings);
-        let out = if mode == GuardMode::Redact && !findings.is_empty() {
-            Bytes::from(serde_json::to_vec(&v).unwrap_or_default())
-        } else {
-            body
-        };
-        parsed = Some(v);
-        out
     } else {
-        let mut text = String::from_utf8_lossy(&body).into_owned();
-        guard::scan_text(&mut text, mode == GuardMode::Redact, &mut findings);
-        if mode == GuardMode::Redact && !findings.is_empty() { Bytes::from(text) } else { body }
+        match serde_json::from_slice::<Value>(&body) {
+            Ok(mut v) => {
+                guard::scan_json(&mut v, mode == GuardMode::Redact, &mut findings);
+                if mode == GuardMode::Redact && !findings.is_empty() {
+                    dirty = true;
+                    redacted = true;
+                }
+                parsed = Some(v);
+                body
+            }
+            Err(e) => {
+                parse_err = Some(e.to_string());
+                let mut text = String::from_utf8_lossy(&body).into_owned();
+                guard::scan_text(&mut text, mode == GuardMode::Redact, &mut findings);
+                if mode == GuardMode::Redact && !findings.is_empty() {
+                    Bytes::from(text)
+                } else {
+                    body
+                }
+            }
+        }
     };
     let model = parsed.as_ref().and_then(|v| v.get("model")).and_then(Value::as_str).map(str::to_string);
     let stream = parsed.as_ref().and_then(|v| v.get("stream")).and_then(Value::as_bool).unwrap_or(false);
@@ -595,6 +634,8 @@ async fn proxy(
         summary,
         request: if blocked {
             format!("[not sent: blocked by guard ({})]", guard::summarize(&findings))
+        } else if redacted {
+            String::new()
         } else {
             cap(&String::from_utf8_lossy(&outgoing), BODY_CAP)
         },
@@ -615,12 +656,11 @@ async fn proxy(
     }
 
     let mut rest = rest;
-    let mut outgoing = outgoing;
     if method == Method::POST && matches!(rest.as_str(), "chat/completions" | "responses") {
         if let Some(eff) = gw.get_effort(agent_name.as_deref()) {
-            if let Ok(mut v) = serde_json::from_slice::<Value>(&outgoing) {
-                translate::inject_effort(&mut v, Some(&eff), rest == "responses");
-                outgoing = Bytes::from(serde_json::to_vec(&v).unwrap_or_default());
+            if let Some(v) = parsed.as_mut() {
+                translate::inject_effort(v, Some(&eff), rest == "responses");
+                dirty = true;
             }
         }
     }
@@ -628,14 +668,16 @@ async fn proxy(
     let anthropic = matches!(p.kind, Kind::Anthropic | Kind::ClaudeOauth);
     let translating = anthropic && method == Method::POST && rest == "chat/completions";
     if translating {
-        match serde_json::from_slice::<Value>(&outgoing) {
-            Ok(v) => {
-                let mut tr = translate::request(&v, true);
+        match parsed.as_mut() {
+            Some(v) => {
+                let mut tr = translate::request(v, true);
                 translate::inject_cache_breakpoints(&mut tr, true);
-                outgoing = Bytes::from(tr.to_string());
+                *v = tr;
+                dirty = true;
                 rest = "messages".into();
             }
-            Err(e) => {
+            None => {
+                let e = parse_err.unwrap_or_else(|| "EOF while parsing a value at line 1 column 0".into());
                 let msg = format!("invalid chat.completions body: {e}");
                 gw.update(id, |r| {
                     r.summary.state = "error";
@@ -646,10 +688,10 @@ async fn proxy(
             }
         }
     } else if method == Method::POST && rest == "chat/completions" && p.kind == Kind::OpenaiChat {
-        if let Ok(mut v) = serde_json::from_slice::<Value>(&outgoing) {
+        if let Some(v) = parsed.as_mut() {
             if v["model"].as_str().is_some_and(|m| m.to_ascii_lowercase().contains("claude")) {
-                translate::inject_cache_breakpoints(&mut v, false);
-                outgoing = Bytes::from(serde_json::to_vec(&v).unwrap_or_default());
+                translate::inject_cache_breakpoints(v, false);
+                dirty = true;
             }
         }
     }
@@ -681,17 +723,28 @@ async fn proxy(
                 None
             };
             let creds = oauth.take().unwrap_or_default();
-            return antigravity(&gw, p, &rest, id, started, &outgoing, stream, creds, permit).await;
+            return antigravity(&gw, p, &rest, id, started, parsed, parse_err, stream, creds, permit).await;
         }
         // Shape after the guard so redaction still covers user content.
-        if let Ok(mut v) = serde_json::from_slice::<Value>(&outgoing) {
+        if let Some(v) = parsed.as_mut() {
             if p.kind == Kind::ClaudeOauth {
-                crate::oauth::shape_claude_body(&mut v);
-                translate::inject_cache_breakpoints(&mut v, true);
+                crate::oauth::shape_claude_body(v);
+                if !translating {
+                    translate::inject_cache_breakpoints(v, true);
+                }
             } else {
-                crate::oauth::shape_chatgpt_body(&mut v);
+                crate::oauth::shape_chatgpt_body(v);
             }
-            outgoing = Bytes::from(serde_json::to_vec(&v).unwrap_or_default());
+            dirty = true;
+        }
+    }
+    if dirty {
+        if let Some(v) = parsed.as_ref() {
+            outgoing = Bytes::from(serde_json::to_vec(v).unwrap_or_default());
+            if let Some(rec) = gw.log.lk().iter_mut().find(|r| r.summary.id == id) {
+                rec.summary.req_bytes = outgoing.len();
+                rec.request = cap(&String::from_utf8_lossy(&outgoing), BODY_CAP);
+            }
         }
     }
     let mut permit = if method == Method::POST {
@@ -763,15 +816,15 @@ async fn proxy(
             let ra = resp.headers().get("retry-after").cloned();
             let bytes = resp.bytes().await.unwrap_or_default();
             if let Some(learned) = translate::parse_effort_rejection(status.as_u16(), &String::from_utf8_lossy(&bytes)) {
-                if let Ok(mut v) = serde_json::from_slice::<Value>(&outgoing) {
+                if let Some(v) = parsed.as_mut() {
                     // Only a request that carried an effort setting can teach us about effort. A
                     // refusal that merely mentions thinking must not erase a model's levels.
-                    if translate::strip_effort(&mut v) {
+                    if translate::strip_effort(v) {
                         if let (Some(cb), Some(m)) = (gw.learned_efforts_cb.rd().clone(), model_name.as_deref()) {
                             cb(&p.id, m, learned);
                         }
                         gw.set_effort(agent_name.as_deref(), None);
-                        outgoing = Bytes::from(serde_json::to_vec(&v).unwrap_or_default());
+                        outgoing = Bytes::from(serde_json::to_vec(v).unwrap_or_default());
                         continue;
                     }
                 }
@@ -899,7 +952,8 @@ async fn antigravity(
     rest: &str,
     id: u64,
     started: Instant,
-    outgoing: &Bytes,
+    parsed: Option<Value>,
+    parse_err: Option<String>,
     stream: bool,
     creds: crate::oauth::Creds,
     mut permit: Option<tokio::sync::OwnedSemaphorePermit>,
@@ -916,9 +970,9 @@ async fn antigravity(
     if rest != "chat/completions" {
         return fail(StatusCode::NOT_FOUND, "philium_route", "Antigravity answers chat requests only".into());
     }
-    let body: Value = match serde_json::from_slice(outgoing) {
-        Ok(v) => v,
-        Err(e) => return fail(StatusCode::BAD_REQUEST, "philium_request", format!("invalid chat.completions body: {e}")),
+    let Some(body) = parsed else {
+        let e = parse_err.unwrap_or_else(|| "EOF while parsing a value at line 1 column 0".into());
+        return fail(StatusCode::BAD_REQUEST, "philium_request", format!("invalid chat.completions body: {e}"));
     };
     let Some(project) = creds.account_id.clone().filter(|p| !p.is_empty()) else {
         return fail(StatusCode::UNAUTHORIZED, "philium_signin", "No Antigravity project for this Google account. Sign in again on the Providers screen".into());
@@ -937,6 +991,15 @@ async fn antigravity(
             let sigs = gw.signatures.lk();
             gemini::request(&body, &project, &crate::oauth::random_string(32), &|k| sigs.get(k).cloned(), &shaping)
         };
+        let payload = wrapped.to_string();
+        if attempt == 1 {
+            if let Some(rec) = gw.log.lk().iter_mut().find(|r| r.summary.id == id) {
+                if rec.request.is_empty() {
+                    rec.summary.req_bytes = payload.len();
+                    rec.request = cap(&payload, BODY_CAP);
+                }
+            }
+        }
         let sent = gw
             .client
             .post(&url)
@@ -946,7 +1009,7 @@ async fn antigravity(
             .header("x-goog-api-client", gemini::API_CLIENT)
             .header("x-goog-request-params", format!("project={project}"))
             .header("x-goog-client-metadata", gemini::CLIENT_METADATA)
-            .body(wrapped.to_string())
+            .body(payload)
             .send()
             .await;
         let resp = match sent {
@@ -1498,6 +1561,44 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 3, "busy-slot 429 retried transparently");
         let a = settle(&gw).await;
         assert_eq!((a.input_tokens, a.output_tokens, a.cached_tokens), (Some(10), Some(2), Some(6)));
+    }
+
+    #[tokio::test]
+    async fn untrusted_provider_enforces_redact_even_if_guard_off() {
+        let gw = Gateway::new("t".repeat(48), None);
+        gw.set_routes(vec![Route {
+            provider: Provider {
+                id: "cn".into(),
+                name: "CN".into(),
+                kind: Kind::OpenaiChat,
+                base_url: "http://127.0.0.1:1/v1".into(),
+                trusted: false,
+                guard: GuardMode::Off,
+                enabled: true,
+                default_model: None,
+            },
+            api_key: Some("REAL-UPSTREAM-KEY".into()),
+        }]);
+        gw.set_effort(None, Some("high"));
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", HeaderValue::from_str(&format!("Bearer {}", "t".repeat(48))).unwrap());
+        let payload = Bytes::from(serde_json::to_vec(&body()).unwrap());
+        let _ = proxy(
+            State(gw.clone()),
+            Path(("cn".into(), "chat/completions".into())),
+            RawQuery(None),
+            Method::POST,
+            headers,
+            payload,
+        )
+        .await;
+        let a = gw.recent().pop().unwrap();
+        assert_eq!(a.guard, "redacted", "untrusted provider must enforce Redact even when configured Off");
+        let d = gw.detail(a.id).unwrap();
+        let req_text = d["request"].as_str().unwrap();
+        assert!(!req_text.contains("AKIAABCDEFGHIJKLMNOP"), "secret must be redacted from request: {req_text}");
+        assert!(req_text.contains("[REDACTED:aws_access_key]"), "{req_text}");
+        assert!(req_text.contains("\"reasoning_effort\":\"high\""), "single-pass effort injection preserved: {req_text}");
     }
 }
 

@@ -102,6 +102,9 @@ pub fn validate(p: &Provider) -> Result<(), String> {
         }
         return Ok(());
     }
+    if !p.trusted && p.guard == GuardMode::Off {
+        return Err("Untrusted providers must have secret guard set to Redact or Block".into());
+    }
     let url = reqwest::Url::parse(&p.base_url).map_err(|_| "Base URL is not a valid URL")?;
     let local = matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"));
     if url.scheme() != "https" && !(url.scheme() == "http" && local) {
@@ -668,14 +671,21 @@ pub fn dedupe_aliases(out: &mut Vec<Discovered>) {
     out.retain(|m| m.id.contains('-') || !full.iter().any(|f| f.split('-').any(|part| part == m.id)));
 }
 
+fn http_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .unwrap_or_default()
+    })
+}
+
 async fn discover(_ctx: &Arc<Ctx>, p: &Provider) -> Result<Vec<Discovered>, String> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| e.to_string())?;
+    let client = http_client();
     let base = p.base_url.trim_end_matches('/');
     if p.kind == Kind::AntigravityOauth {
-        return discover_antigravity(&client, p, base).await;
+        return discover_antigravity(client, p, base).await;
     }
     let mut url = format!("{base}/models");
     let mut req;
@@ -760,17 +770,28 @@ async fn discover_antigravity(client: &reqwest::Client, p: &Provider, base: &str
 /// Refresh one provider's models into SQLite. User edits (enabled, prices,
 /// context window) survive; vanished models are removed.
 pub async fn refresh_models(ctx: &Arc<Ctx>, id: &str) -> Result<Vec<Value>, String> {
+    let (list, _) = refresh_models_inner(ctx, id, true).await?;
+    Ok(list)
+}
+
+async fn refresh_models_inner(ctx: &Arc<Ctx>, id: &str, emit: bool) -> Result<(Vec<Value>, bool), String> {
     let p = get(ctx, id).ok_or("unknown provider")?;
+    let prev_err = ctx.db.kv_get(&format!("models_error.{id}"));
     let found = match discover(ctx, &p).await {
         Ok(f) => f,
         Err(e) => {
+            let err_changed = prev_err.as_deref() != Some(e.as_str());
             ctx.db.kv_set(&format!("models_error.{id}"), &e)?;
-            ctx.notify("providers");
+            if emit || err_changed {
+                ctx.notify("providers");
+            }
             return Err(e);
         }
     };
+    let prev_order = ctx.db.kv_get(&format!("models_order.{id}"));
+    let prev_efforts = ctx.db.kv_get(&format!("models_efforts.{id}"));
     let t = now();
-    ctx.db.with(|c| {
+    let deleted = ctx.db.with(|c| {
         let tx = c.unchecked_transaction()?;
         for m in &found {
             tx.execute(
@@ -782,27 +803,38 @@ pub async fn refresh_models(ctx: &Arc<Ctx>, id: &str) -> Result<Vec<Value>, Stri
                 rusqlite::params![id, m.id, m.display, m.context_window, m.price_in, m.price_out, t],
             )?;
         }
-        tx.execute("DELETE FROM models WHERE provider_id=?1 AND discovered_at<?2", rusqlite::params![id, t])?;
+        let del = tx.execute("DELETE FROM models WHERE provider_id=?1 AND discovered_at<?2", rusqlite::params![id, t])?;
         tx.execute("UPDATE providers SET models_cached_at=?2 WHERE id=?1", rusqlite::params![id, t])?;
-        tx.commit()
+        tx.commit()?;
+        Ok(del)
     })?;
     let order: Vec<&str> = found.iter().map(|m| m.id.as_str()).collect();
-    ctx.db.kv_set(&format!("models_order.{id}"), &serde_json::to_string(&order).unwrap_or_default())?;
+    let order_json = serde_json::to_string(&order).unwrap_or_default();
+    ctx.db.kv_set(&format!("models_order.{id}"), &order_json)?;
     let mut efforts_map = discovered_efforts_map(ctx, id);
     for m in &found {
         if let Some(e) = &m.efforts {
             efforts_map.insert(m.id.clone(), e.clone());
         }
     }
-    if efforts_map.is_empty() {
+    let efforts_json = if efforts_map.is_empty() {
         let _ = ctx.db.exec("DELETE FROM kv WHERE k=?1", [format!("models_efforts.{id}")]);
+        None
     } else {
-        ctx.db.kv_set(&format!("models_efforts.{id}"), &serde_json::to_string(&efforts_map).unwrap_or_default())?;
-    }
+        let s = serde_json::to_string(&efforts_map).unwrap_or_default();
+        ctx.db.kv_set(&format!("models_efforts.{id}"), &s)?;
+        Some(s)
+    };
     ctx.db.exec("DELETE FROM kv WHERE k=?1", [format!("models_error.{id}")])?;
-    ctx.notify("providers");
-    ctx.emit("providers:changed", json!({ "id": id }));
-    models(ctx, Some(id))
+    let changed = deleted > 0
+        || prev_err.is_some()
+        || prev_order.as_deref() != Some(order_json.as_str())
+        || prev_efforts != efforts_json;
+    if emit {
+        ctx.notify("providers");
+        ctx.emit("providers:changed", json!({ "id": id }));
+    }
+    Ok((models(ctx, Some(id))?, changed))
 }
 
 pub fn models(ctx: &Ctx, provider: Option<&str>) -> Result<Vec<Value>, String> {
@@ -812,6 +844,9 @@ pub fn models(ctx: &Ctx, provider: Option<&str>) -> Result<Vec<Value>, String> {
     let mut rows = ctx.db.query(sql, [provider])?;
     let mut disc_cache: std::collections::HashMap<String, std::collections::HashMap<String, Vec<EffortOption>>> =
         std::collections::HashMap::new();
+    // Each provider's models in the provider's own order (newest first for most APIs), so a
+    // picker can show the latest on top. A model the saved order does not know sorts last.
+    let mut ranks: std::collections::HashMap<String, std::collections::HashMap<String, i64>> = std::collections::HashMap::new();
     for r in &mut rows {
         let pid = r["provider_id"].as_str().unwrap_or("").to_string();
         let mid = r["model_id"].as_str().unwrap_or("").to_string();
@@ -820,14 +855,10 @@ pub fn models(ctx: &Ctx, provider: Option<&str>) -> Result<Vec<Value>, String> {
             .entry(pid.clone())
             .or_insert_with(|| discovered_efforts_map(ctx, &pid));
         let exp = disc.get(&mid).map(Vec::as_slice);
-        r["efforts"] = json!(model_efforts(kind, &mid, exp));
-        r["effort_details"] = json!(model_effort_details(kind, &mid, exp));
-    }
-    // Each provider's models in the provider's own order (newest first for most APIs), so a
-    // picker can show the latest on top. A model the saved order does not know sorts last.
-    let mut ranks: std::collections::HashMap<String, std::collections::HashMap<String, i64>> = std::collections::HashMap::new();
-    for r in &mut rows {
-        let pid = r["provider_id"].as_str().unwrap_or("").to_string();
+        let details = model_effort_details(kind, &mid, exp);
+        let efforts: Vec<&str> = details.iter().map(|o| o.value.as_str()).collect();
+        r["efforts"] = json!(efforts);
+        r["effort_details"] = json!(details);
         let order = ranks.entry(pid.clone()).or_insert_with(|| {
             ctx.db
                 .kv_get(&format!("models_order.{pid}"))
@@ -838,11 +869,20 @@ pub fn models(ctx: &Ctx, provider: Option<&str>) -> Result<Vec<Value>, String> {
                 .map(|(i, m)| (m, i as i64))
                 .collect()
         });
-        r["rank"] = json!(order.get(r["model_id"].as_str().unwrap_or("")).copied().unwrap_or(1_000_000));
+        r["rank"] = json!(order.get(mid.as_str()).copied().unwrap_or(1_000_000));
     }
     rows.sort_by(|a, b| {
-        let key = |r: &Value| (r["provider_id"].as_str().unwrap_or("").to_string(), r["rank"].as_i64().unwrap_or(1_000_000), r["model_id"].as_str().unwrap_or("").to_string());
-        key(a).cmp(&key(b))
+        let ka = (
+            a["provider_id"].as_str().unwrap_or(""),
+            a["rank"].as_i64().unwrap_or(1_000_000),
+            a["model_id"].as_str().unwrap_or(""),
+        );
+        let kb = (
+            b["provider_id"].as_str().unwrap_or(""),
+            b["rank"].as_i64().unwrap_or(1_000_000),
+            b["model_id"].as_str().unwrap_or(""),
+        );
+        ka.cmp(&kb)
     });
     Ok(rows)
 }
@@ -894,23 +934,56 @@ pub fn migrate_legacy(ctx: &Ctx) {
 pub fn init(ctx: &Arc<Ctx>) -> Result<(), String> {
     migrate_legacy(ctx);
     sync_routes(ctx);
-    // Refresh stale model lists in the background (6h TTL).
+    // Refresh stale model lists in the background (6h TTL) concurrently.
     let c = ctx.clone();
     tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-        for p in all(&c).into_iter().filter(|p| p.enabled) {
-            let fresh = c
-                .db
-                .query("SELECT models_cached_at FROM providers WHERE id=?1", [&p.id])
-                .ok()
-                .and_then(|r| r.first()?["models_cached_at"].as_i64())
-                .is_some_and(|t| now() - t < 6 * 3600 * 1000);
-            if !fresh {
-                let _ = refresh_models(&c, &p.id).await;
-            }
+        let cutoff = now() - 6 * 3600 * 1000;
+        let stale_ids: Vec<String> = c
+            .db
+            .query("SELECT id, models_cached_at FROM providers WHERE enabled=1 ORDER BY created_at", [])
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r["models_cached_at"].as_i64().is_none_or(|t| t <= cutoff))
+            .filter_map(|r| r["id"].as_str().map(str::to_string))
+            .collect();
+        if stale_ids.is_empty() {
+            return;
+        }
+        let results = futures_util::future::join_all(
+            stale_ids.iter().map(|id| {
+                let c = c.clone();
+                let id = id.clone();
+                async move {
+                    let changed = refresh_models_inner(&c, &id, false).await.map(|(_, ch)| ch).unwrap_or(false);
+                    (id, changed)
+                }
+            }),
+        )
+        .await;
+        let changed_ids: Vec<String> = results.into_iter().filter_map(|(id, ch)| ch.then_some(id)).collect();
+        if !changed_ids.is_empty() {
+            c.notify("providers");
+            c.emit("providers:changed", json!({ "ids": changed_ids }));
         }
     });
     Ok(())
+}
+
+fn public_from(p: &Provider, count: i64, cached: Value, error: Option<String>) -> Value {
+    let mut v = serde_json::to_value(p).unwrap();
+    if p.kind.is_subscription() {
+        let c = crate::oauth::Store::load(&crate::oauth::Keychain, &p.id);
+        v["signed_in"] = json!(c.is_some());
+        v["account"] = json!(c.as_ref().map(|c| json!({ "email": c.email, "plan": c.plan, "account_id": c.account_id })));
+        v["has_key"] = json!(c.is_some());
+    } else {
+        v["has_key"] = json!(get_key(&p.id).is_some_and(|k| !k.is_empty()));
+    }
+    v["model_count"] = json!(count);
+    v["models_cached_at"] = cached;
+    v["models_error"] = json!(error);
+    v["via_gateway"] = json!(true);
+    v
 }
 
 fn public(ctx: &Ctx, p: &Provider) -> Value {
@@ -926,25 +999,50 @@ fn public(ctx: &Ctx, p: &Provider) -> Value {
         .ok()
         .and_then(|r| r.first().map(|x| x["models_cached_at"].clone()))
         .unwrap_or(Value::Null);
-    let mut v = serde_json::to_value(p).unwrap();
-    if p.kind.is_subscription() {
-        let c = crate::oauth::Store::load(&crate::oauth::Keychain, &p.id);
-        v["signed_in"] = json!(c.is_some());
-        v["account"] = json!(c.as_ref().map(|c| json!({ "email": c.email, "plan": c.plan, "account_id": c.account_id })));
-        v["has_key"] = json!(c.is_some());
-    } else {
-        v["has_key"] = json!(get_key(&p.id).is_some_and(|k| !k.is_empty()));
+    let error = ctx.db.kv_get(&format!("models_error.{}", p.id));
+    public_from(p, count, cached, error)
+}
+
+fn list_public(ctx: &Ctx) -> Vec<Value> {
+    let rows = ctx
+        .db
+        .query("SELECT * FROM providers ORDER BY created_at", [])
+        .unwrap_or_default();
+    if rows.is_empty() {
+        return Vec::new();
     }
-    v["model_count"] = json!(count);
-    v["models_cached_at"] = cached;
-    v["models_error"] = json!(ctx.db.kv_get(&format!("models_error.{}", p.id)));
-    v["via_gateway"] = json!(true);
-    v
+    let counts: std::collections::HashMap<String, i64> = ctx
+        .db
+        .query("SELECT provider_id, COUNT(*) AS n FROM models GROUP BY provider_id", [])
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|r| Some((r["provider_id"].as_str()?.to_string(), r["n"].as_i64()?)))
+        .collect();
+    let errors: std::collections::HashMap<String, String> = ctx
+        .db
+        .query("SELECT k, v FROM kv WHERE k LIKE 'models_error.%'", [])
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|r| {
+            let k = r["k"].as_str()?.strip_prefix("models_error.")?.to_string();
+            let v = r["v"].as_str()?.to_string();
+            Some((k, v))
+        })
+        .collect();
+    rows.iter()
+        .filter_map(|r| {
+            let p = from_row(r)?;
+            let count = counts.get(&p.id).copied().unwrap_or(0);
+            let cached = r.get("models_cached_at").cloned().unwrap_or(Value::Null);
+            let error = errors.get(&p.id).cloned();
+            Some(public_from(&p, count, cached, error))
+        })
+        .collect()
 }
 
 pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, String> {
     match method {
-        "list" => Ok(json!(all(ctx).iter().map(|p| public(ctx, p)).collect::<Vec<_>>())),
+        "list" => Ok(json!(list_public(ctx))),
         m if m.starts_with("oauth_") => crate::oauth::call(ctx, m, args).await,
         "save" => {
             let kind = Kind::parse(&arg_str(&args, "kind")?)?;
@@ -978,10 +1076,8 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
             ctx.log_event("provider_saved", None, &json!({ "id": p.id, "kind": p.kind, "trusted": p.trusted }));
             ctx.notify("providers");
             ctx.emit("providers:changed", json!({ "id": p.id }));
-            // Discovery runs after the desk HAL picks up a new subscription.
             let (c, id) = (ctx.clone(), p.id.clone());
             tauri::async_runtime::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
                 let _ = refresh_models(&c, &id).await;
             });
             Ok(public(ctx, &p))
@@ -1017,14 +1113,17 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
                 ctx.db.exec("UPDATE models SET enabled=?3 WHERE provider_id=?1 AND model_id=?2", rusqlite::params![pid, mid, e as i64])?;
             }
             ctx.notify("providers");
+            ctx.emit("providers:changed", json!({ "id": pid, "model": mid }));
             Ok(Value::Null)
         }
         "set_default" => {
             let r = arg_str(&args, "ref")?;
             let (p, m) = resolve(ctx, Some(&r))?;
-            ctx.db.kv_set("setting.default_model", &format!("{}/{m}", p.id))?;
+            let default_ref = format!("{}/{m}", p.id);
+            ctx.db.kv_set("setting.default_model", &default_ref)?;
             ctx.notify("providers");
-            Ok(json!(format!("{}/{m}", p.id)))
+            ctx.emit("providers:changed", json!({ "id": p.id, "default_model": default_ref }));
+            Ok(json!(default_ref))
         }
         "default" => Ok(json!(resolve(ctx, None).ok().map(|(p, m)| format!("{}/{m}", p.id)))),
         _ => Err(format!("unknown providers.{method}")),
@@ -1080,6 +1179,15 @@ mod tests {
         assert!(validate(&s).is_err(), "untrusted subscription rejected");
         s.trusted = true;
         assert!(validate(&s).is_ok());
+
+        let mut untrusted_off = p("cn-off", "https://api.example.cn/v1");
+        untrusted_off.guard = GuardMode::Off;
+        assert_eq!(
+            validate(&untrusted_off).unwrap_err(),
+            "Untrusted providers must have secret guard set to Redact or Block"
+        );
+        untrusted_off.trusted = true;
+        assert!(validate(&untrusted_off).is_ok());
     }
 
     #[test]

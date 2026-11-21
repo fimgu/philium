@@ -7,7 +7,8 @@
 use crate::ctx::{arg_str, Ctx};
 use serde_json::{json, Value};
 
-const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS workday_log(id INTEGER PRIMARY KEY AUTOINCREMENT,ts INTEGER NOT NULL,kind TEXT NOT NULL,what TEXT NOT NULL,ok INTEGER NOT NULL DEFAULT 1,repo TEXT,note TEXT NOT NULL DEFAULT '')";
+const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS workday_log(id INTEGER PRIMARY KEY AUTOINCREMENT,ts INTEGER NOT NULL,kind TEXT NOT NULL,what TEXT NOT NULL,ok INTEGER NOT NULL DEFAULT 1,repo TEXT,note TEXT NOT NULL DEFAULT '');
+CREATE INDEX IF NOT EXISTS workday_log_kind_ts ON workday_log(kind, ts);";
 
 /// What a person does on purpose. Reads, polling and keystrokes are not actions.
 const ACTIONS: &[(&str, &str)] = &[
@@ -113,24 +114,29 @@ fn summary(ctx: &Ctx, since: i64) -> Result<Value, String> {
     Ok(json!({"since":since,"until":crate::db::now(),"actions":actions,"completed":completed,"fallbacks":fallbacks,"tools":TOOLS}))
 }
 
-pub async fn call(ctx: &Ctx, method: &str, args: Value) -> Result<Value, String> {
-    schema(ctx)?;
-    let started = || {
-        ctx.db
+pub async fn call(ctx: &std::sync::Arc<Ctx>, method: &str, args: Value) -> Result<Value, String> {
+    let started = |c: &Ctx| {
+        c.db
             .kv_get("workday.started_at")
             .and_then(|s| s.parse::<i64>().ok())
     };
     match method {
         "summary" => {
-            let mut v = summary(ctx, started().unwrap_or(0))?;
-            v["started"] = json!(started());
-            Ok(v)
+            let c = ctx.clone();
+            tokio::task::spawn_blocking(move || {
+                let st = started(&c);
+                let mut v = summary(&c, st.unwrap_or(0))?;
+                v["started"] = json!(st);
+                Ok(v)
+            })
+            .await
+            .map_err(|e| e.to_string())?
         }
         // Begin an observation window. Earlier entries stay in the log but leave the summary.
         "start" => {
             ctx.db
                 .kv_set("workday.started_at", &crate::db::now().to_string())?;
-            Ok(json!({"started":started()}))
+            Ok(json!({"started":started(ctx)}))
         }
         "fallback" => {
             let tool = arg_str(&args, "tool")?;
@@ -149,18 +155,23 @@ pub async fn call(ctx: &Ctx, method: &str, args: Value) -> Result<Value, String>
         }
         // A file the person can keep or hand over. Written inside the profile, never uploaded.
         "export" => {
-            let v = summary(ctx, started().unwrap_or(0))?;
-            let dir = ctx.data_dir.join("workday");
-            std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-            let path = dir.join(format!("workday-{}.json", crate::db::now()));
-            crate::hal::write_private(
-                &path,
-                serde_json::to_string_pretty(&v)
-                    .map_err(|e| e.to_string())?
-                    .as_bytes(),
-            )
-            .map_err(|e| e.to_string())?;
-            Ok(json!({"path":path}))
+            let c = ctx.clone();
+            tokio::task::spawn_blocking(move || {
+                let v = summary(&c, started(&c).unwrap_or(0))?;
+                let dir = c.data_dir.join("workday");
+                std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+                let path = dir.join(format!("workday-{}.json", crate::db::now()));
+                crate::hal::write_private(
+                    &path,
+                    serde_json::to_string_pretty(&v)
+                        .map_err(|e| e.to_string())?
+                        .as_bytes(),
+                )
+                .map_err(|e| e.to_string())?;
+                Ok(json!({"path":path}))
+            })
+            .await
+            .map_err(|e| e.to_string())?
         }
         _ => Err(format!("unknown workday.{method}")),
     }
