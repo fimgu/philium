@@ -16,6 +16,7 @@ function safeJson(o) { try { return JSON.stringify(o); } catch { return "Somethi
 export function Button(props) {
   const [p, rest] = splitProps(props, ["variant", "size", "class", "children", "busy", "onClick"]);
   const [auto, setAuto] = createSignal(false);
+  const isBusy = () => Boolean(p.busy || auto());
   const click = (e) => {
     if (auto()) return;
     let r;
@@ -29,11 +30,14 @@ export function Button(props) {
     <button
       {...rest}
       onClick={p.onClick ? click : undefined}
-      aria-busy={p.busy || auto() || undefined}
-      disabled={rest.disabled || p.busy || auto()}
+      aria-busy={isBusy() || undefined}
+      disabled={rest.disabled || isBusy()}
       class={`btn ${p.variant ?? ""} ${p.size ?? ""} ${p.class ?? ""}`}
     >
-      {p.busy || auto() ? "…" : p.children}
+      <Show when={isBusy()} fallback={p.children}>
+        <span class="btn-label-busy" style={{ visibility: "hidden", display: "inline-flex", "align-items": "center", gap: "6px" }}>{p.children}</span>
+        <span class="btn-busy-overlay" aria-hidden="true" style={{ position: "absolute", inset: 0, display: "inline-flex", "align-items": "center", "justify-content": "center" }}>…</span>
+      </Show>
     </button>
   );
 }
@@ -205,16 +209,33 @@ export function ConfirmHost() {
 
 const [toasts, setToasts] = createSignal([]);
 let toastId = 0;
+export function dismissToast(id) {
+  setToasts((t) => t.filter((x) => x.id !== id));
+}
 export function toast(text, tone = "") {
   const id = ++toastId;
   setToasts((t) => [...t, { id, text: cleanError(text), tone }]);
-  setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), tone === "bad" || tone === "danger" ? 7000 : 3500);
+  setTimeout(() => dismissToast(id), tone === "bad" || tone === "danger" ? 7000 : 3500);
 }
 export function ToastHost() {
   return (
     <Portal>
       <div class="toasts">
-        <For each={toasts()}>{(t) => <div class={`toast ${t.tone}`}>{t.text}</div>}</For>
+        <For each={toasts()}>
+          {(t) => (
+            <div class={`toast ${t.tone}`}>
+              <span class="toast-text">{t.text}</span>
+              <button
+                type="button"
+                class="toast-close"
+                aria-label="Close notification"
+                onClick={() => dismissToast(t.id)}
+              >
+                ×
+              </button>
+            </div>
+          )}
+        </For>
       </div>
     </Portal>
   );
@@ -229,26 +250,38 @@ export function VirtualList(props) {
   const [scroll, setScroll] = createSignal(0);
   const [height, setHeight] = createSignal(600);
   onMount(() => {
-    const ro = new ResizeObserver(() => setHeight(el.clientHeight));
+    if (el && el.clientHeight) setHeight(el.clientHeight);
+    const ro = new ResizeObserver(() => el && setHeight(el.clientHeight));
     ro.observe(el);
     onCleanup(() => ro.disconnect());
   });
   const range = createMemo(() => {
     const h = props.rowHeight;
+    const len = props.items?.length ?? 0;
     const start = Math.max(0, Math.floor(scroll() / h) - 5);
-    const end = Math.min(props.items.length, Math.ceil((scroll() + height()) / h) + 5);
+    const end = Math.min(len, Math.ceil((scroll() + height()) / h) + 5);
     return { start, end };
   });
-  const visible = createMemo(() => props.items.slice(range().start, range().end).map((item, i) => ({ item, index: range().start + i })));
+  const visible = createMemo(() => (props.items ?? []).slice(range().start, range().end));
   return (
-    <div class="vlist" ref={el} onScroll={(e) => setScroll(e.currentTarget.scrollTop)}>
-      <div class="vlist-inner" style={{ height: `${props.items.length * props.rowHeight}px` }}>
+    <div
+      class={`vlist ${props.class ?? ""}`}
+      ref={(node) => {
+        el = node;
+        if (typeof props.ref === "function") props.ref(node);
+      }}
+      onScroll={(e) => setScroll(e.currentTarget.scrollTop)}
+    >
+      <div class="vlist-inner" style={{ height: `${(props.items?.length ?? 0) * props.rowHeight}px` }}>
         <For each={visible()}>
-          {(v) => (
-            <div style={{ position: "absolute", top: `${v.index * props.rowHeight}px`, left: 0, right: 0, height: `${props.rowHeight}px` }}>
-              {props.children(v.item, v.index)}
-            </div>
-          )}
+          {(item, i) => {
+            const idx = () => range().start + i();
+            return (
+              <div style={{ position: "absolute", top: `${idx() * props.rowHeight}px`, left: 0, right: 0, height: `${props.rowHeight}px` }}>
+                {props.children(item, idx())}
+              </div>
+            );
+          }}
         </For>
       </div>
     </div>
@@ -303,8 +336,15 @@ export function Menu(props) {
   };
   // The opening click is delegated to the document and reaches this listener too: ignore it.
   const onDoc = (e) => { if (e?.type !== "click" || !btn?.contains(e.target)) close(); };
-  onMount(() => { document.addEventListener("click", onDoc); window.addEventListener("resize", onDoc); });
-  onCleanup(() => { document.removeEventListener("click", onDoc); window.removeEventListener("resize", onDoc); });
+  createEffect(() => {
+    if (!pos()) return;
+    document.addEventListener("click", onDoc);
+    window.addEventListener("resize", onDoc);
+    onCleanup(() => {
+      document.removeEventListener("click", onDoc);
+      window.removeEventListener("resize", onDoc);
+    });
+  });
   return (
     <>
       <button ref={btn} type="button" class="btn ghost sm menu-btn" title={props.title ?? "More actions"} aria-haspopup="menu" aria-expanded={!!pos()} onClick={open}>
@@ -471,13 +511,14 @@ export function ModelPicker(props) {
     if (!path.some(inside) && !btn?.contains(e.target) && !e.target?.closest?.(".model-picker-pop")) close();
   };
   const onResize = () => close();
-  onMount(() => {
+  createEffect(() => {
+    if (!open()) return;
     document.addEventListener("click", outside);
     window.addEventListener("resize", onResize);
-  });
-  onCleanup(() => {
-    document.removeEventListener("click", outside);
-    window.removeEventListener("resize", onResize);
+    onCleanup(() => {
+      document.removeEventListener("click", outside);
+      window.removeEventListener("resize", onResize);
+    });
   });
 
   // Arrow keys walk the models; from the search box the first Down lands on the first model.

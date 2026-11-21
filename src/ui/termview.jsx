@@ -7,8 +7,19 @@ import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import { rpc } from "../lib/rpc.js";
 
-const decode = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
-const encode = (s) => btoa(Array.from(new TextEncoder().encode(s), (c) => String.fromCharCode(c)).join(""));
+const decode = (s) => {
+  const bin = atob(s);
+  const len = bin.length;
+  const out = new Uint8Array(len);
+  for (let i = 0; i < len; i++) out[i] = bin.charCodeAt(i);
+  return out;
+};
+const encode = (s) => {
+  const bytes = new TextEncoder().encode(s);
+  let bin = "";
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin);
+};
 
 const THEME = {
   background: "#0e1015", foreground: "#d9dee6", cursor: "#8fb8ff", selectionBackground: "#2a3550",
@@ -19,6 +30,7 @@ const THEME = {
 
 export function TermView(props) {
   let el, term, fit, observer, unlisten, dead = false, ready = false, offset = 0;
+  let resizeRaf = 0, lastCols = 0, lastRows = 0;
   const queued = [];
   const [error, setError] = createSignal("");
   const append = (p) => {
@@ -37,10 +49,19 @@ export function TermView(props) {
     fit = new FitAddon();
     term.loadAddon(fit);
     term.open(el);
-    const resize = () => {
-      if (dead || !el.clientWidth || !el.clientHeight) return;
+    const doResize = () => {
+      resizeRaf = 0;
+      if (dead || !el || !el.clientWidth || !el.clientHeight) return;
       try { fit.fit(); } catch { return; }
-      if (props.running !== false) rpc("terminals.resize", { id: props.id, cols: term.cols, rows: term.rows }).catch(() => {});
+      if (props.running !== false && (term.cols !== lastCols || term.rows !== lastRows)) {
+        lastCols = term.cols;
+        lastRows = term.rows;
+        rpc("terminals.resize", { id: props.id, cols: term.cols, rows: term.rows }).catch(() => {});
+      }
+    };
+    const resize = () => {
+      if (dead || resizeRaf) return;
+      resizeRaf = requestAnimationFrame(doResize);
     };
     observer = new ResizeObserver(resize);
     observer.observe(el);
@@ -63,9 +84,15 @@ export function TermView(props) {
     ready = true;
     for (const p of queued) append(p);
     queued.length = 0;
-    resize();
+    doResize();
   });
-  onCleanup(() => { dead = true; observer?.disconnect(); unlisten?.(); term?.dispose(); });
+  onCleanup(() => {
+    dead = true;
+    if (resizeRaf) cancelAnimationFrame(resizeRaf);
+    observer?.disconnect();
+    unlisten?.();
+    term?.dispose();
+  });
   return (
     <div class="termview">
       <Show when={error()}><div class="termview-err">{error()}</div></Show>

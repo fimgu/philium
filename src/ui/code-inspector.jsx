@@ -1,9 +1,12 @@
 import { For, Show, createEffect, createMemo, createSignal, onCleanup } from "solid-js";
 import { rpc } from "../lib/rpc.js";
 import { openCodeDraft } from "../lib/code-context.js";
+import { VirtualList } from "./kit.jsx";
 
 // Tokens remain ordinary JSX text nodes, never HTML. Covers Python and common C-like languages.
 const tokens = (text) => text.split(/("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\/\/.*$|#.*$|\b(?:def|class|import|from|as|return|if|else|elif|for|while|in|is|not|and|or|None|True|False|async|await|try|except|finally|with|yield|raise|pass|const|let|var|function|export|default|new|throw|catch|public|private|fn|pub|use|struct|impl|match)\b|\b\d+(?:\.\d+)?\b)/g).map((s) => ({ text: s, kind: /^["']/.test(s) ? "string" : /^(#|\/\/)/.test(s) ? "comment" : /^\d/.test(s) ? "number" : /^(def|class|import|from|as|return|if|else|elif|for|while|in|is|not|and|or|None|True|False|async|await|try|except|finally|with|yield|raise|pass|const|let|var|function|export|default|new|throw|catch|public|private|fn|pub|use|struct|impl|match)$/.test(s) ? "keyword" : "" }));
+
+const LINE_HEIGHT = 20;
 
 export default function CodeInspector(props) {
   const [data, setData] = createSignal(null);
@@ -14,10 +17,11 @@ export default function CodeInspector(props) {
   const [chooser, setChooser] = createSignal(null);
   const [agent, setAgent] = createSignal("");
   const [draftError, setDraftError] = createSignal("");
-  let generation = 0, body;
+  let generation = 0, body, vlist;
   const path = () => props.selected?.file;
   createEffect(() => {
     const target = props.target, file = path(), tab = props.tab, tick = props.tick;
+    void tick;
     const request = ++generation;
     setData(null); setError(""); setSelection(null); setChooser(null); setLoading(false);
     if (!file || tab === "references") return;
@@ -63,7 +67,16 @@ export default function CodeInspector(props) {
   const visibleDiff = createMemo(() => diffLines().slice(0, 3000));
   createEffect(() => {
     const line = props.selected?.line, ready = data();
-    if (ready && line && props.tab === "source") queueMicrotask(() => body?.querySelector(`[data-line="${Number(line)}"]`)?.scrollIntoView({ block: "center" }));
+    if (ready && line && props.tab === "source") {
+      queueMicrotask(() => {
+        if (vlist) {
+          const offset = Math.max(0, (Number(line) - 1 - sourceStart()) * LINE_HEIGHT);
+          vlist.scrollTop = Math.max(0, offset - (vlist.clientHeight || 400) / 2);
+          vlist.dispatchEvent?.(new Event("scroll"));
+        }
+        body?.querySelector(`[data-line="${Number(line)}"]`)?.scrollIntoView?.({ block: "center" });
+      });
+    }
   });
   const selectLines = (index, extend) => {
     const start = extend && selection()?.anchor != null ? selection().anchor : index;
@@ -107,7 +120,7 @@ export default function CodeInspector(props) {
     <Show when={props.tab !== "references"} fallback={<div class="inspector-body">{props.children}</div>}>
       <Show when={selection()?.text.trim()}><div class="code-selection"><span>{props.tab === "diff" ? `Diff (${selection().line_side} side)` : "Lines"} {selection().start ?? "header"}–{selection().end ?? "header"}{selection().text.length > 12000 ? " · snippet will be truncated" : ""}</span><button title="Explain selected code in an agent draft" onClick={() => { setChooser("explain"); setAgent(""); }}>Explain</button><button title="Request a change to selected code in an agent draft" onClick={() => { setChooser("change"); setAgent(""); }}>Request a change</button></div></Show>
       <Show when={chooser()}><div class="code-agent-chooser"><label>Choose an agent for a draft (never sends)<select value={agent()} onChange={(e) => setAgent(e.currentTarget.value)}><option value="">Choose agent…</option><For each={agents()}>{(a) => <option value={a.id}>{a.name || a.id}</option>}</For></select></label><Show when={!agents().length}><span>No agents belong to this target. Create one on the Agents page.</span></Show><button disabled={!agent()} onClick={draft}>Open draft</button><button onClick={() => setChooser(null)}>Cancel</button><Show when={draftError()}><div class="err">{draftError()}</div></Show></div></Show>
-      <div class="inspector-body" ref={body} onMouseUp={captureText}>
+      <div class="inspector-body" style={{ display: "flex", "flex-direction": "column" }} ref={body} onMouseUp={captureText}>
         <Show when={loading()}><div class="code-empty">Loading {props.tab}…</div></Show>
         <Show when={error()}><div class="code-empty err" role="alert">Unable to load {props.tab}: {error()}</div></Show>
         <Show when={data()}>
@@ -118,10 +131,14 @@ export default function CodeInspector(props) {
           <Show when={!data().binary && !(props.tab === "source" && data().exists === false)}>
             <Show when={props.tab === "source" || data().patch} fallback={<div class="code-empty">No textual diff for this file against the selected base.</div>}>
               <Show when={lines().length > 3000}><div class="inspector-note">Rendering a bounded preview: {props.tab === "source" ? `lines ${sourceStart() + 1}–${Math.min(sourceStart() + 3000, lines().length)} of ${lines().length}. Select another symbol to jump to its region.` : `first 3000 of ${lines().length} diff lines.`}</div></Show>
-              <div class="code-text" aria-label={props.tab === "source" ? `Read-only ${data().language ?? "source"}` : "Read-only diff"}>
-                <For each={props.tab === "diff" ? visibleDiff() : visibleSource()}>{(l) => <div class={`code-line ${props.tab === "diff" ? "code-diff-line" : "code-source-line"}`} classList={{ selected: selection() && l.index >= selection().lo && l.index <= selection().hi, addition: !!l.addition, deletion: !!l.deletion, jump: props.tab === "source" && l.line === props.selected?.line }} data-index={l.index} data-line={l.line}>
-                  <button class="line-number" title="Select line, shift-click for range" onClick={(e) => selectLines(l.index, e.shiftKey)}>{props.tab === "diff" ? `${l.old ?? ""} ${l.line ?? ""}` : l.line}</button><code><For each={tokens(l.text)}>{(t) => <span class={`syntax-${t.kind}`}>{t.text}</span>}</For>{"\n"}</code><Show when={l.hunk}><button class="hunk-select" onClick={() => selectHunk(l.index)}>Select hunk</button></Show>
-                </div>}</For>
+              <div class="code-text" style={{ flex: 1, "min-height": 0, height: "100%", padding: 0 }} aria-label={props.tab === "source" ? `Read-only ${data().language ?? "source"}` : "Read-only diff"}>
+                <VirtualList ref={(el) => { vlist = el; }} items={props.tab === "diff" ? visibleDiff() : visibleSource()} rowHeight={LINE_HEIGHT}>
+                  {(l) => (
+                    <div class={`code-line ${props.tab === "diff" ? "code-diff-line" : "code-source-line"}`} classList={{ selected: selection() && l.index >= selection().lo && l.index <= selection().hi, addition: !!l.addition, deletion: !!l.deletion, jump: props.tab === "source" && l.line === props.selected?.line }} data-index={l.index} data-line={l.line}>
+                      <button class="line-number" title="Select line, shift-click for range" onClick={(e) => selectLines(l.index, e.shiftKey)}>{props.tab === "diff" ? `${l.old ?? ""} ${l.line ?? ""}` : l.line}</button><code><For each={tokens(l.text)}>{(t) => <span class={`syntax-${t.kind}`}>{t.text}</span>}</For>{"\n"}</code><Show when={l.hunk}><button class="hunk-select" onClick={() => selectHunk(l.index)}>Select hunk</button></Show>
+                    </div>
+                  )}
+                </VirtualList>
               </div>
             </Show>
           </Show>

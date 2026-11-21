@@ -1,29 +1,156 @@
-// Shared reactive store: keeps agents, repos, models, providers, and per-agent
-// event caches warm across screen/agent switches so navigation is instant.
-import { createSignal, createResource, createRoot } from "solid-js";
+// Shared reactive store: keeps agents, repos, models, providers, status, terminals,
+// and per-agent event caches warm across screen/agent switches so navigation is instant.
+import { createSignal, createRoot, onCleanup } from "solid-js";
 import { rpc, useEvent } from "./rpc.js";
 import { playSound } from "./sound.js";
 
-const [activeRepoId, setActiveRepoIdRaw] = createSignal(localStorage.getItem("philium.activeRepo") || "");
+const storage =
+  typeof window !== "undefined" && typeof localStorage !== "undefined" && localStorage
+    ? localStorage
+    : { getItem: () => "", setItem: () => {} };
+
+const [activeRepoId, setActiveRepoIdRaw] = createSignal(storage.getItem("philium.activeRepo") || "");
 export { activeRepoId };
 
 // The profile remembers the selected checkout too, so a reopen restores it even where the
 // web store is not kept. A choice made before that answer arrives wins.
 let chosen = false;
-rpc("app.settings_get").then((s) => {
-  if (!chosen && typeof s?.active_repo === "string") setActiveRepoIdRaw(s.active_repo);
-}).catch(() => {});
+if (typeof window !== "undefined") {
+  rpc("app.settings_get")
+    .then((s) => {
+      if (!chosen && typeof s?.active_repo === "string") setActiveRepoIdRaw(s.active_repo);
+    })
+    .catch(() => {});
+}
 
 export function setActiveRepoId(id) {
   const next = id || "";
   chosen = true;
   setActiveRepoIdRaw(next);
-  localStorage.setItem("philium.activeRepo", next);
+  storage.setItem("philium.activeRepo", next);
   rpc("app.settings_set", { key: "active_repo", value: next }, { local: true }).catch(() => {});
 }
 
-// In-memory event cache per agent id so switching agents never flashes empty/loading.
-export const agentEventsCache = new Map();
+export function createLruMap(max = 10) {
+  const map = new Map();
+  return {
+    get(key) {
+      if (!map.has(key)) return undefined;
+      const value = map.get(key);
+      map.delete(key);
+      map.set(key, value);
+      return value;
+    },
+    set(key, value) {
+      if (map.has(key)) map.delete(key);
+      map.set(key, value);
+      while (map.size > max) {
+        const oldest = map.keys().next().value;
+        map.delete(oldest);
+      }
+      return this;
+    },
+    has(key) {
+      return map.has(key);
+    },
+    delete(key) {
+      return map.delete(key);
+    },
+    clear() {
+      map.clear();
+    },
+    keys() {
+      return map.keys();
+    },
+    values() {
+      return map.values();
+    },
+    entries() {
+      return map.entries();
+    },
+    forEach(fn, thisArg) {
+      map.forEach(fn, thisArg);
+    },
+    get size() {
+      return map.size;
+    },
+    [Symbol.iterator]() {
+      return map[Symbol.iterator]();
+    },
+  };
+}
+
+// Bounded in-memory LRU event cache per agent id (max 10 agents).
+export const agentEventsCache = createLruMap(10);
+
+function createStoreResource(fetcher, { lazy = false } = {}) {
+  const [value, setValue] = createSignal(undefined);
+  const [state, setState] = createSignal("unresolved");
+  const [error, setError] = createSignal(undefined);
+  let current = undefined;
+  let started = false;
+  let seq = 0;
+
+  const load = () => {
+    started = true;
+    const mySeq = ++seq;
+    setState((s) => (s === "ready" || s === "refreshing" ? "refreshing" : "pending"));
+    return Promise.resolve()
+      .then(() => fetcher(current))
+      .then((v) => {
+        if (mySeq !== seq) return current;
+        current = v;
+        setValue(() => v);
+        setError(undefined);
+        setState("ready");
+        return v;
+      })
+      .catch((e) => {
+        if (mySeq !== seq) return current;
+        setError(() => e);
+        setState("errored");
+        return current;
+      });
+  };
+
+  if (!lazy) load();
+
+  const read = () => {
+    if (!started) load();
+    return value();
+  };
+
+  Object.defineProperties(read, {
+    loading: { get: () => state() === "pending" || state() === "refreshing" },
+    state: { get: () => state() },
+    error: { get: () => error() },
+    latest: {
+      get: () => {
+        if (!started) load();
+        return value();
+      },
+    },
+  });
+
+  const mutate = (v) => {
+    started = true;
+    const next = typeof v === "function" ? v(current) : v;
+    current = next;
+    setValue(() => next);
+    setState("ready");
+    return next;
+  };
+
+  return [
+    read,
+    {
+      refetch: load,
+      refetchIfStarted: () => (started ? load() : undefined),
+      isStarted: () => started,
+      mutate,
+    },
+  ];
+}
 
 let store;
 export function useStore() {
@@ -32,8 +159,19 @@ export function useStore() {
     const prevStates = new Map();
     let initialized = false;
 
-    const [agents, { refetch: refetchAgents }] = createResource(async () => {
-      const list = await rpc("agents.list").catch(() => []);
+    const [agents, { refetch: refetchAgents }] = createStoreResource(async () => {
+      let ok = true;
+      const list =
+        (await rpc("agents.list").catch(() => {
+          ok = false;
+          return [];
+        })) ?? [];
+      if (ok) {
+        const activeIds = new Set(list.map((a) => a.id));
+        for (const cachedId of [...agentEventsCache.keys()]) {
+          if (!activeIds.has(cachedId)) agentEventsCache.delete(cachedId);
+        }
+      }
       if (initialized) {
         for (const a of list) {
           const prev = prevStates.get(a.id);
@@ -50,22 +188,67 @@ export function useStore() {
       return list;
     });
 
-    const [repos, { refetch: refetchRepos }] = createResource(() => rpc("workspace.repos_list").catch(() => []));
-    const [models, { refetch: refetchModels }] = createResource(() => rpc("providers.models", {}).catch(() => []));
-    const [providers, { refetch: refetchProviders }] = createResource(() => rpc("providers.list").catch(() => []));
-    const [defaultModel, { refetch: refetchDefault }] = createResource(() => rpc("providers.default").catch(() => null));
+    const [repos, { refetch: refetchRepos }] = createStoreResource(() =>
+      rpc("workspace.repos_list").catch(() => []),
+    );
+    const [providers, { refetch: refetchProviders }] = createStoreResource(() =>
+      rpc("providers.list").catch(() => []),
+    );
+
+    // Lazy slices: fetched on demand when first read so Home cold launch avoids unused RPCs.
+    const [models, { refetch: refetchModels, refetchIfStarted: refetchModelsIfStarted }] =
+      createStoreResource(() => rpc("providers.models", {}).catch(() => []), { lazy: true });
+    const [defaultModel, { refetch: refetchDefault, refetchIfStarted: refetchDefaultIfStarted }] =
+      createStoreResource(() => rpc("providers.default").catch(() => null), { lazy: true });
+    const [terminals, { refetch: refetchTerminals, refetchIfStarted: refetchTerminalsIfStarted }] =
+      createStoreResource(() => rpc("terminals.list").catch(() => []), { lazy: true });
+
+    const [status, { refetch: refetchStatus, mutate: mutateStatus }] = createStoreResource(
+      async (prev) => {
+        try {
+          return await rpc("app.status");
+        } catch {
+          return { ...(prev ?? {}), desk: { ok: false, error: "Backend not responding" } };
+        }
+      },
+    );
 
     let agTimer;
     useEvent("agents:changed", () => {
       clearTimeout(agTimer);
       agTimer = setTimeout(refetchAgents, 120);
     });
+
     useEvent("providers:changed", () => {
-      refetchModels();
+      refetchModelsIfStarted();
       refetchProviders();
-      refetchDefault();
+      refetchDefaultIfStarted();
     });
+
     useEvent("workspace:changed", () => refetchRepos());
+
+    useEvent("app:desk", (payload) => {
+      if (payload?.error) {
+        mutateStatus((prev) => ({ ...(prev ?? {}), desk: { ok: false, error: payload.error } }));
+      }
+      refetchStatus();
+    });
+
+    let termTimer;
+    const scheduleTerminalsRefetch = () => {
+      clearTimeout(termTimer);
+      termTimer = setTimeout(() => refetchTerminalsIfStarted(), 120);
+    };
+    useEvent("terminals:changed", scheduleTerminalsRefetch);
+    useEvent("terminals:exit", scheduleTerminalsRefetch);
+
+    if (typeof window !== "undefined") {
+      const statusTimer = setInterval(() => {
+        if (typeof document === "undefined" || !document.hidden) refetchStatus();
+      }, 30000);
+      statusTimer?.unref?.();
+      onCleanup(() => clearInterval(statusTimer));
+    }
 
     return {
       agents,
@@ -77,6 +260,12 @@ export function useStore() {
       providers,
       refetchProviders,
       defaultModel,
+      refetchDefault,
+      status,
+      refetchStatus,
+      mutateStatus,
+      terminals,
+      refetchTerminals,
     };
   });
   return store;
