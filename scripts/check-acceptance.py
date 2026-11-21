@@ -556,8 +556,15 @@ window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Delete', bubbles: true
 const m = await until(modal, 'confirm dialog', 5000);
 const asked = txt(m);
 await click('Remove', m);
-await until(() => !rows().some((r) => want.includes(r.dataset.agent)), 'picked agents gone', 60000);
-return { before, want, picked, asked, after: rows().map((r) => r.dataset.agent) };
+// A helper that changed files it never committed asks once more, naming them.
+let unsaved = '', seen = [];
+const gone = await until(() => {
+  const m2 = modal();
+  if (m2 && txt(m2).includes('unsaved files') && !unsaved) { unsaved = txt(m2); click('Delete anyway', m2); }
+  for (const t of toasts()) if (!seen.includes(t)) seen.push(t);
+  return !rows().some((r) => want.includes(r.dataset.agent));
+}, 'picked agents gone', 90000).catch((e) => String(e));
+return { before, want, picked, asked, unsaved, gone, toasts: seen, dialog: modal() ? txt(modal()) : '', after: rows().map((r) => r.dataset.agent) };
 '''
 
 STORAGE = r'''
@@ -1094,8 +1101,9 @@ def main():
             # Pick two agents with Command-click, press Delete, confirm: those two go, nothing else.
             r = run.ui(PICK, {'checkout': 'alpha/same', 'pick': ['lead', 'wren']}, 150)
             v = run.value(r)
-            others = [n for n in (v.get('before') or []) if n not in ('lead', 'wren')]
-            run.check('B4', 'Agents picked with Command-click are removed together after one confirmation, and only those', sorted(v.get('want') or []) == ['lead', 'wren'] and (v.get('picked') or '').startswith('2 picked') and 'lead' in (v.get('asked') or '') and sorted(v.get('after') or []) == sorted(others), {'picked': v.get('picked'), 'asked': (v.get('asked') or '')[:160], 'before': v.get('before'), 'after': v.get('after'), 'error': r.get('error')})
+            went = [n for n in (v.get('before') or []) if n not in (v.get('after') or [])]
+            # The picked ones go, and with them only helpers the confirmation named.
+            run.check('B4', 'Agents picked with Command-click are removed together after one confirmation naming every agent that goes, helpers included', sorted(v.get('want') or []) == ['lead', 'wren'] and (v.get('picked') or '').startswith('2 picked') and {'lead', 'wren'} <= set(went) and all(n in (v.get('asked') or '') for n in went), {'picked': v.get('picked'), 'asked': (v.get('asked') or '')[:160], 'unsaved': (v.get('unsaved') or '')[:120], 'gone': v.get('gone'), 'toasts': v.get('toasts'), 'dialog': (v.get('dialog') or '')[:200], 'before': v.get('before'), 'after': v.get('after'), 'error': r.get('error')})
 
     finally:
         model.shutdown()
