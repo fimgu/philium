@@ -509,6 +509,32 @@ const result = await until(() => { const t = convo(); const i = t.lastIndexOf('P
 return { started, picked, head: head(), result, problem: all('.shield.danger', document.querySelector('.agent-view')).map(txt).concat(toasts()).join(' | ') };
 '''
 
+# Two agents in one checkout, started from the New agent dialog as a person would. Each looks a
+# concept up and changes the same function. Their replies say whether the lookup found it and
+# whether Philium told them about the overlap. The stand-in model keeps what each was told.
+CONTEXT = AGENT + r'''
+await workspace(P.checkout);
+const start = async (name, role) => {
+  await go('Agents'); await click('New agent');
+  const m = await until(modal, 'spawn dialog');
+  await fill('Name', name, m);
+  choose(field('Role', m), role);
+  await fill('Mission Brief', 'CONTEXT PROBE', m);
+  await click('Start Agent', m);
+  return until(() => (!modal() ? 'started' : (all('.err', m).map(txt)[0] || null)), 'spawn result', 45000);
+};
+const out = { started: {}, result: {} };
+for (const [name, role] of P.agents) out.started[name] = await start(name, role);
+for (const [name] of P.agents) {
+  await openAgent(name);
+  out.result[name] = await until(() => { const t = convo(); const i = t.lastIndexOf('CONTEXT RESULT'); return i >= 0 ? t.slice(i, i + 420) : null; }, `${name} result`, 150000).catch((e) => String(e) + ' :: ' + convo().slice(-300));
+}
+// The person sees the overlap among everything that needs them, on the Home of all checkouts.
+await workspace('All Workspaces'); await go('Home');
+out.home = await until(() => { const l = all('.list-item').map(txt).filter((t) => t.includes('both change')); return l.length ? l.slice(0, 4) : null; }, 'overlap on Home', 40000).catch(() => []);
+return out;
+'''
+
 REMOVE = AGENT + r'''
 await workspace(P.checkout);
 await openAgent(P.name);
@@ -710,15 +736,16 @@ def main():
         epsilon = syn.new_repo(scratch / 'epsilon', 'philium-fixture/epsilon')
         syn.write(epsilon, {'view.json': '{"column":"name"}'}); e_base = syn.commit_all(epsilon, 'base')
         syn.write(epsilon, {'view.json': '{"column":"status"}'}); e_head = syn.commit_all(epsilon, 'show status')
+        zeta = syn.new_repo(scratch / 'zeta', 'philium-fixture/zeta'); syn.write(zeta, syn.CONTEXT_REPO); syn.commit_all(zeta)
         bin_dir = scratch / 'bin'; bin_dir.mkdir()
         for name, body in [('mycli', syn.MYCLI_STANDIN), ('kubectl', syn.KUBECTL_STANDIN)]:
             (bin_dir / name).write_text(body); (bin_dir / name).chmod(0o755)
         url = f'http://127.0.0.1:{model.server_port}/v1'
 
-        repos = [str(alpha), str(beta), str(ver_a), str(gamma), str(ver_g), str(delta), str(ver_d), str(epsilon)] + ([str(Path(args.public[0]).resolve())] if args.public else [])
+        repos = [str(alpha), str(beta), str(ver_a), str(gamma), str(ver_g), str(delta), str(ver_d), str(epsilon), str(zeta)] + ([str(Path(args.public[0]).resolve())] if args.public else [])
         r = run.ui(SETUP, {'repos': repos, 'model_url': url, 'model_url2': f'http://127.0.0.1:{model2.server_port}/v1', 'key': KEY}, 240)
         v = run.value(r)
-        labels = ['All Workspaces', 'alpha/same', 'beta/same', 'gamma', 'verifier-alpha', 'verifier-gamma', 'delta', 'verifier-delta', 'epsilon'] + ([Path(args.public[0]).resolve().name] if args.public else [])
+        labels = ['All Workspaces', 'alpha/same', 'beta/same', 'gamma', 'verifier-alpha', 'verifier-gamma', 'delta', 'verifier-delta', 'epsilon', 'zeta'] + ([Path(args.public[0]).resolve().name] if args.public else [])
         run.check('B6', 'Two same-named checkouts register from the Repos screen with distinct labels', sorted(v.get('labels') or []) == sorted(labels), v.get('labels') or r.get('error'))
         run.check('B1', 'A provider with an API key can be saved', v.get('keyed') == 'saved', v.get('keyed') or r.get('error'))
         vault = run.profile / 'data/secrets/vault.json'
@@ -1041,6 +1068,20 @@ def main():
             # The orchestrated review, run earlier on a third checkout, left its three items on the board.
             review_items = {'Migrations apply in order on an empty database', 'The list shows the status column', 'The notes mention the new column'} if want('review') else set()
             run.check('B6', 'All Workspaces lists every task', set(v.get('all') or []) == a_tasks | {'Beta only task'} | review_items, v.get('all'))
+
+        if want('context'):
+            # What an agent starts with and hears while it works, in a checkout of its own.
+            r = run.ui(CONTEXT, {'checkout': 'zeta', 'agents': [['kite', 'worker'], ['heron', 'orchestrator']]}, 330)
+            v = run.value(r)
+            res = v.get('result') or {}
+            prompt = syn.Model.prompts.get('kite', ''); lead = syn.Model.prompts.get('heron', '')
+            cmap = prompt.split('\n## Codebase map\n')[1].split('<!-- PHILIUM_CACHE_BREAK -->')[0] if '\n## Codebase map\n' in prompt else ''
+            run.check('A1', 'Both agents start from the New agent dialog in a checkout with code', v.get('started') == {'kite': 'started', 'heron': 'started'}, v.get('started') or r.get('error'))
+            run.check('A1', "A worker's first request carries a codebase map ranked by use, with line spans and without test files", 'src/net.rs  Client 1, retry_backoff 4-6' in cmap and 'helper_for_tests' not in cmap and '<!-- PHILIUM_CACHE_BREAK -->' in prompt.split('\n## Codebase map\n')[1], cmap[:400] or prompt[-400:])
+            run.check('A1', 'Only the coordinator also gets the worktrees and branches of its checkout', '## Worktrees and branches' not in prompt and '## Worktrees and branches' in lead and '\n## Codebase map\n' in lead, lead.split('## Worktrees and branches')[1][:300] if '## Worktrees and branches' in lead else lead[-300:])
+            run.check('A2', 'code_find, called by the agent, finds a function by the words of its doc comment', all('find=ok' in (res.get(n) or '') for n in ['kite', 'heron']), res)
+            run.check('A3', 'After both change the same function, each hears of it on a later tool result, with no one asking', all('clash=heard' in (res.get(n) or '') and 'retry_backoff' in (res.get(n) or '') for n in ['kite', 'heron']), res)
+            run.check('A3', 'Home lists the overlap for the person', any('retry_backoff' in h or 'net.rs' in h for h in v.get('home') or []), v.get('home'))
 
         if want('probe'):
             for name, provider, strict in [('probe', None, False), ('strictprobe', 'Synthetic Strict', True)]:

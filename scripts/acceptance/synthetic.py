@@ -93,6 +93,13 @@ CONTRACTS = {'cases': [
 WHO = re.compile(r'Your agent name is "([^"]+)" \(role: `([^`]+)`\)')
 
 
+# A checkout for the context probe: `Client` is used from three other files, `retry_backoff`
+# is found by the words of its doc comment, and the test file names nothing worth listing.
+NET_RS = 'pub struct Client { pub tries: u32 }\n\n/// Wait longer after each failed try.\npub fn retry_backoff(c: &Client) -> u64 {\n    1u64 << c.tries\n}\n'
+CONTEXT_REPO = {'src/net.rs': NET_RS, 'src/net_test.rs': 'fn helper_for_tests() {}\n',
+                **{f'src/{f}.rs': f'use crate::net::Client;\npub fn use_{f}(c: &Client) -> u32 {{ c.tries }}\n' for f in 'abc'}}
+
+
 def text_of(m):
     c = m.get('content')
     if isinstance(c, str):
@@ -180,6 +187,20 @@ def brain(req):
             cmd = cmd.replace('$PROBE_REAL_HOME', req.get('_probe_home', '')).replace('$PROBE_VAULT', req.get('_probe_vault', ''))
             return {'tool': ('mcp_philium_shell_run', {'command': cmd})}
         return 'PROBE RESULT ' + results[0][:3000]
+    if 'CONTEXT PROBE' in last_user:
+        # Look a concept up, change the same function as the other probe agent, then keep
+        # making small tool calls until Philium says the two overlap, or give up.
+        heard = next((r for r in results if 'your work now overlaps with' in r), None)
+        if step == 0:
+            return {'tool': ('mcp_philium_code_find', {'query': 'retry backoff'})}
+        if step == 1:
+            body = NET_RS.replace('    1u64 << c.tries', f'    // {name} waits one try longer\n    1u64 << (c.tries + 1)')
+            return {'tool': ('mcp_philium_shell_run', {'command': f"cat > src/net.rs <<'EOF'\n{body}EOF\ngit diff --stat"})}
+        if heard or step >= 18:
+            found = 'retry_backoff' in results[0] and 'src/net.rs' in results[0]
+            note = heard[heard.index('your work now overlaps with'):] if heard else results[-1]
+            return f"CONTEXT RESULT {name}: find={'ok' if found else 'missed'} clash={'heard' if heard else 'not heard'} :: {one(note)}"
+        return {'tool': ('mcp_philium_shell_run', {'command': 'sleep 6; echo waited'})}
     m = re.search(r'WORKER TASK ([0-9a-f]+): (SLOW (\d+))?', last_user)
     if m:
         tid = m.group(1)
@@ -214,6 +235,7 @@ def brain(req):
 class Model(http.server.BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
     seen = []          # redacted: who asked, what it was told to do, how the stream ended
+    prompts = {}       # agent name -> the system prompt of its first request
     expect_key = None
     probe = {}
     models = ['synthetic-1']   # in the provider's own order, newest first
@@ -247,6 +269,8 @@ class Model(http.server.BaseHTTPRequestHandler):
                  'plan': plan if isinstance(plan, str) else (plan.get('tool', [None])[0] or (f"status {plan['status']}" if plan.get('status') else f"slow {plan.get('delay')}")),
                  'tool_results': [text_of(m)[:900] for m in req.get('messages', []) if m.get('role') == 'tool'][-2:]}
         Model.seen.append(entry)
+        if req.get('messages') and req['messages'][0].get('role') == 'system':
+            Model.prompts.setdefault(name, text_of(req['messages'][0]))
         if isinstance(plan, dict) and plan.get('status'):
             # A refusal as a provider sends it, with the wait it asks for.
             b = json.dumps({'type': 'error', 'error': {'type': 'rate_limit_error', 'message': 'Synthetic rate limit for this check.'}}).encode()
