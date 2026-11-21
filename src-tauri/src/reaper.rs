@@ -24,16 +24,19 @@ pub fn init(ctx: &Arc<Ctx>) -> Result<(), String> {
     schema(ctx)?;
     // A second profile must never adopt or sweep the installed app's resources.
     if crate::pilot::active() { return Ok(()); }
-    // Runs before any module starts a process this run, so every live process
-    // row belongs to a previous run that did not shut down cleanly.
-    let stale = reap_stale_processes(ctx);
-    if !stale["removed"].as_array().map_or(true, |a| a.is_empty()) || !stale["errors"].as_array().map_or(true, |a| a.is_empty()) {
-        ctx.log_event("reaper:stale_processes", None, &stale);
-    }
     let weak = Arc::downgrade(ctx);
     std::thread::Builder::new()
         .name("philium-reaper".into())
         .spawn(move || {
+            if let Some(ctx) = weak.upgrade() {
+                let stale = reap_stale_processes(&ctx);
+                if !stale["removed"].as_array().map_or(true, |a| a.is_empty())
+                    || !stale["errors"].as_array().map_or(true, |a| a.is_empty())
+                {
+                    ctx.log_event("reaper:stale_processes", None, &stale);
+                }
+            }
+            std::thread::sleep(Duration::from_secs(15));
             let mut tick = 0u64;
             loop {
                 let Some(ctx) = weak.upgrade() else { break };
@@ -237,7 +240,6 @@ fn unsaved(ctx: &Arc<Ctx>, r: &Value) -> bool {
         .unwrap_or(true)
 }
 fn propose(ctx: &Arc<Ctx>, r: &Value, reason: &str, unsaved: bool) -> Result<Value, String> {
-    schema(ctx)?;
     let rid = strval(r, "id")?;
     ctx.db.exec("INSERT OR IGNORE INTO teardown_proposals(id,resource_id,reason,unsaved,created_at) VALUES(?1,?2,?3,?4,?5)",params![new_id(),rid,reason,unsaved,now()])?;
     let p=ctx.db.query("SELECT p.*,r.kind,r.handle,r.agent_id FROM teardown_proposals p JOIN resources r ON r.id=p.resource_id WHERE p.resource_id=?1 AND p.state='pending'",[rid])?.into_iter().next().ok_or("Proposal was not recorded")?;
@@ -470,7 +472,6 @@ fn process_rows(
     explicit: bool,
     force: bool,
 ) -> Result<Value, String> {
-    schema(ctx)?;
     let auto = ctx.setting("teardown.mode", "ask") == "auto";
     let idle_hours = setting_hours(ctx, "teardown.idle_hours", 4);
     let failed_hours = setting_hours(ctx, "teardown.failed_hours", 24);
@@ -826,7 +827,6 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
         .map_err(|e| e.to_string())?
 }
 fn dispatch(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, String> {
-    schema(ctx)?;
     match method {
         "ledger"=>{let mut r=rows(ctx,args["agent_id"].as_str(),args["state"].as_str())?;for item in &mut r{item["meta"]=meta(item);}Ok(json!(r))}
         "proposals"=>Ok(json!(ctx.db.query("SELECT p.*,r.kind,r.handle,r.agent_id,a.name AS agent_name FROM teardown_proposals p JOIN resources r ON r.id=p.resource_id LEFT JOIN agents a ON a.id=r.agent_id WHERE p.state='pending' AND r.state!='released' ORDER BY p.created_at",[])?)),

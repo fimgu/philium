@@ -131,12 +131,20 @@ async fn ensure(ctx: &Arc<Ctx>, agent: &str, shell: &str, s: &mut Slot) -> Resul
     }
     // Wait for the first prompt so the first command is not typed into rc loading.
     let deadline = Instant::now() + Duration::from_secs(10);
+    let mut scan_offset = 0u64;
+    let mut last_total = 0u64;
     while Instant::now() < deadline {
-        let b = crate::terminals::since(ctx, &id, 0).unwrap_or_default();
-        if b.windows(DONE.len()).any(|w| w == DONE) {
-            break;
+        let total = crate::terminals::total(ctx, &id).unwrap_or(last_total);
+        if total > last_total {
+            last_total = total;
+            let chunk = crate::terminals::since(ctx, &id, scan_offset).unwrap_or_default();
+            if chunk.windows(DONE.len()).any(|w| w == DONE) {
+                break;
+            }
+            scan_offset = total.saturating_sub((DONE.len() - 1) as u64);
         }
         if !crate::terminals::alive(ctx, &id) {
+            let b = crate::terminals::since(ctx, &id, 0).unwrap_or_default();
             return Err(format!("the shell exited at startup: {}", text(&b)));
         }
         tokio::time::sleep(Duration::from_millis(30)).await;
@@ -203,20 +211,51 @@ pub async fn run(ctx: &Arc<Ctx>, agent: &str, shell: &str, command: &str, cwd: O
     // Persist before the first await so dropping this request cannot forget
     // the live command and let a retry type into its input.
     s.pending = Some(from);
+    let mut scan_offset = from;
+    let mut last_total = from;
     loop {
-        let buf = crate::terminals::since(ctx, &id, from).unwrap_or_default();
-        if let Some((out, code)) = parse(&buf) {
-            s.pending = None;
-            return Ok(json!({
-                "terminal": id,
-                "exit_code": code,
-                "finished": true,
-                "running": false,
-                "output": crate::mcp::trim_output(&text(&out), 12000),
-            }));
+        let total = crate::terminals::total(ctx, &id).unwrap_or(last_total);
+        if total > last_total {
+            last_total = total;
+            let chunk = crate::terminals::since(ctx, &id, scan_offset).unwrap_or_default();
+            if let Some(d_idx) = chunk.windows(DONE.len()).position(|w| w == DONE) {
+                if chunk[d_idx + DONE.len()..].contains(&b'\x07') {
+                    let buf = if scan_offset == from {
+                        chunk
+                    } else {
+                        crate::terminals::since(ctx, &id, from).unwrap_or_default()
+                    };
+                    if let Some((out, code)) = parse(&buf) {
+                        s.pending = None;
+                        return Ok(json!({
+                            "terminal": id,
+                            "exit_code": code,
+                            "finished": true,
+                            "running": false,
+                            "output": crate::mcp::trim_output(&text(&out), 12000),
+                        }));
+                    }
+                    scan_offset = (scan_offset + d_idx as u64 + DONE.len() as u64).min(total);
+                } else {
+                    scan_offset = (scan_offset + d_idx as u64).min(total);
+                }
+            } else {
+                scan_offset = total.saturating_sub((DONE.len() - 1) as u64).max(from);
+            }
         }
         let alive = crate::terminals::alive(ctx, &id);
         if !alive || Instant::now() >= deadline {
+            let buf = crate::terminals::since(ctx, &id, from).unwrap_or_default();
+            if let Some((out, code)) = parse(&buf) {
+                s.pending = None;
+                return Ok(json!({
+                    "terminal": id,
+                    "exit_code": code,
+                    "finished": true,
+                    "running": false,
+                    "output": crate::mcp::trim_output(&text(&out), 12000),
+                }));
+            }
             if alive {
                 s.pending = Some(from);
             } else {

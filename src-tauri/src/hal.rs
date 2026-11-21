@@ -193,13 +193,20 @@ impl Hal {
     }
 
     fn attach(child: Child, stdin: ChildStdin, tail: Arc<Mutex<Vec<String>>>, base: String, token: String, pid: u32, config: Value) -> Hal {
+        static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+        let client = CLIENT
+            .get_or_init(|| {
+                reqwest::Client::builder()
+                    .no_proxy()
+                    .connect_timeout(std::time::Duration::from_secs(5))
+                    .build()
+                    .unwrap_or_default()
+            })
+            .clone();
         Hal {
             base,
             token,
-            client: reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(5))
-                .build()
-                .unwrap_or_default(),
+            client,
             pid,
             proc: Mutex::new(Some((child, stdin))),
             config,
@@ -238,16 +245,9 @@ impl Hal {
     }
 
     pub fn stop(&self) {
-        if let Some((mut child, stdin)) = self.proc.lk().take() {
+        if let Some((child, stdin)) = self.proc.lk().take() {
             drop(stdin);
-            for _ in 0..30 {
-                if let Ok(Some(_)) = child.try_wait() {
-                    return;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-            let _ = child.kill();
-            let _ = child.wait();
+            reap_child(child);
         }
     }
 
@@ -267,9 +267,26 @@ impl Hal {
     }
 }
 
+fn reap_child(mut child: Child) {
+    for _ in 0..30 {
+        if let Ok(Some(_)) = child.try_wait() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 impl Drop for Hal {
     fn drop(&mut self) {
-        self.stop();
+        if let Some((mut child, stdin)) = self.proc.lk().take() {
+            drop(stdin);
+            if let Ok(Some(_)) = child.try_wait() {
+                return;
+            }
+            std::thread::spawn(move || reap_child(child));
+        }
     }
 }
 

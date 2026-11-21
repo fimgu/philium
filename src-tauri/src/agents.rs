@@ -53,6 +53,7 @@ pub struct Runtime {
     pub session: String,
     pub name: String,
     pub cwd: PathBuf,
+    #[allow(dead_code)]
     pub strict: bool,
     /// Environment for commands the agent runs (shell_run terminals).
     pub env: Vec<(String, String)>,
@@ -481,7 +482,13 @@ async fn provision(ctx: &Arc<Ctx>, id: &str, fresh: bool, brief: Option<String>)
     if let Some(repo_id) = row["repo_id"].as_str() {
         let tokens = crate::codeindex::map_tokens(providers::context_window(ctx, &provider.id, &model_id));
         let coordinates = matches!(role.as_str(), "orchestrator" | "coordinator" | "reviewer");
-        if let Some(cmap) = crate::codeindex::prompt_map(ctx, repo_id, worktree.as_deref(), tokens, coordinates) {
+        let (c_map, rid, wt) = (ctx.clone(), repo_id.to_string(), worktree.clone());
+        let cmap = tokio::task::spawn_blocking(move || {
+            crate::codeindex::prompt_map(&c_map, &rid, wt.as_deref(), tokens, coordinates)
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+        if let Some(cmap) = cmap {
             extra.push_str(&cmap);
         }
     }
@@ -599,7 +606,7 @@ async fn provision(ctx: &Arc<Ctx>, id: &str, fresh: bool, brief: Option<String>)
     let rt = Arc::new(Runtime { hal: hal.clone(), session: session.clone(), name: name.clone(), cwd, strict, env, policy, pump });
     if let Some(old) = runtimes().lk().insert(id.to_string(), rt) {
         old.pump.abort();
-        old.hal.stop();
+        tokio::task::spawn_blocking(move || old.hal.stop());
     }
     let _ = ctx.db.kv_set(&format!("agent_error.{id}"), "");
     set_state(ctx, id, "idle");
@@ -629,9 +636,14 @@ async fn pump_events(ctx: Arc<Ctx>, id: String, hal: Arc<Hal>, session: String) 
         .kv_get(&format!("agent_seq.{id}"))
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
+    let mut persisted_seq = after;
+    let mut current_state = get_row(&ctx, &id)
+        .and_then(|r| r["state"].as_str().map(str::to_string))
+        .unwrap_or_else(|| "idle".to_string());
     loop {
         if let Some(reason) = hal.exit_reason() {
-            on_hal_exit(&ctx, &id, &hal, &reason);
+            let (c, i, h) = (ctx.clone(), id.clone(), hal.clone());
+            let _ = tokio::task::spawn_blocking(move || on_hal_exit(&c, &i, &h, &reason)).await;
             return;
         }
         let url = format!("{}/sessions/{session}/events?stream=true&after={after}", hal.base);
@@ -646,6 +658,9 @@ async fn pump_events(ctx: Arc<Ctx>, id: String, hal: Arc<Hal>, session: String) 
         let mut buf = String::new();
         let mut batch: Vec<Value> = vec![];
         let mut last_flush = std::time::Instant::now();
+        let mut last_db_sync = std::time::Instant::now();
+        let mut dirty_active = false;
+        let mut force_db_sync = false;
         loop {
             let next = tokio::time::timeout(std::time::Duration::from_millis(100), stream.next()).await;
             match next {
@@ -657,7 +672,9 @@ async fn pump_events(ctx: Arc<Ctx>, id: String, hal: Arc<Hal>, session: String) 
                             if let Some(s) = ev["seq"].as_i64() {
                                 after = after.max(s);
                             }
-                            apply_event(&ctx, &id, &ev);
+                            if apply_event(&ctx, &id, &ev, &mut current_state, &mut dirty_active) {
+                                force_db_sync = true;
+                            }
                             batch.push(ev);
                         }
                     }
@@ -667,12 +684,36 @@ async fn pump_events(ctx: Arc<Ctx>, id: String, hal: Arc<Hal>, session: String) 
             }
             if !batch.is_empty() && (last_flush.elapsed().as_millis() >= 100 || batch.len() > 200) {
                 ctx.emit("agents:events", json!({ "id": id, "events": std::mem::take(&mut batch) }));
-                let _ = ctx.db.kv_set(&format!("agent_seq.{id}"), &after.to_string());
                 last_flush = std::time::Instant::now();
+            }
+            if force_db_sync || last_db_sync.elapsed().as_millis() >= 1500 {
+                if after > persisted_seq {
+                    let _ = ctx.db.kv_set(&format!("agent_seq.{id}"), &after.to_string());
+                    persisted_seq = after;
+                }
+                if dirty_active {
+                    let _ = ctx.db.exec(
+                        "UPDATE agents SET last_active_at=?2 WHERE id=?1",
+                        rusqlite::params![id, now()],
+                    );
+                    dirty_active = false;
+                }
+                force_db_sync = false;
+                last_db_sync = std::time::Instant::now();
             }
         }
         if !batch.is_empty() {
             ctx.emit("agents:events", json!({ "id": id, "events": batch }));
+        }
+        if after > persisted_seq {
+            let _ = ctx.db.kv_set(&format!("agent_seq.{id}"), &after.to_string());
+            persisted_seq = after;
+        }
+        if dirty_active {
+            let _ = ctx.db.exec(
+                "UPDATE agents SET last_active_at=?2 WHERE id=?1",
+                rusqlite::params![id, now()],
+            );
         }
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     }
@@ -786,27 +827,65 @@ pub fn next_state(current: &str, event_type: &str) -> Option<&'static str> {
     }
 }
 
-fn apply_event(ctx: &Arc<Ctx>, id: &str, ev: &Value) {
+fn is_state_event(ty: &str) -> bool {
+    matches!(
+        ty,
+        "turn.started"
+            | "model.started"
+            | "tool.started"
+            | "permission.resolved"
+            | "permission.requested"
+            | "assistant.completed"
+            | "turn.cancelled"
+            | "turn.failed"
+    )
+}
+
+fn apply_event(
+    ctx: &Arc<Ctx>,
+    id: &str,
+    ev: &Value,
+    current_state: &mut String,
+    dirty_active: &mut bool,
+) -> bool {
     let ty = ev["type"].as_str().unwrap_or("");
-    let current = get_row(ctx, id).and_then(|r| r["state"].as_str().map(str::to_string)).unwrap_or_default();
-    if let Some(s) = next_state(&current, ty) {
-        if s == "idle" {
-            deliver_mail(ctx, id);
+    if ty == "model.delta" {
+        return false;
+    }
+    let mut flush_now = false;
+    if is_state_event(ty) {
+        if let Some(st) = get_row(ctx, id).and_then(|r| r["state"].as_str().map(str::to_string)) {
+            *current_state = st;
         }
-        if s != current {
-            set_state(ctx, id, s);
+        if let Some(s) = next_state(current_state, ty) {
+            if s == "idle" {
+                deliver_mail(ctx, id);
+                flush_now = true;
+            }
+            if s != current_state.as_str() {
+                set_state(ctx, id, s);
+                *current_state = s.to_string();
+                *dirty_active = false;
+                flush_now = true;
+            } else {
+                *dirty_active = true;
+            }
         }
-    } else if ty != "model.delta" {
-        let _ = ctx.db.exec("UPDATE agents SET last_active_at=?2 WHERE id=?1", rusqlite::params![id, now()]);
+    } else {
+        *dirty_active = true;
     }
     match ty {
-        "permission.requested" => ctx.emit("agents:approval", json!({ "id": id, "event": ev })),
+        "permission.requested" => {
+            ctx.emit("agents:approval", json!({ "id": id, "event": ev }));
+            flush_now = true;
+        }
         "turn.failed" => {
             ctx.log_event("agent_turn_failed", Some(id), &json!({ "error": ev["error"] }));
             let error = ev["error"].as_str().map(str::to_string).unwrap_or_else(|| ev["error"].to_string());
             if rate_limited(&error) {
                 schedule_continue(ctx, id);
             }
+            flush_now = true;
         }
         // A step that went through: the limit is behind it.
         "assistant.completed" => {
@@ -814,9 +893,11 @@ fn apply_event(ctx: &Arc<Ctx>, id: &str, ev: &Value) {
                 let _ = ctx.db.kv_set(&retry_key(id), "");
                 ctx.emit("agents:changed", json!({ "id": id }));
             }
+            flush_now = true;
         }
         _ => {}
     }
+    flush_now
 }
 
 fn rt(id: &str) -> Result<Arc<Runtime>, String> {
@@ -963,23 +1044,62 @@ pub fn init(ctx: &Arc<Ctx>) -> Result<(), String> {
     Ok(())
 }
 
-fn with_live(ctx: &Ctx, mut row: Value) -> Value {
+struct LiveSnapshot {
+    runtimes: HashMap<String, (PathBuf, u32)>,
+    stats: HashMap<String, Value>,
+    clashes: Vec<Value>,
+    errors: HashMap<String, String>,
+    retries: HashMap<String, Value>,
+}
+
+impl LiveSnapshot {
+    fn capture(ctx: &Ctx) -> Self {
+        let runtimes = runtimes()
+            .lk()
+            .iter()
+            .map(|(k, rt)| (k.clone(), (rt.cwd.clone(), rt.hal.pid)))
+            .collect();
+        let stats = ctx.gateway.agent_stats();
+        let clashes = crate::codeindex::cached_clashes();
+        let mut errors = HashMap::new();
+        let mut retries = HashMap::new();
+        if let Ok(kv_rows) = ctx.db.query(
+            "SELECT k, v FROM kv WHERE k LIKE 'agent_error.%' OR k LIKE 'agent.retry.%'",
+            [],
+        ) {
+            for r in kv_rows {
+                let Some(k) = r["k"].as_str() else { continue };
+                let Some(v) = r["v"].as_str().filter(|s| !s.is_empty()) else { continue };
+                if let Some(id) = k.strip_prefix("agent_error.") {
+                    errors.insert(id.to_string(), v.to_string());
+                } else if let Some(id) = k.strip_prefix("agent.retry.") {
+                    if let Ok(parsed) = serde_json::from_str::<Value>(v) {
+                        retries.insert(id.to_string(), parsed);
+                    }
+                }
+            }
+        }
+        Self { runtimes, stats, clashes, errors, retries }
+    }
+}
+
+fn with_live_snapshot(snap: &LiveSnapshot, mut row: Value) -> Value {
     let id = row["id"].as_str().unwrap_or_default().to_string();
     let name = row["name"].as_str().unwrap_or_default().to_string();
-    row["live"] = json!(runtime(&id).is_some());
+    let rt_info = snap.runtimes.get(&id);
+    row["live"] = json!(rt_info.is_some());
     row["strict"] = json!(row["strict"].as_i64() == Some(1));
-    if let Some(e) = ctx.db.kv_get(&format!("agent_error.{id}")).filter(|e| !e.is_empty()) {
+    if let Some(e) = snap.errors.get(&id) {
         row["error"] = json!(e);
     }
-    if let Some(r) = retry_state(ctx, &id) {
-        row["rate_limited"] = r;
+    if let Some(r) = snap.retries.get(&id) {
+        row["rate_limited"] = r.clone();
     }
-    if let Some(rt) = runtime(&id) {
-        row["cwd"] = json!(rt.cwd);
-        row["pid"] = json!(rt.hal.pid);
+    if let Some((cwd, pid)) = rt_info {
+        row["cwd"] = json!(cwd);
+        row["pid"] = json!(pid);
     }
-    let stats = ctx.gateway.agent_stats();
-    let kv = stats.get(&name).cloned().unwrap_or_else(|| {
+    let kv = snap.stats.get(&name).cloned().unwrap_or_else(|| {
         json!({
             "requests": 0,
             "input_tokens": 0,
@@ -995,9 +1115,11 @@ fn with_live(ctx: &Ctx, mut row: Value) -> Value {
             "avg_ttft_ms": Value::Null,
         })
     });
-    let clashes: Vec<Value> = crate::codeindex::cached_clashes()
-        .into_iter()
+    let clashes: Vec<Value> = snap
+        .clashes
+        .iter()
         .filter(|c| c["a"].as_str() == Some(&name) || c["b"].as_str() == Some(&name))
+        .cloned()
         .collect();
     let mut warnings: Vec<Value> = vec![];
     if row["state"].as_str() == Some("waiting") {
@@ -1055,6 +1177,11 @@ fn with_live(ctx: &Ctx, mut row: Value) -> Value {
     row
 }
 
+fn with_live(ctx: &Ctx, row: Value) -> Value {
+    let snap = LiveSnapshot::capture(ctx);
+    with_live_snapshot(&snap, row)
+}
+
 pub fn list(ctx: &Ctx) -> Result<Value, String> {
     let rows = ctx.db.query(
         "SELECT a.*, t.title AS task_title, r.name AS repo_name, w.path AS worktree, w.branch AS branch
@@ -1063,6 +1190,7 @@ pub fn list(ctx: &Ctx) -> Result<Value, String> {
          ORDER BY a.created_at",
         [],
     )?;
+    let snap = LiveSnapshot::capture(ctx);
     let mut by_id: HashMap<String, (String, Option<String>)> = HashMap::new();
     let mut children_count: HashMap<String, usize> = HashMap::new();
     for r in &rows {
@@ -1092,7 +1220,7 @@ pub fn list(ctx: &Ctx) -> Result<Value, String> {
     let enriched: Vec<Value> = rows
         .into_iter()
         .map(|r| {
-            let mut v = with_live(ctx, r);
+            let mut v = with_live_snapshot(&snap, r);
             let id = v["id"].as_str().unwrap_or_default().to_string();
             let pid = v["parent_id"].as_str().filter(|s| !s.is_empty()).map(str::to_string);
             v["parent_name"] = json!(pid.as_ref().and_then(|p| by_id.get(p)).map(|(n, _)| n.clone()));
@@ -1212,7 +1340,10 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
             r.hal.call(reqwest::Method::POST, &format!("/sessions/{}/cancel", r.session), None).await
         }
         "stop" => {
-            stop(ctx, &id()?, "stopped");
+            let (c, id) = (ctx.clone(), id()?);
+            tokio::task::spawn_blocking(move || stop(&c, &id, "stopped"))
+                .await
+                .map_err(|e| e.to_string())?;
             Ok(Value::Null)
         }
         "resume" => {
@@ -1223,7 +1354,10 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
                     return Ok(Value::Null);
                 }
                 // Dead HAL the watcher has not reaped yet: drop it and restart.
-                stop(ctx, &id, "stopped");
+                let (c, id2) = (ctx.clone(), id.clone());
+                tokio::task::spawn_blocking(move || stop(&c, &id2, "stopped"))
+                    .await
+                    .map_err(|e| e.to_string())?;
             }
             if get_row(ctx, &id).is_none() {
                 return Err("unknown agent".into());
@@ -1531,29 +1665,35 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
             let repo_id = ctx::arg_opt_str(&args, "repo_id");
             let only_orchestrator = args["only_orchestrator"].as_bool().unwrap_or(false);
             let all = list(ctx)?.as_array().cloned().unwrap_or_default();
-            let mut sent = 0usize;
-            for a in all {
-                if a["live"].as_bool() != Some(true) {
-                    continue;
-                }
-                let aid = a["id"].as_str().unwrap_or_default();
-                if let Some(cid) = &cluster_id {
-                    if a["cluster_id"].as_str() != Some(cid.as_str()) && aid != cid {
-                        continue;
+            let targets: Vec<String> = all
+                .into_iter()
+                .filter(|a| {
+                    if a["live"].as_bool() != Some(true) {
+                        return false;
                     }
-                    if only_orchestrator && aid != cid {
-                        continue;
+                    let aid = a["id"].as_str().unwrap_or_default();
+                    if let Some(cid) = &cluster_id {
+                        if a["cluster_id"].as_str() != Some(cid.as_str()) && aid != cid {
+                            return false;
+                        }
+                        if only_orchestrator && aid != cid {
+                            return false;
+                        }
                     }
-                }
-                if let Some(rid) = &repo_id {
-                    if a["repo_id"].as_str() != Some(rid.as_str()) {
-                        continue;
+                    if let Some(rid) = &repo_id {
+                        if a["repo_id"].as_str() != Some(rid.as_str()) {
+                            return false;
+                        }
                     }
-                }
-                if send(ctx, aid, &text).await.is_ok() {
-                    sent += 1;
-                }
-            }
+                    true
+                })
+                .filter_map(|a| a["id"].as_str().map(str::to_string))
+                .collect();
+            let results = futures_util::future::join_all(
+                targets.iter().map(|aid| send(ctx, aid, &text)),
+            )
+            .await;
+            let sent = results.into_iter().filter(|r| r.is_ok()).count();
             Ok(json!({ "sent": sent }))
         }
         "batch_permission" => {
@@ -1565,50 +1705,76 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
             let cluster_id = ctx::arg_opt_str(&args, "cluster_id");
             let repo_id = ctx::arg_opt_str(&args, "repo_id");
             let all = list(ctx)?.as_array().cloned().unwrap_or_default();
-            let mut resolved = 0usize;
-            for a in all {
-                if a["state"].as_str() != Some("waiting") || a["live"].as_bool() != Some(true) {
-                    continue;
-                }
-                let aid = a["id"].as_str().unwrap_or_default();
-                if let Some(cid) = &cluster_id {
-                    if a["cluster_id"].as_str() != Some(cid.as_str()) && aid != cid {
-                        continue;
+            let targets: Vec<String> = all
+                .into_iter()
+                .filter(|a| {
+                    if a["state"].as_str() != Some("waiting") || a["live"].as_bool() != Some(true) {
+                        return false;
                     }
-                }
-                if let Some(rid) = &repo_id {
-                    if a["repo_id"].as_str() != Some(rid.as_str()) {
-                        continue;
-                    }
-                }
-                if let Ok(r) = rt(aid) {
-                    if let Ok(perms) = r.hal.call(reqwest::Method::GET, &format!("/sessions/{}/permissions", r.session), None).await {
-                        if let Some(arr) = perms.as_array() {
-                            for p in arr {
-                                if let Some(rid) = p["request_id"].as_str().or_else(|| p["id"].as_str()) {
-                                    let body = if decision == "approve" { Some(json!({ "scope": scope })) } else { None };
-                                    if r.hal.call(reqwest::Method::POST, &format!("/sessions/{}/permissions/{rid}/{decision}", r.session), body).await.is_ok() {
-                                        resolved += 1;
-                                    }
-                                }
-                            }
+                    let aid = a["id"].as_str().unwrap_or_default();
+                    if let Some(cid) = &cluster_id {
+                        if a["cluster_id"].as_str() != Some(cid.as_str()) && aid != cid {
+                            return false;
                         }
                     }
+                    if let Some(rid) = &repo_id {
+                        if a["repo_id"].as_str() != Some(rid.as_str()) {
+                            return false;
+                        }
+                    }
+                    true
+                })
+                .filter_map(|a| a["id"].as_str().map(str::to_string))
+                .collect();
+            let counts = futures_util::future::join_all(targets.iter().map(|aid| {
+                let decision = decision.clone();
+                let scope = scope.clone();
+                async move {
+                    let Ok(r) = rt(aid) else { return 0usize };
+                    let Ok(perms) = r
+                        .hal
+                        .call(reqwest::Method::GET, &format!("/sessions/{}/permissions", r.session), None)
+                        .await
+                    else {
+                        return 0usize;
+                    };
+                    let Some(arr) = perms.as_array() else { return 0usize };
+                    let rids: Vec<String> = arr
+                        .iter()
+                        .filter_map(|p| p["request_id"].as_str().or_else(|| p["id"].as_str()).map(str::to_string))
+                        .collect();
+                    let results = futures_util::future::join_all(rids.iter().map(|rid| {
+                        let body = if decision == "approve" { Some(json!({ "scope": &scope })) } else { None };
+                        let path = format!("/sessions/{}/permissions/{rid}/{decision}", r.session);
+                        let hal = r.hal.clone();
+                        async move { hal.call(reqwest::Method::POST, &path, body).await }
+                    }))
+                    .await;
+                    results.into_iter().filter(|res| res.is_ok()).count()
                 }
-            }
+            }))
+            .await;
+            let resolved: usize = counts.into_iter().sum();
             Ok(json!({ "resolved": resolved }))
         }
         "stop_cluster" => {
             let cid = ctx::arg_str(&args, "cluster_id")?;
             let all = list(ctx)?.as_array().cloned().unwrap_or_default();
-            let mut stopped = 0usize;
-            for a in all {
-                let aid = a["id"].as_str().unwrap_or_default();
-                if (a["cluster_id"].as_str() == Some(cid.as_str()) || aid == cid) && a["live"].as_bool() == Some(true) {
-                    stop(ctx, aid, "stopped");
-                    stopped += 1;
-                }
-            }
+            let targets: Vec<String> = all
+                .into_iter()
+                .filter(|a| {
+                    let aid = a["id"].as_str().unwrap_or_default();
+                    (a["cluster_id"].as_str() == Some(cid.as_str()) || aid == cid)
+                        && a["live"].as_bool() == Some(true)
+                })
+                .filter_map(|a| a["id"].as_str().map(str::to_string))
+                .collect();
+            let results = futures_util::future::join_all(targets.into_iter().map(|aid| {
+                let c = ctx.clone();
+                tokio::task::spawn_blocking(move || stop(&c, &aid, "stopped"))
+            }))
+            .await;
+            let stopped = results.into_iter().filter(|r| r.is_ok()).count();
             Ok(json!({ "stopped": stopped }))
         }
         _ => Err(format!("unknown agents.{method}")),
@@ -1621,9 +1787,13 @@ async fn remove_one(ctx: &Arc<Ctx>, id: &str, force: bool) -> Result<Value, Stri
     if !ctx.db.query("SELECT id FROM agents WHERE parent_id=?1 LIMIT 1", [&id])?.is_empty() {
         return Err("Remove this agent's helpers first".into());
     }
-    stop(ctx, &id, "tearing_down");
     let (c, i) = (ctx.clone(), id.clone());
-    let report = match tokio::task::spawn_blocking(move || crate::reaper::teardown_agent(&c, &i, force)).await {
+    let report = match tokio::task::spawn_blocking(move || {
+        stop(&c, &i, "tearing_down");
+        crate::reaper::teardown_agent(&c, &i, force)
+    })
+    .await
+    {
         Ok(Ok(report)) => report,
         // A refused or failed teardown must not leave the agent looking half removed.
         Ok(Err(e)) => { set_state(ctx, &id, "stopped"); return Err(e); }
@@ -1945,6 +2115,38 @@ mod tests {
         })
         .is_err());
         assert!(ctx.db.query("SELECT * FROM agents", []).unwrap().is_empty());
+    }
+
+    #[test]
+    fn apply_event_short_circuits_delta_and_list_batches_live_snapshot() {
+        let ctx = Ctx::test();
+        ctx.db
+            .exec(
+                "INSERT INTO agents(id,name,model_ref,state,created_at,last_active_at) VALUES('a1','lion','p/m','idle',10,10),('a2','otter','p/m','idle',20,20)",
+                [],
+            )
+            .unwrap();
+        ctx.db.kv_set("agent_error.a2", "crash msg").unwrap();
+        ctx.db.kv_set("agent.retry.a1", r#"{"attempt":2,"until":999}"#).unwrap();
+
+        let mut current = "running".to_string();
+        let mut dirty = false;
+        // model.delta must short-circuit before touching DB or marking dirty_active.
+        assert!(!apply_event(&ctx, "a1", &json!({"type": "model.delta", "delta": "tok"}), &mut current, &mut dirty));
+        assert!(!dirty);
+        assert_eq!(get_row(&ctx, "a1").unwrap()["last_active_at"], 10);
+
+        // State-changing events refresh current_state from DB and transition.
+        assert!(apply_event(&ctx, "a1", &json!({"type": "turn.started"}), &mut current, &mut dirty));
+        assert_eq!(current, "running");
+        assert_eq!(get_row(&ctx, "a1").unwrap()["state"], "running");
+
+        let listed = list(&ctx).unwrap();
+        let arr = listed.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["rate_limited"]["attempt"], 2);
+        assert_eq!(arr[1]["error"], "crash msg");
+        std::fs::remove_dir_all(ctx.data_dir.parent().unwrap()).ok();
     }
 }
 

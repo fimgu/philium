@@ -6,12 +6,19 @@
 //! shared tables below are owned here so every module agrees on them.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 use serde_json::{Map, Value};
 
-pub struct Db(Mutex<Connection>);
+pub struct Db {
+    writer: Mutex<Connection>,
+    readers: Vec<Mutex<Connection>>,
+    next_reader: AtomicUsize,
+}
+
+const READ_POOL_SIZE: usize = 3;
 
 const SCHEMA: &str = r#"
 PRAGMA journal_mode=WAL;
@@ -72,6 +79,11 @@ CREATE TABLE IF NOT EXISTS resources (
   id TEXT PRIMARY KEY, agent_id TEXT, kind TEXT NOT NULL, handle TEXT NOT NULL,
   meta TEXT, state TEXT NOT NULL DEFAULT 'live', created_at INTEGER NOT NULL,
   released_at INTEGER);
+CREATE TABLE IF NOT EXISTS teardown_proposals (
+  id TEXT PRIMARY KEY, resource_id TEXT NOT NULL, reason TEXT NOT NULL,
+  unsaved INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL DEFAULT 'pending',
+  created_at INTEGER NOT NULL);
+CREATE UNIQUE INDEX IF NOT EXISTS proposal_pending ON teardown_proposals(resource_id) WHERE state='pending';
 CREATE TABLE IF NOT EXISTS terminals (
   id TEXT PRIMARY KEY, agent_id TEXT, repo_id TEXT REFERENCES repos(id) ON DELETE SET NULL, title TEXT NOT NULL, command TEXT NOT NULL,
   cwd TEXT NOT NULL, pid INTEGER, exit_code INTEGER, state TEXT NOT NULL DEFAULT 'running',
@@ -86,6 +98,18 @@ CREATE INDEX IF NOT EXISTS requests_ts ON requests(ts);
 CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, kind TEXT NOT NULL,
   agent_id TEXT, body TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS worktrees_agent_state ON worktrees(agent_id, state);
+CREATE INDEX IF NOT EXISTS worktrees_repo_state ON worktrees(repo_id, state);
+CREATE INDEX IF NOT EXISTS tasks_repo_status ON tasks(repo_id, status);
+CREATE INDEX IF NOT EXISTS tasks_status_lease ON tasks(status, lease_expires_at);
+CREATE INDEX IF NOT EXISTS resources_agent_state ON resources(agent_id, state);
+CREATE INDEX IF NOT EXISTS resources_kind_handle_state ON resources(kind, handle, state);
+CREATE INDEX IF NOT EXISTS terminals_agent_state ON terminals(agent_id, state);
+CREATE INDEX IF NOT EXISTS agents_parent ON agents(parent_id);
+CREATE INDEX IF NOT EXISTS agents_repo_state ON agents(repo_id, state);
+CREATE INDEX IF NOT EXISTS agent_queue_agent ON agent_queue(agent_id);
+CREATE INDEX IF NOT EXISTS events_kind_id ON events(kind, id);
+CREATE INDEX IF NOT EXISTS events_ts ON events(ts);
 "#;
 
 pub fn now() -> i64 {
@@ -101,6 +125,13 @@ pub fn new_id() -> String {
     format!("{:x}", n)[..16].to_string()
 }
 
+fn apply_tuning_pragmas(c: &Connection) -> Result<(), String> {
+    c.execute_batch("PRAGMA cache_size=-16000; PRAGMA temp_store=MEMORY;")
+        .map_err(|e| e.to_string())?;
+    let _ = c.execute_batch("PRAGMA mmap_size=268435456;");
+    Ok(())
+}
+
 impl Db {
     pub fn open(path: &Path) -> Result<Db, String> {
         let c = Connection::open(path).map_err(|e| e.to_string())?;
@@ -108,6 +139,14 @@ impl Db {
         // the write lock briefly: wait instead of failing with SQLITE_BUSY.
         c.busy_timeout(std::time::Duration::from_secs(5)).map_err(|e| e.to_string())?;
         c.execute_batch("PRAGMA synchronous=NORMAL;").map_err(|e| e.to_string())?;
+        apply_tuning_pragmas(&c)?;
+        if c.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='terminals')", [], |r| r.get::<_, bool>(0)).unwrap_or(false) {
+            for (name, ddl) in [("agent_id", "agent_id TEXT"), ("state", "state TEXT NOT NULL DEFAULT 'running'")] {
+                if !c.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('terminals') WHERE name=?1)", [name], |r| r.get::<_, bool>(0)).unwrap_or(true) {
+                    let _ = c.execute_batch(&format!("ALTER TABLE terminals ADD COLUMN {ddl}"));
+                }
+            }
+        }
         c.execute_batch(SCHEMA).map_err(|e| e.to_string())?;
         if !c.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('terminals') WHERE name='repo_id')", [], |r| r.get::<_, bool>(0)).map_err(|e| e.to_string())? {
             c.execute_batch("ALTER TABLE terminals ADD COLUMN repo_id TEXT REFERENCES repos(id) ON DELETE SET NULL").map_err(|e|e.to_string())?;
@@ -117,28 +156,70 @@ impl Db {
         if !c.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('agents') WHERE name='base_ref')", [], |r| r.get::<_, bool>(0)).map_err(|e| e.to_string())? {
             c.execute_batch("ALTER TABLE agents ADD COLUMN base_ref TEXT").map_err(|e|e.to_string())?;
         }
-        Ok(Db(Mutex::new(c)))
+        let mut readers = Vec::with_capacity(READ_POOL_SIZE);
+        let ro_flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        for _ in 0..READ_POOL_SIZE {
+            if let Ok(r) = Connection::open_with_flags(path, ro_flags) {
+                let _ = r.busy_timeout(std::time::Duration::from_secs(5));
+                let _ = r.execute_batch("PRAGMA foreign_keys=ON;");
+                let _ = apply_tuning_pragmas(&r);
+                readers.push(Mutex::new(r));
+            }
+        }
+        Ok(Db {
+            writer: Mutex::new(c),
+            readers,
+            next_reader: AtomicUsize::new(0),
+        })
     }
 
     pub fn memory() -> Db {
         let c = Connection::open_in_memory().unwrap();
+        let _ = apply_tuning_pragmas(&c);
         c.execute_batch(SCHEMA).unwrap();
-        Db(Mutex::new(c))
+        Db {
+            writer: Mutex::new(c),
+            readers: Vec::new(),
+            next_reader: AtomicUsize::new(0),
+        }
     }
 
     pub fn with<T>(&self, f: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> Result<T, String> {
-        f(&self.0.lock().unwrap_or_else(|e| e.into_inner())).map_err(|e| e.to_string())
+        f(&self.writer.lock().unwrap_or_else(|e| e.into_inner())).map_err(|e| e.to_string())
+    }
+
+    fn with_reader<T>(&self, f: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> Result<T, String> {
+        let len = self.readers.len();
+        if len == 0 {
+            return self.with(f);
+        }
+        let start = self.next_reader.fetch_add(1, Ordering::Relaxed);
+        for offset in 0..len {
+            if let Ok(guard) = self.readers[(start + offset) % len].try_lock() {
+                return f(&guard).map_err(|e| e.to_string());
+            }
+        }
+        let guard = self.readers[start % len].lock().unwrap_or_else(|e| e.into_inner());
+        f(&guard).map_err(|e| e.to_string())
     }
 
     pub fn exec(&self, sql: &str, params: impl rusqlite::Params) -> Result<usize, String> {
-        self.with(|c| c.execute(sql, params))
+        self.with(|c| {
+            let mut st = c.prepare_cached(sql)?;
+            st.execute(params)
+        })
     }
 
     /// Rows as JSON objects keyed by column name.
     pub fn query(&self, sql: &str, params: impl rusqlite::Params) -> Result<Vec<Value>, String> {
-        self.with(|c| {
-            let mut st = c.prepare(sql)?;
-            let names: Vec<String> = st.column_names().map(|s| s.to_string()).collect();
+        let use_reader = !self.readers.is_empty() && {
+            let s = sql.trim_start().as_bytes();
+            (s.len() >= 6 && s[..6].eq_ignore_ascii_case(b"SELECT") && !sql.contains("RETURNING"))
+                || (s.len() >= 4 && s[..4].eq_ignore_ascii_case(b"WITH") && !sql.contains("INSERT") && !sql.contains("UPDATE") && !sql.contains("DELETE"))
+        };
+        let run = |c: &Connection| -> rusqlite::Result<Vec<Value>> {
+            let mut st = c.prepare_cached(sql)?;
+            let names: Vec<String> = st.column_names().into_iter().map(str::to_string).collect();
             let rows = st.query_map(params, |r| {
                 let mut m = Map::new();
                 for (i, n) in names.iter().enumerate() {
@@ -155,11 +236,20 @@ impl Db {
                 Ok(Value::Object(m))
             })?;
             rows.collect()
-        })
+        };
+        if use_reader {
+            self.with_reader(run)
+        } else {
+            self.with(run)
+        }
     }
 
     pub fn kv_get(&self, k: &str) -> Option<String> {
-        self.with(|c| c.query_row("SELECT v FROM kv WHERE k=?1", [k], |r| r.get(0))).ok()
+        self.with_reader(|c| {
+            let mut st = c.prepare_cached("SELECT v FROM kv WHERE k=?1")?;
+            st.query_row([k], |r| r.get(0))
+        })
+        .ok()
     }
 
     pub fn kv_set(&self, k: &str, v: &str) -> Result<(), String> {
@@ -233,5 +323,54 @@ mod tests {
         .join();
         db.kv_set("a", "1").unwrap();
         assert_eq!(db.kv_get("a").as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn read_pool_concurrency_and_secondary_indexes() {
+        let dir = std::env::temp_dir().join(format!("philium-db-pool-{}", new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pool.db");
+        let db = std::sync::Arc::new(Db::open(&path).unwrap());
+        assert_eq!(db.readers.len(), READ_POOL_SIZE);
+        db.kv_set("k1", "v1").unwrap();
+        assert_eq!(db.kv_get("k1").as_deref(), Some("v1"));
+
+        // While the writer lock is held, read-only queries and kv_get proceed without blocking on writer.
+        let db_reader = db.clone();
+        db.with(|_| {
+            let val = std::thread::spawn(move || {
+                assert_eq!(db_reader.kv_get("k1").as_deref(), Some("v1"));
+                let rows = db_reader.query("SELECT v FROM kv WHERE k=?1", ["k1"]).unwrap();
+                rows[0]["v"].as_str().unwrap().to_string()
+            })
+            .join()
+            .unwrap();
+            assert_eq!(val, "v1");
+            Ok(())
+        })
+        .unwrap();
+
+        let idx_rows = db
+            .query("SELECT name FROM sqlite_master WHERE type='index'", [])
+            .unwrap();
+        let names: Vec<&str> = idx_rows.iter().filter_map(|r| r["name"].as_str()).collect();
+        for expected in [
+            "worktrees_agent_state",
+            "worktrees_repo_state",
+            "tasks_repo_status",
+            "tasks_status_lease",
+            "resources_agent_state",
+            "resources_kind_handle_state",
+            "terminals_agent_state",
+            "agents_parent",
+            "agents_repo_state",
+            "agent_queue_agent",
+            "events_kind_id",
+            "events_ts",
+        ] {
+            assert!(names.contains(&expected), "missing index {expected}");
+        }
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -13,7 +13,7 @@ use std::{
     collections::{HashMap, VecDeque},
     io::{Read, Write},
     path::PathBuf,
-    sync::{Arc, Mutex, OnceLock, Weak},
+    sync::{Arc, Condvar, Mutex, OnceLock, Weak},
     time::Duration,
 };
 const CAP: usize = 256 * 1024;
@@ -43,22 +43,79 @@ struct Terminal {
 struct Manager {
     ctx: Weak<Ctx>,
     entries: Mutex<HashMap<String, Arc<Terminal>>>,
+    dirty: Mutex<bool>,
+    cv: Condvar,
+}
+impl Manager {
+    fn wake(&self) {
+        *self.dirty.lk() = true;
+        self.cv.notify_one();
+    }
 }
 static MANAGERS: OnceLock<Mutex<HashMap<usize, Arc<Manager>>>> = OnceLock::new();
 fn manager(ctx: &Arc<Ctx>) -> Arc<Manager> {
     let mut all = MANAGERS.get_or_init(Default::default).lk();
     all.retain(|_, m| m.ctx.strong_count() > 0);
     all.entry(Arc::as_ptr(ctx) as usize).or_insert_with(|| {
-        let m = Arc::new(Manager { ctx: Arc::downgrade(ctx), entries: Mutex::new(HashMap::new()) });
+        let m = Arc::new(Manager {
+            ctx: Arc::downgrade(ctx),
+            entries: Mutex::new(HashMap::new()),
+            dirty: Mutex::new(false),
+            cv: Condvar::new(),
+        });
         let weak = Arc::downgrade(&m);
         std::thread::spawn(move || loop {
+            let Some(m) = weak.upgrade() else { break };
+            {
+                let mut dirty = m.dirty.lk();
+                while !*dirty {
+                    let (g, _) = m
+                        .cv
+                        .wait_timeout(dirty, Duration::from_secs(5))
+                        .unwrap_or_else(|e| e.into_inner());
+                    dirty = g;
+                    if m.ctx.strong_count() == 0 {
+                        return;
+                    }
+                }
+                *dirty = false;
+            }
+            drop(m);
             std::thread::sleep(Duration::from_millis(16));
             let Some(m) = weak.upgrade() else { break };
             let Some(ctx) = m.ctx.upgrade() else { break };
-            for (id, t) in m.entries.lk().iter() {
-                let mut out = t.output.lk();
-                if !out.pending.is_empty() { ctx.emit("terminals:data", json!({"id":id,"data":B64.encode(std::mem::take(&mut out.pending)),"offset":out.total})); }
-                if let Some(code) = out.exit { if !out.announced { out.announced = true; ctx.emit("terminals:exit", json!({"id":id,"code":code})); ctx.notify("terminals"); } }
+            *m.dirty.lk() = false;
+            let snapshot: Vec<(String, Arc<Terminal>)> = m
+                .entries
+                .lk()
+                .iter()
+                .map(|(id, t)| (id.clone(), t.clone()))
+                .collect();
+            for (id, t) in snapshot {
+                let (chunk, offset, exited) = {
+                    let mut out = t.output.lk();
+                    let chunk = if out.pending.is_empty() {
+                        None
+                    } else {
+                        Some(std::mem::take(&mut out.pending))
+                    };
+                    let offset = out.total;
+                    let exited = match out.exit {
+                        Some(code) if !out.announced => {
+                            out.announced = true;
+                            Some(code)
+                        }
+                        _ => None,
+                    };
+                    (chunk, offset, exited)
+                };
+                if let Some(bytes) = chunk {
+                    ctx.emit("terminals:data", json!({"id":id,"data":B64.encode(bytes),"offset":offset}));
+                }
+                if let Some(code) = exited {
+                    ctx.emit("terminals:exit", json!({"id":id,"code":code}));
+                    ctx.notify("terminals");
+                }
             }
         });
         m
@@ -160,11 +217,12 @@ fn open_in_repo(ctx: &Arc<Ctx>, o: Opts, repo_id: Option<&str>) -> Result<String
         }),
         agent: o.agent_id,
     });
-    manager(ctx)
-        .entries
+    let mgr = manager(ctx);
+    mgr.entries
         .lock()
         .unwrap()
         .insert(id.clone(), t.clone());
+    let weak_mgr = Arc::downgrade(&mgr);
     let weak = Arc::downgrade(ctx);
     let tid = id.clone();
     std::thread::spawn(move || {
@@ -174,17 +232,23 @@ fn open_in_repo(ctx: &Arc<Ctx>, o: Opts, repo_id: Option<&str>) -> Result<String
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    let mut out = t.output.lk();
-                    out.ring.extend(&buf[..n]);
-                    out.total += n as u64;
-                    while out.ring.len() > CAP {
-                        out.ring.pop_front();
+                    {
+                        let mut out = t.output.lk();
+                        out.ring.extend(&buf[..n]);
+                        out.total += n as u64;
+                        if out.ring.len() > CAP {
+                            let excess = out.ring.len() - CAP;
+                            out.ring.drain(..excess);
+                        }
+                        // Bound unread event data as well as retained scrollback.
+                        out.pending.extend_from_slice(&buf[..n]);
+                        if out.pending.len() > CAP {
+                            let excess = out.pending.len() - CAP;
+                            out.pending.drain(..excess);
+                        }
                     }
-                    // Bound unread event data as well as retained scrollback.
-                    out.pending.extend_from_slice(&buf[..n]);
-                    if out.pending.len() > CAP {
-                        let n = out.pending.len() - CAP;
-                        out.pending.drain(..n);
+                    if let Some(m) = weak_mgr.upgrade() {
+                        m.wake();
                     }
                 }
             }
@@ -207,6 +271,9 @@ fn open_in_repo(ctx: &Arc<Ctx>, o: Opts, repo_id: Option<&str>) -> Result<String
             );
         }
         t.output.lk().exit = Some(code);
+        if let Some(m) = weak_mgr.upgrade() {
+            m.wake();
+        }
     });
     ctx.emit("terminals:changed", json!({"id":id}));
     ctx.notify("terminals");
@@ -295,22 +362,21 @@ pub fn since(ctx: &Arc<Ctx>, id: &str, from: u64) -> Option<Vec<u8>> {
 pub fn alive(ctx: &Arc<Ctx>, id: &str) -> bool {
     get(ctx, id).is_ok_and(|t| t.output.lk().exit.is_none())
 }
+fn ansi_regex() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        regex::Regex::new(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-?]*[ -/]*[@-~]|\x1b[@-_]").unwrap()
+    })
+}
 /// Strip terminal escape sequences and carriage returns.
 pub fn clean(text: &str) -> String {
-    static RE: OnceLock<regex::Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| {
-        regex::Regex::new(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-?]*[ -/]*[@-~]|\x1b[@-_]").unwrap()
-    });
-    re.replace_all(text, "").replace("\r\n", "\n").replace('\r', "")
+    ansi_regex().replace_all(text, "").replace("\r\n", "\n").replace('\r', "")
 }
 pub fn snapshot(ctx: &Arc<Ctx>, id: &str, max_bytes: usize) -> Option<String> {
     let data = bytes(ctx, id)?;
     let text = String::from_utf8_lossy(&data);
     // Remove OSC strings, CSI sequences, and remaining two-byte escapes.
-    let re =
-        regex::Regex::new(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-?]*[ -/]*[@-~]|\x1b[@-_]")
-            .unwrap();
-    let clean = re.replace_all(&text, "");
+    let clean = ansi_regex().replace_all(&text, "");
     let mut start = clean.len().saturating_sub(max_bytes);
     while !clean.is_char_boundary(start) {
         start += 1;

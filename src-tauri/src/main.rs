@@ -398,8 +398,9 @@ fn main() {
             }
 
             #[cfg(unix)] managed::start_watcher(&ctx);
-            refresh_desk(&ctx);
             app.manage(App { ctx: ctx.clone() });
+            let c_desk = ctx.clone();
+            tauri::async_runtime::spawn_blocking(move || refresh_desk(&c_desk));
 
             // Desk HAL watcher: surface a crash and restart it with backoff.
             let c4 = ctx.clone();
