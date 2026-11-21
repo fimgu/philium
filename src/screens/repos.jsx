@@ -1,10 +1,11 @@
-import { createSignal, createMemo, createEffect, on, onMount, Show, For } from "solid-js";
+import { createSignal, createMemo, createEffect, on, Show, For } from "solid-js";
 import { repoLabels } from "../lib/repo-labels.js";
-import { params as routeParams } from "../lib/nav.js";
+import { params as routeParams, go } from "../lib/nav.js";
 import { Page, Empty, Button, Input, Field, Badge, Modal, Select, Segmented, VirtualList, Menu, confirm, toast } from "../ui/kit.jsx";
 import { Icon } from "../ui/icons.jsx";
-import { rpc, useEvent, fmt } from "../lib/rpc.js";
-import { go } from "../lib/nav.js";
+import { rpc, fmt } from "../lib/rpc.js";
+import { useStore, activeRepoId, setActiveRepoId } from "../lib/store.js";
+import { useVisibleEvent, useScreenVisible } from "../lib/visibility.js";
 import "../styles/workspace.css";
 
 function Grants(props) {
@@ -120,27 +121,40 @@ function Branches(props) {
 }
 
 export default function Repos() {
-  const [repos, setRepos] = createSignal([]), [selected, setSelected] = createSignal(routeParams()?.repo_id ?? null);
+  const store = useStore();
+  const visible = useScreenVisible();
+  const repos = () => store.repos() ?? [];
+  const [selected, setSelected] = createSignal(routeParams()?.repo_id || activeRepoId() || null);
   const labels = createMemo(() => repoLabels(repos()));
   const [trees, setTrees] = createSignal([]), [branches, setBranches] = createSignal([]);
-  const [error, setError] = createSignal(""), [busy, setBusy] = createSignal(false), [loading, setLoading] = createSignal(true);
+  const [error, setError] = createSignal(""), [busy, setBusy] = createSignal(false);
+  const loading = () => store.repos.loading && !store.repos()?.length;
   const [dialog, setDialog] = createSignal(null), [path, setPath] = createSignal(""), [name, setName] = createSignal("");
   const [diff, setDiff] = createSignal(null), [treeName, setTreeName] = createSignal("");
   let detailRequest = 0;
+  let loadedFor = null;
   const current = createMemo(() => repos().find(r => r.id === selected()));
+  const cleanErr = (e) => String(e?.message ?? e).replace(/^Error:\s*/, "");
   async function details(id) {
     const request = ++detailRequest;
+    loadedFor = id || null;
     if (!id) { setTrees([]); setBranches([]); return; }
     const [w, b] = await Promise.all([rpc("workspace.worktrees", { repo_id: id }), rpc("workspace.branches", { repo_id: id })]);
     if (request === detailRequest && selected() === id) { setTrees(w ?? []); setBranches(b ?? []); }
   }
   async function refresh() {
-    try { const list = (await rpc("workspace.repos_list")) ?? []; setRepos(list); if (!list.some(r => r.id === selected())) setSelected(list[0]?.id ?? null); await details(selected()); setError(""); }
-    catch (e) { setError(cleanErr(e)); } finally { setLoading(false); }
+    try {
+      const list = (await store.refetchRepos()) ?? [];
+      if (!list.some(r => r.id === selected())) {
+        const fallback = (activeRepoId() && list.some(r => r.id === activeRepoId()) ? activeRepoId() : list[0]?.id) ?? null;
+        setSelected(fallback);
+      }
+      if (visible()) await details(selected());
+      setError("");
+    } catch (e) { setError(cleanErr(e)); }
   }
-  const cleanErr = (e) => String(e?.message ?? e).replace(/^Error:\s*/, "");
   async function act(fn) { if (busy()) return; setBusy(true); setError(""); try { await fn(); await refresh(); } catch (e) { setError(cleanErr(e)); toast(cleanErr(e), "danger"); } finally { setBusy(false); } }
-  function choose(id) { setSelected(id); setTrees([]); setBranches([]); details(id).catch(e => setError(cleanErr(e))); }
+  function choose(id) { setSelected(id); setTrees([]); setBranches([]); loadedFor = null; if (visible()) details(id).catch(e => setError(cleanErr(e))); }
   function add(mode) { setPath(""); setName(""); setDialog(mode); }
   async function submit() { await act(async () => { const r = await rpc(dialog() === "local" ? "workspace.repo_add" : "workspace.repo_clone", dialog() === "local" ? { path: path() } : { url: path(), ...(name().trim() ? { name: name().trim() } : {}) }); setSelected(r.id); setDialog(null); }); }
   async function remove(w) {
@@ -153,27 +167,68 @@ export default function Repos() {
   }
   function open(path, app) { act(() => rpc("workspace.open_in", { path, app })); }
   const viewDiff = (w) => act(async () => { const d = await rpc("workspace.diff", { worktree_id: w.id }); setDiff({ ...d, branch: w.branch, files: w.status?.dirty_files }); });
-  const unregister = (r) => act(async () => { if (await confirm("Unregister repository?", "This only unregisters the repository. No user folder is deleted. Managed worktrees must be removed first.")) { await rpc("workspace.repo_remove", { id: r.id }); setSelected(null); } });
-  onMount(refresh); useEvent("workspace:changed", refresh);
-  return <Page title="Repositories" sub="Each agent works in its own branch and worktree" actions={<><Button onClick={() => add("local")}>Add local repo</Button><Button variant="primary" onClick={() => add("clone")}>Clone repo</Button><Button class="ghost" busy={busy()} onClick={refresh} title="Refresh"><Icon name="refresh" size={12} /></Button></>}>
+  const unregister = (r) => act(async () => { if (await confirm("Unregister repository?", "This only unregisters the repository. No user folder is deleted. Managed worktrees must be removed first.")) { await rpc("workspace.repo_remove", { id: r.id }); if (activeRepoId() === r.id) setActiveRepoId(""); setSelected(null); } });
+
+  createEffect(() => {
+    const pid = routeParams()?.repo_id;
+    if (pid && pid !== selected()) {
+      choose(pid);
+    }
+  });
+
+  createEffect(() => {
+    const list = repos();
+    if (!list.length) return;
+    if (!selected() || !list.some((r) => r.id === selected())) {
+      const pid = routeParams()?.repo_id;
+      const aid = activeRepoId();
+      const next = (pid && list.some((r) => r.id === pid) ? pid : aid && list.some((r) => r.id === aid) ? aid : list[0]?.id) ?? null;
+      setSelected(next);
+    }
+  });
+
+  createEffect(() => {
+    const id = selected();
+    if (visible() && id && loadedFor !== id) {
+      details(id).catch((e) => setError(cleanErr(e)));
+    }
+  });
+
+  useVisibleEvent("workspace:changed", () => {
+    if (selected()) details(selected()).catch((e) => setError(cleanErr(e)));
+  }, { debounceMs: 250 });
+
+  return <Page title="Repositories" sub="Each agent works in its own branch and worktree" actions={<><Button variant="primary" onClick={() => add("local")}>Add local repo</Button><Button onClick={() => add("clone")}>Clone repo</Button><Button class="ghost" busy={busy()} onClick={refresh} title="Refresh"><Icon name="refresh" size={12} /></Button></>}>
     <Show when={error()}><div class="ws-alert" role="alert">{error()}</div></Show>
     <Show when={!loading()} fallback={<div class="loading"><span class="spinner" />Loading repositories</div>}>
-      <Show when={repos().length} fallback={<Empty icon={<Icon name="repo" size={28} />} title="Give agents a repository" action={<Button variant="primary" onClick={() => add("local")}>Add your first repository</Button>}>Add an existing local Git repository without moving it, or clone one into your Philium folder.</Empty>}>
+      <Show when={repos().length} fallback={<Empty icon={<Icon name="repo" size={28} />} title="Give agents a repository" action={<div class="row" style={{ gap: "8px", "justify-content": "center" }}><Button variant="primary" onClick={() => add("local")}>Add local repo</Button><Button onClick={() => add("clone")}>Clone repo</Button></div>}>Add an existing local Git repository without moving it, or clone one into your Philium folder.</Empty>}>
         <div class="ws-layout">
           <aside class="ws-repos"><VirtualList items={repos()} rowHeight={84}>{r => <button class={`ws-repo ${selected() === r.id ? "selected" : ""}`} onClick={() => choose(r.id)}>
             <strong class="ellipsis" title={r.path}>{labels().get(r.id)}</strong>
             <span class="ws-mono xs faint"><Icon name="branch" size={11} /> {r.branch || "Detached HEAD"}</span>
-            <span class="rp-line"><Pill tone={r.error ? "bad" : r.dirty ? "warn" : "ok"}>{r.error ? "Unavailable" : r.dirty ? "Dirty" : "Clean"}</Pill><span class="xs faint">{r.worktree_count ?? 0} worktree{r.worktree_count === 1 ? "" : "s"}</span></span>
+            <span class="rp-line"><Pill tone={r.error ? "bad" : r.dirty ? "warn" : "ok"}>{r.error ? "Unavailable" : r.dirty ? "Dirty" : "Clean"}</Pill><Show when={activeRepoId() === r.id}><Pill tone="ok" title="Active workspace">Active</Pill></Show><span class="xs faint">{r.worktree_count ?? 0} worktree{r.worktree_count === 1 ? "" : "s"}</span></span>
           </button>}</VirtualList></aside>
           <Show when={current()} fallback={<Empty title="Select a repository">Pick one on the left to see its worktrees and branches.</Empty>}>{r => <section class="ws-detail">
             <header class="rp-head">
               <div class="rp-title">
                 <h2 class="ellipsis" title={r().name}>{r().name}</h2>
                 <Pill tone={r().error ? "bad" : r().dirty ? "warn" : "ok"}>{r().error ? "Unavailable" : r().dirty ? "Uncommitted changes" : "Clean"}</Pill>
+                <Show when={activeRepoId() === r().id}><Pill tone="ok">Active workspace</Pill></Show>
                 <div class="grow" />
+                <Button
+                  size="sm"
+                  variant={activeRepoId() === r().id ? "ghost" : "primary"}
+                  disabled={activeRepoId() === r().id}
+                  onClick={() => { setActiveRepoId(r().id); toast(`Active workspace: ${r().name}`, "good"); }}
+                >
+                  {activeRepoId() === r().id ? "Active workspace" : "Set active workspace"}
+                </Button>
                 <Button size="sm" onClick={() => open(r().path, "finder")}>Finder</Button>
                 <Button size="sm" onClick={() => open(r().path, "terminal")}>Terminal</Button>
-                <Menu items={[{ label: "Unregister repository", danger: true, onClick: () => unregister(r()) }]} />
+                <Menu items={[
+                  { label: "Set active workspace", disabled: activeRepoId() === r().id, onClick: () => { setActiveRepoId(r().id); toast(`Active workspace: ${r().name}`, "good"); } },
+                  { label: "Unregister repository", danger: true, onClick: () => unregister(r()) },
+                ]} />
               </div>
               <code class="ws-path" title={r().path}>{r().path}</code>
               <div class="rp-meta">

@@ -3,6 +3,8 @@ import { Page, Button, Empty, Badge, toast } from "../ui/kit.jsx";
 import { Icon } from "../ui/icons.jsx";
 import { rpc, useEvent } from "../lib/rpc.js";
 import { route } from "../lib/nav.js";
+import { nativeView } from "../lib/native-view.js";
+import { useScreenVisible } from "../lib/visibility.js";
 import "../styles/browser.css";
 
 // Small local glyphs (same 20px grid and stroke style as ui/icons.jsx).
@@ -17,14 +19,11 @@ const Glyph = (p) => (
     stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d={G[p.name]} /></svg>
 );
 
-// Anything that can paint above the view area. The native webview cannot be
-// covered by DOM, so while one of these intersects the view we hide it.
-const OVERLAYS = ".overlay, .palette, .board-drawer-backdrop, [role=dialog], [role=menu], [role=listbox], .menu, .popover, .toast";
-
 const blank = (u) => !u || u === "about:blank";
 const host = (u) => { try { return new URL(u).host; } catch { return u; } };
 
 export default function Screen() {
+  const visible = useScreenVisible();
   const [tabs, setTabs] = createSignal([]);
   const [active, setActive] = createSignal(null);
   const [addr, setAddr] = createSignal("");
@@ -32,10 +31,9 @@ export default function Screen() {
   const [err, setErr] = createSignal("");
   const [covered, setCovered] = createSignal(false);
   const [notice, setNotice] = createSignal(null);
-  let view, input;
+  const [viewEl, setViewEl] = createSignal(null);
+  let input;
   let alive = true;
-  let shown = null; // tab id currently shown natively
-  let last = "";    // last bounds sent
 
   const cur = createMemo(() => tabs().find((t) => t.id === active()));
   const upsert = (t) => setTabs((l) => (l.some((x) => x.id === t.id) ? l.map((x) => (x.id === t.id ? { ...x, ...t } : x)) : [...l, t]));
@@ -43,51 +41,22 @@ export default function Screen() {
     const rest = tabs().filter((t) => t.id !== id);
     setTabs(rest);
     if (active() === id) setActive(rest.length ? rest[rest.length - 1].id : null);
-    if (shown === id) shown = null;
+  };
+  const onNativeError = (s, tabId) => {
+    if (/is closed|no such tab/.test(s) && tabId) drop(tabId);
+    else setErr(s);
   };
   // Stale tab ids: the backend already forgot them, so just drop locally.
-  const call = (m, a) => rpc(`browser.${m}`, a).catch((e) => {
-    const s = String(e);
-    if (/is closed|no such tab/.test(s) && a?.tab) drop(a.tab); else setErr(s);
-  });
+  const call = (m, a) => rpc(`browser.${m}`, a).catch((e) => onNativeError(String(e), a?.tab));
 
   // The native view should be visible only when all of these hold.
   const wanted = () => {
     const t = cur();
-    return alive && route() === "browser" && t && !blank(t.url) && !t.error && !covered() && !document.hidden ? t.id : null;
+    return alive && visible() && route() === "browser" && t && !blank(t.url) && !t.error ? t.id : null;
   };
 
-  const hideAll = () => { shown = null; last = ""; rpc("browser.hide", {}).catch(() => {}); };
-
-  const sync = async () => {
-    const want = wanted();
-    if (shown && shown !== want) { const id = shown; shown = null; rpc("browser.hide", { tab: id }).catch(() => {}); }
-    if (!want || !view) return;
-    const r = view.getBoundingClientRect();
-    if (r.width < 2 || r.height < 2) return;
-    const b = `${want}:${r.left}:${r.top}:${r.width}:${r.height}`;
-    if (b !== last) { last = b; await call("set_bounds", { tab: want, x: r.left + 1, y: r.top + 1, w: r.width - 2, h: r.height - 2 }); }
-    if (shown !== want && wanted() === want) { shown = want; await call("show", { tab: want }); }
-  };
-
-  // rAF loop: catches position-only moves (sidebar collapse, page scroll) that ResizeObserver misses.
-  let raf = 0;
-  const tick = () => {
-    if (!alive) return;
-    if (view) {
-      const r = view.getBoundingClientRect();
-      let hit = false;
-      for (const el of document.querySelectorAll(OVERLAYS)) {
-        if (view.contains(el)) continue;
-        const o = el.getBoundingClientRect();
-        if (o.width && o.height && o.left < r.right && o.right > r.left && o.top < r.bottom && o.bottom > r.top) { hit = true; break; }
-      }
-      if (hit !== covered()) setCovered(hit);
-      const b = `${wanted()}:${r.left}:${r.top}:${r.width}:${r.height}`;
-      if (b !== last || (wanted() || null) !== shown) sync();
-    }
-    raf = requestAnimationFrame(tick);
-  };
+  const hideAll = () => { rpc("browser.hide", {}).catch(() => {}); };
+  const stopNative = nativeView(viewEl, wanted, setCovered, onNativeError, () => visible() && route() === "browser");
 
   const select = (id) => { setActive(id); setErr(""); };
 
@@ -129,14 +98,13 @@ export default function Screen() {
   const act = (m) => cur() && call(m, { tab: cur().id });
 
   const onKey = (e) => {
-    if (route() !== "browser" || !(e.metaKey || e.ctrlKey)) return;
+    if (!visible() || route() !== "browser" || !(e.metaKey || e.ctrlKey)) return;
     const k = e.key.toLowerCase();
     if (k === "t") { e.preventDefault(); open(); }
     else if (k === "w" && cur()) { e.preventDefault(); close(cur().id); }
     else if (k === "l") { e.preventDefault(); input?.focus(); input?.select(); }
     else if (k === "r" && cur()) { e.preventDefault(); act(cur().loading ? "stop" : "reload"); }
   };
-  const onVis = () => sync();
 
   onMount(async () => {
     // After an app reload native tabs may still be showing: start from a clean slate.
@@ -148,21 +116,18 @@ export default function Screen() {
       if (l.length && !active()) setActive(l[l.length - 1].id);
     } catch (e) { setErr(String(e)); }
     window.addEventListener("keydown", onKey);
-    document.addEventListener("visibilitychange", onVis);
-    raf = requestAnimationFrame(tick);
   });
   // The native webview floats above the DOM: hide every tab when this screen goes away.
   onCleanup(() => {
     alive = false;
-    cancelAnimationFrame(raf);
+    stopNative();
     clearTimeout(noticeT);
     window.removeEventListener("keydown", onKey);
-    document.removeEventListener("visibilitychange", onVis);
     for (const t of tabs()) rpc("browser.hide", { tab: t.id }).catch(() => {});
     hideAll();
   });
   // Leaving the screen without unmount (or a route change before cleanup) also hides.
-  createEffect(() => { if (route() !== "browser") hideAll(); });
+  createEffect(() => { if (!visible() || route() !== "browser") hideAll(); });
 
   const loading = () => !!cur()?.loading && !blank(cur()?.url);
 
@@ -210,7 +175,7 @@ export default function Screen() {
         </form>
         <Show when={err()}><div class="br-note bad"><Glyph name="warn" size={13} /> {err()}<button onClick={() => setErr("")} aria-label="Dismiss"><Glyph name="x" size={11} /></button></div></Show>
         <Show when={notice()}><div class={`br-note ${notice().tone}`}>{notice().text}</div></Show>
-        <div class="br-view" ref={view} classList={{ live: !!wanted() }}>
+        <div class="br-view" ref={setViewEl} classList={{ live: Boolean(wanted() && !covered()) }}>
           <Show when={!cur()}>
             <div class="br-empty"><Empty icon={<Icon name="globe" size={28} />} title="No tab open"
               action={<Button variant="primary" onClick={() => open()}>New tab</Button>}

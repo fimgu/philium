@@ -3,6 +3,8 @@ import {
   Show,
   createSignal,
   createMemo,
+  createEffect,
+  on,
   onMount,
   onCleanup,
 } from "solid-js";
@@ -15,9 +17,11 @@ import {
   Empty,
   VirtualList,
 } from "../ui/kit.jsx";
-import { KvTelemetryBar } from "../ui/conversation.jsx";
-import { rpc, useEvent, fmt } from "../lib/rpc.js";
+import { KvTelemetryBar } from "../ui/kv-bar.jsx";
+import { rpc, fmt } from "../lib/rpc.js";
 import { go } from "../lib/nav.js";
+import { activeRepoId } from "../lib/store.js";
+import { useVisibleEvent } from "../lib/visibility.js";
 import "../styles/terminals.css";
 function UsageTable(props) {
   return (
@@ -91,20 +95,25 @@ export default function Stats() {
     [summary, setSummary] = createSignal(null),
     [series, setSeries] = createSignal([]),
     [efficiency, setEfficiency] = createSignal([]),
+    [loading, setLoading] = createSignal(false),
     [error, setError] = createSignal("");
-  let generation = 0,
-    timer;
+  let generation = 0;
+  const clampPct = (ratio) =>
+    Math.min(100, Math.max(0, Math.round((Number(ratio) || 0) * 100)));
   const load = async () => {
     const g = ++generation,
-      r = range();
+      r = range(),
+      rid = activeRepoId() || undefined;
+    setLoading(true);
     try {
       const [s, t, e] = await Promise.all([
-        rpc("stats.summary", { range: r }),
+        rpc("stats.summary", { range: r, repo_id: rid }),
         rpc("stats.timeseries", {
           range: r,
           bucket: r === "24h" ? "hour" : "day",
+          repo_id: rid,
         }),
-        rpc("stats.efficiency", { range: r }),
+        rpc("stats.efficiency", { range: r, repo_id: rid }),
       ]);
       if (g !== generation) return;
       setSummary(s);
@@ -113,20 +122,22 @@ export default function Stats() {
       setError("");
     } catch (e) {
       if (g === generation) setError(String(e));
+    } finally {
+      if (g === generation) setLoading(false);
     }
   };
   onMount(load);
+  createEffect(on(activeRepoId, () => load(), { defer: true }));
   onCleanup(() => {
     generation++;
-    clearTimeout(timer);
   });
-  useEvent("activity", (a) => {
-    if (a.state !== "pending" && !timer)
-      timer = setTimeout(() => {
-        timer = null;
-        load();
-      }, 1000);
-  });
+  useVisibleEvent(
+    "activity",
+    (a) => {
+      if (a?.state !== "pending") load();
+    },
+    { debounceMs: 1500 },
+  );
   const totals = () => summary()?.totals || {};
   const leaderboard = createMemo(() =>
     [...(summary()?.by_agent || [])].sort(
@@ -139,6 +150,11 @@ export default function Stats() {
       sub="All providers, token efficiency and generation speed"
       actions={
         <>
+          <Show when={loading()}>
+            <span class="xs faint" role="status">
+              Updating {range()}…
+            </span>
+          </Show>
           <Segmented
             value={range()}
             options={["24h", "7d", "30d"]}
@@ -147,11 +163,19 @@ export default function Stats() {
               load();
             }}
           />
-          <Button onClick={load}>Refresh</Button>
+          <Button busy={loading()} onClick={load}>
+            Refresh
+          </Button>
         </>
       }
     >
-      <div class="stats-screen">
+      <div
+        class="stats-screen"
+        style={{
+          opacity: loading() && summary() ? 0.78 : 1,
+          transition: "opacity 120ms ease",
+        }}
+      >
         <Show when={error()}>
           <p role="alert">{error()}</p>
         </Show>
@@ -166,8 +190,10 @@ export default function Stats() {
             value={fmt.compact(totals().tokens_cached)}
             sub={
               totals().tokens_in > 0
-                ? `${Math.round(((totals().tokens_cached || 0) / totals().tokens_in) * 100)}% KV cache hit`
-                : "Shared repo & conversation prefix"
+                ? (totals().tokens_cached || 0) > 0
+                  ? `${clampPct((totals().tokens_cached || 0) / totals().tokens_in)}% KV cache hit`
+                  : "0% KV cache hit (0 cached)"
+                : "Not reported yet"
             }
           />
           <Stat
@@ -250,9 +276,11 @@ export default function Stats() {
                         </td>
                         <td>{e.output_input_ratio?.toFixed(3) ?? "N/A"}</td>
                         <td>
-                          {e.cache_available
-                            ? fmt.pct(e.cached_share)
-                            : "Not reported by gateway"}
+                          {e.cache_available || typeof e.cached_share === "number"
+                            ? `${clampPct(e.cached_share)}%`
+                            : e.tokens_in > 0 && Number(e.tokens_cached) === 0
+                              ? "0% (0 cached)"
+                              : "Not reported by gateway"}
                         </td>
                         <td>
                           {e.cost_per_1k_output == null

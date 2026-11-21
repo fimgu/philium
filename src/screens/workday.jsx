@@ -1,17 +1,21 @@
 // Workday: what you did in Philium, and each time you had to leave it.
 import { For, Show, createResource, createSignal } from "solid-js";
 import { Page, Button } from "../ui/kit.jsx";
-import { rpc, useEvent, fmt } from "../lib/rpc.js";
+import { rpc, fmt } from "../lib/rpc.js";
+import { useVisibleEvent } from "../lib/visibility.js";
 
 export default function Workday() {
   const [data, { refetch }] = createResource(() => rpc("workday.summary", {}, { local: true }).catch((e) => ({ error: String(e) })));
   const [tool, setTool] = createSignal("Jcode"), [note, setNote] = createSignal(""), [busy, setBusy] = createSignal(false), [message, setMessage] = createSignal("");
-  let timer;
-  useEvent("event", () => { clearTimeout(timer); timer = setTimeout(refetch, 500); });
+  useVisibleEvent("event", () => refetch(), { debounceMs: 1000 });
   const act = async (fn) => { setBusy(true); setMessage(""); try { await fn(); await refetch(); } catch (e) { setMessage(String(e)); } finally { setBusy(false); } };
   const record = (e) => { e.preventDefault(); act(async () => { await rpc("workday.fallback", { tool: tool(), note: note() }, { local: true }); setNote(""); setMessage("Fallback recorded."); }); };
-  return <Page title="Workday" sub={<span title="Philium records the name and outcome of each action you take on a screen: not what you typed, no paths, no output, and nothing leaves this Mac. It cannot see you switch to another tool, so record that below.">What you did here, and when you had to leave</span>} actions={<><Button onClick={() => refetch()} disabled={busy()}>Refresh</Button><Button disabled={busy()} onClick={() => act(async () => { const r = await rpc("workday.export", {}, { local: true }); setMessage(`Summary written to ${r.path}`); })}>Export summary</Button></>}>
-    <div class="sheet"><Show when={data()?.error}><p role="alert">{data().error}</p></Show>
+  return <Page title="Workday" sub="What you did here, and when you had to leave" actions={<><Button onClick={() => refetch()} disabled={busy()}>Refresh</Button><Button disabled={busy()} onClick={() => act(async () => { const r = await rpc("workday.export", {}, { local: true }); setMessage(`Summary written to ${r.path}`); })}>Export summary</Button></>}>
+    <div class="sheet">
+      <p class="small dim" style={{ "margin-bottom": "12px" }}>
+        Philium records the name and outcome of each action you take on a screen — not what you typed, no paths, no output, and nothing leaves this Mac. It cannot see when you switch to another tool, so record any fallback below.
+      </p>
+      <Show when={data()?.error}><p role="alert">{data().error}</p></Show>
     <Show when={data() && !data().error}>{() => <div aria-label="Workday ledger" class="sheet">
       <div class="tiles"><div class="tile"><span class="label">Done in Philium</span><span class="value">{data().completed}</span></div><div class="tile"><span class="label">Times you needed something else</span><span class="value">{data().fallbacks.length}</span></div><div class="tile"><span class="label">Watching since</span><span class="value words">{data().started ? new Date(data().started).toLocaleString() : "The first action recorded"}</span></div></div>
       <p aria-label="Observation window">{data().started ? `Observation window started ${new Date(data().started).toLocaleString()}.` : "No observation window started. Showing everything recorded so far."} <Button size="sm" disabled={busy()} onClick={() => act(() => rpc("workday.start", {}, { local: true }))}>Start a new window now</Button></p>

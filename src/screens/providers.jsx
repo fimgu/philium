@@ -1,15 +1,28 @@
 // Providers: accounts, trust level, guard mode, live model lists.
-import { For, Show, createResource, createSignal, createMemo } from "solid-js";
-import { Page, Button, Card, Badge, Empty, Field, Input, Select, Toggle, Segmented, Modal, Shield, toast, confirm } from "../ui/kit.jsx";
+import { For, Show, createResource, createSignal, createMemo, createEffect } from "solid-js";
+import { Page, Button, Card, Badge, Empty, Field, Input, Select, Toggle, Modal, Shield, toast, confirm } from "../ui/kit.jsx";
 import { Icon } from "../ui/icons.jsx";
 import { rpc, useEvent, fmt } from "../lib/rpc.js";
+import { useStore } from "../lib/store.js";
 
 const KINDS = [
   { value: "openai_chat", label: "OpenAI-compatible (chat/completions)", url: "https://api.example.com/v1" },
   { value: "openai_responses", label: "OpenAI Responses API", url: "https://api.openai.com/v1" },
   { value: "anthropic", label: "Anthropic Messages API", url: "https://api.anthropic.com/v1" },
 ];
-const SUB_LABEL = { chatgpt_oauth: "ChatGPT subscription (signed in through Philium)", claude_oauth: "Claude subscription (signed in through Philium)", antigravity_oauth: "Google Antigravity subscription (signed in through Philium)" };
+const SUB_LABEL = {
+  chatgpt_oauth: "ChatGPT subscription (signed in through Philium)",
+  claude_oauth: "Claude subscription (signed in through Philium)",
+  antigravity_oauth: "Google Antigravity subscription (signed in through Philium)",
+};
+const SUB_NOTICE = {
+  claude_oauth:
+    "Using a Claude subscription outside Anthropic's own apps may be billed separately or flagged by Anthropic. An Anthropic API key (add it as a provider) is the risk-free alternative.",
+  chatgpt_oauth:
+    "Using a ChatGPT subscription outside OpenAI's own apps may be rate-limited or flagged by OpenAI. An OpenAI API key (add it as a provider) is the risk-free alternative.",
+  antigravity_oauth:
+    "Gives agents Gemini, and Claude through Google, on your Antigravity plan. Using Antigravity's sign-in outside Google's own apps breaks Google's terms, and Google has suspended accounts for it. A Gemini API key, added as a provider, carries no such risk.",
+};
 const SUBSCRIPTIONS = [["claude_oauth", "Claude"], ["chatgpt_oauth", "ChatGPT"], ["antigravity_oauth", "Google Antigravity"]];
 const kindLabel = (k) => SUB_LABEL[k] ?? KINDS.find((x) => x.value === k)?.label ?? k;
 const isSub = (k) => k in SUB_LABEL;
@@ -17,24 +30,44 @@ const isSub = (k) => k in SUB_LABEL;
 function ProviderForm(props) {
   const editing = !!props.provider && !props.provider.preset;
   const p = props.provider ?? {};
-  const [kind, setKind] = createSignal(p.kind ?? "openai_chat");
+  const initialKind = p.kind ?? "openai_chat";
+  const initialTrusted = isSub(initialKind) ? true : Boolean(p.trusted ?? false);
+  const [kind, setKind] = createSignal(initialKind);
   const [id, setId] = createSignal(p.id ?? "");
   const [name, setName] = createSignal(p.name ?? "");
   const [url, setUrl] = createSignal(p.base_url ?? "");
   const [key, setKey] = createSignal("");
-  const [trusted, setTrusted] = createSignal(p.trusted ?? false);
-  const [guard, setGuard] = createSignal(p.guard ?? "redact");
+  const [trusted, setTrusted] = createSignal(initialTrusted);
+  const [guard, setGuard] = createSignal(!initialTrusted && p.guard === "off" ? "redact" : (p.guard ?? "redact"));
+  const [enabled, setEnabled] = createSignal(p.enabled !== false);
   const [busy, setBusy] = createSignal(false);
   const [err, setErr] = createSignal("");
   const sub = () => isSub(kind());
+  const untrusted = () => !sub() && !trusted();
   const slug = (s) => s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40);
+
+  createEffect(() => {
+    if (untrusted() && guard() === "off") {
+      setGuard("redact");
+    }
+  });
 
   const save = async () => {
     setBusy(true); setErr("");
+    const effTrusted = sub() ? true : trusted();
+    const effGuard = !effTrusted && guard() === "off" ? "redact" : guard();
     try {
       await rpc("providers.save", {
-        create: !editing, id: id() || slug(name()), name: name(), kind: kind(), base_url: url(),
-        api_key: key(), trusted: sub() ? true : trusted(), guard: guard(),
+        create: !editing,
+        id: id() || slug(name()),
+        name: name(),
+        kind: kind(),
+        base_url: url(),
+        api_key: key(),
+        trusted: effTrusted,
+        guard: effGuard,
+        enabled: enabled(),
+        default_model: p.default_model,
       });
       toast(`${name()} saved. Discovering models…`, "good");
       props.onClose(true);
@@ -45,7 +78,12 @@ function ProviderForm(props) {
     <Modal title={editing ? `Edit ${p.name}` : "Add provider"} onClose={() => props.onClose(false)}
       footer={<><Button onClick={() => props.onClose(false)}>Cancel</Button><Button variant="primary" busy={busy()} onClick={save}>Save</Button></>}>
       <Field label="Type">
-        <Select value={kind()} disabled={editing} onValue={(v) => { setKind(v); }} options={KINDS} />
+        <Select
+          value={kind()}
+          disabled={editing || sub()}
+          onValue={(v) => setKind(v)}
+          options={sub() ? [{ value: kind(), label: kindLabel(kind()) }] : KINDS}
+        />
       </Field>
       <div class="grid grid-2">
         <Field label="Name"><Input value={name()} onValue={(v) => { setName(v); if (!editing) setId(slug(v)); }} placeholder="e.g. Zhipu" /></Field>
@@ -58,25 +96,114 @@ function ProviderForm(props) {
         </Field>
         <Field label="Trust">
           <div class="col">
-            <Toggle tone="strict" on={!trusted()} onChange={(v) => setTrusted(!v)} label="Untrusted provider" />
+            <Toggle
+              tone="strict"
+              on={!trusted()}
+              onChange={(v) => {
+                setTrusted(!v);
+                if (v && guard() === "off") setGuard("redact");
+              }}
+              label="Untrusted provider"
+            />
             <span class="xs faint">Untrusted providers only run agents in Strict mode: OS sandbox, egress allowlist, no subscriptions, everything observed.</span>
           </div>
         </Field>
-        <Field label="Secret guard" hint="Scans every outgoing request for keys, tokens and passwords.">
-          <Segmented value={guard()} onChange={setGuard} options={[{ value: "redact", label: "Redact" }, { value: "block", label: "Block" }, { value: "off", label: "Off" }]} />
-        </Field>
       </Show>
+      <Field
+        label="Secret guard"
+        hint={
+          untrusted()
+            ? "Scans every outgoing request for keys, tokens and passwords. Untrusted providers require Redact or Block."
+            : "Scans every outgoing request for keys, tokens and passwords."
+        }
+      >
+        <div class="segmented" role="group" aria-label="Secret guard">
+          <button type="button" class={guard() === "redact" ? "on" : ""} onClick={() => setGuard("redact")}>Redact</button>
+          <button type="button" class={guard() === "block" ? "on" : ""} onClick={() => setGuard("block")}>Block</button>
+          <button
+            type="button"
+            class={guard() === "off" ? "on" : ""}
+            disabled={untrusted()}
+            title={untrusted() ? "Untrusted providers require Redact or Block" : undefined}
+            onClick={() => { if (!untrusted()) setGuard("off"); }}
+          >
+            Off
+          </button>
+        </div>
+        <Show when={untrusted()}>
+          <span class="xs faint" style={{ "margin-top": "4px" }}>Untrusted providers require Redact or Block.</span>
+        </Show>
+      </Field>
+      <Field label="Status">
+        <Toggle on={enabled()} onChange={setEnabled} label="Provider enabled" />
+      </Field>
       <Show when={err()}><Shield tone="danger">{err()}</Shield></Show>
     </Modal>
   );
 }
 
 function ModelList(props) {
-  const [models, { refetch }] = createResource(() => props.provider.id + props.version, () => rpc("providers.models", { provider: props.provider.id }));
+  const [models, { refetch }] = createResource(
+    () => `${props.provider.id}:${props.provider.models_cached_at ?? 0}:${props.provider.model_count ?? 0}`,
+    () => rpc("providers.models", { provider: props.provider.id }),
+  );
   const [q, setQ] = createSignal("");
+  const [editingId, setEditingId] = createSignal(null);
+  const [editCtx, setEditCtx] = createSignal("");
+  const [editIn, setEditIn] = createSignal("");
+  const [editOut, setEditOut] = createSignal("");
   const shown = createMemo(() => (models() ?? []).filter((m) => m.model_id.toLowerCase().includes(q().toLowerCase())));
-  const setDefault = async (ref) => { await rpc("providers.set_default", { ref }); toast(`Default model: ${ref}`, "good"); props.onChange(); };
-  const toggle = async (m) => { await rpc("providers.set_model", { provider: m.provider_id, model: m.model_id, enabled: !m.enabled }); refetch(); };
+
+  const setDefault = async (ref) => {
+    try {
+      await rpc("providers.set_default", { ref });
+      toast(`Default model: ${ref}`, "good");
+      props.onChange?.();
+    } catch (e) {
+      toast(String(e), "bad");
+    }
+  };
+  const toggle = async (m) => {
+    try {
+      await rpc("providers.set_model", { provider: m.provider_id, model: m.model_id, enabled: !m.enabled });
+      await refetch();
+      props.onChange?.();
+    } catch (e) {
+      toast(String(e), "bad");
+    }
+  };
+  const startEdit = (m) => {
+    setEditingId(m.model_id);
+    setEditCtx(m.context_window != null ? String(m.context_window) : "");
+    setEditIn(m.price_in != null ? String(m.price_in) : "");
+    setEditOut(m.price_out != null ? String(m.price_out) : "");
+  };
+  const saveEdit = async (m) => {
+    const parseNum = (s) => (s.trim() === "" ? null : Number(s));
+    const ctxVal = parseNum(editCtx());
+    const inVal = parseNum(editIn());
+    const outVal = parseNum(editOut());
+    if ((ctxVal != null && (!Number.isFinite(ctxVal) || ctxVal < 1)) || (inVal != null && (!Number.isFinite(inVal) || inVal < 0)) || (outVal != null && (!Number.isFinite(outVal) || outVal < 0))) {
+      toast("Enter valid numbers for context window and prices", "bad");
+      return;
+    }
+    try {
+      await rpc("providers.set_model", {
+        provider: m.provider_id,
+        model: m.model_id,
+        ...(ctxVal != null ? { context_window: Math.round(ctxVal) } : {}),
+        ...(inVal != null ? { price_in: inVal } : {}),
+        ...(outVal != null ? { price_out: outVal } : {}),
+      });
+      setEditingId(null);
+      await refetch();
+      props.onChange?.();
+      toast(`Updated ${m.model_id}`, "good");
+    } catch (e) {
+      toast(String(e), "bad");
+    }
+  };
+
   return (
     <div class="col">
       <Show when={(models() ?? []).length > 8}><Input placeholder="Filter models…" value={q()} onValue={setQ} /></Show>
@@ -88,12 +215,55 @@ function ModelList(props) {
               {(m) => (
                 <tr style={{ opacity: m.enabled ? 1 : 0.45 }}>
                   <td class="mono ellipsis" title={m.display ?? m.model_id}>{m.model_id} <Show when={props.defaultRef === m.ref}><Badge tone="accent">default</Badge></Show></td>
-                  <td class="num">{m.context_window ? fmt.compact(m.context_window) : "–"}</td>
-                  <td class="num">{m.price_in != null ? `${m.price_in.toFixed(2)} / ${m.price_out?.toFixed(2)}` : "–"}</td>
-                  <td class="num">
-                    <Button size="sm" variant="ghost" onClick={() => setDefault(m.ref)}>Make default</Button>
-                    <Button size="sm" variant="ghost" onClick={() => toggle(m)}>{m.enabled ? "Hide" : "Show"}</Button>
-                  </td>
+                  <Show
+                    when={editingId() === m.model_id}
+                    fallback={
+                      <>
+                        <td class="num">{m.context_window ? fmt.compact(m.context_window) : "–"}</td>
+                        <td class="num">{m.price_in != null ? `${m.price_in.toFixed(2)} / ${m.price_out?.toFixed(2)}` : "–"}</td>
+                        <td class="num">
+                          <Button size="sm" variant="ghost" onClick={() => setDefault(m.ref)}>Make default</Button>
+                          <Button size="sm" variant="ghost" onClick={() => startEdit(m)}>Pricing</Button>
+                          <Button size="sm" variant="ghost" onClick={() => toggle(m)}>{m.enabled ? "Hide" : "Show"}</Button>
+                        </td>
+                      </>
+                    }
+                  >
+                    <td class="num">
+                      <Input
+                        mono
+                        value={editCtx()}
+                        onValue={setEditCtx}
+                        placeholder="Context tokens"
+                        aria-label={`Context window for ${m.model_id}`}
+                        style={{ width: "110px", display: "inline-block" }}
+                      />
+                    </td>
+                    <td class="num">
+                      <div class="row" style={{ gap: "4px", "justify-content": "flex-end" }}>
+                        <Input
+                          mono
+                          value={editIn()}
+                          onValue={setEditIn}
+                          placeholder="$ in"
+                          aria-label={`Input price per 1M for ${m.model_id}`}
+                          style={{ width: "70px" }}
+                        />
+                        <Input
+                          mono
+                          value={editOut()}
+                          onValue={setEditOut}
+                          placeholder="$ out"
+                          aria-label={`Output price per 1M for ${m.model_id}`}
+                          style={{ width: "70px" }}
+                        />
+                      </div>
+                    </td>
+                    <td class="num">
+                      <Button size="sm" variant="primary" onClick={() => saveEdit(m)}>Save</Button>
+                      <Button size="sm" variant="ghost" onClick={() => setEditingId(null)}>Cancel</Button>
+                    </td>
+                  </Show>
                 </tr>
               )}
             </For>
@@ -116,20 +286,24 @@ function SignIn(props) {
     const d = e?.payload ?? e;
     if (!st() || (d.id && st().id !== d.id)) return;
     setSt(null);
-    if (d.ok) { toast("Signed in", "good"); props.onDone(); } else setErr(String(d.error ?? "Sign-in failed"));
+    if (d.ok) { toast("Signed in", "good"); props.onDone?.(); } else setErr(String(d.error ?? "Sign-in failed"));
   });
   const start = async () => {
     setErr("");
     try { setSt(await rpc("providers.oauth_start", { kind: props.kind })); } catch (e) { setErr(String(e)); }
   };
   const submit = async () => {
-    try { await rpc("providers.oauth_paste", { id: st().id, input: paste() }); setSt(null); setPaste(""); props.onDone(); }
+    try { await rpc("providers.oauth_paste", { id: st().id, input: paste() }); setSt(null); setPaste(""); props.onDone?.(); }
     catch (e) { setErr(String(e)); }
   };
   const cancel = async () => { await rpc("providers.oauth_cancel", { kind: props.kind }).catch(() => {}); setSt(null); };
   const doImport = async () => {
     if (!(await confirm("Import your Claude Code login?", "Philium will read the Claude Code credentials stored on this Mac (macOS may ask for Keychain access) and keep its own copy. Nothing is changed in Claude Code.", { ok: "Import" }))) return;
-    try { await rpc("providers.oauth_import"); toast("Imported", "good"); props.onDone(); } catch (e) { setErr(String(e)); }
+    try { await rpc("providers.oauth_import"); toast("Imported", "good"); props.onDone?.(); } catch (e) { setErr(String(e)); }
+  };
+  const btnLabel = () => {
+    const who = claude ? "Claude" : google ? "Google" : "ChatGPT";
+    return props.again ? `Sign in again with ${who}` : `Sign in with ${who}`;
   };
   return (
     <div class="col" style={{ gap: "8px" }}>
@@ -152,7 +326,7 @@ function SignIn(props) {
           <div><Button size="sm" onClick={cancel}>Cancel</Button></div>
         </div>}>
         <div class="row">
-          <Button variant="primary" onClick={start}>{claude ? "Sign in with Claude" : google ? "Sign in with Google" : "Sign in with ChatGPT"}</Button>
+          <Button variant="primary" onClick={start}>{btnLabel()}</Button>
           <Show when={claude && importable()}><Button onClick={doImport}>Import existing Claude Code login</Button></Show>
         </div>
       </Show>
@@ -162,25 +336,87 @@ function SignIn(props) {
 }
 
 export default function Providers() {
-  const [version, setVersion] = createSignal(0);
-  const [list, { refetch }] = createResource(version, () => rpc("providers.list"));
-  const [def, { refetch: refetchDef }] = createResource(version, () => rpc("providers.default"));
+  const store = useStore();
+  const list = () => store.providers();
+  const def = () => store.defaultModel();
   const [form, setForm] = createSignal(null);
   const [open, setOpen] = createSignal(null);
   const [busy, setBusy] = createSignal(null);
-  const bump = () => setVersion((v) => v + 1);
-  useEvent("providers:changed", bump);
+
+  const syncStore = () =>
+    Promise.all([
+      store.refetchProviders(),
+      store.refetchDefault(),
+      store.refetchModels(),
+    ]);
 
   const refresh = async (p) => {
     setBusy(p.id);
-    try { const m = await rpc("providers.refresh_models", { id: p.id }); toast(`${p.name}: ${m.length} models`, "good"); }
-    catch (e) { toast(`${p.name}: ${e}`, "bad"); }
-    finally { setBusy(null); bump(); }
+    try {
+      const m = await rpc("providers.refresh_models", { id: p.id });
+      toast(`${p.name}: ${m.length} models`, "good");
+    } catch (e) {
+      toast(`${p.name}: ${e}`, "bad");
+    } finally {
+      setBusy(null);
+      await syncStore();
+    }
+  };
+  const toggleEnabled = async (p) => {
+    setBusy(p.id);
+    try {
+      const next = p.enabled === false;
+      await rpc("providers.save", {
+        create: false,
+        id: p.id,
+        name: p.name,
+        kind: p.kind,
+        base_url: p.base_url ?? "",
+        trusted: isSub(p.kind) ? true : Boolean(p.trusted),
+        guard: !p.trusted && !isSub(p.kind) && p.guard === "off" ? "redact" : p.guard,
+        enabled: next,
+        default_model: p.default_model,
+      });
+      toast(`${p.name} ${next ? "enabled" : "disabled"}`, "good");
+      await syncStore();
+    } catch (e) {
+      toast(String(e), "bad");
+    } finally {
+      setBusy(null);
+    }
+  };
+  const signOut = async (p) => {
+    if (
+      !(await confirm(
+        `Sign out of ${p.name}?`,
+        "Agents using this subscription will pause until you sign in again.",
+        { danger: true, ok: "Sign out" },
+      ))
+    )
+      return;
+    setBusy(p.id);
+    try {
+      await rpc("providers.oauth_signout", { id: p.id });
+      toast(`Signed out of ${p.name}`, "good");
+      await syncStore();
+    } catch (e) {
+      toast(String(e), "bad");
+    } finally {
+      setBusy(null);
+    }
   };
   const remove = async (p) => {
     if (!(await confirm(`Remove ${p.name}?`, "Its API key is deleted from Philium's vault. Agents using it will stop working.", { danger: true, ok: "Remove" }))) return;
-    await rpc("providers.remove", { id: p.id });
-    bump();
+    setBusy(p.id);
+    try {
+      await rpc("providers.remove", { id: p.id });
+      toast(`Removed ${p.name}`, "good");
+      await syncStore();
+    } catch (e) {
+      toast(String(e), "bad");
+    } finally {
+      setBusy(null);
+    }
   };
 
   return (
@@ -193,18 +429,14 @@ export default function Providers() {
         </Empty>
       </Show>
       <div class="col" style={{ gap: "12px" }}>
-        <For each={SUBSCRIPTIONS.filter(([k]) => !(list() ?? []).some((p) => p.kind === k && p.signed_in))}>
+        <For each={SUBSCRIPTIONS.filter(([k]) => !(list() ?? []).some((p) => p.kind === k))}>
           {([k, label]) => (
             <Card>
-              <div class="card-head"><h2>{label} subscription</h2>
-                <Show when={(list() ?? []).some((p) => p.kind === k)}><Badge tone="danger">Sign in again</Badge></Show></div>
-              <Show when={k === "claude_oauth"}>
-                <div class="small dim" style={{ "margin-bottom": "8px" }}>Using a Claude subscription outside Anthropic's own apps may be billed separately or flagged by Anthropic. An Anthropic API key (add it as a provider) is the risk-free alternative.</div>
+              <div class="card-head"><h2>{label} subscription</h2></div>
+              <Show when={SUB_NOTICE[k]}>
+                <div class="small dim" style={{ "margin-bottom": "8px" }}>{SUB_NOTICE[k]}</div>
               </Show>
-              <Show when={k === "antigravity_oauth"}>
-                <div class="small dim" style={{ "margin-bottom": "8px" }}>Gives agents Gemini, and Claude through Google, on your Antigravity plan. Using Antigravity's sign-in outside Google's own apps breaks Google's terms, and Google has suspended accounts for it. A Gemini API key, added as a provider, carries no such risk.</div>
-              </Show>
-              <SignIn kind={k} onDone={() => { refetch(); bump(); }} />
+              <SignIn kind={k} onDone={syncStore} />
             </Card>
           )}
         </For>
@@ -215,6 +447,7 @@ export default function Providers() {
                 <span class={`dot ${!p.enabled ? "" : p.models_error ? "bad" : "live"}`} />
                 <h2>{p.name}</h2>
                 <span class="mono faint small">{p.id}</span>
+                <Show when={p.enabled === false}><Badge>Disabled</Badge></Show>
                 <Show when={p.trusted} fallback={<Badge tone="strict" title="Agents on this provider always run in Strict mode"><Icon name="lock" size={12} /> Untrusted · Strict only</Badge>}>
                   <Badge tone="secure"><Icon name="shield" size={12} /> Trusted</Badge>
                 </Show>
@@ -223,9 +456,10 @@ export default function Providers() {
                 <Show when={!isSub(p.kind) && !p.has_key}><Badge tone="danger">No API key</Badge></Show>
                 <div style={{ "margin-left": "auto" }} class="row">
                   <Button size="sm" busy={busy() === p.id} onClick={() => refresh(p)}><Icon name="refresh" size={13} /> Refresh models</Button>
-                  <Show when={isSub(p.kind) && p.signed_in}><Button size="sm" onClick={async () => { await rpc("providers.oauth_signout", { id: p.id }); bump(); }}>Sign out</Button></Show>
+                  <Show when={isSub(p.kind) && p.signed_in}><Button size="sm" busy={busy() === p.id} onClick={() => signOut(p)}>Sign out</Button></Show>
+                  <Button size="sm" variant="ghost" busy={busy() === p.id} onClick={() => toggleEnabled(p)}>{p.enabled === false ? "Enable" : "Disable"}</Button>
                   <Button size="sm" onClick={() => setForm({ provider: p })}>Edit</Button>
-                  <Button size="sm" variant="danger" onClick={() => remove(p)}>Remove</Button>
+                  <Button size="sm" variant="danger" busy={busy() === p.id} onClick={() => remove(p)}>Remove</Button>
                 </div>
               </div>
               <div class="row small dim">
@@ -235,15 +469,23 @@ export default function Providers() {
                 <Show when={p.models_cached_at}><span class="faint">· updated {fmt.ago(p.models_cached_at)}</span></Show>
                 <Button size="sm" variant="ghost" style={{ "margin-left": "auto" }} onClick={() => setOpen(open() === p.id ? null : p.id)}>{open() === p.id ? "Hide models" : "Show models"}</Button>
               </div>
+              <Show when={isSub(p.kind) && !p.signed_in}>
+                <div style={{ "margin-top": "10px" }}>
+                  <Show when={SUB_NOTICE[p.kind]}>
+                    <div class="small dim" style={{ "margin-bottom": "8px" }}>{SUB_NOTICE[p.kind]}</div>
+                  </Show>
+                  <SignIn kind={p.kind} again onDone={syncStore} />
+                </div>
+              </Show>
               <Show when={p.models_error}><div style={{ "margin-top": "10px" }}><Shield tone="danger">Model discovery failed: {p.models_error}</Shield></div></Show>
-              <Show when={open() === p.id}><div style={{ "margin-top": "12px" }}><ModelList provider={p} version={version()} defaultRef={def()} onChange={() => { refetchDef(); bump(); }} /></div></Show>
+              <Show when={open() === p.id}><div style={{ "margin-top": "12px" }}><ModelList provider={p} defaultRef={def()} onChange={syncStore} /></div></Show>
             </Card>
           )}
         </For>
       </div>
       <Show when={form()}>
         {(f) => <ProviderForm provider={f().provider ?? null}
-          onClose={(saved) => { setForm(null); if (saved) { refetch(); bump(); } }} />}
+          onClose={(saved) => { setForm(null); if (saved) syncStore(); }} />}
       </Show>
     </Page>
   );

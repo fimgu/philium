@@ -1,21 +1,37 @@
-import { createSignal, For, Show, onCleanup, onMount } from 'solid-js';
+import { createSignal, createEffect, For, Show, onCleanup, onMount } from 'solid-js';
 import { rpc } from '../lib/rpc.js';
+import { useScreenVisible, useClock } from '../lib/visibility.js';
 
 export function LocalChecks(props) {
+  const visible = useScreenVisible();
+  const now = useClock(1000);
   const [rows,setRows]=createSignal([]), [tasks,setTasks]=createSignal([]), [error,setError]=createSignal('');
   const [target,setTarget]=createSignal('test'), [seconds,setSeconds]=createSignal(120), [task,setTask]=createSignal('');
   const [plan,setPlan]=createSignal(null), [busy,setBusy]=createSignal(false);
-  const [memory,setMemory]=createSignal(null), [now,setNow]=createSignal(Date.now());let memorySeq=0;
+  const [memory,setMemory]=createSignal(null);let memorySeq=0;
   const call=(key,extra={})=>rpc('checks.'+key,{repo_id:props.repo,...extra},{local:true});
-  let alive=true, timer, seq=0;
+  let alive=true, timer=null, pollPending=false, seq=0;
   async function recall(){const n=++memorySeq;try{const m=await call('remembered');if(alive&&n===memorySeq)setMemory(m);}catch(e){if(alive&&n===memorySeq)setError(String(e));}}
-  onMount(()=>{recall();const tick=setInterval(()=>setNow(Date.now()),1000);onCleanup(()=>clearInterval(tick));});
+  onMount(()=>{recall();});
   async function refresh() {
-    const n=++seq; clearTimeout(timer);
+    const n=++seq; clearTimeout(timer); timer=null;
     try { const r=await call('list'); if (!alive || n!==seq) return; setRows(r??[]);
-      if ((r??[]).some(x=>x.state==='running')) timer=setTimeout(refresh,1000);
+      if ((r??[]).some(x=>x.state==='running')) {
+        if (visible()) { pollPending=false; timer=setTimeout(refresh,1000); }
+        else { pollPending=true; }
+      } else { pollPending=false; }
     } catch(e) { if(alive && n===seq) setError(String(e)); }
   }
+  createEffect(()=>{
+    if (visible() && pollPending && alive) {
+      pollPending=false;
+      refresh();
+    } else if (!visible() && timer) {
+      clearTimeout(timer);
+      timer=null;
+      if ((rows()??[]).some(x=>x.state==='running')) pollPending=true;
+    }
+  });
   onMount(()=>{refresh(); rpc('board.list',{repo_id:props.repo},{local:true}).then(r=>{if(alive) setTasks((r??[]).filter(t=>t.repo_id===props.repo));}).catch(e=>{if(alive)setError(String(e));});});
   onCleanup(()=>{alive=false; clearTimeout(timer);});
   async function act(fn) { if(busy())return; setBusy(true); setError(''); try {await fn();} catch(e){if(alive)setError(String(e));} finally{if(alive)setBusy(false);} }

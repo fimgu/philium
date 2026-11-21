@@ -3,13 +3,16 @@ import {
   Show,
   createSignal,
   createMemo,
+  createEffect,
   onMount,
   onCleanup,
 } from "solid-js";
-import { Page, Button, Empty, VirtualList, Shield } from "../ui/kit.jsx";
+import { Page, Button, Empty, VirtualList, Shield, confirm } from "../ui/kit.jsx";
 import { rpc, useEvent, fmt } from "../lib/rpc.js";
+import { useScreenVisible } from "../lib/visibility.js";
 import "../styles/terminals.css";
 export default function Activity() {
+  const visible = useScreenVisible();
   const [rows, setRows] = createSignal([]),
     [provider, setProvider] = createSignal(""),
     [agent, setAgent] = createSignal(""),
@@ -17,23 +20,38 @@ export default function Activity() {
     [detail, setDetail] = createSignal(null),
     [selected, setSelected] = createSignal(null),
     [error, setError] = createSignal("");
-  let timer,
+  let timer = null,
     pending = new Map(),
     detailGeneration = 0;
   const flush = () => {
+    timer = null;
+    if (!visible() || pending.size === 0) return;
     const updates = pending;
     pending = new Map();
-    timer = null;
     setRows((old) => {
       const all = new Map(old.map((r) => [r.id, r]));
       for (const [id, r] of updates) all.set(id, r);
       return [...all.values()].sort((a, b) => b.id - a.id).slice(0, 500);
     });
-    if (selected() && updates.has(selected())) inspect(selected());
+    if (visible() && selected() && updates.has(selected())) inspect(selected());
   };
   useEvent("activity", (a) => {
+    if (!a?.id) return;
+    if (pending.has(a.id)) pending.delete(a.id);
     pending.set(a.id, a);
+    while (pending.size > 500) {
+      const oldest = pending.keys().next().value;
+      pending.delete(oldest);
+    }
+    if (!visible()) return;
     if (!timer) timer = setTimeout(flush, 100);
+  });
+  createEffect(() => {
+    if (visible() && pending.size > 0) {
+      clearTimeout(timer);
+      timer = null;
+      flush();
+    }
   });
   onMount(async () => {
     try {
@@ -67,12 +85,21 @@ export default function Activity() {
       if (g === detailGeneration) {
         setDetail(d);
         if (!d) setError("This request has expired from the live log.");
+        else setError("");
       }
     } catch (e) {
       if (g === detailGeneration) setError(String(e));
     }
   };
   const clear = async () => {
+    if (
+      !(await confirm(
+        "Clear live gateway log?",
+        "Removes all recent requests from the in-memory live activity log. Historical token statistics in Stats are kept.",
+        { danger: true, ok: "Clear live log" },
+      ))
+    )
+      return;
     try {
       await rpc("activity.clear");
       clearTimeout(timer);
@@ -81,6 +108,7 @@ export default function Activity() {
       setRows([]);
       setDetail(null);
       setSelected(null);
+      setError("");
       detailGeneration++;
     } catch (e) {
       setError(String(e));
@@ -261,6 +289,26 @@ export default function Activity() {
               >
                 <h3>Exact outgoing request body</h3>
                 <pre>{detail().request}</pre>
+              </Show>
+              <Show when={detail().response_head || detail().response_tail}>
+                <h3>Response preview</h3>
+                <Show when={detail().response_head}>
+                  <div class="xs faint" style={{ "margin-bottom": "4px" }}>
+                    Response head
+                  </div>
+                  <pre>{detail().response_head}</pre>
+                </Show>
+                <Show
+                  when={
+                    detail().response_tail &&
+                    detail().response_tail !== detail().response_head
+                  }
+                >
+                  <div class="xs faint" style={{ margin: "8px 0 4px" }}>
+                    Response tail
+                  </div>
+                  <pre>{detail().response_tail}</pre>
+                </Show>
               </Show>
               <Show when={detail().summary.error}>
                 <p role="alert">{detail().summary.error}</p>

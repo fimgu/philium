@@ -5,9 +5,11 @@ import { Page, Button, Badge, Select, Input, Segmented, Toggle, Empty, VirtualLi
 import Graph from "../ui/graph.jsx";
 import CodeInspector from "../ui/code-inspector.jsx";
 import { Icon } from "../ui/icons.jsx";
-import { rpc, useEvent, fmt } from "../lib/rpc.js";
-import { params } from "../lib/nav.js";
-import { agentHue, AgentChip } from "./agents.jsx";
+import { rpc, fmt } from "../lib/rpc.js";
+import { params, go } from "../lib/nav.js";
+import { agentHue, AgentChip } from "../ui/agent-chip.jsx";
+import { useStore, activeRepoId } from "../lib/store.js";
+import { useVisibleEvent } from "../lib/visibility.js";
 import "../styles/code.css";
 
 const SEV = { same_symbol: ["danger", "same symbol"], dependent: ["strict", "dependent code"], same_file: ["strict", "same file"] };
@@ -188,19 +190,24 @@ function RefList(props) {
 }
 
 export default function Code() {
-  const [repos] = createResource(() => rpc("workspace.repos_list").catch(() => []));
-  const labels = createMemo(() => repoLabels(repos() ?? []));
-  const [repoId, setRepoId] = createSignal(params()?.repo_id ?? "");
-  const repo = () => repoId() || repos()?.[0]?.id || "";
+  const store = useStore();
+  const repos = () => store.repos() ?? [];
+  const labels = createMemo(() => repoLabels(repos()));
+  const [repoId, setRepoId] = createSignal(params()?.repo_id || activeRepoId() || "");
+  const repo = () => {
+    const list = repos();
+    const want = repoId() || activeRepoId();
+    return (want && list.some((r) => r.id === want) ? want : list[0]?.id) || want || "";
+  };
   const [wts] = createResource(repo, (r) => (r ? rpc("workspace.worktrees", { repo_id: r }).catch(() => []) : []));
-  const [viewId, setViewId] = createSignal("main");
+  const [viewId, setViewId] = createSignal(params()?.worktree_id || "main");
   const [level, setLevel] = createSignal("file");
   const [q, setQ] = createSignal("");
   const [open, setOpen] = createSignal(new Set());
   const [sel, setSel] = createSignal(null); // {id, symbol, label}
   const [busy, setBusy] = createSignal(false);
   const [tab, setTab] = createSignal("source");
-  const [showChanges, setShowChanges] = createSignal(false);
+  const [showChanges, setShowChanges] = createSignal(Boolean(params()?.worktree_id));
   const [changesOnly, setChangesOnly] = createSignal(false);
   const [expanded, setExpanded] = createSignal(false);
   const [inspectorSize, setInspectorSize] = createSignal(360);
@@ -232,8 +239,35 @@ export default function Code() {
   const targetLabel = () => viewId() === "main" ? "Indexed base (fixed commit)" : viewId() === "local" ? "Local checkout (working snapshot)" : `${agentName((wts() ?? []).find((w) => w.id === viewId()) ?? {})} worktree (working snapshot)`;
   const [clashes, clr] = createResource(repo, (r) => (r ? rpc("codeindex.clashes", { repo_id: r }).catch(() => ({ clashes: [] })) : { clashes: [] }));
   const [refs] = createResource(() => (sel()?.symbol ? JSON.stringify([target(), sel().symbol, tick()]) : null), () => rpc("codeindex.refs", { ...target(), symbol: sel().symbol }).catch((e) => ({ error: String(e), defs: [], refs: [] })));
-  useEvent("codeindex:clashes", () => clr.refetch());
-  createEffect(on(repo, () => { setViewId("main"); setSel(null); }, { defer: true }));
+  useVisibleEvent("codeindex:clashes", () => clr.refetch(), { debounceMs: 250 });
+  createEffect(
+    on(
+      activeRepoId,
+      (aid) => {
+        if (aid && aid !== repoId()) {
+          setRepoId(aid);
+          setViewId("main");
+          setSel(null);
+        }
+      },
+      { defer: true },
+    ),
+  );
+  createEffect(() => {
+    const p = params() || {};
+    if (p.repo_id && p.repo_id !== repoId()) {
+      setRepoId(p.repo_id);
+      if (!p.worktree_id) {
+        setViewId("main");
+        setSel(null);
+      }
+    }
+    if (p.worktree_id && p.worktree_id !== viewId()) {
+      setViewId(p.worktree_id);
+      setShowChanges(true);
+      setSel(null);
+    }
+  });
   createEffect(on(viewId, () => { setSel(null); setExpanded(false); setTab("source"); }, { defer: true }));
 
   const agentName = (w) => w.agent_name || w.branch;
@@ -259,9 +293,9 @@ export default function Code() {
     <Page title="Code" sub="Symbols and references, indexed locally" flush>
       <div class="code-wrap">
         <div class="code-bar" style={repo() ? undefined : { display: "none" }}>
-          <Select value={repo()} onValue={setRepoId} options={(repos() ?? []).map((r) => ({ value: r.id, label: labels().get(r.id) }))} />
+          <Select value={repo()} onValue={(v) => { setRepoId(v); setViewId("main"); setSel(null); }} options={repos().map((r) => ({ value: r.id, label: labels().get(r.id) }))} />
           <Select value={viewId()} onValue={(v) => { setViewId(v); setSel(null); }}
-            options={[{ value: "main", label: "Indexed base commit" }, { value: "local", label: "Local checkout" }, ...(wts() ?? []).filter((w) => w.state === "active").map((w) => ({ value: w.id, label: `${agentName(w)} (worktree)` }))]} />
+            options={[{ value: "main", label: "Indexed base commit" }, { value: "local", label: "Local checkout" }, ...(wts() ?? []).filter((w) => w.state === "active" || w.id === viewId()).map((w) => ({ value: w.id, label: `${agentName(w)} (worktree)` }))]} />
           <Show when={viewId() !== "main" && viewId() !== "local"}><AgentChip name={agentName((wts() ?? []).find((w) => w.id === viewId()) ?? {})} /></Show>
           <div class="code-status">
             <Show when={status()?.error}><span class="err">{status().error}</span></Show>
@@ -287,7 +321,7 @@ export default function Code() {
             )}</For>
           </div>
         </Show>
-        <Show when={repo()} fallback={<Empty title="No repositories yet">Add a repository on the Repos screen. Philium indexes its symbols and references so you and your agents can see what depends on what.</Empty>}>
+        <Show when={repo()} fallback={<Empty title="No repositories yet" action={<Button variant="primary" onClick={() => go("repos")}>Open Repositories</Button>}>Add a repository on the Repos screen. Philium indexes its symbols and references so you and your agents can see what depends on what.</Empty>}>
           <div class={`code-main ${sel() ? "has-inspector" : "no-drawer"} ${expanded() && sel() ? "inspector-expanded" : ""}`} style={{ "--inspector-size": `${inspectorSize()}px` }}>
             <div class="code-side">
               <div class="search"><Input placeholder="Search files and symbols" value={q()} onValue={setQ} /></div>

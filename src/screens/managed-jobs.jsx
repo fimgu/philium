@@ -1,14 +1,36 @@
-import {createSignal,For,Show,onMount,onCleanup} from 'solid-js';
+import {createSignal,createEffect,For,Show,onMount,onCleanup} from 'solid-js';
 import {createStore,reconcile} from 'solid-js/store';
 import {rpc} from '../lib/rpc.js';
+import {useScreenVisible} from '../lib/visibility.js';
 
 // Mounted with a stable checkout key; switching checkout destroys the inspector and draft.
 export function ManagedJobs(props){
+  const visible = useScreenVisible();
   const [view,setView]=createStore({data:null}),data=()=>view.data,[error,setError]=createSignal(''),[busy,setBusy]=createSignal(false);
   const [profiles,setProfiles]=createSignal([]),[profile,setProfile]=createSignal(''),[task,setTask]=createSignal(props.taskId||''),[cmd,setCmd]=createSignal(''),[minutes,setMinutes]=createSignal(10),[form,setForm]=createSignal(false),[plan,setPlan]=createSignal(null);
-  const [tail,setTail]=createSignal(null),[release,setRelease]=createSignal('');let live=true,seq=0,lseq=0,timer;
+  const [tail,setTail]=createSignal(null),[release,setRelease]=createSignal('');let live=true,seq=0,lseq=0,timer=null,pollPending=false;
   const invoke=(method,args={})=>rpc('managed.'+method,{repo_id:props.id,...args,...(props.taskId?{task_id:props.taskId}:{})},{local:true});
-  async function refresh(){const n=++seq;clearTimeout(timer);try{const r=await invoke('list');if(!live||seq!==n)return;setView('data',reconcile(r));if((r.jobs||[]).some(j=>j.state!=='released'))timer=setTimeout(refresh,5000);}catch(e){if(live&&seq===n)setError(String(e));}}
+  async function refresh(){
+    const n=++seq;clearTimeout(timer);timer=null;
+    try{
+      const r=await invoke('list');if(!live||seq!==n)return;
+      setView('data',reconcile(r));
+      if((r.jobs||[]).some(j=>j.state!=='released')){
+        if(visible()){pollPending=false;timer=setTimeout(refresh,5000);}
+        else{pollPending=true;}
+      }else{pollPending=false;}
+    }catch(e){if(live&&seq===n)setError(String(e));}
+  }
+  createEffect(()=>{
+    if(visible()&&pollPending&&live){
+      pollPending=false;
+      refresh();
+    }else if(!visible()&&timer){
+      clearTimeout(timer);
+      timer=null;
+      if((data()?.jobs||[]).some(j=>j.state!=='released'))pollPending=true;
+    }
+  });
   onMount(refresh);onCleanup(()=>{live=false;seq++;lseq++;clearTimeout(timer);});
   async function act(fn){if(busy())return;setError('');setBusy(true);try{await fn();}catch(e){if(live)setError(String(e));}finally{if(live)setBusy(false);}}
   async function openForm(){await refresh();if(!live)return;const p=await rpc('environments.profiles',{},{local:true});if(!live)return;setProfiles(p);setProfile(p.length===1?p[0]:'');setForm(true);}
