@@ -122,6 +122,12 @@ fn run_command(
     Ok((out, truncated))
 }
 
+/// Stdout of `command`, at most `cap` bytes, killed with its children after `timeout`.
+/// Exit 1 counts as success, as for grep and diff with nothing to report.
+pub(super) fn bounded_output(command: Command, cap: usize, timeout: Duration) -> Result<Vec<u8>, String> {
+    run_command(command, cap, true, timeout).map(|(out, _)| out)
+}
+
 // Never use workspace::git here: it trims output and has no execution deadline.
 // All inspection Git entry points, including revision fallback, use this wrapper.
 fn run(root: &Path, args: &[&str], cap: usize, diff: bool) -> Result<(Vec<u8>, bool), String> {

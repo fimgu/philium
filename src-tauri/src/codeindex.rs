@@ -51,6 +51,14 @@ mod inspect;
 
 const MAX_FILE: u64 = 400 * 1024;
 const MAX_FILES: usize = 20000;
+/// What `code_find` searches by content: the languages the index parses and the files
+/// beside them that a change to the code often touches. Prose and data (Markdown, JSON,
+/// HTML reports) are left to grep: they outnumber the code that answers "where is".
+const FIND_EXTS: &[&str] = &[
+    "rs", "ts", "mts", "cts", "tsx", "js", "jsx", "mjs", "cjs", "py", "go", "css", "scss", "sass", "less", "vue", "svelte", "sql", "proto", "graphql", "sh",
+];
+/// A search of the code that takes longer than this gives its answer from the names alone.
+const FIND_DEADLINE: Duration = Duration::from_secs(8);
 const SKIP_DIRS: &[&str] = &["node_modules", "target", "dist", "build", "vendor", ".git", "__pycache__", ".next", "venv", ".venv"];
 /// Safety limit only (pathological cases); answers are compact by design, not budgeted.
 const DEFAULT_TOKENS: usize = 60000;
@@ -1294,30 +1302,65 @@ fn singular(w: &str) -> String {
     w.strip_suffix('s').unwrap_or(w).to_string()
 }
 
-/// Lines under `root` that mention any of `terms`, ignoring case: tracked and untracked
-/// files, not ignored ones, no lock files or minified code. At most `limit` lines, each
-/// as (path, line, lowercased text).
-fn grep_lines(root: &Path, terms: &[String], limit: usize) -> Vec<(String, u32, String)> {
+/// One extended regex for any of `words`, in either case: `[rR][eE][tT][rR][yY]|...`.
+/// Characters other than letters, digits and `_` match any character, so no word needs
+/// escaping.
+fn any_word(words: &[String]) -> String {
+    let fold = |t: &str| -> String {
+        t.chars()
+            .map(|c| {
+                let (l, u) = (c.to_lowercase().collect::<String>(), c.to_uppercase().collect::<String>());
+                if c.is_alphabetic() && l != u && l.chars().count() == 1 && u.chars().count() == 1 {
+                    format!("[{l}{u}]")
+                } else if c.is_alphanumeric() || c == '_' {
+                    c.to_string()
+                } else {
+                    ".".to_string()
+                }
+            })
+            .collect()
+    };
+    words.iter().map(|w| fold(w)).collect::<Vec<_>>().join("|")
+}
+
+/// Lines under `root` that mention any of `terms`, ignoring case: code and the files that
+/// style or describe it (`FIND_EXTS`), tracked or untracked, outside vendored folders and
+/// under the index's size limit, never minified bundles. At most `limit` lines, each as
+/// (path, line, lowercased text), within `FIND_DEADLINE`.
+///
+/// Git's `-i` matcher can take minutes on one large file with long lines (a 27 MB HTML
+/// report in one checkout took over ten), so case is folded in the pattern instead:
+/// `[rR][eE][tT][rR][yY]`. The words go in one pattern, `a|b`: with one `-e` each, a
+/// word missing from a file makes git rescan the rest of the file for every line that
+/// holds another, which took seconds on a 500 KB file.
+fn grep_lines(root: &Path, terms: &[String], limit: usize) -> Option<Vec<(String, u32, String)>> {
     if terms.is_empty() {
-        return vec![];
+        return Some(vec![]);
     }
     let mut cmd = Command::new("git");
-    cmd.arg("-C").arg(root).args(["grep", "-n", "-I", "-i", "-F", "--untracked", "--full-name", "--no-color"]);
-    for t in terms {
-        cmd.arg("-e").arg(t);
-    }
-    cmd.args(["--", ".", ":(exclude)*.lock", ":(exclude)*-lock.json", ":(exclude)*.min.js", ":(exclude)*.map", ":(exclude)*.svg"]);
-    let Ok(o) = cmd.stdin(Stdio::null()).stderr(Stdio::null()).output() else { return vec![] };
-    String::from_utf8_lossy(&o.stdout)
-        .lines()
-        .take(limit)
-        .filter_map(|l| {
-            let mut it = l.splitn(3, ':');
-            let p = it.next()?;
-            let n = it.next()?.parse().ok()?;
-            Some((p.to_string(), n, it.next().unwrap_or("").to_lowercase()))
-        })
-        .collect()
+    cmd.arg("-C").arg(root).args(["grep", "-n", "-I", "-E", "--untracked", "--full-name", "--no-color", "-e"]);
+    cmd.arg(any_word(terms));
+    cmd.arg("--");
+    // Only code and the files that style or describe it, the way the index reads them.
+    let mut specs: Vec<String> = FIND_EXTS.iter().map(|e| format!(":(glob)**/*.{e}")).collect();
+    specs.extend(SKIP_DIRS.iter().map(|d| format!(":(exclude,glob)**/{d}/**")));
+    specs.extend([":(exclude)*.min.js", ":(exclude)*.bundle.js", ":(exclude)*-bundle.js"].map(String::from));
+    cmd.args(&specs);
+    let out = inspect::bounded_output(cmd, 8 * 1024 * 1024, FIND_DEADLINE).ok()?;
+    let mut big: HashMap<String, bool> = HashMap::new();
+    Some(
+        String::from_utf8_lossy(&out)
+            .lines()
+            .filter_map(|l| {
+                let mut it = l.splitn(3, ':');
+                let p = it.next()?;
+                let n = it.next()?.parse().ok()?;
+                let too_big = *big.entry(p.to_string()).or_insert_with(|| std::fs::metadata(root.join(p)).map(|m| m.len() > MAX_FILE).unwrap_or(false));
+                (!too_big).then(|| (p.to_string(), n, it.next().unwrap_or("").to_lowercase()))
+            })
+            .take(limit)
+            .collect(),
+    )
 }
 
 /// A place whose code mentions some of the query's words: the innermost indexed symbol
@@ -1380,12 +1423,18 @@ pub fn render_find(v: &View, root: Option<&Path>, q: &str, kind: Option<&str>, c
     // Several words, or a word no name holds (a fuzzy match is a guess), are looked up
     // in the code too.
     let named = terms.len() == 1 && items.iter().any(|s| s.name.to_lowercase().contains(terms[0].as_str()));
-    let content = match root {
-        Some(r) if !terms.is_empty() && !named => by_content(v, &grep_lines(r, &terms, 20000), &terms, kind),
-        _ => vec![],
+    let (content, slow) = match root {
+        Some(r) if !terms.is_empty() && !named => match grep_lines(r, &terms, 20000) {
+            Some(lines) => (by_content(v, &lines, &terms, kind), false),
+            None => (vec![], true),
+        },
+        _ => (vec![], false),
     };
     let mut out = Out::new(cap);
     out.line(format!("find \"{q}\": {} symbols by name, {} places by content", items.len(), content.len()));
+    if slow {
+        out.line("(the search of the code took too long and was stopped: names only. Fewer or rarer words, or grep a folder.)".to_string());
+    }
     let mut last = "";
     for s in items.iter().take(if content.is_empty() { usize::MAX } else { 15 }) {
         let par = if s.parent.is_empty() { String::new() } else { format!("{}.", s.parent) };
@@ -3285,6 +3334,17 @@ mod tests {
         // kind keeps content matches to that kind.
         let f = render_find(&v, Some(&r), "spinner busy", Some("fn"), 1500);
         assert!(!f.contains("ui.css"), "{f}");
+        // Case is folded in the pattern, and files the index would not read are not
+        // searched: a large generated report, a bundle over the size limit, prose.
+        std::fs::write(r.join("src/Theme.ts"), "export const SPINNER_COLOR = 'red'\n").unwrap();
+        std::fs::write(r.join("report.html"), "<td>spinner skeleton</td>\n".repeat(30_000)).unwrap();
+        std::fs::write(r.join("src/huge.js"), "var spinner = 1;\n".repeat(30_000)).unwrap();
+        std::fs::write(r.join("NOTES.md"), "the spinner skeleton\n").unwrap();
+        let lines = grep_lines(&r, &query_terms("spinner skeleton"), 20000).expect("finishes");
+        let files: BTreeSet<&str> = lines.iter().map(|l| l.0.as_str()).collect();
+        assert_eq!(files, BTreeSet::from(["src/Theme.ts", "src/ui.css", "src/ui.rs"]), "{lines:?}");
+        assert!(lines.iter().any(|l| l.2.contains("spinner_color")));
+        assert_eq!(grep_lines(&r, &query_terms("spin+ner"), 20000).map(|l| l.len()), Some(0), "punctuation is not a pattern");
     }
 
     #[test]
@@ -3350,7 +3410,7 @@ mod bench {
     /// Does the context point at the code a task touches? Each recent commit is a task: its
     /// subject is the request and the files it changed are the answer. Compared: `code_find` on
     /// the subject, the start-of-session map, and the word grep agents ran before
-    /// (`git grep -n -i -w` on the subject's words, files ranked by how many words they hold).
+    /// (`git grep -n -w` on the subject's words in either case, files ranked by how many words they hold).
     /// The index is of HEAD, so later code is visible to every method alike.
     /// `BENCH_REPO=/path BENCH_COMMITS=80 cargo test --bin philium localize -- --ignored --nocapture`
     #[test]
@@ -3396,10 +3456,15 @@ mod bench {
             let found = render_find(&v, Some(&repo), subject, None, 4000);
             let f_rank = order(&found);
             // The grep an agent runs: every line that holds one of the words, then the files
-            // that hold the most words. Its cost is the output it would read.
-            let mut args = vec!["grep", "-n", "-i", "-w", "-I"];
-            for w in &words { args.push("-e"); args.push(w); }
-            let out = if words.is_empty() { String::new() } else { git(&repo, &args).unwrap_or_default() };
+            // that hold the most words. Its cost is the output it would read. One folded
+            // pattern, as in `grep_lines`, so a large generated file cannot stall it.
+            let out = if words.is_empty() {
+                String::new()
+            } else {
+                let mut cmd = Command::new("git");
+                cmd.arg("-C").arg(&repo).args(["grep", "-n", "-w", "-I", "-E", "-e", &any_word(&words)]);
+                String::from_utf8_lossy(&inspect::bounded_output(cmd, 64 << 20, Duration::from_secs(60)).unwrap_or_default()).into_owned()
+            };
             let mut per: HashMap<&str, HashSet<String>> = HashMap::new();
             for l in out.lines() {
                 let Some((f, rest)) = l.split_once(':') else { continue };
