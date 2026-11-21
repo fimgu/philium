@@ -3347,6 +3347,88 @@ mod bench {
         }
     }
 
+    /// Does the context point at the code a task touches? Each recent commit is a task: its
+    /// subject is the request and the files it changed are the answer. Compared: `code_find` on
+    /// the subject, the start-of-session map, and the word grep agents ran before
+    /// (`git grep -n -i -w` on the subject's words, files ranked by how many words they hold).
+    /// The index is of HEAD, so later code is visible to every method alike.
+    /// `BENCH_REPO=/path BENCH_COMMITS=80 cargo test --bin philium localize -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn localize() {
+        let Ok(repo) = std::env::var("BENCH_REPO") else { return };
+        let n: usize = std::env::var("BENCH_COMMITS").ok().and_then(|n| n.parse().ok()).unwrap_or(80);
+        let ctx = Ctx::test();
+        ctx.db.with(|c| c.execute_batch(SCHEMA)).unwrap();
+        let repo = PathBuf::from(repo);
+        let br = git(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap();
+        let (v, _) = index_target(&ctx, "b", &repo, &br, None, true).unwrap();
+        let indexed: HashSet<&str> = v.syms.iter().map(|s| s.path.as_str()).collect();
+        let map = render_brief_map(&v, map_tokens(Some(200_000)));
+        // The guess that needs no request: the files with the most symbols.
+        let mut big: Vec<(&str, usize)> = indexed.iter().map(|p| (*p, v.syms.iter().filter(|s| s.path == *p).count())).collect();
+        big.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        let big: Vec<&str> = big.into_iter().map(|b| b.0).collect();
+        // Files in the order an output first names them.
+        let order = |out: &str| -> Vec<String> {
+            let mut seen: Vec<String> = vec![];
+            for tok in out.split(|c: char| c.is_whitespace() || "():;,`'\"".contains(c)) {
+                if indexed.contains(tok) && !seen.iter().any(|s| s == tok) { seen.push(tok.to_string()); }
+            }
+            seen
+        };
+        let hit = |ranked: &[String], k: usize, changed: &[String]| ranked.iter().take(k).any(|r| changed.contains(r));
+        const STOP: &[&str] = &["the", "and", "for", "with", "from", "into", "that", "this", "when", "than", "them", "they", "make", "keep", "only", "each", "what", "does", "show", "after", "before", "without", "their", "while", "every", "once", "more", "less", "same", "other", "then", "use", "add", "fix", "test", "tests"];
+        let log = git(&repo, &["log", "--no-merges", "-n", &(n * 3).to_string(), "--format=%H\t%s"]).unwrap();
+        let (mut tasks, mut map_hit) = (0, 0);
+        // Hits at 1, 3 and 10 for code_find, grep and the biggest files.
+        let mut h = [[0usize; 3]; 3];
+        let (mut find_tok, mut grep_tok) = (vec![], vec![]);
+        for line in log.lines() {
+            if tasks == n { break; }
+            let Some((hash, subject)) = line.split_once('\t') else { continue };
+            let changed: Vec<String> = git(&repo, &["show", "--name-only", "--format=", hash]).unwrap_or_default().lines()
+                .filter(|f| indexed.contains(f) && !is_test(f, "")).map(str::to_string).collect();
+            if changed.is_empty() || changed.len() > 6 { continue; }
+            tasks += 1;
+            let words: Vec<String> = subject.split(|c: char| !c.is_alphanumeric() && c != '_').map(str::to_lowercase)
+                .filter(|w| w.len() >= 4 && !STOP.contains(&w.as_str())).collect::<BTreeSet<_>>().into_iter().collect();
+            let found = render_find(&v, Some(&repo), subject, None, 4000);
+            let f_rank = order(&found);
+            // The grep an agent runs: every line that holds one of the words, then the files
+            // that hold the most words. Its cost is the output it would read.
+            let mut args = vec!["grep", "-n", "-i", "-w", "-I"];
+            for w in &words { args.push("-e"); args.push(w); }
+            let out = if words.is_empty() { String::new() } else { git(&repo, &args).unwrap_or_default() };
+            let mut per: HashMap<&str, HashSet<String>> = HashMap::new();
+            for l in out.lines() {
+                let Some((f, rest)) = l.split_once(':') else { continue };
+                let low = rest.to_lowercase();
+                per.entry(f).or_default().extend(words.iter().filter(|w| low.contains(w.as_str())).cloned());
+            }
+            let mut ranked: Vec<(&str, usize)> = per.into_iter().map(|(f, w)| (f, w.len())).collect();
+            ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+            let g_rank: Vec<String> = ranked.iter().map(|r| r.0.to_string()).collect();
+            let b_rank: Vec<String> = big.iter().map(|b| b.to_string()).collect();
+            for (m, r) in [&f_rank, &g_rank, &b_rank].into_iter().enumerate() {
+                for (i, k) in [1, 3, 10].into_iter().enumerate() { h[m][i] += hit(r, k, &changed) as usize; }
+            }
+            let m_ok = changed.iter().any(|c| order(&map).contains(c));
+            map_hit += m_ok as usize;
+            find_tok.push(found.len() / 4); grep_tok.push(out.len() / 4);
+            let first = |r: &[String]| r.iter().position(|f| changed.contains(f)).map_or("-".into(), |p| (p + 1).to_string());
+            println!("{} find@{} grep@{} map={} | {subject}", &hash[..8], first(&f_rank), first(&g_rank), m_ok as u8);
+        }
+        let med = |v: &mut Vec<usize>| { v.sort(); v.get(v.len() / 2).copied().unwrap_or(0) };
+        let pct = |k: usize| 100 * k / tasks.max(1);
+        println!("\n{tasks} tasks over {} indexed files. A changed file among the first 1 / 3 / 10 named:", indexed.len());
+        for (m, name) in ["code_find on the subject", "grep on its words", "biggest files, no request"].into_iter().enumerate() {
+            println!("  {name:<26} {:>3}% {:>3}% {:>3}%", pct(h[m][0]), pct(h[m][1]), pct(h[m][2]));
+        }
+        println!("Median tokens to read: code_find {}, grep {}.", med(&mut find_tok), med(&mut grep_tok));
+        println!("The prompt map ({} tokens, paid once) names a changed file for {}%.", map.len() / 4, pct(map_hit));
+    }
+
     /// `BENCH_REPO=/path BENCH_SYMS=a,b,c cargo test bench_repo -- --ignored --nocapture`
     #[test]
     #[ignore]
