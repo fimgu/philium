@@ -26,13 +26,31 @@ function termLabel(t, agentName) {
 }
 
 export function AgentTerminals(props) {
-  const [list, { refetch }] = createResource(() => props.id, (id) =>
-    rpc("terminals.list").then((t) => t.filter((x) => x.agent_id === id)).catch(() => []));
-  useEvent("terminals:exit", () => refetch());
-  useEvent("terminals:changed", () => refetch());
-  const [mainId, { refetch: refetchMain }] = createResource(() => [props.id, props.live], ([id]) =>
-    rpc("agents.shell", { id }).catch(() => null));
-  useEvent("terminals:changed", () => refetchMain());
+  const isActive = () => props.active !== false;
+  const [activated, setActivated] = createSignal(isActive());
+  let dirtyList = false, dirtyMain = false;
+  const [list, { refetch }] = createResource(() => (activated() ? props.id : null), (id) => {
+    dirtyList = false;
+    return rpc("terminals.list").then((t) => t.filter((x) => x.agent_id === id)).catch(() => []);
+  });
+  const [mainId, { refetch: refetchMain }] = createResource(() => (activated() && props.id ? [props.id, props.live] : null), ([id]) => {
+    dirtyMain = false;
+    return rpc("agents.shell", { id }).catch(() => null);
+  });
+  useEvent("terminals:exit", () => {
+    if (isActive()) refetch();
+    else dirtyList = true;
+  });
+  useEvent("terminals:changed", () => {
+    if (isActive()) { refetch(); refetchMain(); }
+    else { dirtyList = true; dirtyMain = true; }
+  });
+  createEffect(() => {
+    if (!isActive()) return;
+    if (!activated()) { setActivated(true); return; }
+    if (dirtyList) { dirtyList = false; refetch(); }
+    if (dirtyMain) { dirtyMain = false; refetchMain(); }
+  });
   const [sel, setSel] = createSignal(null);
   const [showDone, setShowDone] = createSignal(false);
 
@@ -96,7 +114,7 @@ export function AgentTerminals(props) {
                 </button>
               </Show>
             </div>
-            <TermView id={tid} running={t().state === "running"} onData={(d) => props.onOutput?.(d)} />
+            <TermView id={tid} running={t().state === "running"} onData={(d) => { if (isActive()) props.onOutput?.(d); }} />
           </div>
         ); }}
       </Show>

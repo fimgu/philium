@@ -1,7 +1,7 @@
 // <AgentBrowser agent={id} /> : the agent's own browser, shown live next to its chat.
 // The agent drives it through MCP browser_* tools; the human can click, type and
 // sign in at any time (both act on the same tabs). Profile is per agent and persistent.
-import { createSignal, createMemo, createEffect, onMount, onCleanup, For, Show } from "solid-js";
+import { createSignal, createMemo, createEffect, onCleanup, For, Show } from "solid-js";
 import { Button, Badge } from "./kit.jsx";
 import { Icon } from "./icons.jsx";
 import { rpc, useEvent } from "../lib/rpc.js";
@@ -43,8 +43,10 @@ export function AgentBrowser(props) {
   const [offers, setOffers] = createSignal([]);
   const [covered, setCovered] = createSignal(false);
   const [info, setInfo] = createSignal(null);
-  let view, input, actionT;
+  let view, input, actionT, termsDirty = false;
   const myTerms = new Set();
+  const isActive = () => props.active !== false;
+  const isVisible = () => isActive() && props.visible !== false;
 
   const name = () => props.name ?? info()?.name ?? "agent";
   const strict = () => props.strict ?? !!info()?.strict;
@@ -63,14 +65,27 @@ export function AgentBrowser(props) {
     if (/is closed|no such tab/.test(s) && a?.tab) drop(a.tab); else setErr(s);
   });
 
+  const refreshTerms = (id = props.agent) => {
+    if (!id) return;
+    termsDirty = false;
+    rpc("terminals.list").then((l) => {
+      if (props.agent !== id) return;
+      myTerms.clear();
+      for (const t of l || []) if (t.agent_id === id) myTerms.add(t.id);
+    }).catch(() => {});
+  };
+
   const load = async () => {
     const id = props.agent;
-    setTabs([]); setActive(null); setOffers([]); myTerms.clear();
+    setTabs([]); setActive(null); setOffers([]); setInfo(null); myTerms.clear();
     if (!id) return;
     // Start clean: no stale native view from a previous mount or app reload stays on screen.
     rpc("browser.hide", { owner: id }).catch(() => {});
-    rpc("agents.get", { id }).then((r) => props.agent === id && setInfo(r)).catch(() => {});
-    rpc("terminals.list").then((l) => { for (const t of l || []) if (t.agent_id === id) myTerms.add(t.id); }).catch(() => {});
+    if (props.name === undefined || props.strict === undefined || props.provider === undefined) {
+      rpc("agents.get", { id }).then((r) => props.agent === id && setInfo(r)).catch(() => {});
+    }
+    if (isActive()) refreshTerms(id);
+    else termsDirty = true;
     try {
       const l = await rpc("browser.tabs", { owner: id });
       if (props.agent !== id) return;
@@ -83,6 +98,9 @@ export function AgentBrowser(props) {
     if (prevAgent && prevAgent !== props.agent) rpc("browser.hide", { owner: prevAgent }).catch(() => {});
     prevAgent = props.agent;
     load();
+  });
+  createEffect(() => {
+    if (isActive() && termsDirty) refreshTerms();
   });
 
   const open = async (url = "about:blank") => {
@@ -97,7 +115,7 @@ export function AgentBrowser(props) {
   const go = (url) => { const t = cur(); t ? call("navigate", { tab: t.id, url }) : open(url); setOffers((o) => o.filter((x) => x !== url)); };
   const close = async (id) => { drop(id); await rpc("browser.close", { tab: id }).catch(() => {}); };
 
-  const ping = () => { if (props.visible === false) props.onActivity?.(); };
+  const ping = () => { if (!isVisible()) props.onActivity?.(); };
   useEvent("browser:tab", (t) => {
     if (t.owner !== props.agent) return;
     if (!tabs().some((x) => x.id === t.id)) ping();
@@ -114,9 +132,12 @@ export function AgentBrowser(props) {
     clearTimeout(actionT); actionT = setTimeout(() => setAction(null), 2500);
   });
   // Dev servers: offer localhost URLs printed by this agent's terminals.
-  useEvent("terminals:changed", () => rpc("terminals.list").then((l) => { for (const t of l || []) if (t.agent_id === props.agent) myTerms.add(t.id); }).catch(() => {}));
+  useEvent("terminals:changed", () => {
+    if (isActive()) refreshTerms();
+    else termsDirty = true;
+  });
   useEvent("terminals:data", (d) => {
-    if (!myTerms.has(d.id)) return;
+    if (!isActive() || !d?.data || !myTerms.has(d.id)) return;
     const found = findLocalUrls(b64(d.data));
     if (!found.length) return;
     if (!tabs().length && props.autoOpen !== false) { open(found[0]); found.shift(); }
@@ -127,14 +148,18 @@ export function AgentBrowser(props) {
 
   createEffect(() => { const t = cur(); if (!editing()) setAddr(t && !blank(t.url) ? t.url : ""); });
 
-  onMount(() => {
+  createEffect(() => {
+    if (!isVisible()) {
+      setCovered(false);
+      return;
+    }
     const stop = nativeView(() => view, () => {
-      if (props.visible === false) return null;
       const t = cur();
       return t && !blank(t.url) && !t.error ? t.id : null;
     }, setCovered, (e, id) => { if (/is closed|no such tab/.test(e)) drop(id); });
-    onCleanup(() => { stop(); clearTimeout(actionT); });
+    onCleanup(stop);
   });
+  onCleanup(() => clearTimeout(actionT));
 
   const submit = (e) => {
     e.preventDefault();

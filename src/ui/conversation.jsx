@@ -1,7 +1,8 @@
 // Conversation view built from HAL session events. Used by Agents and Chat.
 // Events are folded into items: user / assistant (streamed) / tool / file /
 // permission / error. Assistant Markdown is rendered without raw HTML.
-import { For, Index, Show, Switch, Match, createSignal, createMemo, createEffect, on, onCleanup } from "solid-js";
+import { For, Index, Show, Switch, Match, batch, createSignal, createMemo, createComputed, createEffect, on, onCleanup } from "solid-js";
+import { createStore } from "solid-js/store";
 import { Portal } from "solid-js/web";
 import { Badge, Button, toast } from "./kit.jsx";
 import { Icon } from "./icons.jsx";
@@ -93,40 +94,48 @@ import { toolOutput, cleanTerminalText, shellStatus } from "../lib/tool-presenta
 
 function Tool(props) {
   const [open, setOpen] = createSignal(null);
+  const [rawOpen, setRawOpen] = createSignal(false);
   const expanded = () => open() ?? props.terminal;
   const t = () => props.item;
-  const state = () => shellStatus(t().result);
-  const resultText = () => {
-    return cleanTerminalText(toolOutput(t().result, t().out));
-  };
+  const state = createMemo(() => (typeof shellStatus === "function" ? shellStatus(t().result) : null));
+  const resultText = createMemo(() => (typeof cleanTerminalText === "function" ? cleanTerminalText(toolOutput(t().result, t().out)) : ""));
   const active = () => props.active && !t().inactive;
   const [elapsed, setElapsed] = createSignal(0);
   const [silent, setSilent] = createSignal(0);
-  const activeCall = createMemo(() => active() && t().running ? t().seq : null);
+  const activeCall = createMemo(() => (active() && !props.hidden && t().running ? t().seq : null));
   const output = createMemo(() => t().out);
+  let updatedAt = 0;
+  createEffect(() => {
+    output();
+    if (activeCall() == null) return;
+    updatedAt = Date.now();
+    setSilent(0);
+  });
   createEffect(() => {
     if (activeCall() == null) return;
     // Observation time, not execution time: history may have arrived late.
     const started = Date.now();
+    updatedAt = started;
     setElapsed(0);
-    const timer = setInterval(() => setElapsed(Math.floor((Date.now() - started) / 1000)), 1000);
-    onCleanup(() => clearInterval(timer));
-  });
-  createEffect(() => {
-    output();
-    if (activeCall() == null) return;
-    const updated = Date.now();
     setSilent(0);
-    const timer = setInterval(() => setSilent(Math.floor((Date.now() - updated) / 1000)), 1000);
+    const timer = setInterval(() => {
+      const now = Date.now();
+      setElapsed(Math.floor((now - started) / 1000));
+      setSilent(Math.floor((now - updatedAt) / 1000));
+    }, 1000);
     onCleanup(() => clearInterval(timer));
   });
   return (
     <div class="msg tool conv-tool">
-      <button type="button" class="row conv-tool-toggle" aria-expanded={!!expanded()} onClick={() => setOpen(!expanded())}>
+      <button type="button" class="row conv-tool-toggle" aria-expanded={!!expanded()} onClick={() => {
+        const next = !expanded();
+        if (!next) setRawOpen(false);
+        setOpen(next);
+      }}>
         <span class={`dot ${t().running ? active() ? "busy" : "" : t().ok === false || (state()?.startsWith("Exit ") && state() !== "Exit 0") ? "bad" : state() === "Still running" ? "" : "live"}`} />
         <b>{short(t().tool) === "shell_run" ? "Shell" : short(t().tool) === "shell_read" ? "Shell output" : short(t().tool)}</b>
         <span class="ellipsis dim grow">{t().args?.description ?? t().args?.intent ?? (short(t().tool) === "shell_run" ? t().args?.shell ?? "Command" : argSummary(t().tool, t().args))}</span>
-        <span class="xs dim">{t().running ? active() ? "Running" : "Unconfirmed" : t().ok === false ? "Failed" : (shellStatus(t().result) === "Still running" ? "Running at return" : shellStatus(t().result)) ?? "Returned"}</span>
+        <span class="xs dim">{t().running ? active() ? "Running" : "Unconfirmed" : t().ok === false ? "Failed" : (state() === "Still running" ? "Running at return" : state()) ?? "Returned"}</span>
         <Show when={t().ms != null}><span class="faint xs">{(t().ms / 1000).toFixed(1)}s</span></Show>
         <span class="dim" aria-hidden="true">{expanded() ? "▾" : "▸"}</span>
       </button>
@@ -140,10 +149,16 @@ function Tool(props) {
       <Show when={expanded()}>
         <Show when={short(t().tool) !== "shell_run"}><pre class="conv-pre">{JSON.stringify(t().args, null, 2)}</pre></Show>
         <Show when={resultText()}><pre class="conv-pre">{resultText().slice(0, 20000)}</pre><Show when={resultText().length > 20000}><span class="xs dim">Showing the first 20,000 characters of tool output.</span></Show></Show>
-        <details class="tool-raw"><summary>Raw tool data</summary><pre class="conv-pre">{JSON.stringify({ arguments: t().args, result: t().result }, null, 2)?.slice(0, 20000)}</pre></details>
+        <details class="tool-raw" onToggle={(e) => setRawOpen(e.currentTarget.open)}><summary>Raw tool data</summary><Show when={rawOpen()}><pre class="conv-pre">{JSON.stringify({ arguments: t().args, result: t().result }, null, 2)?.slice(0, 20000)}</pre></Show></details>
       </Show>
     </div>
   );
+}
+
+function isSameEvent(a, b) {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return a.seq != null && a.seq === b.seq && a.type === b.type && a.delta === b.delta && a.content === b.content && a.data === b.data && a.ok === b.ok && a.decision === b.decision;
 }
 
 /**
@@ -151,9 +166,264 @@ function Tool(props) {
  */
 export function Conversation(props) {
   let el;
-  const items = createMemo(() => fold(props.events ?? []));
+  const [store, setStore] = createStore({ items: [] });
+  const tools = new Map();
+  let streamingIdx = -1;
+  let turnText = false;
+  let cursor = 0;
+  let firstSeq = undefined;
+  let lastEvent = null;
+
+  const endPendingTools = () => {
+    for (const idx of tools.values()) {
+      if (store.items[idx]?.running) setStore("items", idx, "inactive", true);
+    }
+    if (streamingIdx >= 0) setStore("items", streamingIdx, "live", false);
+  };
+
+  const applyEvent = (e) => {
+    switch (e.type) {
+      case "message.created":
+        if (e.role === "user") {
+          setStore("items", store.items.length, {
+            kind: "user",
+            text: e.content,
+            seq: e.seq,
+            attachments: Array.isArray(e.attachments) ? e.attachments.filter((a) => /^[0-9a-f]{64}$/.test(a?.sha256 ?? "")) : [],
+            imageCount: typeof e.images === "number" ? e.images : 0,
+          });
+          turnText = false;
+        }
+        break;
+      case "model.delta":
+        if (streamingIdx < 0) {
+          streamingIdx = store.items.length;
+          setStore("items", streamingIdx, { kind: "assistant", text: e.delta ?? "", seq: e.seq, live: true, usage: undefined });
+        } else {
+          setStore("items", streamingIdx, "text", (t) => t + e.delta);
+        }
+        turnText = true;
+        break;
+      case "model.finished":
+        if (streamingIdx >= 0) setStore("items", streamingIdx, { live: false, usage: e.usage });
+        streamingIdx = -1;
+        break;
+      case "assistant.completed":
+        endPendingTools();
+        if (streamingIdx >= 0) {
+          setStore("items", streamingIdx, "live", false);
+          streamingIdx = -1;
+        } else if (!turnText && e.text) {
+          setStore("items", store.items.length, { kind: "assistant", text: e.text, seq: e.seq, live: false, usage: undefined });
+        }
+        turnText = false;
+        break;
+      case "tool.started": {
+        if (streamingIdx >= 0) setStore("items", streamingIdx, "live", false);
+        const idx = store.items.length;
+        setStore("items", idx, {
+          kind: "tool",
+          tool: e.tool,
+          args: e.arguments,
+          out: "",
+          seq: e.seq,
+          running: true,
+          inactive: undefined,
+          ok: undefined,
+          ms: undefined,
+          result: undefined,
+        });
+        tools.set(e.call_id, idx);
+        streamingIdx = -1;
+        break;
+      }
+      case "tool.output": {
+        const idx = tools.get(e.call_id);
+        if (idx != null) setStore("items", idx, "out", (out) => out + e.data);
+        break;
+      }
+      case "tool.finished": {
+        const idx = tools.get(e.call_id);
+        if (idx != null) setStore("items", idx, { running: false, ok: e.ok, ms: e.duration_ms, result: e.result });
+        break;
+      }
+      case "file.changed":
+        setStore("items", store.items.length, { kind: "file", path: e.path, diff: e.diff, seq: e.seq });
+        break;
+      case "permission.requested": {
+        const toolIdx = tools.get(e.call_id);
+        const args = toolIdx != null ? store.items[toolIdx]?.args : undefined;
+        setStore("items", store.items.length, {
+          kind: "perm",
+          id: e.request_id,
+          action: e.action,
+          resource: e.resource,
+          args,
+          seq: e.seq,
+          open: true,
+          decision: undefined,
+        });
+        break;
+      }
+      case "permission.resolved": {
+        const pIdx = store.items.findIndex((i) => i.kind === "perm" && i.id === e.request_id);
+        if (pIdx >= 0) setStore("items", pIdx, { open: false, decision: e.decision });
+        break;
+      }
+      case "turn.failed":
+        endPendingTools();
+        setStore("items", store.items.length, { kind: "error", text: e.error, seq: e.seq });
+        streamingIdx = -1;
+        break;
+      case "turn.cancelled":
+        endPendingTools();
+        setStore("items", store.items.length, { kind: "note", text: "Stopped.", seq: e.seq });
+        streamingIdx = -1;
+        break;
+      case "context.compacted":
+        setStore("items", store.items.length, { kind: "note", text: "Context compacted to save tokens.", seq: e.seq });
+        break;
+      case "loop.detected":
+        setStore("items", store.items.length, { kind: "error", text: `Loop detected: the agent repeated ${e.tool ?? "a tool"} ${e.repeats ?? ""} times.`, seq: e.seq });
+        break;
+      case "subagent.started":
+        setStore("items", store.items.length, { kind: "note", text: `Subagent started: ${e.description ?? e.agent ?? ""}`, seq: e.seq });
+        break;
+    }
+  };
+
+  createComputed(() => {
+    const evs = props.events ?? [];
+    batch(() => {
+      const canAppend =
+        cursor === 0
+          ? store.items.length === 0
+          : evs.length >= cursor && evs[0]?.seq === firstSeq && isSameEvent(evs[cursor - 1], lastEvent);
+      if (canAppend) {
+        for (let i = cursor; i < evs.length; i++) applyEvent(evs[i]);
+        cursor = evs.length;
+        firstSeq = evs[0]?.seq;
+        lastEvent = cursor > 0 ? evs[cursor - 1] : null;
+        return;
+      }
+      // Full reset fallback (e.g. switched session, array shrunk, or first seq / boundary event changed)
+      tools.clear();
+      streamingIdx = -1;
+      turnText = false;
+      const nextItems = [];
+      const endPendingNext = () => {
+        for (const idx of tools.values()) if (nextItems[idx]?.running) nextItems[idx].inactive = true;
+        if (streamingIdx >= 0) nextItems[streamingIdx].live = false;
+      };
+      for (const e of evs) {
+        switch (e.type) {
+          case "message.created":
+            if (e.role === "user") {
+              nextItems.push({ kind: "user", text: e.content, seq: e.seq, attachments: Array.isArray(e.attachments) ? e.attachments.filter((a) => /^[0-9a-f]{64}$/.test(a?.sha256 ?? "")) : [], imageCount: typeof e.images === "number" ? e.images : 0 });
+              turnText = false;
+            }
+            break;
+          case "model.delta":
+            if (streamingIdx < 0) {
+              streamingIdx = nextItems.length;
+              nextItems.push({ kind: "assistant", text: e.delta ?? "", seq: e.seq, live: true, usage: undefined });
+            } else {
+              nextItems[streamingIdx].text += e.delta;
+            }
+            turnText = true;
+            break;
+          case "model.finished":
+            if (streamingIdx >= 0) { nextItems[streamingIdx].live = false; nextItems[streamingIdx].usage = e.usage; }
+            streamingIdx = -1;
+            break;
+          case "assistant.completed":
+            endPendingNext();
+            if (streamingIdx >= 0) { nextItems[streamingIdx].live = false; streamingIdx = -1; }
+            else if (!turnText && e.text) nextItems.push({ kind: "assistant", text: e.text, seq: e.seq, live: false, usage: undefined });
+            turnText = false;
+            break;
+          case "tool.started": {
+            if (streamingIdx >= 0) nextItems[streamingIdx].live = false;
+            const idx = nextItems.length;
+            nextItems.push({ kind: "tool", tool: e.tool, args: e.arguments, out: "", seq: e.seq, running: true, inactive: undefined, ok: undefined, ms: undefined, result: undefined });
+            tools.set(e.call_id, idx);
+            streamingIdx = -1;
+            break;
+          }
+          case "tool.output": {
+            const idx = tools.get(e.call_id);
+            if (idx != null) nextItems[idx].out += e.data;
+            break;
+          }
+          case "tool.finished": {
+            const idx = tools.get(e.call_id);
+            if (idx != null) { nextItems[idx].running = false; nextItems[idx].ok = e.ok; nextItems[idx].ms = e.duration_ms; nextItems[idx].result = e.result; }
+            break;
+          }
+          case "file.changed":
+            nextItems.push({ kind: "file", path: e.path, diff: e.diff, seq: e.seq });
+            break;
+          case "permission.requested":
+            nextItems.push({ kind: "perm", id: e.request_id, action: e.action, resource: e.resource, args: nextItems[tools.get(e.call_id)]?.args, seq: e.seq, open: true, decision: undefined });
+            break;
+          case "permission.resolved": {
+            const p = nextItems.find((i) => i.kind === "perm" && i.id === e.request_id);
+            if (p) { p.open = false; p.decision = e.decision; }
+            break;
+          }
+          case "turn.failed":
+            endPendingNext();
+            nextItems.push({ kind: "error", text: e.error, seq: e.seq });
+            streamingIdx = -1;
+            break;
+          case "turn.cancelled":
+            endPendingNext();
+            nextItems.push({ kind: "note", text: "Stopped.", seq: e.seq });
+            streamingIdx = -1;
+            break;
+          case "context.compacted":
+            nextItems.push({ kind: "note", text: "Context compacted to save tokens.", seq: e.seq });
+            break;
+          case "loop.detected":
+            nextItems.push({ kind: "error", text: `Loop detected: the agent repeated ${e.tool ?? "a tool"} ${e.repeats ?? ""} times.`, seq: e.seq });
+            break;
+          case "subagent.started":
+            nextItems.push({ kind: "note", text: `Subagent started: ${e.description ?? e.agent ?? ""}`, seq: e.seq });
+            break;
+        }
+      }
+      if (store.items.length > nextItems.length) {
+        setStore("items", (prev) => prev.slice(0, nextItems.length));
+      }
+      for (let k = 0; k < nextItems.length; k++) {
+        const cur = store.items[k];
+        const nxt = nextItems[k];
+        if (cur && cur.kind === nxt.kind && cur.seq === nxt.seq) {
+          for (const key of Object.keys(nxt)) {
+            if (cur[key] === nxt[key]) continue;
+            if (
+              key === "attachments" &&
+              Array.isArray(cur.attachments) &&
+              Array.isArray(nxt.attachments) &&
+              cur.attachments.length === nxt.attachments.length &&
+              cur.attachments.every((a, idx) => a?.sha256 === nxt.attachments[idx]?.sha256)
+            ) {
+              continue;
+            }
+            setStore("items", k, key, nxt[key]);
+          }
+        } else {
+          setStore("items", k, nxt);
+        }
+      }
+      cursor = evs.length;
+      firstSeq = evs[0]?.seq;
+      lastEvent = cursor > 0 ? evs[cursor - 1] : null;
+    });
+  });
+
   const [stick, setStick] = createSignal(true);
-  createEffect(on(() => [items().length, items().at(-1)?.text?.length], () => {
+  createEffect(on(() => [store.items.length, store.items.at(-1)?.text?.length], () => {
     if (stick() && el) queueMicrotask(() => (el.scrollTop = el.scrollHeight));
   }));
   return (
@@ -164,10 +434,10 @@ export function Conversation(props) {
       <ViewToggle />
       <Lightbox />
       <div class="timeline">
-        <Show when={items().length === 0}>
+        <Show when={store.items.length === 0}>
           <div class="conv-empty">{props.emptyText ?? "No messages yet."}</div>
         </Show>
-        <Index each={items()}>
+        <Index each={store.items}>
           {(it) => (
             <Switch>
               <Match when={it().kind === "user"}><div class="msg user"><SentImages item={it()} load={props.loadAttachment} />{it().text}</div></Match>
@@ -198,7 +468,7 @@ export function Conversation(props) {
                   </Show>
                 </div>
               </Match>
-              <Match when={it().kind === "tool"}><Tool item={it()} active={props.busy && !props.readOnly} terminal={conversationView() === "terminal"} /></Match>
+              <Match when={it().kind === "tool"}><Tool item={it()} active={props.busy && !props.readOnly} hidden={props.hidden} terminal={conversationView() === "terminal"} /></Match>
               <Match when={it().kind === "file"}>
                 <details class="msg tool">
                   <summary><Icon name="repo" size={12} /> edited <b>{it().path}</b></summary>
@@ -237,15 +507,24 @@ export function Conversation(props) {
 
 const formatSize = (n) => n >= 1024 * 1024 ? `${(n / 1024 / 1024).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`;
 
-/** Full-size image overlay. Esc or click closes. */
+/** Full-size image overlay. Esc or click closes. Only the first mounted instance is active. */
 const [lightbox, setLightbox] = createSignal(null);
+const [lightboxHosts, setLightboxHosts] = createSignal([]);
+let lightboxNextId = 0;
 export function Lightbox() {
+  const id = ++lightboxNextId;
+  setLightboxHosts((list) => [...list, id]);
+  onCleanup(() => setLightboxHosts((list) => list.filter((x) => x !== id)));
+  const isHost = createMemo(() => lightboxHosts()[0] === id);
   const close = () => setLightbox(null);
-  const key = (e) => { if (e.key === "Escape" && lightbox()) close(); };
-  window.addEventListener("keydown", key);
-  onCleanup(() => window.removeEventListener("keydown", key));
+  createEffect(() => {
+    if (!isHost() || !lightbox()) return;
+    const key = (e) => { if (e.key === "Escape") close(); };
+    window.addEventListener("keydown", key);
+    onCleanup(() => window.removeEventListener("keydown", key));
+  });
   return (
-    <Show when={lightbox()}><Portal>
+    <Show when={isHost() && lightbox()}><Portal>
       <div class="lightbox" role="dialog" aria-modal="true" aria-label={lightbox().name} onClick={close}>
         <img src={lightbox().src} alt={lightbox().name} />
         <div class="lightbox-caption">{lightbox().name} · Esc to close</div>
@@ -350,6 +629,12 @@ export function KvTelemetryBar(props) {
   );
 }
 
+/** An error as one plain sentence with its fix; the original text under Error details. */
+export function PlainError(props) {
+  const e = () => plainError(props.text);
+  return <>{e().plain}<Show when={e().raw}><details class="tool-raw"><summary>Error details</summary><pre class="conv-pre">{e().raw}</pre></details></Show></>;
+}
+
 /** Effort presets. Names are not guarantees of latency, cost or quality. */
 export const SPEEDS = [
   { value: "fast", label: "Fast", effort: "low", hint: "Requests low reasoning effort, not guaranteed speed" },
@@ -363,14 +648,24 @@ export const effortSpeed = (e) => (e === "low" || e === "minimal" || e === "none
  * Images arrive by paste, drop (anywhere over the agent pane via props.dropTarget),
  * Attach menu file picker, or native screenshot. onSend(text, images) receives HAL
  * image parts [{ data: base64, media_type, name }] built only at send time. */
-/** An error as one plain sentence with its fix; the original text under Error details. */
-export function PlainError(props) {
-  const e = () => plainError(props.text);
-  return <>{e().plain}<Show when={e().raw}><details class="tool-raw"><summary>Error details</summary><pre class="conv-pre">{e().raw}</pre></details></Show></>;
-}
-
 export function Composer(props) {
   const localDraft = newDraft();
+  const revokePreview = (im) => {
+    if (im?.preview && typeof im.preview === "string" && im.preview.startsWith("blob:")) {
+      try { URL.revokeObjectURL(im.preview); } catch {}
+    }
+  };
+  const rawSetLocalImages = localDraft.setImages;
+  localDraft.setImages = (value) => {
+    const before = localDraft.images();
+    const res = rawSetLocalImages(value);
+    const after = new Set(localDraft.images());
+    for (const im of before) if (!after.has(im)) revokePreview(im);
+    return res;
+  };
+  onCleanup(() => {
+    for (const im of localDraft.images()) revokePreview(im);
+  });
   const record = () => props.draftKey ? draftFor(props.draftKey) : localDraft;
   const text = () => record().text(), setText = (value) => record().setText(value);
   const images = () => record().images(), setImages = (value) => record().setImages(value);
@@ -381,7 +676,31 @@ export function Composer(props) {
   const [permission, setPermission] = createSignal(false);
   const [adding, setAdding] = createSignal(0);
   const [menu, setMenu] = createSignal(false);
-  let input, picker;
+  let input, picker, attachEl;
+  const syncHeight = () => {
+    if (!input) return;
+    if (!text()) {
+      input.style.height = "";
+      input.style.overflowY = "hidden";
+      return;
+    }
+    input.style.height = "auto";
+    const sh = input.scrollHeight;
+    input.style.height = sh > 0 ? `${Math.min(sh, 200)}px` : "";
+    input.style.overflowY = sh > 200 ? "auto" : "hidden";
+  };
+  createEffect(on(text, () => syncHeight()));
+  createEffect(() => {
+    if (!menu()) return;
+    const onDown = (e) => { if (attachEl && !attachEl.contains(e.target)) setMenu(false); };
+    const onKey = (e) => { if (e.key === "Escape") setMenu(false); };
+    window.addEventListener("pointerdown", onDown, true);
+    window.addEventListener("keydown", onKey);
+    onCleanup(() => {
+      window.removeEventListener("pointerdown", onDown, true);
+      window.removeEventListener("keydown", onKey);
+    });
+  });
   const canAttach = () => record().ready() && !props.disabled;
   const effortOptions = createMemo(() => {
     const raw = props.effortOptions;
@@ -419,14 +738,17 @@ export function Composer(props) {
     if (!list.length) return;
     setNotice("");
     setAdding((n) => n + list.length);
+    const stored = [];
     try {
       const imgs = await Promise.all(list.map((f) => normalizeImage(f)));
       validateImages(imgs, target.images().length);
-      const stored = [];
       for (const f of imgs) stored.push(props.draftKey ? await attachImage(f, f.name || "image.png") : { sha256: "", media_type: f.type, name: f.name || "image.png", size: f.size, blob: f, preview: URL.createObjectURL(f) });
       if (target.images().length + stored.length > MAX_IMAGES) throw new Error(`Up to ${MAX_IMAGES} images per message.`);
       target.setImages((current) => [...current, ...stored]);
-    } catch (e) { setNotice(String(e?.message ?? e).replace(/^Error: /, "")); }
+    } catch (e) {
+      if (!props.draftKey) for (const im of stored) revokePreview(im);
+      setNotice(String(e?.message ?? e).replace(/^Error: /, ""));
+    }
     finally { setAdding((n) => Math.max(0, n - list.length)); input?.focus(); }
   };
   const capture = async () => {
@@ -570,12 +892,12 @@ export function Composer(props) {
         placeholder={props.placeholder ?? "Message (or /effort, /model)"}
         value={text()}
         disabled={props.disabled || !record().ready()}
-        onInput={(e) => setText(e.currentTarget.value)}
+        onInput={(e) => { setText(e.currentTarget.value); syncHeight(); }}
         onPaste={(e) => { const f = [...(e.clipboardData?.files ?? [])]; if (f.length) { e.preventDefault(); add(f); } }}
         onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); } }}
       />
       <div class="composer-bar">
-        <div class="composer-attach">
+        <div class="composer-attach" ref={attachEl}>
           <button type="button" class="composer-icon" aria-label="Attach" aria-haspopup="menu" aria-expanded={menu()} title="Attach images or a screenshot" disabled={!canAttach()} onClick={() => setMenu(!menu())}><Icon name="plus" size={14} /></button>
           <Show when={menu()}>
             <div class="composer-menu" role="menu" onKeyDown={(e) => e.key === "Escape" && setMenu(false)}>
