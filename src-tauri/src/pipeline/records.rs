@@ -397,7 +397,7 @@ pub(crate) mod tests {
     use super::*;
 
     pub fn db() -> Db {
-        Db::open(&std::env::temp_dir().join(format!("philium-pipe-{}.db", new_id()))).unwrap()
+        Db::open(&crate::ctx::test_dir("philium-pipe").join("records.db")).unwrap()
     }
     const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";

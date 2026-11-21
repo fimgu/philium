@@ -131,8 +131,7 @@ impl Ctx {
     /// Test context: in-memory DB, temp dirs, gateway without a listener.
     #[cfg(test)]
     pub fn test() -> Arc<Ctx> {
-        let dir = std::env::temp_dir().join(format!("philium-test-{}", crate::db::new_id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_dir("philium-test");
         Ctx::new(
             Db::memory(),
             dir.join("data"),
@@ -141,6 +140,44 @@ impl Ctx {
             "http://127.0.0.1:9".into(),
         )
     }
+}
+
+#[cfg(test)]
+static TEST_ROOT: OnceLock<PathBuf> = OnceLock::new();
+
+/// A fresh directory for one test. All of them sit under one root per test process, which
+/// is removed when the process exits. Roots left by test processes that died are removed
+/// the first time a test asks for a directory.
+#[cfg(test)]
+pub fn test_dir(prefix: &str) -> PathBuf {
+    let root = TEST_ROOT.get_or_init(|| {
+        let tmp = std::env::temp_dir();
+        #[cfg(unix)]
+        for entry in std::fs::read_dir(&tmp).into_iter().flatten().flatten() {
+            let name = entry.file_name();
+            let Some(pid) = name.to_str().and_then(|n| n.strip_prefix("philium-tests-")).and_then(|p| p.parse::<i32>().ok()) else { continue };
+            // Signal 0 only asks whether the process exists.
+            let gone = unsafe { libc::kill(pid, 0) } != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+            if gone {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+        let root = tmp.join(format!("philium-tests-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        #[cfg(unix)]
+        {
+            extern "C" fn remove_root() {
+                if let Some(root) = TEST_ROOT.get() {
+                    let _ = std::fs::remove_dir_all(root);
+                }
+            }
+            unsafe { libc::atexit(remove_root) };
+        }
+        root
+    });
+    let dir = root.join(format!("{prefix}-{}", crate::db::new_id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
 }
 
 /// Helpers for pulling typed args out of the `rpc` JSON.

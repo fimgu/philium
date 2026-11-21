@@ -2861,7 +2861,7 @@ mod tests {
     }
 
     fn repo() -> PathBuf {
-        let d = std::env::temp_dir().join(format!("ci-{}", crate::db::new_id()));
+        let d = crate::ctx::test_dir("ci");
         std::fs::create_dir_all(d.join("src")).unwrap();
         sh(&d, &["init", "-q", "-b", "main"]);
         std::fs::write(d.join("src/a.rs"), "pub struct Cfg { x: u32 }\nimpl Cfg {\n    pub fn load(&self) -> u32 {\n        helper(self.x)\n    }\n}\npub fn helper(n: u32) -> u32 {\n    n + 1\n}\npub fn other() {}\n").unwrap();

@@ -683,7 +683,7 @@ mod tests {
 
     #[test]
     fn cwd_stays_inside() {
-        let base = std::env::temp_dir().join(format!("mcp-cwd-{}", crate::db::new_id()));
+        let base = crate::ctx::test_dir("mcp-cwd");
         std::fs::create_dir_all(base.join("sub")).unwrap();
         assert!(inside(&base, Some("sub")).is_ok());
         assert!(inside(&base, Some("..")).is_err());

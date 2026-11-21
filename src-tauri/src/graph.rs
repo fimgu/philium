@@ -260,7 +260,7 @@ mod tests {
 
     #[test]
     fn fallback_graph() {
-        let d = std::env::temp_dir().join(format!("g-{}", crate::db::new_id()));
+        let d = crate::ctx::test_dir("g");
         std::fs::create_dir_all(d.join("src/lib")).unwrap();
         std::fs::create_dir_all(d.join("node_modules/x")).unwrap();
         std::fs::write(d.join("src/a.js"), "import b from './lib/b.js';\nimport r from 'react';\nconst c = require('./c');").unwrap();
