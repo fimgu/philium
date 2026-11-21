@@ -777,6 +777,162 @@ mod e2e {
         agents::stop(&ctx,id,"stopped"); server.abort();
     }
 
+    /// What a real agent is given, through the bundled HAL, the gateway and Philium's MCP:
+    /// a worker's system prompt holds the ranked codebase map and no worktree landscape,
+    /// an orchestrator's holds both, `code_find` answers through the real tool path, and
+    /// once two agents change the same function each hears of it on its next tool result.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agents_start_with_the_map_and_hear_of_clashes() {
+        if !hal::server_path().exists() {
+            eprintln!("skipping: no sidecar at {}", hal::server_path().display());
+            return;
+        }
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+        let dir = Scratch(std::env::temp_dir().join(format!("philium-ctx-e2e-{}", hal::random_token())));
+        std::fs::create_dir(&dir.0).unwrap();
+        // The model: each agent looks a concept up, then outlines a file, then stops. Every
+        // request is kept so the test can read what the agent was told.
+        // The second tool call waits until the test has made the clash, so the call that
+        // ends after the scan is known.
+        let seen: Arc<M<Vec<Value>>> = Default::default();
+        let s2 = seen.clone();
+        let (go, gate) = tokio::sync::watch::channel(false);
+        let app = axum::Router::new().route(
+            "/v1/{*rest}",
+            axum::routing::any(move |body: String| {
+                let s2 = s2.clone();
+                let mut gate = gate.clone();
+                async move {
+                    let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+                    if v["stream"] != json!(true) {
+                        return ([("content-type", "application/json")], r#"{"data":[{"id":"up-model"}]}"#.to_string());
+                    }
+                    s2.lk().push(v.clone());
+                    let results = v["messages"].as_array().map(|m| m.iter().filter(|m| m["role"] == "tool").count()).unwrap_or(0);
+                    if results == 1 {
+                        let _ = gate.wait_for(|open| *open).await;
+                    }
+                    let call = |name: &str, args: Value| json!({"tool_calls":[{"index":0,"id":format!("call_{results}"),"type":"function","function":{"name":name,"arguments":args.to_string()}}]});
+                    let delta = match results {
+                        0 => call("mcp_philium_code_find", json!({"query": "retry backoff"})),
+                        1 => call("mcp_philium_code_outline", json!({"path": "src/net.rs"})),
+                        _ => json!({"role":"assistant","content":"done"}),
+                    };
+                    let fin = if delta.get("tool_calls").is_some() { "tool_calls" } else { "stop" };
+                    let sse = format!(
+                        "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                        json!({"choices":[{"index":0,"delta":delta,"finish_reason":null}]}),
+                        json!({"choices":[{"index":0,"delta":{},"finish_reason":fin}],"usage":{"prompt_tokens":21,"completion_tokens":2}}),
+                    );
+                    ([("content-type", "text/event-stream")], sse)
+                }
+            }),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1", l.local_addr().unwrap());
+        let upstream = tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+
+        let gw = Gateway::new(hal::random_token(), None);
+        let gl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("http://{}", gl.local_addr().unwrap());
+        let router = gw.router();
+        let gateway = tokio::spawn(async move { axum::serve(gl, router).await.unwrap() });
+        let ctx = Ctx::new(db::Db::memory(), dir.0.join("data"), dir.0.join("root"), gw.clone(), addr);
+        ctx.db.kv_set("library.imported_at", "fixture").unwrap();
+        library::init(&ctx).unwrap();
+        codeindex::init(&ctx).unwrap();
+        let ml = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        ctx.mcp_url.set(format!("http://{}/mcp", ml.local_addr().unwrap())).unwrap();
+        let mr = mcp::router(ctx.clone());
+        let mcp_server = tokio::spawn(async move { axum::serve(ml, mr).await.unwrap() });
+        let p = Provider { id: "record".into(), name: "Loopback".into(), kind: Kind::OpenaiChat, base_url: url, trusted: true, guard: GuardMode::Redact, enabled: true, default_model: Some("up-model".into()) };
+        providers::upsert(&ctx, &p).unwrap();
+        gw.set_routes(vec![Route { provider: p, api_key: Some("fixture".into()) }]);
+
+        // A checkout where `Client` is used across files and `retry_backoff` is documented.
+        let repo = dir.0.join("app");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(repo.join("src/net.rs"), "pub struct Client { pub tries: u32 }\n\n/// Wait longer after each failed try.\npub fn retry_backoff(c: &Client) -> u64 {\n    1u64 << c.tries\n}\n").unwrap();
+        for f in ["a", "b", "c"] {
+            std::fs::write(repo.join(format!("src/{f}.rs")), format!("use crate::net::Client;\npub fn use_{f}(c: &Client) -> u32 {{ c.tries }}\n")).unwrap();
+        }
+        std::fs::write(repo.join("src/net_test.rs"), "fn helper_for_tests() {}\n").unwrap();
+        for args in [&["init", "-q", "-b", "main"][..], &["add", "."], &["-c", "user.name=Test", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "fixture"]] {
+            workspace::git(&repo, args).unwrap();
+        }
+        ctx.db.exec("INSERT INTO repos(id,name,path,default_branch,added_at) VALUES('r1','app',?1,'main',0)", [repo.to_str().unwrap()]).unwrap();
+
+        let start = |name: &str, role: &str| {
+            agents::spawn(&ctx, agents::SpawnReq {
+                name: Some(name.into()), role: Some(role.into()), model: Some("record/up-model".into()), repo_id: Some("r1".into()),
+                task_id: None, brief: Some("Look around.".into()), parent_id: None, strict: false, base: None,
+            }).unwrap()["id"].as_str().unwrap().to_string()
+        };
+        let (wid, lid) = (start("wren", "worker"), start("lead", "orchestrator"));
+        let wt_of = |id: &str| -> std::path::PathBuf {
+            let r = ctx.db.query("SELECT path FROM worktrees WHERE agent_id=?1 AND state='active'", [id]).unwrap();
+            r.first().and_then(|x| x["path"].as_str()).map(Into::into).unwrap_or_default()
+        };
+        let who = |r: &Value| r["messages"][0]["content"].as_str().unwrap_or_default().contains("Your agent name is \"wren\"");
+        let after = |r: &Value, n: usize| r["messages"].as_array().map(|m| m.iter().filter(|m| m["role"] == "tool").count()).unwrap_or(0) == n;
+        let waited = |pred: &dyn Fn(&Value) -> bool| {
+            let ok = seen.lk().iter().any(pred);
+            ok
+        };
+        // Both agents ask the model after their first tool result. Their worktrees then
+        // change the same function, a clash scan runs, and only then is the second call made.
+        for _ in 0..300 {
+            if waited(&|r| who(r) && after(r, 1)) && waited(&|r| !who(r) && after(r, 1)) { break; }
+            for id in [&wid, &lid] {
+                if let Some(e) = ctx.db.kv_get(&format!("agent_error.{id}")).filter(|e| !e.is_empty()) { panic!("agent failed: {e}"); }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(waited(&|r| who(r) && after(r, 1)) && waited(&|r| !who(r) && after(r, 1)), "both agents reached their first tool result");
+        let (ww, lw) = (wt_of(&wid), wt_of(&lid));
+        for (wt, body) in [(&ww, "1u64 << (c.tries + 1)"), (&lw, "2u64 << c.tries")] {
+            std::fs::write(wt.join("src/net.rs"), format!("pub struct Client {{ pub tries: u32 }}\n\n/// Wait longer after each failed try.\npub fn retry_backoff(c: &Client) -> u64 {{\n    {body}\n}}\n")).unwrap();
+        }
+        let scan = codeindex::call(&ctx, "clashes", json!({"repo_id": "r1"})).await.unwrap();
+        assert!(scan["text"].as_str().unwrap_or_default().contains("retry_backoff"), "{scan}");
+        go.send(true).unwrap();
+        for _ in 0..300 {
+            if waited(&|r| who(r) && after(r, 2)) && waited(&|r| !who(r) && after(r, 2)) { break; }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let reqs = seen.lk().clone();
+        let system = |worker: bool| reqs.iter().find(|r| who(r) == worker).map(|r| r["messages"][0]["content"].as_str().unwrap_or_default().to_string()).unwrap_or_default();
+        let (ws, ls) = (system(true), system(false));
+        let tool_text = |worker: bool, n: usize| -> String {
+            reqs.iter().filter(|r| who(r) == worker && after(r, n + 1)).flat_map(|r| r["messages"].as_array().cloned().unwrap_or_default())
+                .filter(|m| m["role"] == "tool").nth(n).map(|m| m["content"].to_string()).unwrap_or_default()
+        };
+
+        // The map, ranked: `Client` is used by three other files, the test file names nothing.
+        let map = ws.split("\n## Codebase map\n").nth(1).unwrap_or_default();
+        assert!(map.contains("src/net.rs  Client 1") && !map.contains("helper_for_tests"), "worker prompt map:\n{ws}");
+        assert!(!ws.contains("## Worktrees and branches") && ls.contains("## Worktrees and branches") && ls.contains("\n## Codebase map\n"), "landscape only for the orchestrator:\n{ls}");
+        // The map sits before the cache break, in the part that stays the same every turn.
+        for s in [&ws, &ls] {
+            let (shared, _) = s.split_once("<!-- PHILIUM_CACHE_BREAK -->").expect("cache break marker");
+            assert!(shared.contains("\n## Codebase map\n"), "map after the cache break:\n{s}");
+        }
+        // code_find through HAL and MCP finds the function by the words in its doc comment.
+        let found = tool_text(true, 0);
+        assert!(found.contains("src/net.rs") && found.contains("retry_backoff"), "code_find result: {found}");
+        // Each agent hears of the clash once, on the tool result after the scan.
+        let w2 = tool_text(true, 1);
+        let l2 = tool_text(false, 1);
+        assert!(w2.contains("your work now overlaps with") && w2.contains("retry_backoff"), "worker second result: {w2}");
+        assert!(l2.contains("your work now overlaps with"), "orchestrator second result: {l2}");
+        assert!(!tool_text(true, 0).contains("overlaps"), "no clash before the scan");
+        println!("worker map {} chars, orchestrator prompt adds the landscape, code_find and clash notes reached both agents", map.len());
+
+        for id in [&wid, &lid] { agents::stop(&ctx, id, "stopped"); }
+        for h in [upstream, gateway, mcp_server] { h.abort(); }
+    }
+
     /// Anthropic provider through the real HAL: HAL validates its config, speaks
     /// chat.completions, the gateway translates to Messages and back, and a tool
     /// call round-trips (denied in Chat, result returned to the model).
