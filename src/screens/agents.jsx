@@ -4,17 +4,23 @@
 import { workspaceAgents, selectedAgentId, spawnRepoDefault } from "../lib/agent-workspace.js";
 import { repoLabels } from "../lib/repo-labels.js";
 import { kindResources } from "../lib/kind-resources.js";
-import { For, Show, createSignal, createResource, createMemo, createEffect, on, onCleanup, Suspense } from "solid-js";
-import { NotFound, Page, Button, Badge, Dot, Empty, Modal, Field, Input, TextArea, Select, Toggle, Segmented, ModelPicker, confirm, toast } from "../ui/kit.jsx";
+import { For, Show, createSignal, createResource, createMemo, createEffect, on, onCleanup, Suspense, lazy } from "solid-js";
+import { NotFound, Page, Button, Badge, Dot, Empty, Segmented, ModelPicker, confirm, toast } from "../ui/kit.jsx";
 import { Icon } from "../ui/icons.jsx";
 import { Conversation, Composer, KvTelemetryBar, speedEffort, effortSpeed, agentAttachmentLoader, PlainError } from "../ui/conversation.jsx";
-import { AgentTerminals } from "../ui/agent-terminals.jsx";
-import { AgentBrowser } from "../ui/agent-browser.jsx";
-import { rpc, useEvent, fmt, sendError } from "../lib/rpc.js";
-import { go, params, registerCommands } from "../lib/nav.js";
+import { agentHue, AgentChip, RoleBadge, KvBadge, WarningPills } from "../ui/agent-chip.jsx";
+import { SpawnModal } from "../ui/spawn-modal.jsx";
+import { rpc, fmt, sendError } from "../lib/rpc.js";
+import { route, go, params, registerCommands } from "../lib/nav.js";
 import { useStore, activeRepoId, agentEventsCache } from "../lib/store.js";
+import { useScreenVisible, useVisibleEvent } from "../lib/visibility.js";
 import "../styles/agents.css";
 import "../styles/code.css";
+
+export { agentHue, AgentChip, RoleBadge, KvBadge, WarningPills, SpawnModal };
+
+const AgentTerminals = lazy(() => import("../ui/agent-terminals.jsx").then((m) => ({ default: m.AgentTerminals })));
+const AgentBrowser = lazy(() => import("../ui/agent-browser.jsx").then((m) => ({ default: m.AgentBrowser })));
 
 const STATE = {
   provisioning: ["busy", "Starting"],
@@ -29,174 +35,40 @@ const STATE = {
 const stateDot = (s) => STATE[s]?.[0] ?? "";
 const stateLabel = (s) => STATE[s]?.[1] ?? s;
 
-// Stable color per agent name, used for chips across the app.
-export function agentHue(name = "") {
-  let h = 0;
-  for (const c of name) h = (h * 31 + c.charCodeAt(0)) % 360;
-  return h;
-}
-export function AgentChip(props) {
-  return <span class="agent-chip" style={{ "--h": agentHue(props.name) }}>{props.name}</span>;
-}
-
-export function RoleBadge(props) {
-  const role = () => (props.role || "worker").toLowerCase();
-  return (
-    <span class={`role-badge role-${role()}`} title={`Role: ${role()}`}>
-      {role() === "orchestrator" ? "ORCH" : role() === "reviewer" ? "REV" : "WORK"}
-    </span>
-  );
-}
-
-export function KvBadge(props) {
-  const kv = () => props.kv || {};
-  const reqs = () => kv().requests || 0;
-  const hit = () => kv().cache_hit_pct ?? 0;
-  const inp = () => kv().input_tokens || 0;
-  const cached = () => kv().cached_tokens || 0;
-  const ttft = () => kv().avg_ttft_ms;
-  const tone = () => (hit() >= 60 ? "ok" : hit() >= 25 ? "warn" : inp() >= 8000 ? "bad" : "neutral");
-  return (
-    <Show when={reqs() > 0}>
-      <span
-        class={`kv-badge kv-${tone()}`}
-        title={`KV Cache: ${hit()}% hit (${(cached() / 1000).toFixed(1)}k cached / ${(inp() / 1000).toFixed(1)}k input across ${reqs()} reqs)${ttft() ? ` · avg TTFT ${ttft()}ms` : ""}`}
-      >
-        KV {hit()}%
-      </span>
-    </Show>
-  );
-}
-
-export function WarningPills(props) {
-  const warnings = () => props.warnings ?? [];
-  return (
-    <Show when={warnings().length}>
-      <div class="agent-warnings">
-        <For each={warnings().slice(0, props.max ?? 3)}>
-          {(w) => (
-            <span class={`warn-pill warn-${w.severity || "med"} warn-kind-${w.kind}`} title={w.text}>
-              {w.kind === "clash" ? "⚡ Clash" :
-               w.kind === "kv_cache" ? "❄ Cold KV" :
-               w.kind === "guard" ? "🛡 Guard" :
-               w.kind === "rate_limit" ? "⏳ 429" :
-               w.kind === "waiting" ? "✋ Approval" :
-               "⚠ Alert"}
-              <Show when={!props.compact}><span class="warn-pill-detail">{w.text}</span></Show>
-            </span>
-          )}
-        </For>
-      </div>
-    </Show>
-  );
-}
-
-/** Spawn dialog: name, role, model (live list), repo, task, brief, Strict. */
-export function SpawnModal(props) {
-  const store = useStore();
-  const [names] = createResource(() => rpc("agents.names"));
-  const models = store.models;
-  const providers = store.providers;
-  const repos = store.repos;
-  const labels = createMemo(() => repoLabels(repos() ?? []));
-  const [tasks] = createResource(() => rpc("board.list", { status: "open" }).catch(() => []));
-  const def = store.defaultModel;
-  const [name, setName] = createSignal(props.preset?.name ?? "");
-  const [role, setRole] = createSignal(props.preset?.role ?? "worker");
-  const [model, setModel] = createSignal("");
-  const [repo, setRepo] = createSignal(spawnRepoDefault(props.preset, activeRepoId()));
-  const [task, setTask] = createSignal(props.preset?.task_id ?? "");
-  const [brief, setBrief] = createSignal(props.preset?.brief ?? "");
-  const [strict, setStrict] = createSignal(false);
-  const [busy, setBusy] = createSignal(false);
-  const [err, setErr] = createSignal("");
-
-  const provById = createMemo(() => Object.fromEntries((providers() ?? []).map((p) => [p.id, p])));
-  const modelOptions = createMemo(() =>
-    (models() ?? [])
-      .filter((m) => m.enabled !== 0 && provById()[m.provider_id]?.enabled !== false)
-      .map((m) => {
-        const p = provById()[m.provider_id];
-        const tag = p && !p.trusted ? "  (untrusted, Strict)" : "";
-        return { value: m.ref, label: `${m.provider_name ?? m.provider_id} / ${m.display || m.model_id}${tag}` };
-      }));
-  const chosen = () => model() || def() || "";
-  const chosenProvider = () => provById()[(chosen() || "").split("/")[0]];
-  const forcedStrict = () => chosenProvider() && !chosenProvider().trusted;
-  const isSub = () => ["chatgpt_oauth", "claude_oauth", "antigravity_oauth"].includes(chosenProvider()?.kind);
-
-  createEffect(on(task, (t) => {
-    const tk = (tasks() ?? []).find((x) => x.id === t);
-    if (tk && !brief()) setBrief(`Work on board task "${tk.title}" (id ${tk.id}). Claim it first, follow the playbook, open a PR when done.\n\n${tk.detail ?? ""}`.trim());
-    if (tk?.repo_id && !repo()) setRepo(tk.repo_id);
-  }));
-
-  const submit = async () => {
-    if (role() === "orchestrator" && !repo()) { setErr("Choose a repo. A coordinator without a checkout cannot create tasks or start helpers."); return; }
-    setBusy(true); setErr("");
-    try {
-      const a = await rpc("agents.spawn", {
-        name: name().trim() || null,
-        role: role() || "worker",
-        parent_id: props.preset?.parent_id || null,
-        model: chosen() || null,
-        repo_id: repo() || null,
-        task_id: task() || null,
-        brief: brief(),
-        strict: strict() || forcedStrict(),
-      });
-      toast(`${a.name} (${role()}) is starting`, "secure");
-      props.onClose(a);
-    } catch (e) { setErr(String(e)); } finally { setBusy(false); }
-  };
-
-  return (
-    <Modal title="New agent" onClose={() => props.onClose(null)} footer={<>
-      <Button onClick={() => props.onClose(null)}>Cancel</Button>
-      <Button variant="primary" busy={busy()} onClick={submit}>Start Agent</Button>
-    </>}>
-      <div class="grid-2">
-        <Field label="Name" hint={`Leave empty for ${names()?.[0] ?? "a free name"}`}>
-          <Input value={name()} placeholder={names()?.[0] ?? "lion"} onValue={(v) => setName(v.toLowerCase().replace(/[^a-z0-9-]/g, ""))} />
-        </Field>
-        <Field label="Role" hint="Standard agent or multi-agent orchestrator">
-          <Select value={role()} onValue={setRole} options={[
-            { value: "worker", label: "Agent (Standard)" },
-            { value: "orchestrator", label: "Orchestrator (Spawns sub-agents)" },
-            { value: "reviewer", label: "Reviewer (Audits diffs & PRs)" },
-          ]} />
-        </Field>
-        <Field label="Model" hint="From your providers, discovered live">
-          <ModelPicker
-            value={chosen()}
-            onValue={setModel}
-            models={models() ?? []}
-            providers={providers() ?? []}
-            allowUntrusted={true}
-            placeholder="Choose a model"
-          />
-        </Field>
-        <Field label="Repo" hint="The agent gets its own worktree and branch">
-          <Select value={repo()} onValue={id => { setTask(""); setRepo(id); }} options={[{ value: "", label: "No repo (scratch only)" }, ...(repos() ?? []).map((r) => ({ value: r.id, label: labels().get(r.id) }))]} />
-        </Field>
-        <Field label="Task" hint="Optional: link a board task">
-          <Select value={task()} onValue={setTask} options={[{ value: "", label: "None" }, ...(tasks() ?? []).filter(t => (t.repo_id ?? "") === repo()).map((t) => ({ value: t.id, label: t.title }))]} />
-        </Field>
-      </div>
-      <Field label="Mission Brief" hint="The first instruction. Orchestrators will automatically plan, spawn workers on disjoint files, and synthesize results.">
-        <TextArea rows={5} value={brief()} onValue={setBrief} placeholder="Describe the mission, target PR, or task..." />
-      </Field>
-      <div class="row" style={{ "margin-top": "8px" }}>
-        <Toggle tone="strict" on={strict() || forcedStrict()} disabled={forcedStrict() || isSub()} onChange={setStrict} label="Strict mode" />
-        <span class="small dim">
-          <Show when={forcedStrict()} fallback={<Show when={isSub()} fallback="Sandboxed: own worktree only, network only to allowed hosts.">Subscriptions are trusted and run in Standard mode.</Show>}>
-            Required: this provider is untrusted. Sandboxed, every request recorded.
-          </Show>
-        </span>
-      </div>
-      <Show when={err()}><div class="err small" style={{ "margin-top": "8px" }}>{err()}</div></Show>
-    </Modal>
-  );
+/**
+ * Fast-path O(K) event merge when incoming events are strictly newer than previous.at(-1).seq.
+ * Falls back to Map deduplication + seq sort when events overlap or arrive out of order.
+ */
+function mergeEvents(previous, incoming) {
+  if (!incoming?.length) return previous;
+  if (!previous?.length) {
+    let sorted = true;
+    for (let i = 1; i < incoming.length; i++) {
+      if (incoming[i].seq == null || incoming[i - 1].seq == null || incoming[i].seq <= incoming[i - 1].seq) {
+        sorted = false;
+        break;
+      }
+    }
+    if (sorted) return incoming.slice();
+  } else {
+    const lastSeq = previous.at(-1)?.seq;
+    if (lastSeq != null) {
+      let canAppend = true;
+      let prevSeq = lastSeq;
+      for (let i = 0; i < incoming.length; i++) {
+        const s = incoming[i].seq;
+        if (s == null || s <= prevSeq) {
+          canAppend = false;
+          break;
+        }
+        prevSeq = s;
+      }
+      if (canAppend) return previous.concat(incoming);
+    }
+  }
+  const bySeq = new Map(previous.map((event) => [event.seq, event]));
+  for (const event of incoming) if (!bySeq.has(event.seq)) bySeq.set(event.seq, event);
+  return [...bySeq.values()].sort((a, b) => a.seq - b.seq);
 }
 
 function AgentRow(props) {
@@ -221,8 +93,8 @@ function AgentRow(props) {
 
 function Terminals(props) {
   const [list, { refetch }] = createResource(() => props.id, (id) => rpc("terminals.list").then((t) => t.filter((x) => x.agent_id === id)).catch(() => []));
-  useEvent("terminals:exit", () => refetch());
-  useEvent("terminals:changed", () => refetch());
+  useVisibleEvent("terminals:exit", () => refetch(), { debounceMs: 120 });
+  useVisibleEvent("terminals:changed", () => refetch(), { debounceMs: 120 });
   return (
     <div class="page-body">
       <Show when={(list() ?? []).length} fallback={<Empty title="No commands yet">Every command this agent runs opens a visible terminal here.</Empty>}>
@@ -264,10 +136,22 @@ function Impact(props) {
 
 function Changes(props) {
   const [diff, { refetch }] = createResource(() => props.id, (id) => rpc("agents.diff", { id }).catch((e) => ({ error: String(e) })));
+  const a = () => props.agent;
   return (
     <div class="page-body">
-      <div class="row" style={{ "margin-bottom": "8px" }}>
+      <div class="row" style={{ "margin-bottom": "8px", "flex-wrap": "wrap" }}>
         <span class="small dim grow">Changes in this agent's worktree, compared with where it started.</span>
+        <Show when={a()?.repo_id}>
+          <Button size="sm" variant="primary" onClick={() => go("code", { repo_id: a().repo_id, ...(a().worktree_id ? { worktree_id: a().worktree_id } : {}) })}>
+            <Icon name="graph" size={12} /> Inspect & comment in Code
+          </Button>
+        </Show>
+        <Button size="sm" onClick={() => props.onOpenShell ? props.onOpenShell() : go("terminals")}>
+          <Icon name="terminal" size={12} /> Open terminal
+        </Button>
+        <Button size="sm" variant="ghost" onClick={() => go("review")}>
+          <Icon name="pr" size={12} /> Review
+        </Button>
         <Button size="sm" onClick={refetch}><Icon name="refresh" size={12} /> Refresh</Button>
       </div>
       <Impact id={props.id} />
@@ -416,12 +300,22 @@ function Details(props) {
 }
 
 function AgentView(props) {
+  const screenVisible = useScreenVisible();
   const [tab, setTab] = createSignal("chat");
   const [aside, setAsideRaw] = createSignal(localStorage.getItem("agent.aside") ?? "none");
   const setAside = (v) => { setAsideRaw(v); localStorage.setItem("agent.aside", v); };
   const [asideW, setAsideW] = createSignal(Number(localStorage.getItem("agent.aside.w")) || 520);
   const [browserPing, setBrowserPing] = createSignal(false);
-  createEffect(on(aside, (v) => { if (v === "browser") setBrowserPing(false); }));
+  createEffect(on(aside, (v, prev) => {
+    if (v === "browser") setBrowserPing(false);
+    else if (prev === "browser" && props.id) rpc("browser.hide", { owner: props.id }).catch(() => {});
+  }));
+  useVisibleEvent("browser:tab", (t) => {
+    if (t?.owner === props.id && aside() !== "browser") setBrowserPing(true);
+  });
+  useVisibleEvent("browser:agent_action", (act) => {
+    if (act?.owner === props.id && aside() !== "browser") setBrowserPing(true);
+  });
   const drag = (e) => {
     e.preventDefault();
     const x0 = e.clientX, w0 = asideW();
@@ -442,11 +336,7 @@ function AgentView(props) {
   const [historyMore, setHistoryMore] = createSignal(false);
   let retryAfter = 0;
   let generation = 0, historyId;
-  const merge = (previous, incoming) => {
-    const bySeq = new Map(previous.map((event) => [event.seq, event]));
-    for (const event of incoming) if (!bySeq.has(event.seq)) bySeq.set(event.seq, event);
-    return [...bySeq.values()].sort((a, b) => a.seq - b.seq);
-  };
+  const merge = mergeEvents;
   const load = async (id, after = 0) => {
     const request = ++generation;
     let effectiveAfter = after;
@@ -487,7 +377,7 @@ function AgentView(props) {
   };
   onCleanup(() => generation++);
   createEffect(on(() => props.id, (id) => load(id)));
-  useEvent("agents:events", (p) => {
+  useVisibleEvent("agents:events", (p) => {
     if (p.id !== props.id || historyId !== props.id) return;
     setEvents((current) => {
       const next = merge(current, p.events ?? []);
@@ -495,7 +385,7 @@ function AgentView(props) {
       return next;
     });
   });
-  useEvent("agents:changed", (p) => { if (p.id === props.id) refetch(); });
+  useVisibleEvent("agents:changed", (p) => { if (p.id === props.id) refetch(); });
 
   const a = () => info()?.id === props.id ? info() : props.agent;
   const [effort, setEffort] = createSignal("default");
@@ -593,7 +483,7 @@ function AgentView(props) {
 
   // What is typed while the agent works waits here, survives a quit, and is sent when the step ends.
   const [queued, { refetch: refetchQueue }] = createResource(() => props.id, (id) => rpc("agents.queue_list", { id }).catch(() => []));
-  useEvent("agents:queue", (p) => { if (p.id === props.id || p.id === a()?.id) refetchQueue(); });
+  useVisibleEvent("agents:queue", (p) => { if (p.id === props.id || p.id === a()?.id) refetchQueue(); });
   const queue = async (text, images = []) => {
     try { await rpc("agents.queue_add", { id: props.id, text, images }, { action: true }); refetchQueue(); return true; }
     catch (e) { toast(String(e), "danger"); return false; }
@@ -654,7 +544,7 @@ function AgentView(props) {
         <Segmented value={aside()} onChange={setAside} options={[
           { value: "terminal", label: <span class="row gap-4" title="Open the agent's live terminal alongside its conversation"><Icon name="terminal" size={12} /> Live shell</span> },
           { value: "browser", label: <span class="row gap-4" title="The agent's live browser"><Icon name="globe" size={12} /> Browser<Show when={browserPing()}><span class="ping" /></Show></span> },
-          { value: "none", label: <span title="Focus on the conversation and inline command output">Focus</span> },
+          { value: "none", label: <span title="Hide the side panel and focus on the conversation">Hide panel</span> },
         ]} />
         <Show when={live()} fallback={<Button size="sm" onClick={() => rpc("agents.resume", { id: props.id }, { action: true }).catch((e) => toast(String(e), "danger"))}><Icon name="play" size={11} /> Resume</Button>}>
           <Button size="sm" onClick={() => rpc("agents.stop", { id: props.id }, { action: true }).catch((e) => toast(String(e), "danger"))}><Icon name="stop" size={11} /> Stop</Button>
@@ -701,22 +591,26 @@ function AgentView(props) {
               placeholder={live() ? `Message ${a()?.name ?? ""} (or /effort, /model)` : "Agent is stopped"} />
           </Show>
           <Show when={tab() === "terms"}><Terminals id={props.id} /></Show>
-          <Show when={tab() === "changes"}><Changes id={props.id} /></Show>
+          <Show when={tab() === "changes"}><Changes id={props.id} agent={a()} onOpenShell={() => setAside("terminal")} /></Show>
           <Show when={tab() === "info" && info()}><Details agent={info()} onRefetch={refetch} /></Show>
         </div>
         <div class="agent-aside" classList={{ hidden: aside() === "none" }} style={{ width: `${asideW()}px` }}>
-            <div class="aside-grip" onPointerDown={drag} title="Drag to resize" />
-            <div class="aside-body" classList={{ hidden: aside() !== "terminal" }}>
+          <div class="aside-grip" onPointerDown={drag} title="Drag to resize" />
+          <Show when={aside() === "terminal"}>
+            <div class="aside-body">
               <Suspense fallback={<div class="small dim" role="status">Loading terminals…</div>}>
-                <AgentTerminals id={props.id} name={a()?.name ?? ""} live={live()} />
+                <AgentTerminals id={props.id} name={a()?.name ?? ""} live={live()} active={screenVisible() && aside() === "terminal"} />
               </Suspense>
             </div>
-            <div class="aside-body" classList={{ hidden: aside() !== "browser" }}>
+          </Show>
+          <Show when={aside() === "browser"}>
+            <div class="aside-body">
               <Suspense fallback={<div class="small dim" role="status">Loading browser…</div>}>
-                <AgentBrowser agent={props.id} name={a()?.name} strict={a()?.strict} provider={a()?.model_ref?.split("/")[0]} visible={aside() === "browser"} onActivity={() => setBrowserPing(true)} />
+                <AgentBrowser agent={props.id} name={a()?.name} strict={a()?.strict} provider={a()?.model_ref?.split("/")[0]} active={screenVisible() && aside() === "browser"} visible={screenVisible() && aside() === "browser"} onActivity={() => setBrowserPing(true)} />
               </Suspense>
             </div>
-          </div>
+          </Show>
+        </div>
       </div>
     </div>
   );
@@ -729,25 +623,33 @@ export function AgentGridCard(props) {
   const [sending, setSending] = createSignal(false);
   let generation = 0;
 
-  const merge = (previous, incoming) => {
-    const bySeq = new Map(previous.map((event) => [event.seq, event]));
-    for (const event of incoming) if (!bySeq.has(event.seq)) bySeq.set(event.seq, event);
-    return [...bySeq.values()].sort((x, y) => x.seq - y.seq);
-  };
-
   const load = async (id) => {
     const req = ++generation;
+    const cached = agentEventsCache.get(id);
+    const after = cached?.length ? (cached.at(-1)?.seq ?? 0) : 0;
+    if (cached?.length) setEvents(cached);
     try {
-      const evs = await rpc("agents.events", { id, after: 0, limit: 250 }, { local: true });
-      if (req === generation && Array.isArray(evs)) setEvents((cur) => merge(cur, evs));
+      const evs = await rpc("agents.events", { id, after, limit: 5000 }, { local: true });
+      if (req === generation && Array.isArray(evs)) {
+        setEvents((cur) => {
+          const next = mergeEvents(cur, evs);
+          agentEventsCache.set(id, next);
+          return next;
+        });
+      }
     } catch {}
   };
 
   onCleanup(() => generation++);
   createEffect(on(() => a()?.id, (id) => { if (id) load(id); }));
-  useEvent("agents:events", (p) => {
-    if (p.id !== a()?.id) return;
-    setEvents((cur) => merge(cur, p.events ?? []));
+  useVisibleEvent("agents:events", (p) => {
+    const id = a()?.id;
+    if (!id || p.id !== id) return;
+    setEvents((cur) => {
+      const next = mergeEvents(cur, p.events ?? []);
+      agentEventsCache.set(id, next);
+      return next;
+    });
   });
 
   const live = () => !!a()?.live;
@@ -892,10 +794,11 @@ function FleetHeatmapTile(props) {
 
 /** Quick Mission Dispatch Bar: 1-line launch for an Orchestrator cluster or Worker. */
 function MissionDispatchBar(props) {
-  const [repos] = createResource(() => rpc("workspace.repos_list").catch(() => []));
+  const store = useStore();
+  const repos = store.repos;
   const labels = createMemo(() => repoLabels(repos() ?? []));
-  const [repoId, setRepoId] = createSignal(activeRepoId());
-  createEffect(on(activeRepoId, id => setRepoId(id), { defer: true }));
+  const [repo, setRepo] = createSignal(spawnRepoDefault(props.preset, activeRepoId()));
+  createEffect(on(activeRepoId, (id) => setRepo(spawnRepoDefault(props.preset, id)), { defer: true }));
   const [role, setRole] = createSignal("orchestrator");
   const [brief, setBrief] = createSignal("");
   const [busy, setBusy] = createSignal(false);
@@ -908,7 +811,7 @@ function MissionDispatchBar(props) {
     try {
       const a = await rpc("agents.spawn", {
         role: role(),
-        repo_id: repoId() || null,
+        repo_id: repo() || null,
         brief: text,
       });
       setBrief("");
@@ -929,9 +832,9 @@ function MissionDispatchBar(props) {
         <option value="worker">Worker (Single Task)</option>
         <option value="reviewer">Reviewer (PR / Diff Audit)</option>
       </select>
-      <select class="select mission-select" value={repoId()} onChange={(e) => setRepoId(e.currentTarget.value)} aria-label="Target repository">
+      <select class="select mission-select" value={repo()} onChange={(e) => setRepo(e.currentTarget.value)} aria-label="Target repository">
         <option value="">Any / Scratch Repo</option>
-        <For each={repos() ?? []}>{(r) => <option value={r.id} selected={repoId() === r.id}>{labels().get(r.id)}</option>}</For>
+        <For each={repos() ?? []}>{(r) => <option value={r.id} selected={repo() === r.id}>{labels().get(r.id)}</option>}</For>
       </select>
       <input
         type="text"
@@ -952,13 +855,18 @@ export default function Agents() {
   const store = useStore();
   const list = store.agents;
   const refetch = store.refetchAgents;
+  const screenVisible = typeof useScreenVisible === "function" ? useScreenVisible() : () => true;
   const [spawn, setSpawn] = createSignal(null);
-  // Stopped or failed agents: what they found stays in Review and Board after they go.
-  const finished = () => (list() || []).filter((a) => a.state === "stopped" || a.state === "failed");
+  const scoped = createMemo(() => workspaceAgents(list() ?? [], activeRepoId(), store.repos() ?? []));
+  // Stopped or failed agents in the active workspace scope: what they found stays in Review and Board after they go.
+  const finished = createMemo(() => scoped().filter((a) => a.state === "stopped" || a.state === "failed"));
   async function removeFinished() {
-    const names = finished().map((a) => a.name);
+    const targets = finished();
+    const ids = targets.map((a) => a.id);
+    const names = targets.map((a) => a.name);
+    if (!ids.length) return;
     if (!(await confirm(`Remove ${names.length} finished agent${names.length === 1 ? "" : "s"}?`, `${names.join(", ")}. Their folders and saved history go; what they found stays in Review and Board. Agents that are working or waiting for you stay.`, { danger: true, ok: "Remove" }))) return;
-    const r = await rpc("agents.remove_many", { scope: "finished" }, { action: true }).catch((e) => ({ error: String(e) }));
+    const r = await rpc("agents.remove_many", { scope: "finished", ids }, { action: true }).catch((e) => ({ error: String(e) }));
     if (r.error) return toast(r.error, "bad");
     let removed = r.removed?.length || 0;
     if (r.unsaved?.length) {
@@ -990,7 +898,8 @@ export default function Agents() {
   }
   async function removePicked() {
     const all = list() || [];
-    const ids = picked().filter((id) => all.some((a) => a.id === id));
+    const allIds = new Set(all.map((a) => a.id));
+    const ids = picked().filter((id) => allIds.has(id));
     if (!ids.length) return;
     // Helpers go with their lead; say so before anything is removed.
     const going = new Set(ids);
@@ -1019,7 +928,8 @@ export default function Agents() {
     refetch?.();
   }
   const onKey = (e) => {
-    if (!picked().length || e.target.closest?.("input, textarea, select, [contenteditable=true]")) return;
+    if (!screenVisible() || (typeof route === "function" && route() !== "agents")) return;
+    if (!picked().length || e.target?.closest?.("input, textarea, select, [contenteditable=true]")) return;
     if (e.key === "Delete" || e.key === "Backspace") { e.preventDefault(); removePicked(); }
     else if (e.key === "Escape") setPicked([]);
   };
@@ -1035,17 +945,20 @@ export default function Agents() {
     if (params().focusOwner && params().id) {
       setFilter('all'); setSearch(''); setViewModeRaw('split');
     }
+    if (params().spawn) {
+      setSpawn(typeof params().spawn === "object" ? params().spawn : {});
+    }
   });
 
-  registerCommands([
+  const unregisterCommands = registerCommands([
     { id: "agent.new", label: "New agent / orchestrator", run: () => setSpawn({}) },
     { id: "agent.clusters", label: "Agents: Cluster hierarchy view (Orchestrator -> Workers)", run: () => setViewMode("clusters") },
     { id: "agent.grid", label: "Agents: Grid view (all agents side-by-side)", run: () => setViewMode("grid") },
     { id: "agent.fleet", label: "Agents: Fleet heatmap view (100+ agents)", run: () => setViewMode("fleet") },
     { id: "agent.split", label: "Agents: Focus view (single agent + shell/browser)", run: () => setViewMode("split") },
   ]);
+  if (typeof onCleanup === "function" && unregisterCommands) onCleanup(unregisterCommands);
 
-  const scoped = createMemo(() => workspaceAgents(list() ?? [], activeRepoId(), store.repos() ?? []));
   const filtered = createMemo(() => {
     const q = search().trim().toLowerCase();
     return scoped().filter((a) => {
@@ -1064,9 +977,10 @@ export default function Agents() {
   // Tree order: parents first, children indented beneath.
   const tree = createMemo(() => {
     const all = filtered();
+    const ids = new Set(all.map((x) => x.id));
     const byParent = new Map();
     for (const a of all) {
-      const p = all.some((x) => x.id === a.parent_id) ? a.parent_id : null;
+      const p = a.parent_id && ids.has(a.parent_id) ? a.parent_id : null;
       if (!byParent.has(p)) byParent.set(p, []);
       byParent.get(p).push(a);
     }
@@ -1097,7 +1011,7 @@ export default function Agents() {
     return [...groups.values()];
   });
 
-  const selected = () => selectedAgentId(tree().map(({ a }) => a), params().id);
+  const selected = createMemo(() => selectedAgentId(tree().map(({ a }) => a), params().id));
 
   const telemetry = createMemo(() => {
     const l = scoped();
@@ -1134,10 +1048,23 @@ export default function Agents() {
   };
 
   const approveAllWaiting = async (clusterId = null) => {
+    const waitingAgents = scoped().filter(
+      (a) => a.state === "waiting" && (!clusterId || a.cluster_id === clusterId || a.id === clusterId),
+    );
+    if (typeof confirm === "function") {
+      const names = waitingAgents.map((a) => a.name);
+      const count = waitingAgents.length || telemetry().waiting;
+      const ok = await confirm(
+        `Approve ${count} waiting agent${count === 1 ? "" : "s"}?`,
+        `Approve pending permission request(s) once for: ${names.join(", ") || "waiting agents"}. Open an agent directly to review or grant session-wide permissions.`,
+        { ok: `Approve once (${count})` },
+      );
+      if (!ok) return;
+    }
     try {
       const res = await rpc("agents.batch_permission", {
         decision: "approve",
-        scope: "session",
+        scope: "once",
         cluster_id: clusterId,
         repo_id: activeRepoId() || null,
       });
@@ -1179,11 +1106,15 @@ export default function Agents() {
             { value: "all", label: "All" },
             { value: "live", label: "Running" },
             { value: "waiting", label: `Need you${telemetry().waiting ? ` (${telemetry().waiting})` : ""}` },
+            ...(telemetry().warnings > 0 || filter() === "warnings"
+              ? [{ value: "warnings", label: `Warnings (${telemetry().warnings})` }]
+              : []),
           ]} />
           <Segmented value={viewMode()} onChange={setViewMode} options={[
             { value: "split", label: <span class="row gap-4" title="Single agent with live terminal & browser"><Icon name="agents" size={12} /> Focus</span> },
             { value: "grid", label: <span class="row gap-4" title="Watch and control all agents side-by-side"><Icon name="grid" size={12} /> Grid</span> },
             { value: "clusters", label: <span class="row gap-4" title="Grouped by cluster"><Icon name="board" size={12} /> Clusters</span> },
+            { value: "fleet", label: <span class="row gap-4" title="Compact fleet heatmap"><Icon name="activity" size={12} /> Fleet</span> },
           ]} />
         </Show>
         <Button variant="primary" onClick={() => setSpawn({})}><Icon name="plus" size={12} /> New agent</Button>

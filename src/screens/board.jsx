@@ -1,8 +1,9 @@
-import { createSignal, createMemo, onMount, onCleanup, For, Show } from "solid-js";
+import { createSignal, createMemo, createEffect, on, onMount, For, Show } from "solid-js";
 import { Page, Button, Empty, VirtualList } from "../ui/kit.jsx";
-import { rpc, useEvent, fmt } from "../lib/rpc.js";
+import { rpc, fmt } from "../lib/rpc.js";
 import { activeRepoId, useStore } from "../lib/store.js";
-import { go } from "../lib/nav.js";
+import { go, params } from "../lib/nav.js";
+import { useVisibleEvent, useClock } from "../lib/visibility.js";
 import { ManagedJobs } from "./managed-jobs.jsx";
 import "../styles/board.css";
 
@@ -14,15 +15,23 @@ const holder = (t) => t.owner || (t.assigned ? `Handed to ${t.assigned} · ${STA
 const color = (name) => `hsl(${[...(name || "you")].reduce((n, c) => n + c.charCodeAt(0) * 13, 0) % 360} 55% 65%)`;
 export default function Board() {
   const store = useStore();
+  const clock = useClock(1000);
   const [handTo, setHandTo] = createSignal("");
   const [rawTasks, setTasks] = createSignal([]), [tab, setTab] = createSignal("board"), [cancelled, setCancelled] = createSignal(false);
   const tasks = createMemo(() => {
     const rid = activeRepoId();
     return rid ? rawTasks().filter((t) => t.repo_id === rid) : rawTasks();
   });
+  const tasksByStatus = createMemo(() => {
+    const grouped = { open: [], claimed: [], in_review: [], done: [], cancelled: [] };
+    for (const t of tasks()) {
+      (grouped[t.status] ??= []).push(t);
+    }
+    return grouped;
+  });
   const [title, setTitle] = createSignal(""), [priority, setPriority] = createSignal("normal"), [job, setJob] = createSignal("commit"), [books, setBooks] = createSignal([]);
   const [selected, setSelected] = createSignal(null), [detail, setDetail] = createSignal(""), [editTitle, setEditTitle] = createSignal(""), [depText, setDepText] = createSignal(""), [note, setNote] = createSignal("");
-  const [error, setError] = createSignal(""), [busy, setBusy] = createSignal(false), [clock, setClock] = createSignal(Date.now());
+  const [error, setError] = createSignal(""), [busy, setBusy] = createSignal(false);
   const [taskMail, setTaskMail] = createSignal([]);
   const [mail, setMail] = createSignal([]), [messages, setMessages] = createSignal([]), [a, setA] = createSignal("you"), [b, setB] = createSignal("all"), [body, setBody] = createSignal("");
   const columns = createMemo(() => cancelled() ? [...statuses, ["cancelled", "Cancelled"]] : statuses);
@@ -31,9 +40,33 @@ export default function Board() {
   async function readMail() { setMail(await rpc("board.mail_inbox", { agent: a(), mark_read: true })); await readThread(); }
   async function readTaskMail(t) { const rows = await rpc("board.mail_threads", { a: "you", b: t.owner || "all", limit: 1000 }); setTaskMail(rows.filter(m => m.body.includes(t.id))); }
   async function readThread() { setMessages(await rpc("board.mail_threads", { a: a(), b: b(), limit: 1000 })); }
-  onMount(() => { attempt(async () => { await refresh(); setBooks(await rpc("board.playbooks")); await readMail(); }); const timer = setInterval(() => setClock(Date.now()), 1000); onCleanup(() => clearInterval(timer)); });
-  useEvent("board:changed", () => attempt(refresh)); useEvent("mail:new", () => attempt(async () => { await readMail(); if (selected()) await readTaskMail(selected()); }));
-  async function openTask(task) { await attempt(async () => { const t = await rpc("board.get", { task_id: task.id }); setSelected(t); setDetail(t.detail); setEditTitle(t.title); setDepText(t.depends_on.join(", ")); setNote(""); await readTaskMail(t); }); }
+  async function openTask(task) {
+    if (!task?.id) return;
+    await attempt(async () => {
+      const t = await rpc("board.get", { task_id: task.id });
+      if (!t) return;
+      setSelected(t);
+      setDetail(t.detail ?? "");
+      setEditTitle(t.title ?? "");
+      setDepText((t.depends_on ?? []).join(", "));
+      setNote("");
+      await readTaskMail(t);
+    });
+  }
+  onMount(() => {
+    attempt(async () => {
+      const [, playbooks] = await Promise.all([refresh(), rpc("board.playbooks"), readMail()]);
+      setBooks(playbooks ?? []);
+    });
+  });
+  createEffect(on(() => params()?.id, (id) => {
+    if (id && selected()?.id !== id) {
+      setTab("board");
+      openTask({ id });
+    }
+  }));
+  useVisibleEvent("board:changed", () => attempt(refresh), { debounceMs: 150 });
+  useVisibleEvent("mail:new", () => attempt(async () => { await readMail(); if (selected()) await readTaskMail(selected()); }), { debounceMs: 150 });
   async function patch(patch) { await rpc("board.update", { task_id: selected().id, patch }); await refresh(); }
   async function sendBack(t) { await attempt(async () => { if (t.status === "in_review") await rpc("board.update", { task_id: t.id, patch: { status: "claimed", note: "Changes requested: resolve failed checks and resubmit." } }); await rpc("board.mail_send", { to: t.owner || "all", body: `Task ${t.id}: please resolve failed checks and resubmit.` }); await refresh(); }); }
   const failures = (t) => (t.check_results || []).filter(c => c.passed === false);
@@ -47,7 +80,7 @@ export default function Board() {
     </section>}>
       <form class="board-add" onSubmit={e => { e.preventDefault(); attempt(async () => { await rpc("board.create", { title: title(), priority: priority(), playbook: job() || null, repo_id: activeRepoId() || null }); setTitle(""); await refresh(); }); }}><input aria-label="New task title" placeholder="What needs doing?" value={title()} onInput={e => setTitle(e.currentTarget.value)} /><select aria-label="Priority" value={priority()} onChange={e => setPriority(e.currentTarget.value)}><option>low</option><option>normal</option><option>high</option><option>urgent</option></select><select aria-label="Playbook" value={job()} onChange={e => setJob(e.currentTarget.value)}><option value="" selected={job() === ""}>No playbook</option><For each={books()}>{p => <option value={p.job}>{p.job}</option>}</For></select><Button type="submit" disabled={busy() || !title().trim()}>Add task</Button></form>
       <label class="board-toggle"><input type="checkbox" checked={cancelled()} onChange={e => setCancelled(e.currentTarget.checked)} /> Show cancelled</label>
-      <div class="board-columns"><For each={columns()}>{([status, label]) => <section class="board-column"><h3>{label} <span>{tasks().filter(t => t.status === status).length}</span></h3><Show when={tasks().some(t => t.status === status)} fallback={<p class="board-empty">{status === "open" ? "Add a task above to begin." : "Tasks appear here as work progresses."}</p>}><VirtualList items={tasks().filter(t => t.status === status)} rowHeight={136}>{t => <article class={`board-task ${t.blocked ? "blocked" : ""}`}><button class="board-task-title" onClick={() => openTask(t)}>{t.title}</button><div class="board-meta"><span class="board-owner" style={{ color: color(t.owner || t.assigned) }}>{holder(t)}</span><span>{t.priority}</span><span>{t.depends_on.length} deps{t.blocked ? " · Blocked" : ""}</span></div><Show when={t.lease_expires_at}><small>Lease {Math.max(0, Math.ceil((t.lease_expires_at - clock()) / 1000))}s</small></Show><div class="board-progress"><For each={t.playbook_progress?.steps || []}>{(step, i) => <span classList={{ current: i() === t.step, complete: i() < t.step }} title={step}>{i() + 1}. {step}</span>}</For></div><Show when={failures(t).length}><p class="board-warning">{failures(t)[0].message}</p><Button onClick={() => sendBack(t)}>Send back</Button></Show></article>}</VirtualList></Show></section>}</For></div>
+      <div class="board-columns"><For each={columns()}>{([status, label]) => { const colTasks = () => tasksByStatus()[status] ?? []; return <section class="board-column"><h3>{label} <span>{colTasks().length}</span></h3><Show when={colTasks().length > 0} fallback={<p class="board-empty">{status === "open" ? "Add a task above to begin." : "Tasks appear here as work progresses."}</p>}><VirtualList items={colTasks()} rowHeight={136}>{t => <article class={`board-task ${t.blocked ? "blocked" : ""}`}><button class="board-task-title" onClick={() => openTask(t)}>{t.title}</button><div class="board-meta"><span class="board-owner" style={{ color: color(t.owner || t.assigned) }}>{holder(t)}</span><span>{t.priority}</span><span>{t.depends_on.length} deps{t.blocked ? " · Blocked" : ""}</span></div><Show when={t.lease_expires_at}><small>Lease {Math.max(0, Math.ceil((t.lease_expires_at - clock()) / 1000))}s</small></Show><div class="board-progress"><For each={t.playbook_progress?.steps || []}>{(step, i) => <span classList={{ current: i() === t.step, complete: i() < t.step }} title={step}>{i() + 1}. {step}</span>}</For></div><Show when={failures(t).length}><p class="board-warning">{failures(t)[0].message}</p><Button onClick={() => sendBack(t)}>Send back</Button></Show></article>}</VirtualList></Show></section>; }}</For></div>
     </Show>
     <Show when={selected()}>{() => <div class="board-drawer-backdrop" onClick={e => { if (e.target === e.currentTarget) setSelected(null); }}><aside class="board-drawer" role="dialog" aria-modal="true" aria-label="Task details"><header><h2>Task details</h2><Button onClick={() => setSelected(null)}>Close</Button></header><code>{selected().id}</code><p aria-label="Task owner">Owner: {holder(selected())} <Show when={selected().owner_agent_id || selected().assigned_agent_id}>{id=><Button onClick={()=>{const owner=id();setSelected(null);go('agents',{id:owner,focusOwner:true});}}>Open agent</Button>}</Show></p><Show when={!selected().owner && selected().assigned}><p aria-label="Task handover">{selected().assigned} is {STATE[selected().assigned_state] || selected().assigned_state}. Resume the agent and it takes this task back, or hand the task to someone else.</p></Show><Show when={selected().repo_id && !["done","cancelled"].includes(selected().status)}><div class="board-task-actions"><label>Hand to agent <select aria-label="Hand to agent" value={handTo()} onChange={e=>setHandTo(e.currentTarget.value)}><option value="">Choose an agent in this checkout</option><For each={(store.agents()||[]).filter(a=>a.repo_id===selected().repo_id)}>{a=><option value={a.id}>{a.name} · {STATE[a.state] || a.state}</option>}</For></select></label><Button disabled={busy()||!handTo()} onClick={()=>attempt(async()=>{await rpc("board.assign",{task_id:selected().id,agent:handTo()});setHandTo("");await refresh();})}>Hand over</Button></div></Show><Show when={selected().repo_id && selected().id} keyed>{id=><ManagedJobs id={selected().repo_id} taskId={id}/>}</Show><label>Title<input value={editTitle()} onInput={e => setEditTitle(e.currentTarget.value)} /></label><label>Description<textarea value={detail()} onInput={e => setDetail(e.currentTarget.value)} /></label><Button disabled={busy()} onClick={() => attempt(() => patch({ title: editTitle(), detail: detail() }))}>Save changes</Button><label>Dependency IDs, separated by commas<input value={depText()} disabled={selected().status !== "open"} onInput={e => setDepText(e.currentTarget.value)} /></label><Button disabled={busy() || selected().status !== "open"} onClick={() => attempt(async () => { await rpc("board.deps_set", { task_id: selected().id, depends_on: depText().split(",").map(s => s.trim()).filter(Boolean) }); await refresh(); })}>Save dependencies</Button><For each={selected().dependencies}>{d => <p>{d.title}: {d.status}</p>}</For><label>Note or submission summary<textarea value={note()} onInput={e => setNote(e.currentTarget.value)} /></label><div class="board-task-actions"><Button onClick={() => attempt(() => patch({ note: note() }))}>Add note</Button><Show when={selected().status === "open"}><Button disabled={selected().blocked} onClick={() => attempt(async () => { await rpc("board.claim", { task_id: selected().id }); await refresh(); })}>Claim for you</Button></Show><Show when={selected().status === "claimed"}><Button onClick={() => attempt(() => patch({ status: "open" }))}>Release</Button><Button onClick={() => attempt(async () => { await rpc("board.submit", { task_id: selected().id, summary: note() }); await refresh(); })}>Submit for review</Button></Show><Show when={selected().status === "in_review"}><Button onClick={() => attempt(() => patch({ status: "done" }))}>Accept</Button><Button onClick={() => sendBack(selected())}>Send back</Button></Show><Show when={["open", "claimed"].includes(selected().status)}><Button onClick={() => attempt(() => patch({ status: "cancelled" }))}>Cancel task</Button></Show></div><Show when={selected().playbook_progress}><h3>Playbook progress</h3><For each={selected().playbook_progress?.steps}>{(s, i) => <button class="board-step" classList={{ current: selected().step === i() }} onClick={() => attempt(() => patch({ step: i() }))}>{i() + 1}. {s}</button>}</For></Show><For each={selected().check_results}>{c => <p classList={{ "board-warning": c.passed === false }}>{c.check}: {c.passed === true ? "Passed" : c.message || "Pending"}</p>}</For><h3>History</h3><div class="board-history"><VirtualList items={selected().history || []} rowHeight={84}>{e => <article><strong>{e.actor} · {e.kind}</strong><small>{fmt.ago(e.created_at)}</small><p>{e.body}</p></article>}</VirtualList></div><h3>Task messages</h3><Show when={taskMail().length} fallback={<p>No messages linked to this task yet.</p>}><div class="board-history"><VirtualList items={taskMail()} rowHeight={100}>{m => <article class="board-message"><strong style={{ color: color(m.from_agent) }}>{m.from_agent}</strong><p>{m.body}</p></article>}</VirtualList></div></Show><h3>Message task owner</h3><form onSubmit={e => { e.preventDefault(); attempt(async () => { await rpc("board.mail_send", { to: selected().owner || "all", body: `Task ${selected().id}: ${note()}` }); setNote(""); }); }}><p>Uses the note above. Recipient: {selected().owner || "all"}</p><Button type="submit" disabled={!note().trim()}>Send message</Button></form></aside></div>}</Show>
   </Page>;

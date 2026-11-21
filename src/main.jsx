@@ -7,10 +7,12 @@ import { Dynamic } from "solid-js/web";
 import { ToastHost, ConfirmHost, Guard, toast, cleanError } from "./ui/kit.jsx";
 import { ImproveHost } from "./ui/improve.jsx";
 import { Icon } from "./ui/icons.jsx";
-import { rpc, failures, clearFailures } from "./lib/rpc.js";
+import { failures, clearFailures } from "./lib/rpc.js";
 import { repoLabels } from "./lib/repo-labels.js";
+import { workspaceAgents } from "./lib/agent-workspace.js";
 import { route, go, commands, improve } from "./lib/nav.js";
 import { useStore, activeRepoId, setActiveRepoId } from "./lib/store.js";
+import { ScreenVisibilityProvider } from "./lib/visibility.js";
 import { soundEnabled, setSoundEnabled, playSound } from "./lib/sound.js";
 import "./lib/alerts.js";
 import "./styles/tokens.css";
@@ -21,8 +23,8 @@ const SCREENS = [
   { id: "home", label: "Home", icon: "home", group: "work", load: () => import("./screens/home.jsx") },
   { id: "agents", label: "Agents", icon: "agents", group: "work", load: () => import("./screens/agents.jsx") },
   { id: "board", label: "Board", icon: "board", group: "work", load: () => import("./screens/board.jsx") },
-  { id: "review", label: "Review", icon: "repo", group: "work", load: () => import("./screens/review.jsx") },
-  { id: "environments", label: "Environments", icon: "graph", group: "work", load: () => import("./screens/environments.jsx") },
+  { id: "review", label: "Review", icon: "pr", group: "work", load: () => import("./screens/review.jsx") },
+  { id: "environments", label: "Environments", icon: "shield", group: "work", load: () => import("./screens/environments.jsx") },
   { id: "chat", label: "Chat", icon: "chat", group: "work", load: () => import("./screens/chat.jsx") },
   { id: "terminals", label: "Terminals", icon: "terminal", group: "tools", load: () => import("./screens/terminals.jsx") },
   { id: "browser", label: "Browser", icon: "globe", group: "tools", load: () => import("./screens/browser.jsx") },
@@ -30,7 +32,7 @@ const SCREENS = [
   { id: "code", label: "Code", icon: "graph", group: "tools", load: () => import("./screens/code.jsx") },
   { id: "activity", label: "Activity", icon: "activity", group: "watch", load: () => import("./screens/activity.jsx") },
   { id: "stats", label: "Stats", icon: "stats", group: "watch", load: () => import("./screens/stats.jsx") },
-  { id: "workday", label: "Workday", icon: "activity", group: "watch", load: () => import("./screens/workday.jsx") },
+  { id: "workday", label: "Workday", icon: "grid", group: "watch", load: () => import("./screens/workday.jsx") },
   { id: "providers", label: "Providers", icon: "key", group: "setup", load: () => import("./screens/providers.jsx") },
   { id: "settings", label: "Settings", icon: "settings", group: "setup", load: () => import("./screens/settings.jsx") },
 ];
@@ -38,32 +40,64 @@ const COMPONENTS = Object.fromEntries(SCREENS.map((s) => [s.id, lazy(s.load)]));
 const GROUPS = [["work", "Work"], ["tools", "Tools"], ["watch", "Observe"], ["setup", "Setup"]];
 
 function Palette(props) {
+  const store = useStore();
+  const labels = createMemo(() => repoLabels(store.repos() ?? []));
   const [q, setQ] = createSignal("");
   const [sel, setSel] = createSignal(0);
-  const all = createMemo(() => [
-    ...SCREENS.map((s) => ({ label: `Go to ${s.label}`, run: () => go(s.id) })),
-    { label: "Improve Philium…", run: () => improve() },
-    ...commands(),
-  ]);
+  const all = createMemo(() => {
+    const screenCmds = SCREENS.map((s, idx) => ({
+      label: `Go to ${s.label}`,
+      kbd: idx < 9 ? `⌘${idx + 1}` : undefined,
+      run: () => go(s.id),
+    }));
+    const repoCmds = [
+      { label: "Switch workspace: All Workspaces", run: () => setActiveRepoId("") },
+      ...(store.repos() ?? []).map((r) => ({
+        label: `Switch workspace: ${labels().get(r.id) || r.name}`,
+        run: () => setActiveRepoId(r.id),
+      })),
+    ];
+    const agentCmds = (store.agents() ?? []).map((a) => ({
+      label: `Open agent: ${a.name}${a.repo_name ? ` (${a.repo_name})` : ""}`,
+      run: () => go("agents", { id: a.id }),
+    }));
+    const registered = commands();
+    const hasNewAgent = registered.some((c) => c.id === "agent.new");
+    return [
+      ...screenCmds,
+      ...(!hasNewAgent ? [{ label: "New agent", run: () => go("agents", { spawn: true }) }] : []),
+      { label: "Improve Philium…", run: () => improve() },
+      ...registered,
+      ...repoCmds,
+      ...agentCmds,
+    ];
+  });
   const shown = createMemo(() => {
-    const t = q().toLowerCase();
-    return all().filter((c) => c.label.toLowerCase().includes(t)).slice(0, 12);
+    const t = q().trim().toLowerCase();
+    return all().filter((c) => c.label.toLowerCase().includes(t)).slice(0, 30);
   });
   const run = (c) => { props.onClose(); c?.run(); };
   return (
     <div class="overlay" onMouseDown={(e) => e.target === e.currentTarget && props.onClose()}>
       <div class="palette">
-        <input autofocus placeholder="Type a command or screen…" value={q()}
+        <input autofocus placeholder="Type a command, screen, workspace, or agent…" value={q()}
           onInput={(e) => { setQ(e.currentTarget.value); setSel(0); }}
           onKeyDown={(e) => {
-            if (e.key === "ArrowDown") { setSel((s) => Math.min(s + 1, shown().length - 1)); e.preventDefault(); }
+            if (e.key === "ArrowDown") { setSel((s) => Math.min(s + 1, Math.max(0, shown().length - 1))); e.preventDefault(); }
             else if (e.key === "ArrowUp") { setSel((s) => Math.max(s - 1, 0)); e.preventDefault(); }
             else if (e.key === "Enter") run(shown()[sel()]);
             else if (e.key === "Escape") props.onClose();
           }} />
-        <For each={shown()}>
-          {(c, i) => <div class={`opt ${i() === sel() ? "on" : ""}`} onMouseEnter={() => setSel(i())} onClick={() => run(c)}>{c.label}</div>}
-        </For>
+        <div style={{ "max-height": "56vh", "overflow-y": "auto" }}>
+          <For each={shown()}>
+            {(c, i) => (
+              <div class={`opt ${i() === sel() ? "on" : ""}`} onMouseEnter={() => setSel(i())} onClick={() => run(c)}>
+                <span class="grow ellipsis">{c.label}</span>
+                <Show when={c.kbd}><span class="kbd">{c.kbd}</span></Show>
+              </div>
+            )}
+          </For>
+        </div>
       </div>
     </div>
   );
@@ -71,11 +105,10 @@ function Palette(props) {
 
 function App() {
   const store = useStore();
+  const status = store.status;
   const labels = createMemo(() => repoLabels(store.repos() ?? []));
   const [palette, setPalette] = createSignal(false);
-  const [status, setStatus] = createSignal(null);
-  const refresh = () => rpc("app.status").then(setStatus).catch(() => setStatus((s) => ({ ...(s ?? {}), desk: { ok: false, error: "Backend not responding" } })));
-  const [attempt, setAttempt] = createSignal(0);
+  const [attempts, setAttempts] = createSignal({});
   const [visited, setVisited] = createSignal([route()]);
   createEffect(() => {
     const r = route();
@@ -86,19 +119,46 @@ function App() {
     const list = store.repos();
     if (store.repos.state === "ready" && activeRepoId() && !(list ?? []).some((r) => r.id === activeRepoId())) setActiveRepoId("");
   });
+  const agentBadge = createMemo(() => {
+    const list = workspaceAgents(store.agents() ?? [], activeRepoId(), store.repos() ?? []);
+    const waiting = list.filter((a) => a.state === "waiting").length;
+    if (waiting > 0) return { count: String(waiting), warn: true, title: `${waiting} agent${waiting === 1 ? "" : "s"} waiting for approval` };
+    const running = list.filter((a) => a.live).length;
+    if (running > 0) return { count: String(running), warn: false, title: `${running} agent${running === 1 ? "" : "s"} running` };
+    return null;
+  });
   const failing = () => Object.entries(failures()).filter(([k]) => !k.startsWith("browser.") && k !== "app.status");
-  const retry = () => { clearFailures(); refresh(); setVisited([route()]); setAttempt((n) => n + 1); };
+  const retry = () => {
+    clearFailures();
+    store.refetchStatus();
+    store.refetchAgents();
+    store.refetchRepos();
+    store.refetchProviders();
+    const cur = route();
+    setAttempts((prev) => ({ ...prev, [cur]: (prev[cur] ?? 0) + 1 }));
+  };
   onMount(() => {
-    refresh();
-    const t = setInterval(refresh, 5000);
     const onKey = (e) => {
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") { e.preventDefault(); setPalette((p) => !p); }
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        setPalette((p) => !p);
+        return;
+      }
+      if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && /^[1-9]$/.test(e.key)) {
+        if (e.target?.closest?.("input, textarea, select, [contenteditable=true]")) return;
+        const target = SCREENS[Number(e.key) - 1];
+        if (target) {
+          e.preventDefault();
+          go(target.id);
+        }
+      }
     };
     window.addEventListener("keydown", onKey);
-    onCleanup(() => { clearInterval(t); window.removeEventListener("keydown", onKey); });
+    onCleanup(() => window.removeEventListener("keydown", onKey));
   });
   return (
     <div class="app">
+      <style>{`.nav-item .count[data-count]::after { content: attr(data-count); }`}</style>
       <nav class="sidebar">
         <div class="brand">
           <svg class="brand-mark" viewBox="0 0 64 64" aria-hidden="true">
@@ -130,6 +190,16 @@ function App() {
                 {(s) => (
                   <button class={`nav-item ${route() === s.id ? "on" : ""}`} onClick={() => go(s.id)}>
                     <Icon name={s.icon} /> {s.label}
+                    <Show when={s.id === "agents" && agentBadge()}>
+                      {(b) => (
+                        <span
+                          class="count"
+                          data-count={b().count}
+                          title={b().title}
+                          style={b().warn ? { color: "var(--strict)", "font-weight": "600" } : undefined}
+                        />
+                      )}
+                    </Show>
                   </button>
                 )}
               </For>
@@ -161,9 +231,11 @@ function App() {
         <For each={visited()}>
           {(id) => (
             <div class={`screen-pane ${route() === id ? "" : "hidden"}`}>
-              <Suspense fallback={<div class="loading" role="status"><span class="spinner" />Loading</div>}>
-                <For each={[attempt()]}>{() => <Guard><Dynamic component={COMPONENTS[id] ?? COMPONENTS.home} /></Guard>}</For>
-              </Suspense>
+              <ScreenVisibilityProvider visible={route() === id}>
+                <Suspense fallback={<div class="loading" role="status"><span class="spinner" />Loading</div>}>
+                  <For each={[attempts()[id] ?? 0]}>{() => <Guard><Dynamic component={COMPONENTS[id] ?? COMPONENTS.home} /></Guard>}</For>
+                </Suspense>
+              </ScreenVisibilityProvider>
             </div>
           )}
         </For>

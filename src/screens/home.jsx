@@ -1,16 +1,29 @@
 // Home: what is running, what needs you, and how much it costs.
-import { For, Show, createResource, createMemo, createSignal, onCleanup } from "solid-js";
+import { For, Show, createResource, createMemo, createSignal } from "solid-js";
 import { Page, Button, Badge, Dot, Empty, Stat, Card, toast } from "../ui/kit.jsx";
 import { Icon } from "../ui/icons.jsx";
-import { rpc, useEvent, fmt } from "../lib/rpc.js";
+import { AgentChip } from "../ui/agent-chip.jsx";
+import { SpawnModal } from "../ui/spawn-modal.jsx";
+import { rpc, fmt } from "../lib/rpc.js";
 import { go } from "../lib/nav.js";
-import { activeRepoId } from "../lib/store.js";
+import { useStore, activeRepoId } from "../lib/store.js";
+import { useVisibleEvent } from "../lib/visibility.js";
 import CheckoutHome from "./checkout-home.jsx";
-import { AgentChip, SpawnModal } from "./agents.jsx";
 import "../styles/home.css";
 
-const n = (x) => (x == null ? "0" : x >= 1e6 ? `${(x / 1e6).toFixed(1)}M` : x >= 1e3 ? `${(x / 1e3).toFixed(1)}k` : String(Math.round(x)));
+const n = (x) => {
+  const num = Number(x);
+  if (!Number.isFinite(num)) return "0";
+  return num >= 1e6 ? `${(num / 1e6).toFixed(1)}M` : num >= 1e3 ? `${(num / 1e3).toFixed(1)}k` : String(Math.round(num));
+};
 const bytes = (b) => (b >= 1e9 ? `${(b / 1e9).toFixed(1)} GB` : b >= 1e6 ? `${(b / 1e6).toFixed(0)} MB` : `${Math.round((b ?? 0) / 1e3)} KB`);
+const guardCount = (ga) => {
+  if (typeof ga === "number") return Number.isFinite(ga) ? ga : 0;
+  if (ga && typeof ga === "object") {
+    return Object.entries(ga).reduce((sum, [k, v]) => (k === "pass" ? sum : sum + (Number(v) || 0)), 0);
+  }
+  return 0;
+};
 
 function Section(props) {
   return (
@@ -29,26 +42,26 @@ export default function Home() {
 }
 
 function GlobalHome() {
-  const [agents, ag] = createResource(() => rpc("agents.list").catch(() => []));
+  const store = useStore();
+  const agents = store.agents;
+  const providers = store.providers;
+  const repos = store.repos;
   const [tasks, tk] = createResource(() => rpc("board.list", {}).catch(() => []));
   const [proposals, pr] = createResource(() => rpc("reaper.proposals").catch(() => []));
   const [leaked] = createResource(() => rpc("reaper.ledger", { state: "leaked" }).catch(() => []));
   const [stats, st] = createResource(() => rpc("stats.summary", { range: "24h" }).catch(() => null));
   const [events, ev] = createResource(() => rpc("app.events", { limit: 30 }).catch(() => []));
   const [disk] = createResource(() => rpc("app.disk").catch(() => null));
-  const [providers] = createResource(() => rpc("providers.list").catch(() => []));
   const [clashes, cl] = createResource(() => rpc("codeindex.clashes", {}).then((r) => r?.clashes ?? []).catch(() => []));
   const [spawn, setSpawn] = createSignal(false);
+  const [hideOnboarding, setHideOnboarding] = createSignal(false);
 
-  let t;
-  const soon = (f) => { clearTimeout(t); t = setTimeout(f, 300); };
-  onCleanup(() => clearTimeout(t));
-  useEvent("agents:changed", () => soon(() => { ag.refetch(); ev.refetch(); }));
-  useEvent("board:changed", () => tk.refetch());
-  useEvent("event", () => soon(() => { ev.refetch(); st.refetch(); }));
-  useEvent("codeindex:clashes", () => cl.refetch());
-  useEvent("reaper:proposals", () => pr.refetch());
-  useEvent("reaper:changed", () => pr.refetch());
+  useVisibleEvent("agents:changed", () => ev.refetch(), { debounceMs: 300 });
+  useVisibleEvent("board:changed", () => tk.refetch(), { debounceMs: 200 });
+  useVisibleEvent("event", () => { ev.refetch(); st.refetch(); }, { debounceMs: 300 });
+  useVisibleEvent("codeindex:clashes", () => cl.refetch(), { debounceMs: 300 });
+  useVisibleEvent("reaper:proposals", () => pr.refetch(), { debounceMs: 200 });
+  useVisibleEvent("reaper:changed", () => pr.refetch(), { debounceMs: 200 });
 
   const live = createMemo(() => (agents() ?? []).filter((a) => a.live));
   const waiting = createMemo(() => (agents() ?? []).filter((a) => a.state === "waiting"));
@@ -63,13 +76,38 @@ function GlobalHome() {
   const diskTotal = () => Object.values(disk() ?? {}).reduce((s, v) => s + (v.bytes ?? 0), 0);
   const attention = () => waiting().length + (proposals() ?? []).length + (leaked() ?? []).length + failed().length + (clashes() ?? []).length;
 
+  const hasProviders = () => (providers() ?? []).length > 0;
+  const hasRepos = () => (repos() ?? []).length > 0;
+  const hasAgents = () => (agents() ?? []).length > 0;
+  const showOnboarding = () =>
+    !hideOnboarding() &&
+    providers.state === "ready" &&
+    repos.state === "ready" &&
+    agents.state === "ready" &&
+    (!hasProviders() || !hasRepos() || !hasAgents());
+
   return (
     <Page title="Home" actions={<Button variant="primary" onClick={() => setSpawn(true)}><Icon name="plus" size={12} /> New agent</Button>}>
-      <Show when={(providers() ?? []).length === 0 && providers.state === "ready"}>
+      <Show when={showOnboarding()}>
         <Card class="home-hero">
-          <h2>Welcome to Philium</h2>
-          <p class="dim">Add a provider to start. Subscriptions (ChatGPT, Claude) are used directly. API keys stay in Philium's private vault, out of agents' reach, and every request passes through the local gateway, which removes secrets before they leave your machine.</p>
-          <Button variant="primary" onClick={() => go("providers")}><Icon name="key" size={12} /> Add a provider</Button>
+          <div class="row" style={{ "margin-bottom": "4px" }}>
+            <h2 class="grow" style={{ margin: 0 }}>Welcome to Philium</h2>
+            <Button size="sm" variant="ghost" onClick={() => setHideOnboarding(true)}>Dismiss</Button>
+          </div>
+          <p class="dim" style={{ margin: "0 0 10px" }}>
+            Subscriptions (ChatGPT, Claude) are used directly. API keys stay in Philium's private vault, out of agents' reach, and every request passes through the local gateway, which removes secrets before they leave your machine.
+          </p>
+          <div class="row" style={{ "flex-wrap": "wrap", gap: "8px" }}>
+            <Show when={!hasProviders()} fallback={<Badge tone="secure">1. Provider added ✓</Badge>}>
+              <Button size="sm" variant="primary" onClick={() => go("providers")}><Icon name="key" size={12} /> 1. Add a provider</Button>
+            </Show>
+            <Show when={!hasRepos()} fallback={<Badge tone="secure">2. Repository added ✓</Badge>}>
+              <Button size="sm" variant={hasProviders() ? "primary" : ""} onClick={() => go("repos")}><Icon name="repo" size={12} /> 2. Add a repository</Button>
+            </Show>
+            <Show when={!hasAgents()} fallback={<Badge tone="secure">3. First agent launched ✓</Badge>}>
+              <Button size="sm" variant={hasProviders() && hasRepos() ? "primary" : ""} onClick={() => setSpawn(true)}><Icon name="plus" size={12} /> 3. Launch your first agent</Button>
+            </Show>
+          </div>
         </Card>
       </Show>
 
@@ -79,7 +117,7 @@ function GlobalHome() {
         <Stat label="Requests (24h)" value={n(totals().requests)} sub={totals().error_rate ? `${(totals().error_rate * 100).toFixed(1)}% errors` : "no errors"} />
         <Stat label="Tokens (24h)" value={n((totals().tokens_in ?? 0) + (totals().tokens_out ?? 0))} sub={totals().avg_tps ? `${totals().avg_tps.toFixed(0)} tok/s avg` : ""} />
         <Stat label="Cost (24h)" value={totals().cost != null ? `$${totals().cost.toFixed(2)}` : "n/a"} sub={totals().unpriced_requests ? `${totals().unpriced_requests} unpriced` : ""} />
-        <Stat label="Secrets removed" value={n(totals().guard_actions)} sub="by the gateway, 24h" />
+        <Stat label="Secrets removed" value={n(guardCount(totals().guard_actions))} sub="by the gateway, 24h" />
       </div>
 
       <Show when={attention()}>

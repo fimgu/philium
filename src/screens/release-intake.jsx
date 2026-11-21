@@ -1,5 +1,7 @@
 import { createResource, createSignal, For, Show } from 'solid-js';
-import { rpc, useEvent } from '../lib/rpc.js';
+import { rpc } from '../lib/rpc.js';
+import { go } from '../lib/nav.js';
+import { useVisibleEvent } from '../lib/visibility.js';
 import { plainError } from '../lib/plain-error.js';
 import { Markdown } from '../ui/markdown.jsx';
 import { readiness, summaryMarkdown, tone, HEADLINE } from '../lib/readiness.js';
@@ -56,7 +58,7 @@ export function ReleaseIntake(props) {
   const KEPT='kept-by-philium';
   const [file,setFile]=createSignal(''),[drafting,setDrafting]=createSignal(false);
   const [proposals,{refetch:reloadProposals}]=createResource(()=>call('sql_proposals').catch(()=>[]));
-  useEvent('release:proposals',()=>reloadProposals());
+  useVisibleEvent('release:proposals',()=>reloadProposals());
   let setupEl;
   async function useKept(){await pick(KEPT);if(setupEl)setupEl.open=true;}
   async function importFile(){setBusy(true);try{await call('sql_import',{file:file().trim()});setFile('');await useKept();setMessage('Read. Check them below, then confirm.');}catch(e){setMessage(`Not read: ${String(e)}`);}finally{setBusy(false);}}
@@ -85,11 +87,31 @@ export function ReleaseIntake(props) {
   async function resolve(event){event.preventDefault();if(busy())return;setBusy(true);setMessage('Reading the pull request…');setGraph(null);setReceipt(null);
     setDecision(null);try{const r=await call('verify_url',{url:url().trim()});await refetch();await inspect(r.generation,r.pr);setDecision(r);setReceipt(r.receipt);setMessage('');}
     catch(e){setMessage(`Not checked: ${String(e)}`);}finally{setBusy(false);}}
-  async function inspect(seq,pr,discover=false){setDecision(null);setMembers(null);setCover(null);setGraph(null);setReceipt(null);setBusy(true);try{setDecision(await call('decision',{generation:seq}));setReceipt(await call('sql_receipt',{generation:seq}));const g=await call('graph',{generation:seq});const scope=await call('followup',{generation:seq});setGraph({...g,scope,pr,seq});setMembers(await call(discover?'discover_members':'members',{generation:seq}).catch(()=>null));setCover(await call('coverage',{generation:seq}).catch(()=>null));setMessage(`Inspected #${pr}, generation ${seq}.`);}catch(e){setMessage(`Revisions recorded for #${pr}. Ancestry not verified: ${String(e)}`);}finally{setBusy(false);}}
+  async function inspect(seq,pr,discover=false){
+    setDecision(null);setMembers(null);setCover(null);setGraph(null);setReceipt(null);setBusy(true);
+    try{
+      const [dec,rec,g,scope,mem,cov]=await Promise.all([
+        call('decision',{generation:seq}),
+        call('sql_receipt',{generation:seq}),
+        call('graph',{generation:seq}),
+        call('followup',{generation:seq}),
+        call(discover?'discover_members':'members',{generation:seq}).catch(()=>null),
+        call('coverage',{generation:seq}).catch(()=>null),
+      ]);
+      setDecision(dec);
+      setReceipt(rec);
+      setGraph({...g,scope,pr,seq});
+      setMembers(mem);
+      setCover(cov);
+      setMessage(`Inspected #${pr}, generation ${seq}.`);
+    }catch(e){setMessage(`Revisions recorded for #${pr}. Ancestry not verified: ${String(e)}`);}finally{setBusy(false);}
+  }
   // One action for the whole review: check the facts, then start an orchestrator that plans the
   // checks, hands them to helpers, and writes the report with every finding's severity and origin.
   const [review,{refetch:reloadReview}]=createResource(()=>decision()?.generation??graph()?.seq??null,g=>g?call('review_items',{generation:g}).catch(()=>null):null);
-  useEvent('release:review',()=>{reloadReview();reloadDrafter();});useEvent('board:changed',()=>reloadReview());useEvent('agents:changed',()=>{reloadReview();reloadDrafter();});
+  useVisibleEvent('release:review',()=>{reloadReview();reloadDrafter();});
+  useVisibleEvent('board:changed',()=>reloadReview());
+  useVisibleEvent('agents:changed',()=>{reloadReview();reloadDrafter();});
   async function reviewWithAgents(){if(busy())return;await resolve({preventDefault(){}});const d=decision();if(!d)return;setBusy(true);
     try{const r=await call('review_start',{generation:d.generation});if(!r?.brief)throw new Error('Philium did not prepare the review. Try again.');if(r.previous_lead?.id)await rpc('agents.remove_many',{scope:'tree',root:r.previous_lead.id},{action:true}).catch(()=>null);
       // The orchestrator and its helpers start on the pull request's head, the revision under review.
@@ -110,7 +132,7 @@ export function ReleaseIntake(props) {
     <div class="status-line">
     <span aria-label="GitHub connection" title={github.latest?.login?'Read through the GitHub CLI sign-in on this Mac. Philium keeps no token.':'Uses the sign-in the GitHub CLI already has on this Mac. No token to create.'}>{github.latest?.login?<>GitHub · <strong>{github.latest.login}</strong> <button type="button" class="link" disabled={busy()} onClick={disconnectGithub}>Disconnect</button></>:github.latest?.token_saved||access.latest?.token_saved?<>GitHub · read-only token</>:<>GitHub · not connected <button type="button" class="primary" disabled={busy()} onClick={connectGithub}>Connect GitHub</button></>}</span>
     <details aria-label="Release verification setup" ref={setupEl}><summary title="Facts that must hold in every release of this checkout. Philium keeps them outside the checkout, so a pull request cannot change what judges it.">Checks · <span aria-label="Verification setup summary">{profile.latest ? <>{profile.latest.driver===KEPT?<>kept by Philium</>:<>verifier {profile.latest.driver_name || profile.latest.driver}</>}, pinned at <code>{String(profile.latest.pin).slice(0, 12)}</code></> : 'none yet'}</span></summary>
-      <p><button type="button" disabled={busy()||drafting()} onClick={draft} title={graph()||decision()?'An agent reads this release and proposes checks. You decide which count.':'Verify a pull request first, so the agent reads exactly that release.'}>Draft checks with an agent</button><Show when={drafter()&&['failed','provisioning','running','waiting'].includes(drafter().state)}>{l=><span role={l().state==='failed'?'alert':'status'} aria-label="Drafting agent"> {l().state==='failed'?`${l().name} could not start: ${plainError(l().error||'no reason was recorded').plain.replace(/\.\s*$/,'')}. Press the button to try again.`:l().state==='provisioning'?`Starting ${l().name}…`:`${l().name} is drafting checks.`}</span>}</Show></p>
+      <p><button type="button" disabled={busy()||drafting()} onClick={draft} title={graph()||decision()?'An agent reads this release and proposes checks. You decide which count.':'Verify a pull request first, so the agent reads exactly that release.'}>Draft checks with an agent</button><Show when={drafter()&&['failed','provisioning','running','waiting'].includes(drafter().state)}>{l=><span role={l().state==='failed'?'alert':'status'} aria-label="Drafting agent"> {l().state==='failed'?`${l().name} could not start: ${plainError(l().error||'no reason was recorded').plain.replace(/\.\s*$/,'')}. Press the button to try again.`:l().state==='provisioning'?`Starting ${l().name}…`:<><button type="button" class="link" onClick={()=>go('agents',{id:l().id})}>{l().name}</button> is drafting checks.</>}</span>}</Show></p>
       <For each={proposals.latest||[]}>{p=><section aria-label="Proposed checks"><h3>Proposed by {p.agent}</h3><Checks label="Proposed by an agent" checks={p.checks}/><button type="button" disabled={busy()} onClick={()=>accept(p.id)}>Use these checks</button> <button type="button" disabled={busy()} onClick={()=>dismiss(p.id)}>Dismiss</button></section>}</For>
       <details aria-label="Advanced setup"><summary>Advanced</summary><p><label>Checks file (absolute path) <input aria-label="Checks file" disabled={busy()} value={file()} onInput={e=>setFile(e.currentTarget.value)}/></label> <button type="button" disabled={busy()||!file().trim()} onClick={importFile}>Read this file</button></p><p><select aria-label="Independent SQL driver" disabled={busy()} value={driver()===KEPT?'':driver()} onChange={e=>pick(e.currentTarget.value)}><option value="">Use a registered checkout</option><For each={drivers.latest||[]}>{r=><option value={r.id}>{r.name} · {r.id.slice(0,8)}</option>}</For></select> <label>Trusted loopback deployment observer port (optional) <input type="number" min="1024" max="65535" disabled={busy()} value={port()} onInput={e=>setPort(e.currentTarget.value)}/></label></p><p aria-label="Origin read access">{access.latest?.token_saved ? 'A read-only token is saved for private repositories.' : 'Private repositories need the GitHub CLI sign-in or a read-only token.'}</p><p><input type="password" autocomplete="off" aria-label="GitHub read-only token" placeholder="GitHub read-only token" title="Kept in the private vault, which agents cannot read. Sent only to api.github.com." disabled={busy()} value={token()} onInput={e=>setToken(e.currentTarget.value)}/> <button disabled={busy()||!token().trim()} onClick={saveToken}>Save token</button> <Show when={access.latest?.token_saved}><button disabled={busy()} onClick={clearToken}>Remove token</button></Show></p></details>
       <Show when={preview()?.error}><p role="alert">{preview().error}</p></Show>
@@ -124,10 +146,10 @@ export function ReleaseIntake(props) {
     <GateChecks repo={props.repo} generation={decision()?.generation??graph()?.seq??null}/>
     <GateQuality repo={props.repo}/>
     <Show when={review.latest&&(review.latest.items?.length||review.latest.run)?review.latest:null}>{v=><section aria-label="Agent review" class={`decision ${({do_not_ship:'bad',passed:'ok'})[v().headline]||'unknown'}`}>
-      <div class="verdict"><span class="glyph" aria-hidden="true">{v().lead?.state==='failed'?'!':({do_not_ship:'✕',passed:'✓'})[v().headline]||'…'}</span><div class="grow"><h3 title="P0 and P1 decide: a failure this release introduced, or whose origin is unverified, means do not ship; a pre-existing one, or anything not passed, means not ready. P2 to P5 inform.">{reviewHead(v())}</h3><p>#{v().pr}{v().items.length?` · ${v().items.filter(i=>i.result).length} of ${v().items.length} items have a result`:''}{v().lead&&v().items.length?` · led by ${v().lead.name}`:''}</p></div></div>
+      <div class="verdict"><span class="glyph" aria-hidden="true">{v().lead?.state==='failed'?'!':({do_not_ship:'✕',passed:'✓'})[v().headline]||'…'}</span><div class="grow"><h3 title="P0 and P1 decide: a failure this release introduced, or whose origin is unverified, means do not ship; a pre-existing one, or anything not passed, means not ready. P2 to P5 inform.">{reviewHead(v())}</h3><p>#{v().pr}{v().items.length?` · ${v().items.filter(i=>i.result).length} of ${v().items.length} items have a result`:''}<Show when={v().lead&&v().items.length}>{' · led by '}<button type="button" class="link" onClick={()=>go('agents',{id:v().lead.id})}>{v().lead.name}</button></Show>{' · '}<button type="button" class="link" onClick={()=>go('board')}>Open board</button></p></div></div>
       <Show when={v().lead?.state==='failed'}><p role="alert" aria-label="Review start failed">{v().lead.name} could not start: {plainError(v().lead.error||'no reason was recorded').plain.replace(/\.\s*$/,'')}. No model was asked anything.</p></Show>
       <Show when={v().lead?.rate_limited&&v().lead.state==='idle'&&!v().report}><p aria-label="Review rate limited">{v().lead.rate_limited.until?`The model provider's rate limit stopped ${v().lead.name}. It continues at ${new Date(v().lead.rate_limited.until).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}.`:`${v().lead.name} stopped at the rate limit. Send it a message to continue.`}</p></Show>
-      <Show when={v().lead?.state==='stopped'&&!v().report}><p aria-label="Review stopped">{v().lead.name} stopped before finishing. Resume it under Agents, or start again.</p></Show>
+      <Show when={v().lead?.state==='stopped'&&!v().report}><p aria-label="Review stopped"><button type="button" class="link" onClick={()=>go('agents',{id:v().lead.id})}>{v().lead.name}</button> stopped before finishing. Resume it under <button type="button" class="link" onClick={()=>go('agents',{id:v().lead.id})}>Agents</button>, or start again.</p></Show>
       <Show when={!v().items.length&&(!v().lead||v().lead.state==='failed'||v().lead.state==='stopped')}><p><button type="button" class="primary" disabled={busy()} onClick={reviewWithAgents}>{v().lead?'Start the review again':'Start the review'}</button></p></Show>
       <table class="ready plan" aria-label="Review plan"><tbody><For each={byWeight(v().items)}>{it=><tr data-item={it.id} data-severity={it.result==='fail'?String(it.severity??''):''} data-result={it.result||''} data-origin={it.result==='fail'?(it.origin||'unverified'):''}><td class="mark"><span class={itemMark(it)[0]} title={itemMark(it)[2]}>{itemMark(it)[1]}</span></td><th scope="row"><Show when={it.result==='fail'}><span class={`tier sev${it.severity??1}`} title={v().severity?.[it.severity??1]?.means}>P{it.severity??'?'}</span></Show>{String(it.title).replace(/^P\d\s+/,'')}</th><td><Show when={it.result==='fail'}><span class={`origin ${it.origin||'unverified'}`} title={ORIGIN_MEANS[it.origin||'unverified']}>{ORIGIN[it.origin||'unverified']}</span> </Show>{it.result?it.evidence:itemMark(it)[2]}<Show when={it.owner&&!it.result}><small> · {it.owner}</small></Show></td></tr>}</For></tbody></table>
       <Show when={v().report}><details open aria-label="Review report"><summary>Report by {v().report.by}</summary><div class="report" data-report={v().report.text.slice(0, 400)}><Markdown text={v().report.text}/></div></details></Show>

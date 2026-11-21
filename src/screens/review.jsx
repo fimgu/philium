@@ -1,5 +1,6 @@
 import { createSignal, For, Show, onCleanup } from 'solid-js';
 import { activeRepoId, useStore } from '../lib/store.js';
+import { go } from '../lib/nav.js';
 import { Empty, Page } from '../ui/kit.jsx';
 import { githubIdentity, maxPacketBytes, reviewPreview } from '../lib/review-packet.js';
 import { tenantBundle } from '../lib/tenant-bundle.js';
@@ -48,7 +49,11 @@ export default function Review() {
   // Key by stable values, not the repo row object: background refresh is not a switch.
   const key = () => slug() && JSON.stringify([activeRepoId(), slug()]);
   return <Page title="Review" sub="Is this release good to go?"><div class="sheet">
-    <Show when={key()} keyed>{k=><ReleaseIntake repo={JSON.parse(k)[0]}/>}</Show>
+    <Show when={key()} keyed fallback={
+      <Empty title="Select a GitHub workspace" body="Use the workspace picker in the sidebar to verify release readiness, run checks, or view a saved PR review for a repository." />
+    }>
+      {k => <ReleaseIntake repo={JSON.parse(k)[0]}/>}
+    </Show>
     <details aria-label="More review tools"><summary>More</summary>
     <Show when={workspace()?.id} keyed>{id => <LocalChecks repo={id}/>}</Show>
     <Show when={workspace()?.id} keyed>{id => <details aria-label="Kubernetes tenant plan">
@@ -63,11 +68,11 @@ export default function Review() {
       <h3>Agents in this workspace</h3>
       <p>These are configured agents, not recipients of the saved review. Starting a separate agent session can send its prompt, code map and requested code to its configured provider.</p>
       <ul><For each={(store.agents() || []).filter(a => a.repo_id === id)} fallback={<li>No agents listed for this workspace.</li>}>{a => <li>
-        <strong>{a.name}</strong> · {a.model_ref || a.model || 'Unknown recipient'} · {a.strict ? 'No memory or history access' : 'May request this repository’s memory and session metadata'}
+        <strong style={{ cursor: 'pointer' }} onClick={() => go('agents', { id: a.id })}>{a.name}</strong> · {a.model_ref || a.model || 'Unknown recipient'} · {a.strict ? 'No memory or history access' : 'May request this repository’s memory and session metadata'}
       </li>}</For></ul>
       <p>Helpers inherit the parent’s workspace and configured model. The skills tool serves the built-in review procedure, not imported personal skills or their files.</p>
     </details>}</Show>
-    <Show when={key()} keyed fallback={<Empty title="Select a GitHub workspace" body="Use the workspace picker to view a saved PR review for one repository." />}>
+    <Show when={key()} keyed>
       {_identity => <Reader workspace={workspace} slug={slug()} />}
     </Show>
     </details>

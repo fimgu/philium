@@ -4,24 +4,28 @@ import { For, Show, createSignal, createResource, createMemo, createEffect, on, 
 import { NotFound, Page, Button, ModelPicker, toast } from "../ui/kit.jsx";
 import { Icon } from "../ui/icons.jsx";
 import { Conversation, Composer, KvTelemetryBar, speedEffort, effortSpeed } from "../ui/conversation.jsx";
-import { rpc, hal, useEvent, fmt, sendError } from "../lib/rpc.js";
+import { rpc, hal, fmt, sendError } from "../lib/rpc.js";
 import { go, params } from "../lib/nav.js";
+import { useStore } from "../lib/store.js";
+import { useScreenVisible } from "../lib/visibility.js";
 import { createSessionPoller } from "../lib/session-poller.js";
 import "../styles/agents.css";
 
 const TERMINAL = new Set(["assistant.completed", "turn.failed", "turn.cancelled"]);
 
 export default function Chat() {
+  const store = useStore();
+  const screenVisible = useScreenVisible();
+  const models = store.models;
+  const providers = store.providers;
+  const def = store.defaultModel;
   const [sessions, { refetch }] = createResource(() =>
     hal("GET", "/sessions").then((l) => (l ?? []).filter((s) => !s.parent_id)).catch(() => []));
-  const [models, { refetch: refetchModels }] = createResource(() => rpc("providers.models", {}).catch(() => []));
-  const [providers, { refetch: refetchProviders }] = createResource(() => rpc("providers.list").catch(() => []));
-  useEvent("providers:changed", () => { refetchModels(); refetchProviders(); });
-  const [def] = createResource(() => rpc("providers.default").catch(() => null));
   const [model, setModel] = createSignal("");
   const [events, setEvents] = createSignal([]);
   const [busy, setBusy] = createSignal(false);
   const selected = () => params().session ?? sessions()?.[0]?.id;
+  const activeId = () => selected() || "new";
   const current = () => (sessions() ?? []).find((s) => s.id === selected());
 
   const provById = createMemo(() => Object.fromEntries((providers() ?? []).map((p) => [p.id, p])));
@@ -79,7 +83,7 @@ export default function Chat() {
 
   const poller = createSessionPoller({
     fetchEvents: (id, after) => hal("GET", `/sessions/${id}/events?after=${after}`),
-    isBusy: busy,
+    isBusy: () => busy() && (typeof screenVisible === "function" ? screenVisible() : true),
     onEvents(evs) {
       setEvents((x) => x.concat(evs));
       for (const event of evs) {
@@ -93,6 +97,12 @@ export default function Chat() {
     setEvents([]); setBusy(false);
     poller.select(id);
   }));
+  createEffect(() => {
+    if (typeof screenVisible === "function" && screenVisible() && busy()) {
+      const id = selected();
+      if (id) poller.poll(id);
+    }
+  });
   onCleanup(() => poller.dispose());
 
   const newChat = async () => {
@@ -184,7 +194,7 @@ export default function Chat() {
             <NotFound title="Chat not found" action={<Button onClick={() => go("chat", {})}>Open latest chat</Button>}>This chat was deleted.</NotFound>
           </Show>
           <Conversation hidden={!!(params().session && sessions.state === "ready" && !current())} events={events()} busy={busy()} emptyText="Ask anything. This chat has no access to files, commands or the web." />
-          <Composer onSend={send} busy={busy()} onCancel={() => hal("POST", `/sessions/${selected()}/cancel`).catch((e) => toast(String(e), "danger"))}
+          <Composer draftKey={`chat:${activeId()}`} onSend={send} busy={busy()} onCancel={() => hal("POST", `/sessions/${selected()}/cancel`).catch((e) => toast(String(e), "danger"))}
             effort={current()?.effort || "default"} speed={effortSpeed(current()?.effort)} effortOptions={activeModel()?.effort_details ?? []} onEffort={setSpeed} onSpeed={setSpeed} onSlashModel={handleSlashModel}
             placeholder={`Message ${chosen() || "a model"} (or /effort, /model)`} />
         </div>

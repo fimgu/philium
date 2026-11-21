@@ -1,7 +1,7 @@
 // "Improve Philium": ask for a change from any screen, an agent builds it in
 // a worktree of the Philium source, you test, preview, accept or roll back.
 import { For, Show, createSignal, createResource, onCleanup } from "solid-js";
-import { Modal, Button, Field, TextArea, Badge, Dot, Empty, confirm, toast } from "../ui/kit.jsx";
+import { Modal, Button, Field, Input, TextArea, Badge, Dot, Empty, confirm, toast } from "../ui/kit.jsx";
 import { Icon } from "../ui/icons.jsx";
 import { rpc, useEvent, fmt } from "../lib/rpc.js";
 import { improveOpen, closeImprove, go } from "../lib/nav.js";
@@ -96,10 +96,33 @@ function Item(props) {
 
 export function ImproveHost() {
   const [text, setText] = createSignal("");
+  const [sourcePath, setSourcePath] = createSignal("");
+  const [savingSource, setSavingSource] = createSignal(false);
   const [busy, setBusy] = createSignal(false);
   const [list, { refetch }] = createResource(() => improveOpen(), () => rpc("selfdev.list").catch(() => []));
-  const [source] = createResource(() => improveOpen(), () => rpc("selfdev.source").catch(() => null));
+  const [source, { refetch: refetchSource }] = createResource(() => improveOpen(), () => rpc("selfdev.source").catch(() => null));
   useEvent("selfdev:changed", () => improveOpen() && refetch());
+
+  const saveSourcePath = async (e) => {
+    e?.preventDefault();
+    const val = sourcePath().trim();
+    if (!val || savingSource()) return;
+    setSavingSource(true);
+    try {
+      await rpc("app.settings_set", { key: "selfdev.source", value: val });
+      const resolved = await refetchSource();
+      if (resolved) {
+        setSourcePath("");
+        toast(`Philium source set to ${resolved}`, "secure");
+      } else {
+        toast("Folder must be a Philium git checkout containing src-tauri/", "danger");
+      }
+    } catch (err) {
+      toast(String(err), "danger");
+    } finally {
+      setSavingSource(false);
+    }
+  };
 
   const submit = async () => {
     setBusy(true);
@@ -119,7 +142,15 @@ export function ImproveHost() {
           Describe a change. An agent builds it in a separate copy of the Philium source, so this app keeps working. You run the tests, try a preview with no access to your keys, then accept or reject. Accepted changes can be rolled back.
         </p>
         <Show when={source() === null}>
-          <div class="shield strict small">Philium source folder not found. Set it in Settings under "Improve Philium".</div>
+          <div class="shield strict small" style={{ display: "grid", gap: "8px" }}>
+            <div>
+              Philium source checkout not found. Clone Philium into <code class="mono">~/Philium/repos/philium</code> (or add it under <a href="#" onClick={(e) => { e.preventDefault(); closeImprove(); go("repos"); }}>Repos</a>), or enter the local checkout path below:
+            </div>
+            <form class="row" onSubmit={saveSourcePath}>
+              <Input value={sourcePath()} onValue={setSourcePath} placeholder="/path/to/philium (containing .git and src-tauri)" />
+              <Button size="sm" variant="primary" type="submit" busy={savingSource()} disabled={!sourcePath().trim()}>Use folder</Button>
+            </form>
+          </div>
         </Show>
         <Field label={`Change for the ${improveOpen()?.screen ?? ""} screen`}>
           <TextArea rows={4} value={text()} onValue={setText} placeholder="For example: show token cost next to each agent in the list" />
