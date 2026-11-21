@@ -358,7 +358,7 @@ pub fn hal_setup(ctx: &Ctx, hal_data: &Path, opts: &ConfigOpts) -> HalSetup {
     }
 }
 
-fn context_window(ctx: &Ctx, pid: &str, mid: &str) -> Option<i64> {
+pub fn context_window(ctx: &Ctx, pid: &str, mid: &str) -> Option<i64> {
     ctx.db
         .query("SELECT context_window FROM models WHERE provider_id=?1 AND model_id=?2", [pid, mid])
         .ok()?

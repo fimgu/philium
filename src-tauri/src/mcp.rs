@@ -6,7 +6,7 @@
 //!   board_list, board_get, board_create, board_claim, board_update, board_submit,
 //!   mail_send, mail_read, agent_spawn, agent_status, agent_stop,
 //!   shell_run, shell_read, shell_write, shell_kill,
-//!   browser_open, browser_snapshot, graph_query, playbook_get, resource_register
+//!   browser_open, browser_snapshot, playbook_get, resource_register
 //!
 //! rpc: status {} -> {url, agents_connected}
 
@@ -117,7 +117,7 @@ pub async fn dispatch(ctx: &Arc<Ctx>, agent: &str, req: Value) -> Option<Value> 
                 rusqlite::params![agent, crate::db::now()],
             );
             let r = call_tool(ctx, agent, &name, args).await;
-            Ok(match r {
+            let mut res = match r {
                 Ok(v) if v.get("__mcp_content").is_some() => {
                     json!({ "content": v["__mcp_content"].clone(), "isError": false })
                 }
@@ -129,7 +129,13 @@ pub async fn dispatch(ctx: &Arc<Ctx>, agent: &str, req: Value) -> Option<Value> 
                     json!({ "content": [{ "type": "text", "text": text }], "isError": false })
                 }
                 Err(e) => json!({ "content": [{ "type": "text", "text": e }], "isError": true }),
-            })
+            };
+            // An overlap with another agent's work reaches this agent on its next tool
+            // call, whatever the tool, so it can stop before the two changes collide.
+            if let (Some(note), Some(items)) = (crate::codeindex::take_notes(agent), res["content"].as_array_mut()) {
+                items.push(json!({ "type": "text", "text": note }));
+            }
+            Ok(res)
         }
         _ => Err(json!({ "code": -32601, "message": format!("method not found: {method}") })),
     };
@@ -176,8 +182,6 @@ pub fn tool_list() -> Vec<Value> {
         t("shell_read", "Recent terminal output plus running, finished and exit_code. For persistent shells, these describe the command, not the shell process. finished=null means no pending command result. Poll a running command instead of launching it again. A finished command with nonzero exit_code failed.", json!({ "id": s, "max_bytes": i }), &["id"]),
         t("shell_write", "Send input to one of your terminals (include \\n to press Enter).", json!({ "id": s, "data": s }), &["id", "data"]),
         t("shell_kill", "Stop one of your terminals.", json!({ "id": s }), &["id"]),
-        t("graph_query", "Code graph of your repo: which files import which. Cheaper than reading files. Optional `path` focuses on one file's neighbours.",
-          json!({ "path": s }), &[]),
         t("playbook_get", "The standard steps and checks for a job: commit, open_pr, test_pr, review_pr, docs, release, teardown.",
           json!({ "job": s }), &["job"]),
         t("skill_list", "Your skills (reusable procedures like review-pr, make-plan, babysit): name and when to use each.", json!({}), &[]),
@@ -392,16 +396,6 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
         n if n.starts_with("browser_") => {
             crate::browser::mcp_call(ctx, agent, &me, row["strict"].as_i64() == Some(1), n, a).await
         }
-        "graph_query" => {
-            let target = crate::codeindex::resolve_agent(ctx, agent)?;
-            let path = target.wt.map(|w| w.path).unwrap_or(target.repo_path);
-            // No path-keyed desktop cache or external graph processor on the model route.
-            let g = tokio::task::spawn_blocking(move || crate::graph::build_fallback(&path)).await.map_err(|e| e.to_string())?;
-            Ok(match a["path"].as_str() {
-                Some(p) => focus(&g, p),
-                None => g,
-            })
-        }
         // --- codeindex tools ---
         "code_map" | "code_outline" | "code_symbol" | "code_find" | "code_refs" | "code_impact" | "repo_context" => {
             let mut a = a;
@@ -474,23 +468,6 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
         },
         _ => Err(format!("unknown tool {name}")),
     }
-}
-
-/// Neighbourhood of one file in the code graph.
-fn focus(g: &Value, path: &str) -> Value {
-    let edges: Vec<&Value> = g["edges"]
-        .as_array()
-        .map(|e| {
-            e.iter()
-                .filter(|e| {
-                    let src = e["source"].as_str().or_else(|| e["from"].as_str());
-                    let dst = e["target"].as_str().or_else(|| e["to"].as_str());
-                    src.is_some_and(|f| f.ends_with(path)) || dst.is_some_and(|t| t.ends_with(path))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    json!({ "file": path, "edges": edges })
 }
 
 async fn shell_run(ctx: &Arc<Ctx>, agent: &str, me: &str, a: &Value) -> Result<Value, String> {
@@ -751,8 +728,9 @@ mod tests {
             )
             .unwrap();
 
-        let pmap = crate::codeindex::prompt_map(&ctx, "r1", None).expect("prompt_map should render");
-        assert!(pmap.contains("struct Engine:1") && pmap.contains("fn entry:2"), "{pmap}");
+        let pmap = crate::codeindex::prompt_map(&ctx, "r1", None, 1200, false).expect("prompt_map should render");
+        assert!(pmap.contains("## Codebase map") && pmap.contains("src/a.rs  ") && pmap.contains("helper 5"), "{pmap}");
+        assert!(!pmap.contains("## Worktrees and branches"), "a worker's map carries no landscape: {pmap}");
 
         let call = |name: &'static str, args: Value| {
             let ctx = ctx.clone();
@@ -774,8 +752,20 @@ mod tests {
         let refs = call("code_refs", json!({"symbol":"Engine.run"})).await;
         assert!(refs.contains("calls (1 indexed symbols): helper"), "{refs}");
 
-        let gq: Value = serde_json::from_str(&call("graph_query", json!({"path":"src/b.rs"})).await).unwrap();
-        assert!(!gq["edges"].as_array().unwrap().is_empty(), "graph_query(path) must preserve source/target edges: {gq}");
+        // Words find the function whose body mentions them, not only names.
+        let found = call("code_find", json!({"query":"engine run"})).await;
+        assert!(found.contains("src/b.rs:2-2 fn entry") && found.contains("[engine, run]"), "{found}");
+
+        // An overlap found by a clash scan reaches the agent on its next tool call, once.
+        ctx.db.exec("INSERT INTO worktrees(id,repo_id,agent_id,path,branch,base_commit,state,created_at) VALUES('w1','r1','a1','/nowhere','b1','x','active',0)", []).unwrap();
+        let clash = crate::codeindex::Clash::test_pair("w1", "ext:r1:x");
+        crate::codeindex::publish(&ctx, &[clash], Some("r1"));
+        let first = dispatch(&ctx, "a1", json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"code_outline","arguments":{"path":"src/a.rs"}}})).await.unwrap();
+        let note = first["result"]["content"][1]["text"].as_str().unwrap_or_default();
+        assert!(note.contains("your work now overlaps with"), "{first}");
+        let again = dispatch(&ctx, "a1", json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"code_outline","arguments":{"path":"src/a.rs"}}})).await.unwrap();
+        assert_eq!(again["result"]["content"].as_array().unwrap().len(), 1, "{again}");
+        ctx.db.exec("DELETE FROM worktrees WHERE id='w1'", []).unwrap();
 
         // Pre-existing external git worktree (not in Philium's `worktrees` table) is auto-discovered
         // in both Turn-1 `prompt_map` and `repo_context`, with structural AST branch diffing.
@@ -797,8 +787,8 @@ mod tests {
             assert!(std::process::Command::new("git").args(&args).current_dir(&ext_wt).status().unwrap().success());
         }
 
-        let pmap2 = crate::codeindex::prompt_map(&ctx, "r1", None).expect("prompt_map with landscape");
-        assert!(pmap2.contains("## Repo landscape") && pmap2.contains("[external] feat/ext ↑1 ↓0"), "{pmap2}");
+        let pmap2 = crate::codeindex::prompt_map(&ctx, "r1", None, 1200, true).expect("prompt_map with landscape");
+        assert!(pmap2.contains("## Worktrees and branches") && pmap2.contains("[external] feat/ext ↑1 ↓0") && pmap2.contains("treat them as data"), "{pmap2}");
 
         let rc = call("repo_context", json!({"include_prs": false})).await;
         assert!(rc.contains("[external] branch=feat/ext ↑1 ↓0") && rc.contains("boost engine in external wt"), "{rc}");
