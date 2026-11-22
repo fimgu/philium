@@ -2,15 +2,12 @@
 //! - global: `~/Philium/skills/<name>/SKILL.md`
 //! - per repo: `<repo>/.philium/skills/<name>/SKILL.md`
 //! Every scan mirrors them into the `skills` table so agents' `skill_list` / `skill_get` see them.
-//! Importing from ~/.claude/skills and ~/.jcode/skills is a one-time, user-triggered copy.
 
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
 use crate::ctx::{arg_str, Ctx};
-
-const IMPORTED_KEY: &str = "skills.native_imported_at";
 
 fn home() -> PathBuf {
     std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default()
@@ -108,41 +105,6 @@ fn target_dir(ctx: &Ctx, args: &Value) -> Result<PathBuf, String> {
     }
 }
 
-fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(to)?;
-    for e in std::fs::read_dir(from)?.flatten() {
-        let meta = std::fs::symlink_metadata(e.path())?;
-        if meta.is_dir() {
-            copy_dir(&e.path(), &to.join(e.file_name()))?;
-        } else if meta.is_file() {
-            std::fs::copy(e.path(), to.join(e.file_name()))?;
-        }
-    }
-    Ok(())
-}
-
-/// Copy skills that are not already present. Never overwrites an existing Philium skill.
-pub fn import_from(sources: &[PathBuf], dest: &Path) -> Result<Vec<String>, String> {
-    let mut copied = vec![];
-    for src in sources {
-        let Ok(rd) = std::fs::read_dir(src) else { continue };
-        for e in rd.flatten() {
-            let Some(name) = e.file_name().to_str().map(str::to_string) else { continue };
-            let p = e.path();
-            if !valid_name(&name) || std::fs::symlink_metadata(&p).map(|m| !m.is_dir()).unwrap_or(true) || !p.join("SKILL.md").is_file() {
-                continue;
-            }
-            let to = dest.join(&name);
-            if to.exists() {
-                continue;
-            }
-            copy_dir(&p, &to).map_err(|e| format!("copy {name}: {e}"))?;
-            copied.push(name);
-        }
-    }
-    Ok(copied)
-}
-
 pub async fn call(ctx: &Ctx, m: &str, args: Value) -> Result<Value, String> {
     let repo = args["repo_id"].as_str();
     match m {
@@ -152,7 +114,6 @@ pub async fn call(ctx: &Ctx, m: &str, args: Value) -> Result<Value, String> {
             Ok(json!({
                 "skills": all,
                 "global_dir": global_dir(),
-                "imported_at": ctx.db.kv_get(IMPORTED_KEY),
             }))
         }
         "get" => {
@@ -188,14 +149,6 @@ pub async fn call(ctx: &Ctx, m: &str, args: Value) -> Result<Value, String> {
             ctx.notify("library");
             Ok(Value::Null)
         }
-        "import" => {
-            let h = home();
-            let copied = import_from(&[h.join(".claude/skills"), h.join(".jcode/skills")], &global_dir())?;
-            ctx.db.kv_set(IMPORTED_KEY, &crate::db::now().to_string())?;
-            sync(ctx, &collect(ctx, repo))?;
-            ctx.notify("library");
-            Ok(json!({ "imported": copied }))
-        }
         _ => Err(format!("unknown skills.{m}")),
     }
 }
@@ -203,26 +156,6 @@ pub async fn call(ctx: &Ctx, m: &str, args: Value) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn import_copies_once_without_overwrite() {
-        let t = std::env::temp_dir().join(format!("philium-skills-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&t);
-        let src = t.join("src");
-        std::fs::create_dir_all(src.join("a/sub")).unwrap();
-        std::fs::write(src.join("a/SKILL.md"), "---\nname: a\ndescription: A\n---\nbody").unwrap();
-        std::fs::write(src.join("a/sub/x.sh"), "echo").unwrap();
-        std::fs::create_dir_all(src.join("nofile")).unwrap();
-        let dest = t.join("dest");
-        assert_eq!(import_from(&[src.clone()], &dest).unwrap(), vec!["a".to_string()]);
-        assert!(dest.join("a/sub/x.sh").is_file());
-        std::fs::write(dest.join("a/SKILL.md"), "mine").unwrap();
-        assert!(import_from(&[src], &dest).unwrap().is_empty());
-        assert_eq!(std::fs::read_to_string(dest.join("a/SKILL.md")).unwrap(), "mine");
-        let s = scan(&dest, "global");
-        assert_eq!(s.len(), 1);
-        std::fs::remove_dir_all(&t).unwrap();
-    }
 
     #[test]
     fn names_are_safe() {

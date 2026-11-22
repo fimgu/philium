@@ -31,22 +31,14 @@ export default function Skills() {
     setSel(null);
     refetch();
   };
-  const runImport = async () => {
-    const r = await rpc("skills.import", { repo_id: repo() }, { action: true });
-    toast(r.imported.length ? `Imported ${r.imported.length} skills` : "Nothing new to import", "secure");
-    refetch();
-  };
 
   return (
     <Page title="Skills" sub={data()?.global_dir}
-      actions={<>
-        <Show when={!data()?.imported_at}><Button variant="ghost" onClick={runImport}>Import from Claude / Jcode</Button></Show>
-        <Button onClick={startNew}>New skill</Button>
-      </>}>
+      actions={<Button onClick={startNew}>New skill</Button>}>
       <div class="row gap-12" style={{ "align-items": "flex-start", height: "100%" }}>
         <div class="col gap-8" style={{ width: "300px", "flex-shrink": 0 }}>
           <Input placeholder="Filter skills" value={q()} onValue={setQ} />
-          <Show when={skills().length} fallback={<Empty title="No skills yet" body="Create one, or import from ~/.claude/skills and ~/.jcode/skills." />}>
+          <Show when={skills().length} fallback={<Empty title="No skills yet" body="Create one to get started." />}>
             <For each={skills()}>{(s) => (
               <button class={`nav-item ${sel()?.name === s.name && sel()?.scope === s.scope ? "on" : ""}`} style={{ "text-align": "left", display: "block", width: "100%" }}
                 onClick={() => setSel({ name: s.name, scope: s.scope, body: s.body, isNew: false })}>
