@@ -9,6 +9,7 @@ import { Icon } from "../ui/icons.jsx";
 import { Conversation, Composer, KvTelemetryBar, speedEffort, effortSpeed, agentAttachmentLoader, PlainError } from "../ui/conversation.jsx";
 import { agentHue, AgentChip, RoleBadge, KvBadge, WarningPills } from "../ui/agent-chip.jsx";
 import { SpawnModal } from "../ui/spawn-modal.jsx";
+import { AgentProgressLine, AgentProgressPanel } from "../ui/agent-progress.jsx";
 import { AccessApprovalBar } from "../ui/access-requests.jsx";
 import { pendingAccessByAgent, agentNeedsUser } from "../lib/access-helpers.js";
 import { rpc, fmt, sendError } from "../lib/rpc.js";
@@ -99,6 +100,7 @@ function AgentRow(props) {
           <Show when={(a().warnings ?? []).some((w) => w.kind === "clash")}><Badge tone="danger">Clash</Badge></Show>
         </div>
         <div class="xs faint ellipsis">{a().task_title || a().repo_name || a().branch || (a().model_ref ?? "").split("/").pop()}</div>
+        <AgentProgressLine agent={a()} />
       </div>
       <span class="xs faint">{fmt.ago(a().last_active_at)}</span>
     </div>
@@ -823,6 +825,7 @@ export function AgentGridCard(props) {
           </Button>
         </div>
       </div>
+      <AgentProgressPanel agent={a()} />
       <Show when={calmWarnings(a()?.warnings).length}>
         <div class="agent-card-warnings">
           <WarningPills warnings={calmWarnings(a()?.warnings)} max={3} />
@@ -877,6 +880,7 @@ function FleetHeatmapTile(props) {
       <div class="fleet-tile-mid xs faint ellipsis">
         {a()?.repo_name ? `${a().repo_name}${a().branch ? `@${a().branch}` : ""}` : (a()?.task_title || (a()?.model_ref ?? "").split("/").pop())}
       </div>
+      <AgentProgressLine agent={a()} />
       <Show when={warnings().length}>
         <WarningPills warnings={warnings()} compact max={2} />
       </Show>

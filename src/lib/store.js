@@ -2,6 +2,7 @@
 // and per-agent event caches warm across screen/agent switches so navigation is instant.
 import { createSignal, createRoot, onCleanup } from "solid-js";
 import { rpc, useEvent } from "./rpc.js";
+import { subscribeAgentProgress } from "./agent-progress.js";
 import { playSound } from "./sound.js";
 
 const storage =
@@ -212,6 +213,8 @@ export function useStore() {
         }
       },
     );
+
+    subscribeAgentProgress(useEvent);
 
     let agTimer;
     useEvent("agents:changed", () => {

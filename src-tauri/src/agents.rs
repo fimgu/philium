@@ -898,6 +898,7 @@ async fn pump_events(ctx: Arc<Ctx>, id: String, hal: Arc<Hal>, session: String) 
             }
             if !batch.is_empty() && (last_flush.elapsed().as_millis() >= 100 || batch.len() > 200) {
                 ctx.emit("agents:events", json!({ "id": id, "events": std::mem::take(&mut batch) }));
+                ctx.emit("agents:progress", json!({ "id": id, "progress": progress_json(&id) }));
                 last_flush = std::time::Instant::now();
             }
             if force_db_sync || last_db_sync.elapsed().as_millis() >= 1500 {
@@ -918,6 +919,7 @@ async fn pump_events(ctx: Arc<Ctx>, id: String, hal: Arc<Hal>, session: String) 
         }
         if !batch.is_empty() {
             ctx.emit("agents:events", json!({ "id": id, "events": batch }));
+            ctx.emit("agents:progress", json!({ "id": id, "progress": progress_json(&id) }));
         }
         if after > persisted_seq {
             let _ = ctx.db.kv_set(&format!("agent_seq.{id}"), &after.to_string());
@@ -1059,6 +1061,138 @@ fn is_state_event(ty: &str) -> bool {
     )
 }
 
+/// What a long-running agent is doing right now, derived only from HAL lifecycle
+/// events: the turn's start, the tool in flight, the last event time, and a
+/// checklist parsed from markdown checkboxes in its latest assistant text.
+#[derive(Default, Clone)]
+struct Progress {
+    turn_started_at: Option<i64>,
+    turn_ended_at: Option<i64>,
+    last_event_at: i64,
+    tools_run: u32,
+    tools: Vec<(String, String, Value)>,
+    last_tool: Option<(String, Value)>,
+    text: String,
+    checklist: Vec<(bool, String)>,
+    phase: &'static str,
+}
+
+fn progress_map() -> &'static Mutex<HashMap<String, Progress>> {
+    static P: OnceLock<Mutex<HashMap<String, Progress>>> = OnceLock::new();
+    P.get_or_init(Default::default)
+}
+
+/// `- [x] item` / `* [ ] item` / `1. [x] item` lines, in order. The last block wins.
+pub fn parse_checklist(text: &str) -> Vec<(bool, String)> {
+    let mut out = vec![];
+    for line in text.lines() {
+        let t = line.trim_start();
+        let t = t
+            .strip_prefix("- ")
+            .or_else(|| t.strip_prefix("* "))
+            .or_else(|| {
+                let digits = t.chars().take_while(|c| c.is_ascii_digit()).count();
+                if digits > 0 { t[digits..].strip_prefix(". ") } else { None }
+            });
+        let Some(t) = t else { continue };
+        let (done, rest) = if let Some(r) = t.strip_prefix("[x]").or_else(|| t.strip_prefix("[X]")) {
+            (true, r)
+        } else if let Some(r) = t.strip_prefix("[ ]") {
+            (false, r)
+        } else {
+            continue;
+        };
+        let label = rest.trim();
+        if !label.is_empty() {
+            out.push((done, label.chars().take(140).collect()));
+        }
+    }
+    out.truncate(40);
+    out
+}
+
+fn track_progress(id: &str, ev: &Value) {
+    let ty = ev["type"].as_str().unwrap_or("");
+    let ts = crate::db::now();
+    let mut map = progress_map().lk();
+    let p = map.entry(id.to_string()).or_default();
+    p.last_event_at = ts;
+    match ty {
+        "turn.started" => {
+            let checklist = std::mem::take(&mut p.checklist);
+            *p = Progress { turn_started_at: Some(ts), last_event_at: ts, checklist, phase: "thinking", ..Default::default() };
+        }
+        "model.started" => p.phase = "thinking",
+        "model.retrying" => p.phase = "retrying",
+        "model.delta" => {
+            if let Some(d) = ev["delta"].as_str() {
+                p.phase = "writing";
+                p.text.push_str(d);
+                if p.text.len() > 32_000 {
+                    let cut = p.text.len() - 24_000;
+                    let cut = (cut..p.text.len()).find(|i| p.text.is_char_boundary(*i)).unwrap_or(0);
+                    p.text.drain(..cut);
+                }
+            }
+        }
+        "model.finished" => {
+            let list = parse_checklist(&p.text);
+            if !list.is_empty() {
+                p.checklist = list;
+            }
+            p.text.clear();
+        }
+        "tool.started" => {
+            let tool = ev["tool"].as_str().unwrap_or("tool").to_string();
+            let call = ev["call_id"].as_str().unwrap_or_default().to_string();
+            p.tools.push((call, tool.clone(), ev["arguments"].clone()));
+            p.last_tool = Some((tool, ev["arguments"].clone()));
+            p.tools_run += 1;
+            p.phase = "working";
+        }
+        "tool.finished" => {
+            let call = ev["call_id"].as_str().unwrap_or_default();
+            p.tools.retain(|(c, _, _)| c != call);
+        }
+        "permission.requested" => p.phase = "approval",
+        "permission.resolved" => p.phase = "working",
+        "assistant.completed" | "turn.failed" | "turn.cancelled" => {
+            if let Some(t) = ev["text"].as_str() {
+                let list = parse_checklist(t);
+                if !list.is_empty() {
+                    p.checklist = list;
+                }
+            }
+            p.tools.clear();
+            p.text.clear();
+            p.turn_ended_at = Some(ts);
+            p.phase = "idle";
+        }
+        _ => {}
+    }
+}
+
+fn progress_json(id: &str) -> Value {
+    let map = progress_map().lk();
+    let Some(p) = map.get(id) else { return Value::Null };
+    let current = p.tools.last().map(|(_, t, a)| json!({ "tool": t, "arguments": a }));
+    let last = p.last_tool.as_ref().map(|(t, a)| json!({ "tool": t, "arguments": a }));
+    let done = p.checklist.iter().filter(|(d, _)| *d).count();
+    json!({
+        "phase": p.phase,
+        "turn_started_at": p.turn_started_at,
+        "turn_ended_at": p.turn_ended_at,
+        "last_event_at": p.last_event_at,
+        "tools_run": p.tools_run,
+        "tools_running": p.tools.len(),
+        "current_tool": current,
+        "last_tool": last,
+        "checklist": p.checklist.iter().map(|(d, t)| json!({ "done": d, "text": t })).collect::<Vec<_>>(),
+        "checklist_done": done,
+        "checklist_total": p.checklist.len(),
+    })
+}
+
 fn apply_event(
     ctx: &Arc<Ctx>,
     id: &str,
@@ -1067,6 +1201,7 @@ fn apply_event(
     dirty_active: &mut bool,
 ) -> bool {
     let ty = ev["type"].as_str().unwrap_or("");
+    track_progress(id, ev);
     if ty == "model.delta" {
         return false;
     }
@@ -1459,6 +1594,7 @@ fn with_live_snapshot(snap: &LiveSnapshot, mut row: Value) -> Value {
             (global, snap.working_note_scopes.contains("global"))
         }
     };
+    row["progress"] = progress_json(&id);
     row["memory_count"] = json!(memory_count);
     row["has_working_note"] = json!(has_working_note);
     row["kv"] = kv;
@@ -2113,6 +2249,33 @@ async fn remove_one(ctx: &Arc<Ctx>, id: &str, force: bool) -> Result<Value, Stri
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn checklist_parses_markdown_boxes() {
+        let l = super::parse_checklist("Plan:\n- [x] read code\n* [ ] write UI\n  2. [X] build\n- plain\n- [ ]   \n");
+        assert_eq!(l, vec![(true, "read code".into()), (false, "write UI".into()), (true, "build".into())]);
+    }
+
+    #[test]
+    fn progress_tracks_tools_and_turns() {
+        use serde_json::json;
+        let id = "progress-test";
+        super::track_progress(id, &json!({"type":"turn.started"}));
+        super::track_progress(id, &json!({"type":"tool.started","call_id":"c1","tool":"shell_run","arguments":{"command":"ls"}}));
+        let p = super::progress_json(id);
+        assert_eq!(p["current_tool"]["tool"], "shell_run");
+        assert_eq!(p["phase"], "working");
+        super::track_progress(id, &json!({"type":"tool.finished","call_id":"c1"}));
+        super::track_progress(id, &json!({"type":"model.delta","delta":"- [x] a\n- [ ] b\n"}));
+        super::track_progress(id, &json!({"type":"model.finished"}));
+        super::track_progress(id, &json!({"type":"assistant.completed"}));
+        let p = super::progress_json(id);
+        assert_eq!(p["phase"], "idle");
+        assert_eq!(p["checklist_done"], 1);
+        assert_eq!(p["checklist_total"], 2);
+        assert!(p["current_tool"].is_null());
+        assert_eq!(p["tools_run"], 1);
+    }
+
     use super::*;
 
     #[tokio::test]
