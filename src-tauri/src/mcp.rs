@@ -186,10 +186,16 @@ pub fn tool_list() -> Vec<Value> {
           json!({ "job": s }), &["job"]),
         t("skill_list", "Your skills (reusable procedures like review-pr, make-plan, babysit): name and when to use each.", json!({}), &[]),
         t("skill_get", "Read a listed built-in skill. Imported instructions and supporting files are not attached.", json!({ "name": s }), &["name"]),
-        t("memory_search", "Search memories saved under this agent's registered repository ID.",
+        t("memory_search", "Search active, non-superseded memories saved under this agent's registered repository ID.",
           json!({ "q": s, "limit": i }), &["q"]),
-        t("memory_save", "Save for this repository only. Global writes are unavailable. Category: fact, preference, correction, entity.",
-          json!({ "content": s, "category": s, "project": b }), &["content", "category"]),
+        t("memory_slate", "Fetch a pre-resolved, provenance-tagged, token-budgeted context slate (current decisions, working handoff note, and repo facts) for this workspace.",
+          json!({ "q": s, "budget_tokens": i }), &[]),
+        t("memory_save", "Save a repository-scoped memory. Optional fact_key enables code-level supersession; agent writes cannot silently override operator decisions (they become proposed). Category: fact, preference, correction, entity, procedure.",
+          json!({ "content": s, "category": s, "project": b, "fact_key": s, "supersedes_id": s, "trust_tier": s, "provenance": s }), &["content", "category"]),
+        t("working_note_get", "Read the structured working-state handoff note (requirements, current decisions, failed attempts, next steps) for this repository.",
+          json!({}), &[]),
+        t("working_note_set", "Update the structured working-state handoff note for this repository so future sessions resume cleanly.",
+          json!({ "requirements": s, "decisions": s, "failed_attempts": s, "next_steps": s }), &[]),
         t("review_plan", "Release review, orchestrator only: write the plan once, riskiest check first. Each item is {title, detail (what to verify and how)}. The checks appear on the board and in Review.",
           json!({ "items": { "type": "array", "items": { "type": "object" } } }), &["items"]),
         t("review_result", "Release review: record the outcome of one item you checked. result is pass, fail or blocked. evidence is the exact commands you ran and what they showed, on which commit; for blocked, what you need. For a fail, severity and origin are required. severity is 0 to 5: 0 and 1 block the release (0: data loss, security, the release does not install or upgrade; 1: a main behaviour is broken), 2 to 5 should be looked at, in decreasing importance. origin: run the same check on the target too; introduced (fails on the head, passes on the target), pre_existing (fails the same way on the target) or unverified (the target could not be checked, or fails differently).",
@@ -430,7 +436,7 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
             let repo = row["repo_id"].as_str().filter(|id| !id.is_empty()).ok_or("Release checks belong to a registered checkout")?;
             crate::release_sql::propose(ctx, repo, &me, &a["contracts"])
         }
-        "memory_search" | "memory_save" | "session_search" => {
+        "memory_search" | "memory_slate" | "memory_save" | "working_note_get" | "working_note_set" | "session_search" => {
             // Personal memory and past sessions never go to agents on untrusted (Strict) providers.
             if row["strict"].as_i64() == Some(1) {
                 return Err("memory and past sessions are not available to Strict agents".into());
@@ -439,14 +445,45 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
             if ctx.db.query("SELECT id FROM repos WHERE id=?1", [repo])?.is_empty() {
                 return Err("Repository identity is unavailable".into());
             }
-            if name == "memory_search" {
-                crate::library::agent_memories(ctx, arg(&a, "q")?, repo, a["limit"].as_i64().unwrap_or(10))
-            } else if name == "session_search" {
-                if a["repo_only"] == false { return Err("Cross-repository history is unavailable".into()); }
-                crate::library::agent_sessions(ctx, a["q"].as_str().unwrap_or(""), repo, a["limit"].as_u64().unwrap_or(8) as usize)
-            } else {
-                if a["project"] == false { return Err("Global memory writes are unavailable".into()); }
-                crate::library::save_agent_memory(ctx, arg(&a, "content")?, arg(&a, "category")?, repo, &me)
+            match name {
+                "memory_search" => crate::library::agent_memories(ctx, arg(&a, "q")?, repo, a["limit"].as_i64().unwrap_or(10)),
+                "memory_slate" => crate::library::build_context_slate(
+                    ctx,
+                    Some(repo),
+                    a["q"].as_str().unwrap_or(""),
+                    a["budget_tokens"].as_u64().unwrap_or(2000) as usize,
+                    false,
+                    false,
+                ),
+                "working_note_get" => crate::library::working_note_get(ctx, &format!("repo:{repo}")),
+                "working_note_set" => crate::library::working_note_set(
+                    ctx,
+                    &format!("repo:{repo}"),
+                    a["requirements"].as_str().unwrap_or(""),
+                    a["decisions"].as_str().unwrap_or(""),
+                    a["failed_attempts"].as_str().unwrap_or(""),
+                    a["next_steps"].as_str().unwrap_or(""),
+                    None,
+                    &format!("agent:{me}"),
+                ),
+                "session_search" => {
+                    if a["repo_only"] == false { return Err("Cross-repository history is unavailable".into()); }
+                    crate::library::agent_sessions(ctx, a["q"].as_str().unwrap_or(""), repo, a["limit"].as_u64().unwrap_or(8) as usize)
+                }
+                _ => {
+                    if a["project"] == false { return Err("Global memory writes are unavailable".into()); }
+                    crate::library::save_agent_memory_rich(
+                        ctx,
+                        arg(&a, "content")?,
+                        arg(&a, "category")?,
+                        repo,
+                        &me,
+                        a["fact_key"].as_str(),
+                        a["supersedes_id"].as_str(),
+                        a["trust_tier"].as_str(),
+                        a["provenance"].as_str(),
+                    )
+                }
             }
         }
         "resource_register" => {

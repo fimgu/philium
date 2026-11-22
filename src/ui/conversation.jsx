@@ -729,6 +729,18 @@ export function Composer(props) {
     if (t.startsWith("/model")) {
       return { kind: "model", label: "Press Enter to choose from a list, or type a name: /model sonnet. Switching costs no tokens." };
     }
+    if (t.startsWith("/context") && props.onSlashContext) {
+      return { kind: "context", label: "Open the live Context Slate Inspector (budget, active facts, working note). 0 tokens." };
+    }
+    if (t.startsWith("/remember") && props.onSlashRemember) {
+      return { kind: "remember", label: "Save a direct decision to the fact ledger: /remember [key=]decision text. 0 tokens." };
+    }
+    if (t.startsWith("/fork") && props.onSlashFork) {
+      return { kind: "fork", label: "Fork a new agent on this workspace with the current working handoff: /fork [brief]" };
+    }
+    if (t.startsWith("/compact") && props.onSlashCompact) {
+      return { kind: "compact", label: "Open the working handoff note so future turns stay lean." };
+    }
     return null;
   });
   const add = async (files) => {
@@ -815,6 +827,28 @@ export function Composer(props) {
       const arg = t.replace(/^\/model\s*/i, "").trim();
       const ok = await props.onSlashModel(arg);
       if (ok !== false) clearSentDraft(target, draft, attached);
+      return;
+    }
+    if (!attached.length && /^\/context(\s+.*)?$/i.test(t) && props.onSlashContext) {
+      await props.onSlashContext();
+      clearSentDraft(target, draft, attached);
+      return;
+    }
+    if (!attached.length && /^\/remember(\s+.*)?$/i.test(t) && props.onSlashRemember) {
+      const arg = t.replace(/^\/remember\s*/i, "").trim();
+      const ok = await props.onSlashRemember(arg);
+      if (ok !== false) clearSentDraft(target, draft, attached);
+      return;
+    }
+    if (!attached.length && /^\/fork(\s+.*)?$/i.test(t) && props.onSlashFork) {
+      const arg = t.replace(/^\/fork\s*/i, "").trim();
+      const ok = await props.onSlashFork(arg);
+      if (ok !== false) clearSentDraft(target, draft, attached);
+      return;
+    }
+    if (!attached.length && /^\/compact(\s+.*)?$/i.test(t) && props.onSlashCompact) {
+      await props.onSlashCompact();
+      clearSentDraft(target, draft, attached);
       return;
     }
     target.setSending(true);
