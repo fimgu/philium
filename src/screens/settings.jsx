@@ -316,6 +316,198 @@ function PlaybooksSection(props) {
   );
 }
 
+function MemoryEmbeddingsSection(props) {
+  const [cfg, setCfg] = createSignal(null);
+  const [embProvider, setEmbProvider] = createSignal("");
+  const [embEndpoint, setEmbEndpoint] = createSignal("");
+  const [embModel, setEmbModel] = createSignal("");
+  const [rrProvider, setRrProvider] = createSignal("");
+  const [rrEndpoint, setRrEndpoint] = createSignal("");
+  const [rrModel, setRrModel] = createSignal("");
+  const [memBusy, setMemBusy] = createSignal(false);
+  const [reindexing, setReindexing] = createSignal(false);
+  const [memErr, setMemErr] = createSignal("");
+
+  const trustedProviders = createMemo(() =>
+    (props.providers ?? []).filter((p) => p && p.enabled !== 0 && p.enabled !== false && p.trusted !== false),
+  );
+
+  const providerOptions = (current) => {
+    const list = trustedProviders();
+    const opts = [
+      { value: "", label: "Auto / Direct loopback" },
+      ...list.map((p) => ({ value: p.id, label: p.name || p.id })),
+    ];
+    if (current && !opts.some((o) => o.value === current)) {
+      opts.push({ value: current, label: current });
+    }
+    return opts;
+  };
+
+  async function loadConfig() {
+    setMemErr("");
+    try {
+      const c = await rpc("library.config_get", {}, { local: true });
+      if (!c) return;
+      setCfg(c);
+      setEmbProvider(c.embedding_provider ?? "");
+      setEmbEndpoint(c.embedding_endpoint ?? "");
+      setEmbModel(c.embedding_model ?? "");
+      setRrProvider(c.rerank_provider ?? "");
+      setRrEndpoint(c.rerank_endpoint ?? "");
+      setRrModel(c.rerank_model ?? "");
+    } catch {
+      // Degrade gracefully if backend config_get is unavailable.
+    }
+  }
+
+  async function saveConfig() {
+    setMemBusy(true);
+    setMemErr("");
+    try {
+      await rpc("library.config_set", {
+        embedding_provider: embProvider().trim(),
+        embedding_endpoint: embEndpoint().trim(),
+        embedding_model: embModel().trim(),
+        rerank_provider: rrProvider().trim(),
+        rerank_endpoint: rrEndpoint().trim(),
+        rerank_model: rrModel().trim(),
+      });
+      await loadConfig();
+      toast("Memory retrieval config saved", "good");
+    } catch (e) {
+      setMemErr(String(e));
+      toast(String(e), "danger");
+    } finally {
+      setMemBusy(false);
+    }
+  }
+
+  async function runReindex() {
+    setReindexing(true);
+    setMemErr("");
+    try {
+      const res = await rpc("library.reindex", {});
+      await loadConfig();
+      const label = res?.embed_model || res?.mode || "Lexical (FTS5)";
+      toast(`Reindexed ${res?.indexed ?? 0} memories (${label})`, "good");
+    } catch (e) {
+      setMemErr(String(e));
+      toast(String(e), "danger");
+    } finally {
+      setReindexing(false);
+    }
+  }
+
+  onMount(loadConfig);
+
+  const activeEmbed = () => cfg()?.active_embed_model || "";
+  const rerankerOn = () => Boolean(cfg()?.reranker_active || cfg()?.active_rerank_model);
+
+  return (
+    <section class="ws-section">
+      <details onToggle={(e) => e.currentTarget.open && loadConfig()}>
+        <summary class="ws-row" style={{ cursor: "pointer" }}>
+          <strong>Memory Embeddings &amp; Reranker</strong>
+          <div class="ws-actions">
+            <Badge tone={activeEmbed() ? "secure" : ""}>
+              {activeEmbed() || "Lexical (FTS5)"}
+            </Badge>
+            <Badge
+              tone={rerankerOn() ? "secure" : ""}
+              title={cfg()?.active_rerank_model ? `Active reranker: ${cfg().active_rerank_model}` : "Cross-encoder reranker off"}
+            >
+              {rerankerOn() ? "Reranker: Active" : "Reranker: Off"}
+            </Badge>
+          </div>
+        </summary>
+        <div class="col" style={{ gap: "14px", "margin-top": "14px" }}>
+          <p class="ws-muted">
+            Optional embeddings and cross-encoder reranking for Memory retrieval. Remote providers route via Philium&apos;s gateway; direct endpoints must be localhost/loopback.
+          </p>
+          <Show when={memErr()}>
+            <div class="ws-alert" role="alert">{memErr()}</div>
+          </Show>
+          <div class="ws-row">
+            <Field label="Embedding provider" hint="Trusted gateway provider, or leave on Auto for loopback.">
+              <Select
+                value={embProvider()}
+                options={providerOptions(embProvider())}
+                onValue={setEmbProvider}
+                disabled={memBusy() || props.busy}
+              />
+            </Field>
+            <Field label="Loopback endpoint" hint="Localhost only (e.g. http://127.0.0.1:11434/v1/embeddings).">
+              <Input
+                mono
+                value={embEndpoint()}
+                onValue={setEmbEndpoint}
+                placeholder="http://127.0.0.1:11434/v1/embeddings"
+                disabled={memBusy() || props.busy}
+              />
+            </Field>
+            <Field label="Embedding model" hint="e.g. bge-m3, Qwen3-Embedding-0.6B">
+              <Input
+                mono
+                value={embModel()}
+                onValue={setEmbModel}
+                placeholder="bge-m3"
+                disabled={memBusy() || props.busy}
+              />
+            </Field>
+          </div>
+          <div class="ws-row">
+            <Field label="Reranker provider" hint="Optional cross-encoder via trusted provider.">
+              <Select
+                value={rrProvider()}
+                options={providerOptions(rrProvider())}
+                onValue={setRrProvider}
+                disabled={memBusy() || props.busy}
+              />
+            </Field>
+            <Field label="Reranker endpoint" hint="Optional loopback /rerank endpoint.">
+              <Input
+                mono
+                value={rrEndpoint()}
+                onValue={setRrEndpoint}
+                placeholder="http://127.0.0.1:8080/rerank"
+                disabled={memBusy() || props.busy}
+              />
+            </Field>
+            <Field label="Reranker model" hint="e.g. bge-reranker-v2-m3, Qwen3-Reranker-0.6B">
+              <Input
+                mono
+                value={rrModel()}
+                onValue={setRrModel}
+                placeholder="bge-reranker-v2-m3"
+                disabled={memBusy() || props.busy}
+              />
+            </Field>
+          </div>
+          <div class="ws-row">
+            <span class="xs faint">
+              <Show when={cfg()?.active_rerank_model}>
+                Active reranker: <code>{cfg().active_rerank_model}</code>
+              </Show>
+              <Show when={!cfg()?.active_rerank_model && cfg()?.mode}>
+                Mode: <code>{cfg().mode}</code>
+              </Show>
+            </span>
+            <div class="ws-actions">
+              <Button variant="primary" busy={memBusy() || props.busy} onClick={saveConfig}>
+                Save
+              </Button>
+              <Button busy={reindexing() || props.busy} onClick={runReindex}>
+                Reindex
+              </Button>
+            </div>
+          </div>
+        </div>
+      </details>
+    </section>
+  );
+}
+
 export default function Settings() {
   const store = useStore();
   const status = () => store.status() ?? {};
@@ -481,6 +673,7 @@ export default function Settings() {
       </section>
       <StrictSandboxSection busy={busy()} />
       <PlaybooksSection busy={busy()} />
+      <MemoryEmbeddingsSection providers={store.providers()} busy={busy()} />
       <section class="ws-section">
         <h2>Teardown</h2>
         <Field label="Cleanup mode" hint="Unsaved or unmerged work always requires confirmation." title="Ask is the default. Auto removes eligible idle resources without prompting, except unsaved or unmerged work.">

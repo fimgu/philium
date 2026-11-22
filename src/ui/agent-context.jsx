@@ -144,6 +144,14 @@ export function AgentContext(props) {
         <div class="col" style={{ gap: "4px" }}>
           <div class="row xs dim">
             <span class="grow">Context</span>
+            <Show when={slate()?.reranker}>
+              <span
+                class="ctx-rerank-tag"
+                title={typeof slate().reranker === "string" ? `Reranked (${slate().reranker})` : "Cross-encoder reranked"}
+              >
+                Reranked
+              </span>
+            </Show>
             <span class="mono">{slate()?.used_tokens ?? 0} / {fmtBudget()}</span>
           </div>
           <Meter value={pct()} tone={pct() > 85 ? "strict" : "secure"} />
@@ -207,6 +215,36 @@ export function AgentContext(props) {
             </form>
           </Show>
         </div>
+
+        <Show when={(slate()?.procedures ?? []).length > 0}>
+          <details class="ctx-section quiet-details">
+            <summary class="ctx-section-head" style={{ cursor: "pointer" }}>
+              <span class="grow">Procedures ({slate().procedures.length})</span>
+              <span class="faint">▾</span>
+            </summary>
+            <div class="col" style={{ gap: "6px", "margin-top": "6px" }}>
+              <For each={slate().procedures}>
+                {(p) => (
+                  <div class="mem-card">
+                    <div class="mem-body xs"><strong>{p.title}</strong></div>
+                    <Show when={p.steps}>
+                      <div class="xs dim" style={{ "white-space": "pre-wrap" }}>{p.steps}</div>
+                    </Show>
+                    <div class="mem-meta">
+                      <span class="mem-chip mono">v{p.version ?? 1}</span>
+                      <Show when={p.support_count != null}>
+                        <span class="mem-chip mono">runs={p.support_count}</span>
+                      </Show>
+                      <Show when={p.verify_cmd}>
+                        <span class="mem-key">{p.verify_cmd}</span>
+                      </Show>
+                    </div>
+                  </div>
+                )}
+              </For>
+            </div>
+          </details>
+        </Show>
 
         <div class="ctx-section">
           <div class="ctx-section-head">

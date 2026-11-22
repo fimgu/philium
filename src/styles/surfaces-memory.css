@@ -256,3 +256,56 @@
   border-top: 1px solid var(--line);
 }
 
+.mem-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: var(--fs-xs);
+  color: var(--text-dim);
+  background: var(--bg-raised);
+  border: 1px solid var(--line);
+}
+
+.mem-validity-row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.mem-asof-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  background: var(--bg-raised);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+
+.mem-adv-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+
+.mem-audit-item {
+  display: grid;
+  gap: 4px;
+  padding: 6px 8px;
+  background: var(--bg-raised);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-s);
+}
+
+.ctx-rerank-tag {
+  font-size: 10px;
+  padding: 0 5px;
+  border-radius: 4px;
+  color: var(--accent);
+  background: var(--accent-dim);
+}
+
+
