@@ -4226,6 +4226,69 @@ mod tests {
         assert_eq!(call(&ctx, "count", json!({"scope": "*"})).await.unwrap()["count"], 251);
     }
 
+    /// Contract for src/screens/memory.jsx + src/lib/memory-format.js: the wire shape of
+    /// library.list / library.count / library.models_status. Set MEMCONTRACT_OUT to dump the JSON.
+    #[tokio::test]
+    async fn memory_screen_rpc_contract_matches_ui() {
+        let ctx = Arc::new(Ctx::test());
+        ctx.db.kv_set("library.imported_at", "fixture").unwrap();
+        init(&ctx).unwrap();
+        let save = |content: &str, scope: &str, title: Option<&str>, files: &[&str]| {
+            let meta = MemoryMeta { title: title.map(str::to_string), files: files.iter().map(|f| f.to_string()).collect() };
+            save_structured_meta(&ctx, SaveOpts { content, category: "decision", scope, source: "user", trust_tier: "user_direct", fact_key: None, supersedes_id: None, source_event_id: None, provenance: None }, &meta).unwrap();
+        };
+        save("zero files body", "repo:ra", Some("Zero files"), &[]);
+        save("one file body", "repo:ra", Some("One file"), &["src/a.rs"]);
+        save("five files body", "repo:ra", Some("Five files"), &["f1.rs", "f2.rs", "f3.rs", "f4.rs", "f5.rs"]);
+        save("Untitled first line\nsecond line", "repo:ra", None, &[]);
+        save("foreign repo body", "repo:rb", Some("Foreign"), &["x.rs"]);
+
+        let list = call(&ctx, "list", json!({"scope": "repo:ra", "status": "active", "q": "", "limit": 150})).await.unwrap();
+        let rows = list.as_array().expect("list is an array");
+        assert_eq!(rows.len(), 4);
+        for r in rows {
+            assert_eq!(r["scope"], "repo:ra", "foreign scope leaked: {r}");
+            assert!(r["content"].is_string() && r["category"].is_string() && r["status"].is_string(), "{r}");
+            assert!(r["id"].is_string() || r["id"].is_number(), "{r}");
+            assert!(r["title"].is_string() || r["title"].is_null(), "title: {r}");
+            assert!(r["created_at"].is_string() || r["created_at"].is_number(), "created_at: {r}");
+            assert!(r["updated_at"].is_null() || r["updated_at"].is_string() || r["updated_at"].is_number(), "{r}");
+            let files: Vec<String> = match &r["files"] {
+                Value::Null => vec![],
+                Value::Array(a) => a.iter().map(|v| v.as_str().expect("file string").to_string()).collect(),
+                Value::String(s) if s.trim().is_empty() => vec![],
+                Value::String(s) => serde_json::from_str(s).expect("files is a JSON array of strings"),
+                other => panic!("files has unexpected type: {other}"),
+            };
+            let want = match r["title"].as_str() {
+                Some("Zero files") | None => 0,
+                Some("One file") => 1,
+                Some("Five files") => 5,
+                t => panic!("unexpected title {t:?}"),
+            };
+            assert_eq!(files.len(), want, "{r}");
+        }
+        assert!(rows.iter().any(|r| r["title"].is_null() || r["title"] == ""), "untitled row present");
+
+        let count = call(&ctx, "count", json!({"scope": "repo:ra", "status": "active"})).await.unwrap();
+        assert!(count["count"].is_number(), "memory.jsx requires typeof count === 'number'");
+        assert_eq!(count["count"], 4);
+        assert_eq!(call(&ctx, "count", json!({"scope": "repo:rb", "status": "active"})).await.unwrap()["count"], 1);
+
+        let models = call(&ctx, "models_status", json!({})).await.unwrap();
+        for k in ["embed", "rerank"] {
+            let s = &models[k];
+            assert!(["ready", "downloading", "failed", "missing"].contains(&s["state"].as_str().unwrap()), "{s}");
+            assert!(s["bytes_done"].is_number() && s["bytes_total"].is_number(), "{s}");
+            assert!(s["error"].is_null() || s["error"].is_string(), "{s}");
+        }
+
+        if let Ok(out) = std::env::var("MEMCONTRACT_OUT") {
+            let dump = json!({ "list": list, "count": count, "models_status": models });
+            std::fs::write(out, serde_json::to_string_pretty(&dump).unwrap()).unwrap();
+        }
+    }
+
     #[test]
     fn memory_index_is_repo_scoped_titled_and_bounded() {
         let ctx = Ctx::test();
