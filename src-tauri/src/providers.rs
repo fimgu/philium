@@ -694,7 +694,7 @@ async fn discover(_ctx: &Arc<Ctx>, p: &Provider) -> Result<Vec<Discovered>, Stri
         if p.kind == Kind::ClaudeOauth {
             url.push_str("?limit=1000");
             req = client.get(&url).bearer_auth(&c.access).header("anthropic-version", "2023-06-01")
-                .header("anthropic-beta", crate::oauth::claude_beta(None)).header("user-agent", crate::oauth::CLAUDE_CLI_USER_AGENT);
+                .header("anthropic-beta", crate::oauth::claude_beta(None)).header("user-agent", crate::oauth::claude_cli_user_agent());
         } else {
             url.push_str("?client_version=1.0.0");
             req = client.get(&url).bearer_auth(&c.access).header("originator", crate::oauth::CHATGPT_ORIGINATOR);

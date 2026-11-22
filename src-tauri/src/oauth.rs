@@ -26,9 +26,100 @@ pub const CLAUDE_MANUAL_REDIRECT: &str = "https://platform.claude.com/oauth/code
 pub const CLAUDE_PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
 pub const CLAUDE_SCOPES: &str = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
 pub const CLAUDE_REFRESH_SCOPES: &str = "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
-pub const CLAUDE_CLI_USER_AGENT: &str = "claude-cli/2.1.280 (external, sdk-cli)";
+/// Compiled-in floor, used only until the npm registry has been read once.
+const CLAUDE_CLI_FLOOR: &str = "2.1.330";
+const CLAUDE_VERSION_KEY: &str = "claude_cli_version";
+const CLAUDE_VERSION_AT_KEY: &str = "claude_cli_version_at";
+const CLAUDE_NPM_LATEST: &str = "https://registry.npmjs.org/@anthropic-ai/claude-code/latest";
+
+fn claude_version_cell() -> &'static std::sync::RwLock<String> {
+    static V: OnceLock<std::sync::RwLock<String>> = OnceLock::new();
+    V.get_or_init(|| std::sync::RwLock::new(CLAUDE_CLI_FLOOR.to_string()))
+}
+
+fn version_tuple(v: &str) -> Option<Vec<u64>> {
+    let parts: Option<Vec<u64>> = v.trim().split('.').map(|p| p.parse().ok()).collect();
+    parts.filter(|p| p.len() >= 2)
+}
+
+/// The Claude Code version Philium presents. Only ever moves forward.
+pub fn claude_cli_version() -> String {
+    claude_version_cell().read().map(|v| v.clone()).unwrap_or_else(|_| CLAUDE_CLI_FLOOR.into())
+}
+
+/// Adopt `v` if it is a valid version newer than the current one. Returns true when it changed.
+pub fn set_claude_cli_version(v: &str) -> bool {
+    let Some(new) = version_tuple(v) else { return false };
+    let mut cur = match claude_version_cell().write() { Ok(c) => c, Err(_) => return false };
+    if version_tuple(&cur).is_some_and(|c| c >= new) {
+        return false;
+    }
+    *cur = v.trim().to_string();
+    true
+}
+
+pub fn claude_cli_user_agent() -> String {
+    format!("claude-cli/{} (external, sdk-cli)", claude_cli_version())
+}
+
+fn claude_billing() -> String {
+    format!("x-anthropic-billing-header: cc_version={}; cc_entrypoint=sdk-cli; cch=33f85;", claude_cli_version())
+}
+
+/// Parse "version X or newer is required" from a `claude_code_version_too_old` error body.
+pub fn parse_version_too_old(body: &str) -> Option<String> {
+    if !body.contains("claude_code_version_too_old") && !body.contains("or newer is required") {
+        return None;
+    }
+    let i = body.find("version ").map(|i| i + 8)?;
+    let rest = &body[i..];
+    let v: String = rest.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+    let v = v.trim_end_matches('.').to_string();
+    version_tuple(&v).map(|_| v)
+}
+
+/// Load the cached version and refresh it from npm when older than a day.
+pub fn init_claude_version(ctx: &Arc<Ctx>) {
+    if let Some(v) = ctx.db.kv_get(CLAUDE_VERSION_KEY) {
+        set_claude_cli_version(&v);
+    }
+    let pctx = ctx.clone();
+    let _ = persist_cell().set(Box::new(move |v| {
+        let _ = pctx.db.kv_set(CLAUDE_VERSION_KEY, v);
+    }));
+    let at: i64 = ctx.db.kv_get(CLAUDE_VERSION_AT_KEY).and_then(|s| s.parse().ok()).unwrap_or(0);
+    if crate::db::now() - at < 86_400 {
+        return;
+    }
+    let ctx = ctx.clone();
+    tauri::async_runtime::spawn(async move {
+        let Ok(c) = reqwest::Client::builder().timeout(std::time::Duration::from_secs(5)).build() else { return };
+        let Ok(r) = c.get(CLAUDE_NPM_LATEST).send().await else { return };
+        let Ok(v) = r.json::<Value>().await else { return };
+        if let Some(ver) = v["version"].as_str().filter(|s| version_tuple(s).is_some()) {
+            set_claude_cli_version(ver);
+            let _ = ctx.db.kv_set(CLAUDE_VERSION_KEY, &claude_cli_version());
+            let _ = ctx.db.kv_set(CLAUDE_VERSION_AT_KEY, &crate::db::now().to_string());
+        }
+    });
+}
+
+fn persist_cell() -> &'static OnceLock<Box<dyn Fn(&str) + Send + Sync>> {
+    static P: OnceLock<Box<dyn Fn(&str) + Send + Sync>> = OnceLock::new();
+    &P
+}
+
+/// Record a server-mandated minimum. Returns true if the version moved forward.
+pub fn learn_claude_min_version(v: &str) -> bool {
+    let changed = set_claude_cli_version(v);
+    if changed {
+        if let Some(p) = persist_cell().get() {
+            p(&claude_cli_version());
+        }
+    }
+    changed
+}
 pub const CLAUDE_BETA: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,effort-2025-11-24";
-const CLAUDE_BILLING: &str = "x-anthropic-billing-header: cc_version=2.1.280; cc_entrypoint=sdk-cli; cch=33f85;";
 const CLAUDE_IDENTITY: &str = "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
 
 pub const OPENAI_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -418,10 +509,10 @@ pub fn claude_beta(incoming: Option<&str>) -> String {
 /// system blocks. The caller's own system prompt follows.
 pub fn shape_claude_body(v: &mut Value) {
     let block = |t: &str| json!({ "type": "text", "text": t });
-    let mut system = vec![block(CLAUDE_BILLING), block(CLAUDE_IDENTITY)];
+    let mut system = vec![block(&claude_billing()), block(CLAUDE_IDENTITY)];
     match v.get("system").cloned() {
         Some(Value::String(s)) if !s.is_empty() => system.push(block(&s)),
-        Some(Value::Array(a)) => system.extend(a.into_iter().filter(|b| b["text"] != CLAUDE_IDENTITY && b["text"] != CLAUDE_BILLING)),
+        Some(Value::Array(a)) => system.extend(a.into_iter().filter(|b| b["text"] != CLAUDE_IDENTITY && !b["text"].as_str().is_some_and(|t| t.starts_with("x-anthropic-billing-header:")))),
         _ => {}
     }
     v["system"] = json!(system);
@@ -444,7 +535,7 @@ pub fn shape_chatgpt_body(v: &mut Value) {
 
 async fn claude_profile(access: &str, url: &str) -> (Option<String>, Option<String>) {
     let Ok(c) = client() else { return (None, None) };
-    let Ok(r) = c.get(url).bearer_auth(access).header("user-agent", CLAUDE_CLI_USER_AGENT)
+    let Ok(r) = c.get(url).bearer_auth(access).header("user-agent", claude_cli_user_agent())
         .header("anthropic-beta", "oauth-2025-04-20,claude-code-20250219").send().await else { return (None, None) };
     let Ok(v) = r.json::<Value>().await else { return (None, None) };
     let email = v["account"]["email"].as_str().map(str::to_string);
@@ -739,6 +830,20 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
 mod tests {
     use super::*;
     use axum::{routing::post, Json, Router};
+
+    #[test]
+    fn claude_version_parses_and_only_moves_forward() {
+        let body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"Claude Code 2.1.280 does not support this model; version 2.1.290 or newer is required","error_code":"claude_code_version_too_old"}}"#;
+        assert_eq!(parse_version_too_old(body).as_deref(), Some("2.1.290"));
+        assert_eq!(parse_version_too_old(r#"{"error":"other"}"#), None);
+        assert!(!set_claude_cli_version("1.0.0"));
+        assert!(!set_claude_cli_version("garbage"));
+        assert!(set_claude_cli_version("999.0.1"));
+        assert!(claude_cli_user_agent().starts_with("claude-cli/999.0.1 "));
+        let mut v = json!({"system": "hi"});
+        shape_claude_body(&mut v);
+        assert!(v["system"][0]["text"].as_str().unwrap().contains("cc_version=999.0.1;"));
+    }
 
     async fn fake_token(counter: Arc<Mutex<Vec<Value>>>) -> String {
         let app = Router::new().route(

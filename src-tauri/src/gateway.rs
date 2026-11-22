@@ -771,7 +771,7 @@ async fn proxy(
                 let beta = headers.get("anthropic-beta").and_then(|v| v.to_str().ok());
                 req = req
                     .header("anthropic-beta", crate::oauth::claude_beta(beta))
-                    .header("user-agent", crate::oauth::CLAUDE_CLI_USER_AGENT);
+                    .header("user-agent", crate::oauth::claude_cli_user_agent());
                 if headers.get("anthropic-version").is_none() {
                     req = req.header("anthropic-version", "2023-06-01");
                 }
@@ -797,6 +797,7 @@ async fn proxy(
     };
     let mut buffered_err: Option<(reqwest::StatusCode, Option<HeaderValue>, Option<HeaderValue>, Bytes)> = None;
     let mut upstream_resp = None;
+    let mut version_retried = false;
     for attempt in 0..4 {
         let resp = match build_req(&outgoing).send().await {
             Ok(r) => r,
@@ -815,6 +816,18 @@ async fn proxy(
             let ct = resp.headers().get("content-type").cloned();
             let ra = resp.headers().get("retry-after").cloned();
             let bytes = resp.bytes().await.unwrap_or_default();
+            if p.kind == Kind::ClaudeOauth && !version_retried {
+                if let Some(min) = crate::oauth::parse_version_too_old(&String::from_utf8_lossy(&bytes)) {
+                    version_retried = true;
+                    if crate::oauth::learn_claude_min_version(&min) {
+                        if let Some(v) = parsed.as_mut() {
+                            crate::oauth::shape_claude_body(v);
+                            outgoing = Bytes::from(serde_json::to_vec(v).unwrap_or_default());
+                        }
+                        continue;
+                    }
+                }
+            }
             if let Some(learned) = translate::parse_effort_rejection(status.as_u16(), &String::from_utf8_lossy(&bytes)) {
                 if let Some(v) = parsed.as_mut() {
                     // Only a request that carried an effort setting can teach us about effort. A
