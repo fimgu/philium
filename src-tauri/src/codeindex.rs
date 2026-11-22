@@ -823,23 +823,7 @@ pub fn change_set(wt: &Path, base: &str) -> ChangeSet {
     let mut cs = ChangeSet::new();
     let mb = git(wt, &["merge-base", "HEAD", base]).unwrap_or_else(|_| base.to_string());
     if let Ok(d) = git(wt, &["-c", "core.quotepath=off", "diff", "-U0", "--no-renames", &mb]) {
-        let mut cur: Option<String> = None;
-        for l in d.lines() {
-            if let Some(p) = l.strip_prefix("+++ ") {
-                cur = p.strip_prefix("b/").map(str::to_string);
-                if let Some(c) = &cur {
-                    cs.entry(c.clone()).or_insert_with(|| Some(vec![]));
-                }
-            } else if l.starts_with("@@") {
-                let (Some(c), Some(plus)) = (&cur, l.split_whitespace().find(|t| t.starts_with('+'))) else { continue };
-                let t = plus.trim_start_matches('+');
-                let (s, n) = t.split_once(',').unwrap_or((t, "1"));
-                let (s, n): (u32, u32) = (s.parse().unwrap_or(1), n.parse().unwrap_or(1));
-                if let Some(Some(v)) = cs.get_mut(c) {
-                    v.push((s, if n == 0 { s } else { s + n - 1 }));
-                }
-            }
-        }
+        add_hunks(&mut cs, &d);
     }
     if let Ok(o) = git(wt, &["-c", "core.quotepath=off", "ls-files", "--others", "--exclude-standard"]) {
         for p in lines_of(&o) {
@@ -848,6 +832,27 @@ pub fn change_set(wt: &Path, base: &str) -> ChangeSet {
     }
     cs.retain(|p, _| lang_of(p).is_some() && !skipped(p));
     cs
+}
+
+/// The files and new-side line ranges of a `git diff -U0`.
+fn add_hunks(cs: &mut ChangeSet, diff: &str) {
+    let mut cur: Option<String> = None;
+    for l in diff.lines() {
+        if let Some(p) = l.strip_prefix("+++ ") {
+            cur = p.strip_prefix("b/").map(str::to_string);
+            if let Some(c) = &cur {
+                cs.entry(c.clone()).or_insert_with(|| Some(vec![]));
+            }
+        } else if l.starts_with("@@") {
+            let (Some(c), Some(plus)) = (&cur, l.split_whitespace().find(|t| t.starts_with('+'))) else { continue };
+            let t = plus.trim_start_matches('+');
+            let (s, n) = t.split_once(',').unwrap_or((t, "1"));
+            let (s, n): (u32, u32) = (s.parse().unwrap_or(1), n.parse().unwrap_or(1));
+            if let Some(Some(v)) = cs.get_mut(c) {
+                v.push((s, if n == 0 { s } else { s + n - 1 }));
+            }
+        }
+    }
 }
 
 fn overlaps(r: &Option<Vec<(u32, u32)>>, a: u32, b: u32) -> bool {
@@ -3492,6 +3497,90 @@ mod bench {
         }
         println!("Median tokens to read: code_find {}, grep {}.", med(&mut find_tok), med(&mut grep_tok));
         println!("The prompt map ({} tokens, paid once) names a changed file for {}%.", map.len() / 4, pct(map_hit));
+    }
+
+    /// Would the clash notes have been right? Each merge in a repo's history stands for two
+    /// agents at work at once: each side, from where they split to the parent, is one
+    /// worktree. The notes `clashes_from` gives the pair are compared with what happened:
+    /// files git could not merge, and files a person changed while merging.
+    /// `BENCH_REPO=/path BENCH_MERGES=150 cargo test --bin philium clash_replay -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn clash_replay() {
+        let Ok(repo) = std::env::var("BENCH_REPO") else { return };
+        let n: usize = std::env::var("BENCH_MERGES").ok().and_then(|n| n.parse().ok()).unwrap_or(150);
+        let repo = PathBuf::from(repo);
+        let run = |args: &[&str]| -> (bool, String) {
+            let o = Command::new("git").arg("-C").arg(&repo).args(args).output().unwrap();
+            (o.status.success(), String::from_utf8_lossy(&o.stdout).into_owned())
+        };
+        let side = |base: &str, tip: &str, label: &str| -> Option<WtChange> {
+            let mut cs = ChangeSet::new();
+            add_hunks(&mut cs, &run(&["-c", "core.quotepath=off", "diff", "-U0", "--no-renames", base, tip]).1);
+            cs.retain(|p, _| lang_of(p).is_some() && !skipped(p));
+            if cs.is_empty() || cs.len() > MAX_CLASH_DELTA { return None; }
+            let paths: Vec<&String> = cs.keys().collect();
+            let specs: Vec<String> = paths.iter().map(|p| format!("{tip}:{p}")).collect();
+            let mut v = View::default();
+            let _ = read_blobs(&repo, &specs, |i, bytes| {
+                let (s, r) = parse(paths[i], &String::from_utf8_lossy(&bytes));
+                v.syms.extend(s);
+                v.refs.extend(r);
+            });
+            Some(wt_change(&v, &cs, label, label))
+        };
+        let merges = run(&["log", "--merges", "-n", &(n * 4).to_string(), "--format=%H %P"]).1;
+        let (mut pairs, mut too_big, mut one_sided) = (0, 0, 0);
+        // severity -> [pairs told, of them with a conflict, of them hand-fixed]
+        let mut told: BTreeMap<&str, [usize; 3]> = BTreeMap::new();
+        let (mut conflicts, mut fixed, mut conflicts_told, mut fixed_told) = (0, 0, 0, 0);
+        let (mut detail_lens, mut silent_conflicts) = (vec![], vec![]);
+        for line in merges.lines() {
+            if pairs == n { break; }
+            let h: Vec<&str> = line.split_whitespace().collect();
+            if h.len() != 3 { continue; }
+            let (m, p1, p2) = (h[0], h[1], h[2]);
+            let (ok, mb) = run(&["merge-base", p1, p2]);
+            if !ok { continue; }
+            let mb = mb.trim().to_string();
+            let (a, b) = (side(&mb, p1, "a"), side(&mb, p2, "b"));
+            let (Some(a), Some(b)) = (a, b) else {
+                let big = |t: &str| { let (_, d) = run(&["diff", "--name-only", &mb, t]); d.lines().filter(|p| lang_of(p).is_some() && !skipped(p)).count() > MAX_CLASH_DELTA };
+                if big(p1) || big(p2) { too_big += 1 } else { one_sided += 1 }
+                continue;
+            };
+            pairs += 1;
+            // What git could not merge, and what the merge commit changed beyond git's merge.
+            let mt = Command::new("git").arg("-C").arg(&repo).args(["merge-tree", "--write-tree", "--name-only", "--no-messages", p1, p2]).output().unwrap();
+            let out = String::from_utf8_lossy(&mt.stdout).into_owned();
+            let mut it = out.lines();
+            let tree = it.next().unwrap_or("").to_string();
+            let code = |p: &&str| lang_of(p).is_some() && !skipped(p);
+            let conflicted: BTreeSet<String> = it.filter(code).map(str::to_string).collect();
+            let hand: BTreeSet<String> = run(&["diff", "--name-only", &tree, m]).1.lines().filter(code).map(str::to_string).collect();
+            let (c, f) = (!conflicted.is_empty(), !hand.is_empty() && conflicted.is_empty());
+            conflicts += c as usize;
+            fixed += f as usize;
+            let cl = clashes_from(&[a, b]);
+            if let Some(x) = cl.first() {
+                let e = told.entry(x.severity).or_default();
+                e[0] += 1; e[1] += c as usize; e[2] += f as usize;
+                conflicts_told += c as usize; fixed_told += f as usize;
+                detail_lens.push(x.detail.len());
+            } else if c {
+                silent_conflicts.push(format!("{} {:?}", &m[..8], conflicted));
+            }
+        }
+        let med = |v: &mut Vec<usize>| { v.sort(); v.get(v.len() / 2).copied().unwrap_or(0) };
+        println!("{pairs} merges replayed ({too_big} skipped as over {MAX_CLASH_DELTA} files, {one_sided} with code on one side only).");
+        println!("git could not merge code in {conflicts}; a person changed code while merging {fixed} more.");
+        for (s, [t, c, f]) in &told {
+            println!("  told {s:<12} {t:>4} pairs: {c} with a conflict, {f} hand-fixed, {} merged cleanly", t - c - f);
+        }
+        let quiet = pairs - told.values().map(|v| v[0]).sum::<usize>();
+        println!("  told nothing     {quiet:>4} pairs");
+        println!("Conflicts told of: {conflicts_told}/{conflicts}. Hand fixes told of: {fixed_told}/{fixed}. Median items in a note: {}.", med(&mut detail_lens));
+        for s in silent_conflicts.iter().take(10) { println!("  conflict with no note: {s}"); }
     }
 
     /// `BENCH_REPO=/path BENCH_SYMS=a,b,c cargo test bench_repo -- --ignored --nocapture`
