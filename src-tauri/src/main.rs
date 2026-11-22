@@ -46,6 +46,8 @@ mod memory_consolidation;
 mod memory_ledger;
 mod memory_skills;
 mod mcp;
+mod mcp_servers;
+mod skills;
 mod oauth;
 mod pipeline;
 mod providers;
@@ -196,9 +198,11 @@ async fn rpc_inner(app: &App, method: String, args: Option<Value>) -> Result<Val
         "stats" => stats::call(&ctx, m, args).await,
         "storage" => storage::call(&ctx, m, args).await,
         "reaper" => reaper::call(&ctx, m, args).await,
+        "skills" => skills::call(&ctx, m, args).await,
         "library" => library::call(&ctx, m, args).await,
         "surfaces" => surfaces::call(&ctx, m, args).await,
         "selfdev" => selfdev::call(&ctx, m, args).await,
+        "mcp" if m.starts_with("servers_") => mcp_servers::call(&ctx, m, args).await,
         "mcp" => mcp::call(&ctx, m, args).await,
         "workday" => workday::call(&ctx, m, args).await,
         "pipeline" => pipeline::app::call(&ctx, m, args).await,

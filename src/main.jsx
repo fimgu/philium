@@ -29,6 +29,7 @@ const SCREENS = [
   { id: "terminals", label: "Terminals", icon: "terminal", group: "workbench", load: () => import("./screens/terminals.jsx") },
   { id: "browser", label: "Browser", icon: "globe", group: "workbench", load: () => import("./screens/browser.jsx") },
   { id: "surfaces", label: "Apps", icon: "layers", group: "workbench", load: () => import("./screens/surfaces.jsx") },
+  { id: "skills", label: "Skills", icon: "layers", group: "workbench", load: () => import("./screens/skills.jsx") },
   { id: "memory", label: "Memory", icon: "brain", group: "workbench", load: () => import("./screens/memory.jsx") },
   { id: "chat", label: "Chat", icon: "chat", group: "system", load: () => import("./screens/chat.jsx") },
   { id: "environments", label: "Environments", icon: "shield", group: "system", load: () => import("./screens/environments.jsx") },

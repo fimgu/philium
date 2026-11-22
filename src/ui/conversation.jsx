@@ -12,6 +12,8 @@ import { ViewToggle } from "./conversation-view.jsx";
 import { conversationView } from "../lib/conversation-view.js";
 import "../styles/composer.css";
 import { plainError } from "../lib/plain-error.js";
+import { rpc } from "../lib/rpc.js";
+import { activeRepoId } from "../lib/store.js";
 import { draftFor, newDraft, clearSentDraft, attachImage, sendableImages } from "../lib/drafts.js";
 import { validateImages, normalizeImage, createImageCache, MAX_IMAGES } from "../lib/images.js";
 
@@ -845,6 +847,9 @@ export function Composer(props) {
     if (t.startsWith("/fork") && props.onSlashFork) {
       return { kind: "fork", label: "Fork a new agent on this workspace with the current working handoff: /fork [brief]" };
     }
+    if (t.startsWith("/skill")) {
+      return { kind: "skill", label: "Send with a skill from the Skills screen: /skill <name> [task]" };
+    }
     if (t.startsWith("/compact") && props.onSlashCompact) {
       return { kind: "compact", label: "Open the working handoff note so future turns stay lean." };
     }
@@ -960,9 +965,15 @@ export function Composer(props) {
     }
     target.setSending(true);
     try {
+      let out = t;
+      const sk = /^\/skill\s+([A-Za-z0-9_-]+)\s*([\s\S]*)$/.exec(t);
+      if (sk) {
+        const s = await rpc("skills.get", { name: sk[1], repo_id: activeRepoId() || null }, { fresh: true });
+        out = `Use the "${s.name}" skill below.\n\n<skill name="${s.name}">\n${s.body}\n</skill>${sk[2].trim() ? `\n\n${sk[2].trim()}` : ""}`;
+      }
       // While the agent works, a message is queued and delivered when the current step ends.
       const deliver = props.busy && props.onQueue ? props.onQueue : props.onSend;
-      const accepted = await deliver(t, await sendableImages(attached));
+      const accepted = await deliver(out, await sendableImages(attached));
       if (accepted !== false) clearSentDraft(target, draft, attached);
     } catch (e) { toast(String(e), "danger"); }
     finally { target.setSending(false); }

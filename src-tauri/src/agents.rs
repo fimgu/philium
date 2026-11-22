@@ -711,6 +711,7 @@ async fn provision(ctx: &Arc<Ctx>, id: &str, fresh: bool, brief: Option<String>)
             "timeout_secs": 900,
         }}});
     }
+    crate::mcp_servers::merge(ctx, &mut config, row["repo_id"].as_str(), strict);
 
     let _ = crate::surfaces::ensure_shims(ctx);
     let path = format!(
