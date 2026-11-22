@@ -1,4 +1,4 @@
-import { createSignal, createMemo, onMount, Show, For } from "solid-js";
+import { createSignal, createMemo, onMount, onCleanup, Show, For } from "solid-js";
 import { Page, Button, Field, Input, TextArea, Select, Toggle, Segmented, Badge, VirtualList, confirm, toast } from "../ui/kit.jsx";
 import { rpc, fmt } from "../lib/rpc.js";
 import { useStore } from "../lib/store.js";
@@ -6,6 +6,42 @@ import { useVisibleEvent } from "../lib/visibility.js";
 import "../styles/workspace.css";
 import { Storage } from "./storage.jsx";
 import { McpServersSection } from "./mcp-servers.jsx";
+import { modelsSummary } from "../lib/memory-format.js";
+
+function LocalModelsRow() {
+  const [st, setSt] = createSignal(null);
+  const [busy, setBusy] = createSignal(false);
+  let timer;
+  const info = () => modelsSummary(st());
+  async function load() {
+    clearTimeout(timer);
+    const r = await rpc("library.models_status", {}, { local: true }).catch(() => null);
+    setSt(r);
+    if (modelsSummary(r).downloading) timer = setTimeout(load, 1500);
+  }
+  async function download() {
+    setBusy(true);
+    try { await rpc("library.models_download", { enabled: true }, { local: true }); }
+    catch (e) { toast(String(e), "danger"); }
+    finally { setBusy(false); load(); }
+  }
+  onMount(load);
+  onCleanup(() => clearTimeout(timer));
+  return (
+    <div class="ws-row">
+      <div class="col" style={{ gap: "2px" }}>
+        <strong style={{ "font-size": "12px" }}>Local search models</strong>
+        <span class="xs faint">On-device embedding and reranking, about 90 MB, downloaded once.</span>
+      </div>
+      <div class="ws-actions">
+        <Badge tone={info().state === "ready" ? "secure" : info().state === "failed" ? "strict" : ""}>{info().text}</Badge>
+        <Show when={info().action}>
+          <Button size="sm" busy={busy()} onClick={download}>{info().action}</Button>
+        </Show>
+      </div>
+    </div>
+  );
+}
 
 function StrictSandboxSection(props) {
   const [sbStatus, setSbStatus] = createSignal(null);
@@ -426,6 +462,7 @@ function MemoryEmbeddingsSection(props) {
           <p class="ws-muted">
             Optional embeddings and cross-encoder reranking for Memory retrieval. Remote providers route via Philium&apos;s gateway; direct endpoints must be localhost/loopback.
           </p>
+          <LocalModelsRow />
           <Show when={memErr()}>
             <div class="ws-alert" role="alert">{memErr()}</div>
           </Show>

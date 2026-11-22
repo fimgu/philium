@@ -1,10 +1,11 @@
 // Memory: clean, self-explanatory workspace memory, notes, procedures, and maintenance.
-import { For, Show, createSignal, createResource, createMemo, createEffect, on } from "solid-js";
+import { For, Show, createSignal, createResource, createMemo, createEffect, on, onCleanup } from "solid-js";
 import { Page, Button, Badge, Segmented, Empty, Input, TextArea, Select, Meter, confirm, toast } from "../ui/kit.jsx";
 import { Icon } from "../ui/icons.jsx";
 import { rpc } from "../lib/rpc.js";
 import { useStore, activeRepoId } from "../lib/store.js";
 import { useVisibleEvent } from "../lib/visibility.js";
+import { MEMORY_CATEGORIES, categoryLabel, memoryTitle, fileChips, relTime, modelsSummary } from "../lib/memory-format.js";
 import "../styles/surfaces-memory.css";
 
 const TIER = {
@@ -96,6 +97,32 @@ export default function Memory() {
   const [libStatus, { refetch: refetchStatus }] = createResource(() =>
     rpc("library.status", {}, { local: true }).catch(() => null),
   );
+  const [activeCount, { refetch: refetchActiveCount }] = createResource(
+    () => effectiveScope() || "*",
+    (scope) =>
+      scope === "*"
+        ? Promise.resolve(null)
+        : rpc("library.list", { scope, status: "active", q: "", limit: 100000 }, { local: true })
+            .then((r) => (Array.isArray(r) ? r.length : null))
+            .catch(() => null),
+  );
+  const [models, { refetch: refetchModels }] = createResource(() =>
+    rpc("library.models_status", {}, { local: true }).catch(() => null),
+  );
+  const modelsInfo = createMemo(() => modelsSummary(models()));
+  let modelsTimer;
+  createEffect(() => {
+    clearTimeout(modelsTimer);
+    if (modelsInfo().downloading) modelsTimer = setTimeout(refetchModels, 1500);
+  });
+  onCleanup(() => clearTimeout(modelsTimer));
+  const [modelsBusy, setModelsBusy] = createSignal(false);
+  async function downloadModels() {
+    setModelsBusy(true);
+    try { await rpc("library.models_download", { enabled: true }, { local: true }); }
+    catch (e) { toast(String(e), "danger"); }
+    finally { setModelsBusy(false); refetchModels(); }
+  }
   const [memConfig, { refetch: refetchConfig }] = createResource(() =>
     rpc("library.config_get", {}, { local: true }).catch(() => null),
   );
@@ -181,6 +208,7 @@ export default function Memory() {
 
   const refreshAll = () => {
     refetchStatus();
+    refetchActiveCount();
     refetchConfig();
     refetchItems();
     refetchProcedures();
@@ -533,7 +561,7 @@ export default function Memory() {
             value={statusTab()}
             onChange={setStatusTab}
             options={[
-              { value: "active", label: `Active (${libStatus()?.memories ?? 0})` },
+              { value: "active", label: `Active (${activeCount() ?? libStatus()?.memories ?? 0})` },
               { value: "proposed", label: pendingCount() ? `Pending (${pendingCount()})` : "Pending" },
               { value: "superseded", label: "History" },
               { value: "quarantined", label: "Blocked" },
@@ -552,6 +580,17 @@ export default function Memory() {
           />
         </div>
 
+        <Show when={models() && modelsInfo().state !== "ready"}>
+          <div class="mem-models-banner">
+            <span class="grow">
+              <span class="dim">Local search models</span> <span class="faint">{modelsInfo().text}</span>
+            </span>
+            <Show when={modelsInfo().action}>
+              <Button size="sm" variant="ghost" busy={modelsBusy()} onClick={downloadModels}>{modelsInfo().action}</Button>
+            </Show>
+          </div>
+        </Show>
+
         <Show when={showAdd()}>
           <form class="card col" style={{ gap: "10px" }} onSubmit={submitMemory}>
             <div class="row">
@@ -564,12 +603,7 @@ export default function Memory() {
               <Select
                 value={category()}
                 onValue={setCategory}
-                options={[
-                  { value: "preference", label: "Rule" },
-                  { value: "correction", label: "Correction" },
-                  { value: "fact", label: "Fact" },
-                  { value: "procedure", label: "Procedure" },
-                ]}
+                options={MEMORY_CATEGORIES}
               />
               <Button variant="primary" type="submit" busy={saving()} disabled={!content().trim()}>
                 {supersedeTarget() ? "Update" : "Save"}
@@ -640,9 +674,25 @@ export default function Memory() {
                   <For each={items()}>
                     {(m) => {
                       const t = TIER[m.trust_tier] ?? TIER.agent_inferred;
+                      const title = memoryTitle(m);
+                      const chips = fileChips(m.files);
+                      const when = relTime(m.updated_at || m.created_at);
                       return (
                         <div class={`mem-card hover-actions ${m.status}`}>
-                          <div class="mem-body">{m.content}</div>
+                          <div class="mem-head">
+                            <strong class="mem-title grow">{title}</strong>
+                            <Show when={m.category}><span class="mem-cat">{categoryLabel(m.category)}</span></Show>
+                            <Show when={when}><span class="xs faint" title={m.updated_at || m.created_at}>{when}</span></Show>
+                          </div>
+                          <Show when={m.content && m.content.trim() !== title}>
+                            <div class="mem-body">{m.content}</div>
+                          </Show>
+                          <Show when={chips.shown.length}>
+                            <div class="mem-files">
+                              <For each={chips.shown}>{(f) => <span class="mem-file mono" title={f}>{f.split("/").pop()}</span>}</For>
+                              <Show when={chips.more}><span class="mem-file mono">+{chips.more}</span></Show>
+                            </div>
+                          </Show>
                           <div class="mem-meta">
                             <Badge tone={t.tone}>{t.label}</Badge>
                             <Show when={m.fact_key}><span class="mem-key">{m.fact_key}</span></Show>
