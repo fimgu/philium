@@ -156,6 +156,9 @@ export function AgentContext(props) {
     return !!(n && (n.requirements || n.decisions || n.failed_attempts || n.next_steps));
   };
 
+  const hasActiveMemory = () =>
+    (slate()?.items ?? []).length > 0 || (slate()?.procedures ?? []).length > 0 || hasNote();
+
   return (
     <div class="ctx-panel">
       <div class="ctx-header">
@@ -188,6 +191,11 @@ export function AgentContext(props) {
             <span class="mono">{slate()?.used_tokens ?? 0} / {fmtBudget()}</span>
           </div>
           <Meter value={pct()} tone={pct() > 85 ? "strict" : "secure"} />
+          <div class="xs faint">
+            {hasActiveMemory()
+              ? "Auto-injected on session start. Save more via /remember or below."
+              : "Auto-injected on session start. Type /remember <fact> in chat or save below."}
+          </div>
         </div>
 
         <form class="row" style={{ gap: "6px" }} onSubmit={saveDirect}>
@@ -282,6 +290,13 @@ export function AgentContext(props) {
         <div class="ctx-section">
           <div class="ctx-section-head">
             <span class="grow">Active ({(slate()?.items ?? []).length})</span>
+            <Show when={hasActiveMemory()}>
+              <span style={{ "text-transform": "none", "letter-spacing": "normal" }}>
+                <Badge tone="secure" title="Loaded into this agent's context automatically on session start">
+                  Injected automatically
+                </Badge>
+              </span>
+            </Show>
           </div>
           <Show when={(slate()?.items ?? []).length} fallback={<div class="xs faint">Nothing saved yet.</div>}>
             <For each={slate()?.items ?? []}>

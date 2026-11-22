@@ -189,6 +189,117 @@ function RefList(props) {
   );
 }
 
+function InspectorOverview(props) {
+  const changedFiles = () => props.changes?.files ?? [];
+  const topFiles = () => (props.files ?? []).slice(0, 12);
+  const clashes = () => props.clashes ?? [];
+  const worktrees = () => props.worktrees ?? [];
+
+  return (
+    <div style={{ display: "flex", "flex-direction": "column", gap: "18px", padding: "20px 24px", overflow: "auto", "min-width": 0, "min-height": 0, background: "var(--bg)" }}>
+      <div class="row" style={{ "align-items": "flex-start", "flex-wrap": "wrap", gap: "10px" }}>
+        <div class="grow" style={{ "min-width": "220px" }}>
+          <div style={{ "font-weight": 600, "font-size": "var(--fs-m, 14px)" }}>{props.targetLabel}</div>
+          <div class="small dim" style={{ "margin-top": "4px" }}>
+            Select a file or symbol on the left to inspect source, diffs, and references.
+          </div>
+        </div>
+        <Button size="sm" variant="ghost" onClick={props.onOpenGraph}>
+          <Icon name="graph" size={12} /> Dependency graph
+        </Button>
+      </div>
+
+      <Show when={clashes().length > 0}>
+        <section style={{ display: "flex", "flex-direction": "column", gap: "8px" }}>
+          <div class="xs faint" style={{ "text-transform": "uppercase", "letter-spacing": "0.06em" }}>
+            Active overlaps ({clashes().length})
+          </div>
+          <div class="list">
+            <For each={clashes()}>{(c) => (
+              <div class="list-item" style={{ cursor: "default", "flex-wrap": "wrap", gap: "8px" }}>
+                <Badge tone={sevOf(c.severity)[0]}>{sevOf(c.severity)[1]}</Badge>
+                <AgentChip name={c.a ?? "?"} />
+                <span class="xs dim">and</span>
+                <AgentChip name={c.b ?? "?"} />
+                <span class="mono xs dim grow ellipsis" title={(c.detail ?? []).join("\n")}>
+                  {(c.detail ?? []).join(", ")}
+                </span>
+              </div>
+            )}</For>
+          </div>
+        </section>
+      </Show>
+
+      <Show when={worktrees().length > 0}>
+        <section style={{ display: "flex", "flex-direction": "column", gap: "8px" }}>
+          <div class="xs faint" style={{ "text-transform": "uppercase", "letter-spacing": "0.06em" }}>
+            Active agent worktrees ({worktrees().length})
+          </div>
+          <div class="row" style={{ "flex-wrap": "wrap", gap: "6px" }}>
+            <For each={worktrees()}>{(w) => (
+              <Button
+                size="sm"
+                variant={props.viewId === w.id ? "primary" : "ghost"}
+                onClick={() => props.onPickWorktree(w.id)}
+              >
+                <AgentChip name={props.agentName(w)} />
+                <Show when={w.branch}><span class="mono xs faint">{w.branch}</span></Show>
+              </Button>
+            )}</For>
+          </div>
+        </section>
+      </Show>
+
+      <Show when={changedFiles().length > 0}>
+        <section style={{ display: "flex", "flex-direction": "column", gap: "6px" }}>
+          <div class="xs faint" style={{ "text-transform": "uppercase", "letter-spacing": "0.06em" }}>
+            Changed files ({changedFiles().length})
+          </div>
+          <div class="list">
+            <For each={changedFiles()}>{(f) => (
+              <button
+                type="button"
+                class="changed-file"
+                style={{ padding: "7px 10px" }}
+                title={f.old_path ? `${f.old_path} → ${f.path}` : f.path}
+                onClick={() => props.onOpenDiff(f.path)}
+              >
+                <b>{f.status}</b>
+                <span>{f.old_path ? `${f.old_path} → ` : ""}{f.path}</span>
+                <small>+{f.added ?? 0} −{f.removed ?? 0}</small>
+              </button>
+            )}</For>
+          </div>
+        </section>
+      </Show>
+
+      <Show when={topFiles().length > 0}>
+        <section style={{ display: "flex", "flex-direction": "column", gap: "6px" }}>
+          <div class="xs faint" style={{ "text-transform": "uppercase", "letter-spacing": "0.06em" }}>
+            Indexed files
+          </div>
+          <div class="list">
+            <For each={topFiles()}>{(f) => (
+              <div class="list-item" onClick={() => props.onOpenFile(f.path)}>
+                <span class="mono small grow ellipsis" title={f.path}>
+                  <span class="faint">{dirname(f.path)}</span>{basename(f.path)}
+                </span>
+                <span class="xs faint">{(f.syms ?? []).length} symbols</span>
+              </div>
+            )}</For>
+          </div>
+        </section>
+      </Show>
+
+      <Show when={!props.loading && !changedFiles().length && !topFiles().length}>
+        <div class="code-empty" style={{ padding: "12px 0" }}>
+          No indexed files in this view yet. Run Reindex to scan this repository.
+        </div>
+      </Show>
+    </div>
+  );
+}
+
 export default function Code() {
   const store = useStore();
   const repos = () => store.repos() ?? [];
@@ -201,6 +312,7 @@ export default function Code() {
   };
   const [wts] = createResource(repo, (r) => (r ? rpc("workspace.worktrees", { repo_id: r }).catch(() => []) : []));
   const [viewId, setViewId] = createSignal(params()?.worktree_id || "main");
+  const [viewMode, setViewMode] = createSignal("inspector");
   const [level, setLevel] = createSignal("file");
   const [q, setQ] = createSignal("");
   const [open, setOpen] = createSignal(new Set());
@@ -232,7 +344,7 @@ export default function Code() {
   const [tick, setTick] = createSignal(0);
   const [status] = createResource(key, () => rpc("codeindex.status", target()).catch((e) => ({ error: String(e) })));
   const [tree] = createResource(key, () => rpc("codeindex.tree", target()).catch(() => ({ files: [] })));
-  const gkey = () => { const k = key(); return k ? k + level() : null; };
+  const gkey = () => { const k = key(); return viewMode() === "graph" && k ? k + level() : null; };
   const [graph] = createResource(gkey, () => rpc("codeindex.graph", { ...target(), level: level(), worktrees: true }).catch(() => ({ nodes: [], edges: [] })));
   const [changes] = createResource(key, () => rpc("codeindex.changes", target()).catch((e) => ({ files: [], error: String(e) })));
   const changedPaths = createMemo(() => new Set((changes()?.files ?? []).flatMap((f) => [f.path, f.old_path].filter(Boolean))));
@@ -289,14 +401,25 @@ export default function Code() {
   const reindex = async () => { setBusy(true); try { await rpc("codeindex.reindex", target()); setTick((t) => t + 1); } finally { setBusy(false); } };
   const upToDate = () => !!status() && !status().error;
 
+  const activeWorktrees = createMemo(() => (wts() ?? []).filter((w) => w.state === "active" || w.id === viewId()));
+  const mainClass = () => {
+    if (viewMode() === "inspector") return "code-main no-drawer";
+    return `code-main ${sel() ? "has-inspector" : "no-drawer"} ${expanded() && sel() ? "inspector-expanded" : ""}`;
+  };
+
   return (
     <Page title="Code" sub="Symbols and references, indexed locally" flush>
       <div class="code-wrap">
         <div class="code-bar" style={repo() ? undefined : { display: "none" }}>
           <Select value={repo()} onValue={(v) => { setRepoId(v); setViewId("main"); setSel(null); }} options={repos().map((r) => ({ value: r.id, label: labels().get(r.id) }))} />
           <Select value={viewId()} onValue={(v) => { setViewId(v); setSel(null); }}
-            options={[{ value: "main", label: "Indexed base commit" }, { value: "local", label: "Local checkout" }, ...(wts() ?? []).filter((w) => w.state === "active" || w.id === viewId()).map((w) => ({ value: w.id, label: `${agentName(w)} (worktree)` }))]} />
+            options={[{ value: "main", label: "Indexed base commit" }, { value: "local", label: "Local checkout" }, ...activeWorktrees().map((w) => ({ value: w.id, label: `${agentName(w)} (worktree)` }))]} />
           <Show when={viewId() !== "main" && viewId() !== "local"}><AgentChip name={agentName((wts() ?? []).find((w) => w.id === viewId()) ?? {})} /></Show>
+          <Segmented
+            value={viewMode()}
+            onChange={(v) => { setViewMode(v); if (v === "inspector") setExpanded(false); }}
+            options={[{ value: "inspector", label: "Inspector" }, { value: "graph", label: "Graph" }]}
+          />
           <div class="code-status">
             <Show when={status()?.error}><span class="err">{status().error}</span></Show>
             <Show when={upToDate()}>
@@ -307,7 +430,7 @@ export default function Code() {
             </Show>
           </div>
           <Toggle on={showChanges()} label={`Changes (${changes()?.files?.length ?? 0})`} onChange={setShowChanges} />
-          <Show when={showChanges()}><Toggle on={changesOnly()} label="Changed nodes only" onChange={setChangesOnly} /></Show>
+          <Show when={viewMode() === "graph" && showChanges()}><Toggle on={changesOnly()} label="Changed nodes only" onChange={setChangesOnly} /></Show>
           <Button size="sm" disabled={busy()} onClick={reindex}><Icon name="refresh" size={12} /> {busy() ? "Indexing" : "Reindex"}</Button>
         </div>
         <Show when={(clashes()?.clashes ?? []).length}>
@@ -322,7 +445,7 @@ export default function Code() {
           </div>
         </Show>
         <Show when={repo()} fallback={<Empty title="No repositories yet" action={<Button variant="primary" onClick={() => go("repos")}>Open Repositories</Button>}>Add a repository on the Repos screen. Philium indexes its symbols and references so you and your agents can see what depends on what.</Empty>}>
-          <div class={`code-main ${sel() ? "has-inspector" : "no-drawer"} ${expanded() && sel() ? "inspector-expanded" : ""}`} style={{ "--inspector-size": `${inspectorSize()}px` }}>
+          <div class={mainClass()} style={{ "--inspector-size": `${inspectorSize()}px` }}>
             <div class="code-side">
               <div class="search"><Input placeholder="Search files and symbols" value={q()} onValue={setQ} /></div>
               <Show when={showChanges()}><section class="changed-files"><div class="dsec">Changes against base {(changes()?.base_commit ?? "").slice(0, 8)}</div><Show when={changes.loading}><div class="inspector-note">Loading changes…</div></Show><Show when={changes()?.error}><div class="inspector-note err">{changes().error}</div></Show><Show when={changes()?.note}><div class="inspector-note">{changes().note}</div></Show><Show when={changes()?.truncated}><div class="inspector-note">Changed file list truncated.</div></Show><For each={changes()?.files ?? []}>{(f) => <button class="changed-file" title={f.old_path ? `${f.old_path} → ${f.path}` : f.path} onClick={() => { setSel({ id: f.path, file: f.path, label: basename(f.path) }); setTab("diff"); }}><b>{f.status}</b><span>{f.old_path ? `${f.old_path} → ` : ""}{f.path}</span><small>+{f.added ?? 0} −{f.removed ?? 0}</small></button>}</For><Show when={!changes.loading && !changes()?.files?.length && !changes()?.note}><div class="inspector-note">No changes in this target.</div></Show></section></Show>
@@ -345,11 +468,31 @@ export default function Code() {
               </Show>
               <Show when={tree()?.truncated}><div class="xs faint" style={{ padding: "6px 10px" }}>Showing top-ranked files only. Search to narrow.</div></Show>
             </div>
-            <GraphView showChanges={showChanges()} changesOnly={showChanges() && changesOnly()} changedPaths={changedPaths()} data={graph()} level={level()} onLevel={setLevel} selected={sel()?.id} onSelect={(n) => (n ? pickNode(n) : setSel(null))} onOpen={(n) => { if (n.kind === "file") { setOpen((o) => new Set(o).add(n.id)); setLevel("symbol"); } }} />
+            <Show when={viewMode() === "graph"}>
+              <GraphView showChanges={showChanges()} changesOnly={showChanges() && changesOnly()} changedPaths={changedPaths()} data={graph()} level={level()} onLevel={setLevel} selected={sel()?.id} onSelect={(n) => (n ? pickNode(n) : setSel(null))} onOpen={(n) => { if (n.kind === "file") { setOpen((o) => new Set(o).add(n.id)); setLevel("symbol"); } }} />
+            </Show>
+            <Show when={viewMode() === "inspector" && !sel()}>
+              <InspectorOverview
+                targetLabel={targetLabel()}
+                viewId={viewId()}
+                worktrees={activeWorktrees()}
+                agentName={agentName}
+                changes={changes()}
+                clashes={clashes()?.clashes ?? []}
+                files={tree()?.files ?? []}
+                loading={tree.loading || changes.loading}
+                onOpenGraph={() => setViewMode("graph")}
+                onPickWorktree={(id) => { setViewId(id); setShowChanges(true); setSel(null); }}
+                onOpenDiff={(path) => { setSel({ id: path, file: path, label: basename(path) }); setTab("diff"); }}
+                onOpenFile={(path) => { setSel({ id: path, file: path, label: basename(path) }); setTab("source"); }}
+              />
+            </Show>
             <Show when={sel()}>
-              <div class="inspector-slot">
-                <div class="inspector-resize" role="separator" tabindex="0" aria-label="Resize code inspector" onPointerDown={resize} onKeyDown={(e) => { if (["ArrowLeft", "ArrowUp", "ArrowRight", "ArrowDown"].includes(e.key)) { e.preventDefault(); setInspectorSize((s) => Math.max(180, s + (["ArrowLeft", "ArrowUp"].includes(e.key) ? 30 : -30))); } }} />
-                <CodeInspector selected={sel()} target={target()} targetAgentId={(wts() ?? []).find((w) => w.id === viewId())?.agent_id} targetLabel={targetLabel()} repoId={repo()} baseCommit={status()?.base_commit} tab={tab()} onTab={setTab} expanded={expanded()} onExpand={() => setExpanded(!expanded())} onClose={() => { setSel(null); setExpanded(false); }} tick={tick()}>
+              <div class="inspector-slot" style={viewMode() === "inspector" ? { "padding-left": "0" } : undefined}>
+                <Show when={viewMode() === "graph"}>
+                  <div class="inspector-resize" role="separator" tabindex="0" aria-label="Resize code inspector" onPointerDown={resize} onKeyDown={(e) => { if (["ArrowLeft", "ArrowUp", "ArrowRight", "ArrowDown"].includes(e.key)) { e.preventDefault(); setInspectorSize((s) => Math.max(180, s + (["ArrowLeft", "ArrowUp"].includes(e.key) ? 30 : -30))); } }} />
+                </Show>
+                <CodeInspector selected={sel()} target={target()} targetAgentId={(wts() ?? []).find((w) => w.id === viewId())?.agent_id} targetLabel={targetLabel()} repoId={repo()} baseCommit={status()?.base_commit} tab={tab()} onTab={setTab} expanded={viewMode() === "inspector" ? true : expanded()} onExpand={() => { if (viewMode() === "inspector") { setViewMode("graph"); setExpanded(false); } else { setExpanded(!expanded()); } }} onClose={() => { setSel(null); setExpanded(false); }} tick={tick()}>
                   <Show when={sel()?.symbol} fallback={<div class="code-empty">Select a symbol to inspect its references. File contents are in Source.</div>}>
                     <Show when={!refs.loading} fallback={<div class="code-empty">Loading references…</div>}>
                       <Show when={!refs()?.error} fallback={<div class="code-empty err">{refs().error}</div>}><RefList data={refs()} onJump={(r) => { setSel({ id: r.path, file: r.path, label: basename(r.path), line: r.line }); setTab("source"); }} /></Show>

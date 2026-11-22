@@ -38,6 +38,15 @@ const STATE = {
 const stateDot = (s) => STATE[s]?.[0] ?? "";
 const stateLabel = (s) => STATE[s]?.[1] ?? s;
 const roleLabel = (r) => (r === "orchestrator" ? "Coordinator" : r === "reviewer" ? "Reviewer" : "Agent");
+// "Needs you" badge + inline approval card already say "waiting"; don't repeat it as a warning pill.
+const calmWarnings = (ws) => (ws ?? []).filter((w) => w?.kind !== "waiting");
+// Repo memory loaded for this agent: count of active memories, or a dot for a working note only.
+const memoryHint = (a) => {
+  if (!a || a.strict) return "";
+  const n = Number(a.memory_count) || 0;
+  if (n > 0) return String(n);
+  return a.has_working_note ? "•" : "";
+};
 
 /**
  * Fast-path O(K) event merge when incoming events are strictly newer than previous.at(-1).seq.
@@ -391,6 +400,7 @@ function AgentView(props) {
     });
   });
   useVisibleEvent("agents:changed", (p) => { if (p.id === props.id) refetch(); });
+  useVisibleEvent("library", () => refetch(), { debounceMs: 250 });
 
   const a = () => info()?.id === props.id ? info() : props.agent;
   const [effort, setEffort] = createSignal("default");
@@ -616,8 +626,9 @@ function AgentView(props) {
           <button type="button" class={aside() === "surfaces" ? "on" : ""} onClick={() => toggleAside("surfaces")} title="Isolated apps (KiCad, DBeaver, Chromium)">
             <span class="row gap-4"><Icon name="layers" size={12} /> Apps</span>
           </button>
-          <button type="button" class={aside() === "context" ? "on" : ""} onClick={() => toggleAside("context")} title="Workspace memory & notes">
-            <span class="row gap-4"><Icon name="brain" size={12} /> Memory</span>
+          <button type="button" class={aside() === "context" ? "on" : ""} onClick={() => toggleAside("context")}
+            title={memoryHint(a()) ? `Repo memory active: ${Number(a()?.memory_count) || 0} memories${a()?.has_working_note ? " + working note" : ""}, injected automatically` : "Workspace memory & notes"}>
+            <span class="row gap-4"><Icon name="brain" size={12} /> Memory<Show when={memoryHint(a())}><span class="xs dim">· {memoryHint(a())}</span></Show></span>
           </button>
         </div>
         <Show when={live()} fallback={<Button size="sm" onClick={() => rpc("agents.resume", { id: props.id }, { action: true }).catch((e) => toast(String(e), "danger"))}><Icon name="play" size={11} /> Resume</Button>}>
@@ -646,8 +657,8 @@ function AgentView(props) {
       </Show>
       <Show when={a()?.error}><div class="shield danger" style={{ margin: "8px 16px 0" }}><PlainError text={a().error} /></div></Show>
           <Show when={a()?.rate_limited && a()?.state === "idle"}><div class="shield" role="status" style={{ margin: "8px 16px 0" }}>{a().rate_limited.until ? `The model provider's rate limit stopped the last step. ${a().name} continues at ${new Date(a().rate_limited.until).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}, or when you send a message.` : `Stopped at the rate limit after several tries. Send a message to continue.`}</div></Show>
-      <Show when={(a()?.warnings ?? []).length}>
-        <div style={{ padding: "6px 16px 0" }}><WarningPills warnings={a().warnings} max={6} /></div>
+      <Show when={calmWarnings(a()?.warnings).length}>
+        <div style={{ padding: "6px 16px 0" }}><WarningPills warnings={calmWarnings(a()?.warnings)} max={4} /></div>
       </Show>
       <div class="agent-body">
         <div class="agent-main" ref={agentMain}>
@@ -812,9 +823,9 @@ export function AgentGridCard(props) {
           </Button>
         </div>
       </div>
-      <Show when={(a()?.warnings ?? []).length}>
+      <Show when={calmWarnings(a()?.warnings).length}>
         <div class="agent-card-warnings">
-          <WarningPills warnings={a().warnings} max={3} />
+          <WarningPills warnings={calmWarnings(a()?.warnings)} max={3} />
         </div>
       </Show>
       <Show when={a()?.error}><div class="shield danger xs" style={{ margin: "6px 10px 0" }}>{a().error}</div></Show>
