@@ -3680,6 +3680,15 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
             Some(repo) => agent_memories_async(ctx, args["q"].as_str().unwrap_or(""), repo, args["limit"].as_i64().unwrap_or(50)).await,
             None => memory_search_async(ctx, args["q"].as_str().unwrap_or(""), None, args["limit"].as_i64().unwrap_or(50)).await,
         },
+        "count" => {
+            let scope = args["scope"].as_str().filter(|s| !s.is_empty() && *s != "*");
+            let status = args["status"].as_str().unwrap_or("active");
+            let n = match scope {
+                Some(s) => ctx.db.query("SELECT count(*) AS n FROM memories WHERE scope=?1 AND status=?2", params![s, status])?,
+                None => ctx.db.query("SELECT count(*) AS n FROM memories WHERE status=?1", [status])?,
+            };
+            Ok(json!({ "count": n.first().map(|r| r["n"].clone()).unwrap_or(json!(0)) }))
+        }
         "list" => {
             let scope = args["scope"].as_str().or_else(|| args["repo_id"].as_str().map(|_| ""));
             let scope_owned = args["repo_id"].as_str().filter(|s| !s.is_empty()).map(|r| format!("repo:{r}"));
@@ -4649,6 +4658,21 @@ mod tests {
             assert_eq!(first_json_object(&t), Some(json!({"a":1})), "{body}");
         }
         assert_eq!(first_json_object("x {\"s\":\"}{\"} y"), Some(json!({"s":"}{"})));
+    }
+
+    #[tokio::test]
+    async fn count_rpc_is_exact_past_the_list_cap_and_per_scope() {
+        let ctx = Arc::new(Ctx::test());
+        ctx.db.kv_set("library.imported_at", "fixture").unwrap();
+        init(&ctx).unwrap();
+        for i in 0..250 {
+            let c = format!("bulk memory {i}");
+            save_structured(&ctx, SaveOpts { content: &c, category: "fact", scope: "repo:ra", source: "user", trust_tier: "user_direct", fact_key: None, supersedes_id: None, source_event_id: None, provenance: None }).unwrap();
+        }
+        save_structured(&ctx, SaveOpts { content: "other", category: "fact", scope: "repo:rb", source: "user", trust_tier: "user_direct", fact_key: None, supersedes_id: None, source_event_id: None, provenance: None }).unwrap();
+        assert_eq!(call(&ctx, "count", json!({"scope": "repo:ra", "status": "active"})).await.unwrap()["count"], 250);
+        assert_eq!(call(&ctx, "count", json!({"scope": "repo:rb"})).await.unwrap()["count"], 1);
+        assert_eq!(call(&ctx, "count", json!({"scope": "*"})).await.unwrap()["count"], 251);
     }
 
     #[test]

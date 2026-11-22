@@ -102,8 +102,8 @@ export default function Memory() {
     (scope) =>
       scope === "*"
         ? Promise.resolve(null)
-        : rpc("library.list", { scope, status: "active", q: "", limit: 100000 }, { local: true })
-            .then((r) => (Array.isArray(r) ? r.length : null))
+        : rpc("library.count", { scope, status: "active" }, { local: true })
+            .then((r) => (typeof r?.count === "number" ? r.count : null))
             .catch(() => null),
   );
   const [models, { refetch: refetchModels }] = createResource(() =>
