@@ -10,6 +10,7 @@
 //!
 //! The web UI never sees a token or key.
 
+mod access;
 mod agents;
 mod attention;
 mod agentshell;
