@@ -185,7 +185,7 @@ pub fn tool_list() -> Vec<Value> {
         t("playbook_get", "The standard steps and checks for a job: commit, open_pr, test_pr, review_pr, docs, release, teardown.",
           json!({ "job": s }), &["job"]),
         t("skill_list", "Your skills (reusable procedures like review-pr, make-plan, babysit): name and when to use each.", json!({}), &[]),
-        t("skill_get", "Read a listed built-in skill. Imported instructions and supporting files are not attached.", json!({ "name": s }), &["name"]),
+        t("skill_get", "Read a listed skill (built-in review-pr, or imported skills in Standard mode).", json!({ "name": s }), &["name"]),
         t("memory_search", "Search active, non-superseded memories saved under this agent's registered repository ID.",
           json!({ "q": s, "limit": i }), &["q"]),
         t("memory_slate", "Fetch a pre-resolved, provenance-tagged, token-budgeted context slate (current decisions, working handoff note, and repo facts) for this workspace.",
@@ -209,7 +209,7 @@ pub fn tool_list() -> Vec<Value> {
           json!({ "kind": s, "handle": s, "note": s }), &["kind", "handle"]),
         t("kind_cluster", "Manage an isolated Kubernetes-in-Docker (kind) test cluster scoped to your agent (`philium-<agent>-<suffix>`), pre-registered in Philium's Reaper and wired to your isolated KUBECONFIG and port block. action: create | list | delete.",
           json!({ "action": s, "suffix": s, "cluster": s }), &["action"]),
-    ].into_iter().chain(crate::browser::mcp_tools()).chain(crate::codeindex::mcp_tools()).collect()
+    ].into_iter().chain(crate::browser::mcp_tools()).chain(crate::codeindex::mcp_tools()).chain(crate::surfaces::mcp_tools()).collect()
 }
 
 fn arg<'a>(a: &'a Value, k: &str) -> Result<&'a str, String> {
@@ -299,7 +299,16 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
             }
             crate::board::update(ctx, agent, arg(&a, "id")?, &patch).map(|r| json!({"id":r["id"],"status":r["status"]}))
         }
-        "board_submit" => crate::board::submit(ctx, agent, arg(&a, "id")?, arg(&a, "summary")?, a["pr_url"].as_str()).map(|r| json!({"id":r["id"],"status":r["status"]})),
+        "board_submit" => {
+            let r = crate::board::submit(ctx, agent, arg(&a, "id")?, arg(&a, "summary")?, a["pr_url"].as_str())?;
+            let mut out = json!({"id": r["id"], "status": r["status"]});
+            if row["strict"].as_i64() != Some(1) {
+                if let Some(rems) = r.get("reminders").filter(|v| v.as_array().is_some_and(|arr| !arr.is_empty())) {
+                    out["reminders"] = rems.clone();
+                }
+            }
+            Ok(out)
+        }
         "mail_send" => {
             let to = arg(&a, "to")?;
             if to != "you" && (to == "all" || ctx.db.query("SELECT id FROM agents WHERE name=?1 AND repo_id=?2 AND model_ref=?3 AND strict=?4",rusqlite::params![to,repo()?,row["model_ref"].as_str(),row["strict"].as_i64()])?.is_empty()) {
@@ -402,6 +411,9 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
         n if n.starts_with("browser_") => {
             crate::browser::mcp_call(ctx, agent, &me, row["strict"].as_i64() == Some(1), n, a).await
         }
+        n if n.starts_with("surface_") => {
+            crate::surfaces::mcp_call(ctx, agent, &me, row["strict"].as_i64() == Some(1), n, a).await
+        }
         // --- codeindex tools ---
         "code_map" | "code_outline" | "code_symbol" | "code_find" | "code_refs" | "code_impact" | "repo_context" => {
             let mut a = a;
@@ -419,15 +431,38 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
         "skill_list" | "skill_get" => {
             let repo = row["repo_id"].as_str().ok_or("Skills require a registered workspace")?;
             if crate::workspace::repo(ctx, repo).is_none() { return Err("Workspace unavailable".into()); }
-            // Imported instructions and their supporting files belong to the operator.
-            // Only ship reviewed product text until a per-recipient grant exists.
-            let skill = json!({"name":"review-pr", "description":"Check a PR against its real workflow", "source":"Philium built-in", "policy_sha256":crate::board::review_policy_digest()});
-            if name == "skill_list" { return Ok(json!([skill])); }
-            if arg(&a,"name")? != "review-pr" { return Err("No attached skill with that name".into()); }
-            let mut result = skill;
-            result["body"] = json!(crate::board::REVIEW_POLICY);
-            result["files"] = json!({});
-            Ok(result)
+            let strict = row["strict"].as_i64() == Some(1);
+            // Built-in review-pr is always authoritative and cannot be replaced by an imported skill.
+            let builtin_review = json!({
+                "name": "review-pr",
+                "description": "Check a PR against its real workflow",
+                "source": "Philium built-in",
+                "policy_sha256": crate::board::review_policy_digest(),
+            });
+            if name == "skill_list" {
+                let mut list = vec![builtin_review];
+                if !strict {
+                    if let Ok(Value::Array(imported)) = crate::library::skill_list(ctx) {
+                        for item in imported {
+                            if item["name"].as_str() != Some("review-pr") {
+                                list.push(item);
+                            }
+                        }
+                    }
+                }
+                return Ok(Value::Array(list));
+            }
+            let requested = arg(&a, "name")?;
+            if requested == "review-pr" {
+                let mut result = builtin_review;
+                result["body"] = json!(crate::board::REVIEW_POLICY);
+                result["files"] = json!({});
+                return Ok(result);
+            }
+            if strict {
+                return Err("Strict agents may only read built-in skills".into());
+            }
+            crate::library::skill_get(ctx, requested)
         }
         "review_plan" => crate::review_run::plan(ctx, &me, &row, &a["items"]),
         "review_result" => crate::review_run::result(ctx, agent, &me, &row, arg(&a, "task_id")?, arg(&a, "result")?, a["severity"].as_i64().or_else(|| a["severity"].as_str().and_then(|s| s.trim().trim_start_matches(['P', 'p']).parse().ok())), a["origin"].as_str(), arg(&a, "evidence")?),
@@ -468,7 +503,13 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
                 ),
                 "session_search" => {
                     if a["repo_only"] == false { return Err("Cross-repository history is unavailable".into()); }
-                    crate::library::agent_sessions(ctx, a["q"].as_str().unwrap_or(""), repo, a["limit"].as_u64().unwrap_or(8) as usize)
+                    let c = ctx.clone();
+                    let q = a["q"].as_str().unwrap_or("").to_string();
+                    let repo = repo.to_string();
+                    let limit = a["limit"].as_u64().unwrap_or(8) as usize;
+                    tokio::task::spawn_blocking(move || crate::library::agent_sessions(&c, &q, &repo, limit))
+                        .await
+                        .map_err(|e| e.to_string())?
                 }
                 _ => {
                     if a["project"] == false { return Err("Global memory writes are unavailable".into()); }
@@ -640,6 +681,45 @@ mod tests {
         let denied = call("s1", "memory_search", json!({"q":"terse"})).await;
         assert_eq!(denied["result"]["isError"], true);
         assert!(!text(&denied).contains("terse replies"));
+
+        // Imported skills are visible to Standard agents, never to Strict agents; built-in review-pr always wins.
+        ctx.db.exec(
+            "INSERT INTO skills(name,description,body,files,source,updated_at) VALUES('make-plan','Plan work','# Plan steps','{\"check.sh\":\"echo plan\"}','jcode',0)",
+            [],
+        ).unwrap();
+        ctx.db.exec("INSERT INTO agents(id,name,repo_id,model_ref,strict,created_at,last_active_at) VALUES('s2','strict-repo','ra','p/m',1,0,0)", []).unwrap();
+
+        let std_list: Value = serde_json::from_str(&text(&call("t1", "skill_list", json!({})).await)).unwrap();
+        let std_names: Vec<&str> = std_list.as_array().unwrap().iter().map(|s| s["name"].as_str().unwrap()).collect();
+        assert_eq!(std_names, vec!["review-pr", "make-plan"]);
+        let std_imported: Value = serde_json::from_str(&text(&call("t1", "skill_get", json!({"name":"make-plan"})).await)).unwrap();
+        assert_eq!(std_imported["body"], "# Plan steps");
+        assert_eq!(std_imported["files"]["check.sh"], "echo plan");
+
+        let strict_list: Value = serde_json::from_str(&text(&call("s2", "skill_list", json!({})).await)).unwrap();
+        let strict_names: Vec<&str> = strict_list.as_array().unwrap().iter().map(|s| s["name"].as_str().unwrap()).collect();
+        assert_eq!(strict_names, vec!["review-pr"]);
+        let strict_builtin: Value = serde_json::from_str(&text(&call("s2", "skill_get", json!({"name":"review-pr"})).await)).unwrap();
+        assert_eq!(strict_builtin["body"], crate::board::REVIEW_POLICY);
+        assert_eq!(call("s2", "skill_get", json!({"name":"make-plan"})).await["result"]["isError"], true);
+
+        // board_submit surfaces matching on_pr / pre_release reminders to Standard agents ONLY, NEVER Strict.
+        crate::library::intention_add(&ctx, "repo:ra", "on_pr", "", "Verify changelog entry", "user").unwrap();
+        crate::library::intention_add(&ctx, "repo:ra", "pre_release", "release", "Run smoke suite", "user").unwrap();
+        crate::library::intention_add(&ctx, "repo:rb", "on_pr", "", "Sibling repo reminder", "user").unwrap();
+        ctx.db.exec(
+            "INSERT INTO tasks(id,title,repo_id,status,created_at,updated_at) VALUES('t_std','Ship release','ra','open',0,0),('t_strict','Strict task','ra','open',0,0)",
+            [],
+        ).unwrap();
+        assert_ne!(call("t1", "board_claim", json!({"id":"t_std"})).await["result"]["isError"], true);
+        let sub_std: Value = serde_json::from_str(&text(&call("t1", "board_submit", json!({"id":"t_std","summary":"Ready for release"})).await)).unwrap();
+        let rems = sub_std["reminders"].as_array().expect("Standard board_submit gets reminders");
+        assert_eq!(rems.len(), 2, "{sub_std}");
+        assert!(!sub_std.to_string().contains("Sibling repo reminder"));
+
+        assert_ne!(call("s2", "board_claim", json!({"id":"t_strict"})).await["result"]["isError"], true);
+        let sub_strict: Value = serde_json::from_str(&text(&call("s2", "board_submit", json!({"id":"t_strict","summary":"Ready for release"})).await)).unwrap();
+        assert!(sub_strict.get("reminders").is_none(), "Strict board_submit must never include reminders: {sub_strict}");
     }
 
     #[test]

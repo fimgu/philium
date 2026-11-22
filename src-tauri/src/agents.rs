@@ -231,6 +231,8 @@ fn shared_instructions(strict: bool) -> String {
          - Changes: `code_impact` lists what your change touches and who calls it. Philium adds a note to your next tool result when your work overlaps another agent's.\n\
          - Commands: `shell_run` types into your persistent shell. Run builds, test suites and servers with `background=true` and poll `shell_read`. A running result or a transport error does not mean the command stopped: read the terminal before starting it again. Check `exit_code` before reporting a result. `shell_open {name}` gives a second shell.\n\
          - Web pages: use your browser, not curl. `browser_open`, then `browser_snapshot` for the page and numbered refs, then `browser_click` / `browser_type` / `browser_press`. Snapshot again after each navigation. The person approves browser calls; respect a denial.\n\
+         - App surfaces: `surface_catalog`, `surface_launch`, `surface_exec`, `surface_screenshot`, `surface_stop` run isolated GUI/CLI apps (KiCad, DBeaver, Chromium) off the host desktop.\n\
+         - Memory: `memory_slate`, `memory_search`, `memory_save`, `working_note_get`, `working_note_set` manage repository facts and handoff notes (Standard mode only).\n\
          - Tasks and people: `board_*` for tasks (claim before working, keep the lease alive), `mail_send` / `mail_read` for messages. `mail_send` to `\"you\"` reaches the person. Jobs like commit, open_pr, review_pr and release: `playbook_get` first and follow it. Finished work lands as a GitHub pull request.\n\
          - Philium renders `mermaid`, `diff`, `svg`, `math` and `csv` blocks and GFM tables in your replies.\n\
          \n\
@@ -244,7 +246,7 @@ fn shared_instructions(strict: bool) -> String {
     );
     if strict {
         s.push_str("- You run in Strict mode. You can read and run every tool on this machine except private data (credentials, personal folders). You can write your worktree, $TMPDIR and folders granted for this repo. \
-            Shell network goes through Philium's proxy, which only allows approved hosts (package registries and similar): a 403 \"host not on allowlist\" is expected, so use your browser for websites instead.\n");
+            Shell network and browser navigation are limited to localhost and hosts on your Strict allowlist (package registries, GitHub, and hosts approved in Sandbox settings): a 403 or blocked URL means that host is not allowlisted.\n");
     }
     s
 }
@@ -252,6 +254,24 @@ fn shared_instructions(strict: bool) -> String {
 /// Human-configured standing rules are intentional instructions. Never append archived memories here.
 pub(crate) fn prompt_rules(ctx: &Ctx, strict: bool) -> String {
     format!("{}\n{}", shared_instructions(strict), crate::library::rules(ctx))
+}
+
+/// Post-prefix session context (reminders + bounded working note) placed AFTER `<!-- PHILIUM_CACHE_BREAK -->`
+/// so shared prefix KV caching stays intact. Strictly empty for Strict/untrusted agents.
+pub(crate) fn agent_session_context(ctx: &Ctx, strict: bool, repo_id: Option<&str>) -> String {
+    if strict {
+        return String::new();
+    }
+    let mut out = String::new();
+    if let Some(reminders) = crate::library::session_start_reminders_prompt(ctx, repo_id) {
+        out.push_str(&reminders);
+    }
+    if let Some(rid) = repo_id.filter(|s| !s.is_empty()) {
+        if let Some(note) = crate::library::working_note_prompt(ctx, rid) {
+            out.push_str(&note);
+        }
+    }
+    out
 }
 
 /// Per-agent identity tail placed after the shared repo cache prefix.
@@ -491,14 +511,10 @@ async fn provision(ctx: &Arc<Ctx>, id: &str, fresh: bool, brief: Option<String>)
         if let Some(cmap) = cmap {
             extra.push_str(&cmap);
         }
-        if !strict {
-            if let Some(note) = crate::library::working_note_prompt(ctx, repo_id) {
-                extra.push_str(&note);
-            }
-        }
     }
     extra.push_str("\n<!-- PHILIUM_CACHE_BREAK -->\n");
     extra.push_str(&agent_identity_tail(&name, &role, parent_name.as_deref(), worktree.as_deref()));
+    extra.push_str(&agent_session_context(ctx, strict, row["repo_id"].as_str()));
     config["prompt"] = json!({ "extra": extra });
     if let Some(url) = ctx.mcp_url.get() {
         config["mcp"] = json!({ "servers": { "philium": {
@@ -547,6 +563,9 @@ async fn provision(ctx: &Arc<Ctx>, id: &str, fresh: bool, brief: Option<String>)
         }
         crate::sandbox::Policy { workdir: cwd.clone(), scratch: dir.clone(), hal_dir: hal_dir.clone(), read_only: ro, read_write: rw, allow_hosts: vec![] }
     });
+    if let Some(ref p) = policy {
+        crate::sandbox::register_policy(&name, p);
+    }
 
     let (cfg, hd, cwd2, allow_logins) = (config, hal_dir.clone(), cwd.clone(), setup.allow_logins);
     let wrap_policy = policy.clone();
@@ -745,6 +764,7 @@ fn on_hal_exit(ctx: &Arc<Ctx>, id: &str, hal: &Arc<Hal>, reason: &str) {
     let _ = ctx.db.kv_set(&format!("agent_error.{id}"), &msg);
     if let Some(n) = get_row(ctx, id).and_then(|r| r["name"].as_str().map(str::to_string)) {
         ctx.gateway.revoke_agent(&n);
+        crate::sandbox::revoke(&n);
     }
     crate::mcp::revoke(id);
     crate::terminals::kill_agent(ctx, id);
@@ -1021,6 +1041,7 @@ pub fn stop(ctx: &Arc<Ctx>, id: &str, state: &str) {
     if let Some(row) = get_row(ctx, id) {
         if let Some(n) = row["name"].as_str() {
             ctx.gateway.revoke_agent(n);
+            crate::sandbox::revoke(n);
         }
     }
     crate::mcp::revoke(id);
@@ -1817,6 +1838,7 @@ async fn remove_one(ctx: &Arc<Ctx>, id: &str, force: bool) -> Result<Value, Stri
         }
     }
     crate::browser::forget_agent(ctx, &id);
+    crate::surfaces::forget_agent(ctx, &id);
     ctx.db.exec("DELETE FROM agents WHERE id=?1", [&id])?;
     let _ = ctx.db.exec("DELETE FROM agent_queue WHERE agent_id=?1", [&id]);
     for k in ["agent_error", "agent_seq", "agent.retry"] {
@@ -2155,6 +2177,37 @@ mod tests {
         assert_eq!(arr[0]["rate_limited"]["attempt"], 2);
         assert_eq!(arr[1]["error"], "crash msg");
         std::fs::remove_dir_all(ctx.data_dir.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn standard_agents_get_post_prefix_session_context_and_strict_never_does() {
+        let ctx = Ctx::test();
+        ctx.db.kv_set("library.imported_at", "fixture").unwrap();
+        crate::library::init(&ctx).unwrap();
+        crate::library::intention_add(&ctx, "repo:ra", "on_session_start", "", "Run cargo check first", "user").unwrap();
+        crate::library::intention_add(&ctx, "repo:rb", "on_session_start", "", "Sibling repo secret", "user").unwrap();
+        crate::library::intention_add(&ctx, "global", "on_session_start", "", "Keep diffs minimal", "user").unwrap();
+        let huge = "handoff detail ".repeat(250);
+        crate::library::working_note_set(&ctx, "repo:ra", &huge, "Use SQLite", "", "Finish wiring", None, "user").unwrap();
+
+        // Shared prefix lists surface_* and memory tools cleanly and NEVER includes working note or reminders.
+        let prefix = prompt_rules(&ctx, false);
+        for tok in ["surface_catalog", "surface_launch", "surface_exec", "surface_screenshot", "surface_stop", "memory_slate", "memory_search", "memory_save", "working_note_get", "working_note_set"] {
+            assert!(prefix.contains(tok), "shared_instructions missing {tok}");
+        }
+        assert!(!prefix.contains("Run cargo check first") && !prefix.contains("handoff detail"));
+
+        // Standard agent gets active on_session_start reminders + bounded working note after prefix.
+        let std_tail = agent_session_context(&ctx, false, Some("ra"));
+        assert!(std_tail.contains("Run cargo check first"));
+        assert!(std_tail.contains("Keep diffs minimal"));
+        assert!(std_tail.contains("Workspace working note"));
+        assert!(!std_tail.contains("Sibling repo secret"));
+        assert!(std_tail.len() <= 4096, "session context must stay bounded: {}", std_tail.len());
+
+        // Strict agent NEVER receives reminders or working notes.
+        assert!(agent_session_context(&ctx, true, Some("ra")).is_empty());
+        assert!(agent_session_context(&ctx, true, None).is_empty());
     }
 }
 

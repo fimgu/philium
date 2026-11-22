@@ -316,12 +316,28 @@ pub(crate) fn tab_for(owner: &str, a: &Value) -> Result<String, String> {
     s.tabs.iter().rev().find(|t| t.owner.as_deref() == Some(owner)).map(|t| t.id.clone()).ok_or_else(|| "no tab open: call browser_open first".into())
 }
 
-/// Strict (untrusted provider) agents may only point their own tools at local pages.
+/// Strict (untrusted provider) agents may only point their own tools at local pages
+/// or hosts explicitly permitted by their Strict allowlist.
 pub fn strict_url_ok(url: &str) -> bool {
     match url.parse::<tauri::Url>() {
         Ok(u) => u.scheme() == "http" && matches!(u.host_str(), Some("localhost" | "127.0.0.1" | "[::1]")) || url == "about:blank",
         Err(_) => false,
     }
+}
+
+/// Whether a Strict agent may navigate to `url`: always allows local pages (`strict_url_ok`),
+/// plus http(s) hosts on the agent's effective Strict allowlist (settings + `Policy.allow_hosts`).
+pub fn strict_browser_url_allowed(ctx: &Ctx, agent_name: &str, url: &str) -> bool {
+    if strict_url_ok(url) {
+        return true;
+    }
+    let Ok(parsed) = url.parse::<tauri::Url>() else { return false };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return false;
+    }
+    let Some(host) = parsed.host_str() else { return false };
+    let list = crate::sandbox::effective_allowlist(ctx, agent_name);
+    crate::sandbox::host_allowed(&list, host)
 }
 
 fn status(ctx: &Ctx, owner: &str, tab: &str, me: &str, text: &str) {
@@ -331,11 +347,13 @@ fn status(ctx: &Ctx, owner: &str, tab: &str, me: &str, text: &str) {
 /// Entry from `mcp::call_tool` for every `browser_*` tool. `agent` is the agent id.
 /// Image results are returned as `{"__mcp_content": [...]}`.
 pub async fn mcp_call(ctx: &Arc<Ctx>, agent: &str, me: &str, strict: bool, name: &str, a: Value) -> Result<Value, String> {
-    // Strict agents may browse anywhere: the pane warns that page content
-    // reaches their provider, and each agent's profile holds only the logins
-    // the human chose to make in it.
-    let _ = strict;
-    let check = |url: &str| -> Result<String, String> { normalize_url(url) };
+    let check = |url: &str| -> Result<String, String> {
+        let norm = normalize_url(url)?;
+        if strict && !strict_browser_url_allowed(ctx, me, &norm) {
+            return Err("Strict agents may only open local URLs (localhost/127.0.0.1) or hosts on their Strict allowlist; add the host in Sandbox allowlist to permit it".into());
+        }
+        Ok(norm)
+    };
     match name {
         "browser_open" => {
             let url = check(super::arg_str(&a, "url")?.as_str())?;

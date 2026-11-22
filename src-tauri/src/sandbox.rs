@@ -98,8 +98,7 @@ pub struct Policy {
     pub read_only: Vec<PathBuf>,
     /// Extra read+write folders (the repo's git dir, writable repo grants).
     pub read_write: Vec<PathBuf>,
-    /// Informational: enforcement is done by the egress proxy (the kernel only
-    /// permits loopback). The proxy reads the live list from settings.
+    /// Extra hosts allowed for this agent in the egress proxy alongside global/per-agent settings.
     pub allow_hosts: Vec<String>,
 }
 
@@ -339,9 +338,26 @@ fn agent_token(agent: &str) -> String {
     tokens().lk().entry(agent.to_string()).or_insert_with(crate::hal::random_token).clone()
 }
 
-/// Drop the agent's proxy credential (kill switch / teardown).
+fn policy_hosts() -> &'static Mutex<HashMap<String, Vec<String>>> {
+    static H: OnceLock<Mutex<HashMap<String, Vec<String>>>> = OnceLock::new();
+    H.get_or_init(Default::default)
+}
+
+/// Register `Policy.allow_hosts` for `agent` so the egress proxy honors them
+/// alongside global `strict.allow_hosts` and per-agent allowlist overrides.
+pub fn register_policy(agent: &str, policy: &Policy) {
+    let hosts: Vec<String> = policy.allow_hosts.iter().flat_map(|s| parse_hosts(s)).collect();
+    if hosts.is_empty() {
+        policy_hosts().lk().remove(agent);
+    } else {
+        policy_hosts().lk().insert(agent.to_string(), hosts);
+    }
+}
+
+/// Drop the agent's proxy credential and policy host grants (kill switch / teardown).
 pub fn revoke(agent: &str) {
     tokens().lk().remove(agent);
+    policy_hosts().lk().remove(agent);
 }
 
 /// Env for a strict agent. Proxy credential is per agent.
@@ -402,6 +418,20 @@ pub fn allowlist(ctx: &Ctx, agent: Option<&str>) -> (Vec<String>, bool) {
     };
     allowlist_cache().wr().insert(key, val.clone());
     val
+}
+
+/// Effective host allowlist for an agent: settings allowlist (per-agent override or global)
+/// unioned with any hosts registered from its `Policy.allow_hosts`.
+pub fn effective_allowlist(ctx: &Ctx, agent: &str) -> Vec<String> {
+    let (mut list, _) = allowlist(ctx, Some(agent));
+    if let Some(extra) = policy_hosts().lk().get(agent) {
+        for h in extra {
+            if !list.contains(h) {
+                list.push(h.clone());
+            }
+        }
+    }
+    list
 }
 
 /// Exact host or any subdomain of an entry.
@@ -488,7 +518,7 @@ async fn handle(ctx: Arc<Ctx>, mut c: TcpStream) {
         log_conn(&ctx, "?", &head.target, 0, false, 0);
         return reply(&mut c, "407 Proxy Authentication Required", "Proxy-Authenticate: Basic realm=\"philium\"\r\n").await;
     };
-    let (list, _) = allowlist(&ctx, Some(&agent));
+    let list = effective_allowlist(&ctx, &agent);
     let is_connect = head.method.eq_ignore_ascii_case("CONNECT");
     let (host, port, path) = if is_connect {
         let (h, p) = split_hostport(&head.target, 443);
@@ -848,6 +878,57 @@ mod tests {
         // CONNECT denied for a non-listed host
         let r = go(format!("CONNECT evil.example:443 HTTP/1.1\r\nProxy-Authorization: Basic {cred}\r\n\r\n")).await;
         assert!(r.starts_with("HTTP/1.1 403"));
+        revoke("lion");
+    }
+
+    #[tokio::test]
+    async fn policy_allow_hosts_honored_by_egress_proxy() {
+        let ctx = Ctx::test();
+        setup_db(&ctx).unwrap();
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let _ = ctx.egress_url.set(format!("http://{}", l.local_addr().unwrap()));
+        tokio::spawn(serve(ctx.clone(), l));
+        let agent = "policy-host-agent";
+        let _ = env(&ctx, agent);
+        let proxy_addr = ctx.egress_url.get().unwrap().trim_start_matches("http://").to_string();
+        let tok = agent_token(agent);
+        let cred = base64::engine::general_purpose::STANDARD.encode(format!("{agent}:{tok}"));
+
+        let up = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_port = up.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = up.accept().await {
+                let mut b = [0u8; 1024];
+                let _ = s.read(&mut b).await;
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").await;
+            }
+        });
+        let go = |r: String| {
+            let a = proxy_addr.clone();
+            async move {
+                let mut s = TcpStream::connect(a).await.unwrap();
+                s.write_all(r.as_bytes()).await.unwrap();
+                let mut o = String::new();
+                let _ = s.read_to_string(&mut o).await;
+                o
+            }
+        };
+        let req = format!("GET http://127.0.0.1:{up_port}/ HTTP/1.1\r\nHost: 127.0.0.1\r\nProxy-Authorization: Basic {cred}\r\n\r\n");
+        // Global allowlist does not include 127.0.0.1: denied before Policy.allow_hosts is registered.
+        assert!(go(req.clone()).await.starts_with("HTTP/1.1 403"));
+        let mut p = pol(Path::new("/tmp/policy-test"));
+        p.allow_hosts = vec!["127.0.0.1".into(), "*.policy.example".into()];
+        register_policy(agent, &p);
+        let eff = effective_allowlist(&ctx, agent);
+        assert!(host_allowed(&eff, "127.0.0.1"));
+        assert!(host_allowed(&eff, "api.policy.example"));
+        // Proxy now allows 127.0.0.1 via Policy.allow_hosts while still denying unlisted hosts.
+        let ok = go(req).await;
+        assert!(ok.starts_with("HTTP/1.1 200") && ok.ends_with("ok"), "{ok}");
+        let denied = go(format!("CONNECT evil.example:443 HTTP/1.1\r\nProxy-Authorization: Basic {cred}\r\n\r\n")).await;
+        assert!(denied.starts_with("HTTP/1.1 403"), "{denied}");
+        revoke(agent);
+        assert!(!host_allowed(&effective_allowlist(&ctx, agent), "api.policy.example"));
     }
 
     #[cfg(target_os = "macos")]

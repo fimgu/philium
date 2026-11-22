@@ -296,3 +296,100 @@ async fn browser_mcp_requires_consent_and_scopes_grants() {
         fixture.hal.take().unwrap().stop();
     }
 }
+
+#[tokio::test]
+async fn strict_browser_blocks_unlisted_remote_urls_unless_allowlisted() {
+    let ctx = Ctx::test();
+    let agent_name = "strict-browser-fox";
+    // Non-local, non-allowlisted URL is blocked by Strict URL policy before any webview call.
+    let err = browser::mcp_call(
+        &ctx,
+        "ag-strict",
+        agent_name,
+        true,
+        "browser_open",
+        json!({"url": "https://untrusted.example/secret"}),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.contains("Strict allowlist"),
+        "expected Strict allowlist rejection, got: {err}"
+    );
+    assert!(!browser::agent::strict_browser_url_allowed(
+        &ctx,
+        agent_name,
+        "https://untrusted.example/secret"
+    ));
+
+    // Local URLs always pass Strict URL policy (only failing later on missing Tauri handle in unit tests).
+    assert!(browser::agent::strict_browser_url_allowed(
+        &ctx,
+        agent_name,
+        "http://localhost:3000/app"
+    ));
+    let local_err = browser::mcp_call(
+        &ctx,
+        "ag-strict",
+        agent_name,
+        true,
+        "browser_open",
+        json!({"url": "http://localhost:3000/app"}),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        !local_err.contains("Strict allowlist"),
+        "localhost must not be blocked by Strict URL policy: {local_err}"
+    );
+
+    // Explicitly allowlisting a host (via Sandbox settings or Policy.allow_hosts) permits Strict browsing to it.
+    sandbox::call(
+        &ctx,
+        "allowlist_set",
+        json!({"agent": agent_name, "hosts": ["docs.example.org"]}),
+    )
+    .await
+    .unwrap();
+    assert!(browser::agent::strict_browser_url_allowed(
+        &ctx,
+        agent_name,
+        "https://docs.example.org/guide"
+    ));
+    assert!(!browser::agent::strict_browser_url_allowed(
+        &ctx,
+        agent_name,
+        "https://untrusted.example/secret"
+    ));
+    let allowed_err = browser::mcp_call(
+        &ctx,
+        "ag-strict",
+        agent_name,
+        true,
+        "browser_open",
+        json!({"url": "https://docs.example.org/guide"}),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        !allowed_err.contains("Strict allowlist"),
+        "allowlisted host must not be blocked by Strict URL policy: {allowed_err}"
+    );
+
+    // Standard (non-Strict) agents are not restricted by the Strict URL policy (still gated by HAL 'ask').
+    let std_err = browser::mcp_call(
+        &ctx,
+        "ag-std",
+        "std-owl",
+        false,
+        "browser_open",
+        json!({"url": "https://untrusted.example/page"}),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        !std_err.contains("Strict allowlist"),
+        "Standard agent must not hit Strict allowlist block: {std_err}"
+    );
+    sandbox::revoke(agent_name);
+}

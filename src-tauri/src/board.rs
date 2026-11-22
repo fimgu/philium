@@ -554,7 +554,30 @@ fn submit_inner(
         &json!({"summary":summary,"pr_url":pr_url}),
     )?;
     changed(ctx);
-    get(ctx, id)
+    let mut out = get(ctx, id)?;
+    let is_strict = actor != "you"
+        && ctx
+            .db
+            .query("SELECT strict FROM agents WHERE id=?1 OR name=?1", [actor])
+            .ok()
+            .and_then(|rows| rows.into_iter().next())
+            .and_then(|r| r["strict"].as_i64())
+            == Some(1);
+    if !is_strict {
+        let haystack = format!(
+            "{} {} {} {} {}",
+            t["title"].as_str().unwrap_or(""),
+            t["detail"].as_str().unwrap_or(""),
+            t["playbook"].as_str().unwrap_or(""),
+            summary,
+            pr_url.unwrap_or(""),
+        );
+        let reminders = crate::library::submit_reminders(ctx, t["repo_id"].as_str(), &haystack);
+        if !reminders.is_empty() {
+            out["reminders"] = json!(reminders);
+        }
+    }
+    Ok(out)
 }
 /// A release review item whose pass or fail is recorded is finished. The outcome is the work and
 /// the person reads it in Review, so it does not wait on the board for acceptance.

@@ -25,14 +25,19 @@ use crate::{ctx::Ctx, db::now};
 use rusqlite::params;
 use serde_json::{json, Value};
 use std::{
+    collections::HashMap,
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex, OnceLock},
+    time::SystemTime,
 };
 
 const MAX_SKILL_FILE: u64 = 64 * 1024;
 const MAX_SKILL_FILES: usize = 12;
 const MAX_UNTRUSTED_PER_SLATE: usize = 2;
+const MAX_WORKING_NOTE_PROMPT_BYTES: usize = 2048;
+const MAX_REMINDERS_PROMPT_BYTES: usize = 2048;
+const SESSION_CACHE_CAP: usize = 512;
 const LOCAL_EMBED_MODEL: &str = "philium-local-ngram-256-v1";
 const LOCAL_EMBED_DIM: usize = 256;
 const RRF_K: f64 = 60.0;
@@ -681,6 +686,7 @@ fn search_scope(ctx: &Ctx, q: &str, scope: &str, include_global: bool, limit: i6
     Ok(Value::Array(merged.into_iter().take(limit as usize).map(|(_, v)| v).collect()))
 }
 
+#[cfg(test)]
 pub fn memory_save(ctx: &Ctx, content: &str, category: &str, project: Option<&str>, by: &str) -> Result<Value, String> {
     let scope = project.map(|p| format!("project:{p}")).unwrap_or("global".into());
     let trust = if by == "user" { "user_direct" } else { "agent_inferred" };
@@ -698,6 +704,7 @@ pub fn memory_save(ctx: &Ctx, content: &str, category: &str, project: Option<&st
     })
 }
 
+#[cfg(test)]
 pub fn save_agent_memory(ctx: &Ctx, content: &str, category: &str, repo_id: &str, by: &str) -> Result<Value, String> {
     save_agent_memory_rich(ctx, content, category, repo_id, by, None, None, None, None)
 }
@@ -1003,7 +1010,117 @@ pub fn working_note_set(
     working_note_get(ctx, scope)
 }
 
-/// Concise prompt block for a repo's working handoff note (if non-empty).
+/// Truncate `s` cleanly on a UTF-8 boundary so the resulting string is at most `max_bytes` bytes.
+fn truncate_utf8(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let suffix = "\n... [truncated]\n";
+    if max_bytes <= suffix.len() {
+        let mut end = max_bytes;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        return s[..end].to_string();
+    }
+    let mut end = max_bytes - suffix.len();
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{suffix}", &s[..end])
+}
+
+/// Active intentions matching `repo_id` (or global only when `repo_id` is None) and `trigger_kinds`.
+/// If `context_haystack` is Some, intentions with a non-empty `trigger_match` must match it
+/// case-insensitively. Returns empty vec safely if the `intentions` table is not initialized.
+pub fn matching_intentions(
+    ctx: &Ctx,
+    repo_id: Option<&str>,
+    trigger_kinds: &[&str],
+    context_haystack: Option<&str>,
+) -> Vec<Value> {
+    if trigger_kinds.is_empty() {
+        return vec![];
+    }
+    let repo_scope = repo_id.filter(|s| !s.is_empty()).map(|r| format!("repo:{r}"));
+    let rows = match repo_scope {
+        Some(ref rs) => ctx.db.query(
+            "SELECT id, scope, trigger_kind, trigger_match, instruction, created_by, created_at
+             FROM intentions
+             WHERE active=1 AND (scope=?1 OR scope='global')
+             ORDER BY (scope=?1) DESC, created_at DESC LIMIT 40",
+            params![rs],
+        ),
+        None => ctx.db.query(
+            "SELECT id, scope, trigger_kind, trigger_match, instruction, created_by, created_at
+             FROM intentions
+             WHERE active=1 AND scope='global'
+             ORDER BY created_at DESC LIMIT 40",
+            [],
+        ),
+    }
+    .unwrap_or_default();
+    let hay_low = context_haystack.map(|h| h.to_lowercase());
+    rows.into_iter()
+        .filter(|r| {
+            let kind = r["trigger_kind"].as_str().unwrap_or("");
+            if !trigger_kinds.contains(&kind) {
+                return false;
+            }
+            let tm = r["trigger_match"].as_str().unwrap_or("").trim();
+            if tm.is_empty() {
+                return true;
+            }
+            match &hay_low {
+                Some(h) => h.contains(&tm.to_lowercase()),
+                None => true,
+            }
+        })
+        .collect()
+}
+
+/// Bounded prompt block of active `on_session_start` reminders for trusted Standard agents ONLY.
+pub fn session_start_reminders_prompt(ctx: &Ctx, repo_id: Option<&str>) -> Option<String> {
+    let items = matching_intentions(ctx, repo_id, &["on_session_start"], None);
+    if items.is_empty() {
+        return None;
+    }
+    let mut out = String::from("\n## Session start reminders\n");
+    for item in items {
+        let inst = item["instruction"].as_str().unwrap_or("").trim();
+        if inst.is_empty() {
+            continue;
+        }
+        let tm = item["trigger_match"].as_str().unwrap_or("").trim();
+        if tm.is_empty() {
+            out.push_str(&format!("- {inst}\n"));
+        } else {
+            out.push_str(&format!("- [{tm}] {inst}\n"));
+        }
+    }
+    if out == "\n## Session start reminders\n" {
+        return None;
+    }
+    Some(truncate_utf8(&out, MAX_REMINDERS_PROMPT_BYTES))
+}
+
+/// Matching `on_pr` / `pre_release` reminders surfaced to trusted Standard agents on `board_submit`.
+pub fn submit_reminders(ctx: &Ctx, repo_id: Option<&str>, haystack: &str) -> Vec<Value> {
+    matching_intentions(ctx, repo_id, &["on_pr", "pre_release"], Some(haystack))
+        .into_iter()
+        .map(|r| {
+            json!({
+                "id": r["id"],
+                "scope": r["scope"],
+                "trigger_kind": r["trigger_kind"],
+                "trigger_match": r["trigger_match"],
+                "instruction": r["instruction"],
+            })
+        })
+        .collect()
+}
+
+/// Concise, size-bounded (<= 2048 bytes) prompt block for a repo's working handoff note (if non-empty).
 pub fn working_note_prompt(ctx: &Ctx, repo_id: &str) -> Option<String> {
     let note = working_note_get(ctx, &format!("repo:{repo_id}")).ok()?;
     let req = note["requirements"].as_str().unwrap_or("").trim();
@@ -1026,7 +1143,7 @@ pub fn working_note_prompt(ctx: &Ctx, repo_id: &str) -> Option<String> {
     if !next.is_empty() {
         out.push_str(&format!("- Next steps: {next}\n"));
     }
-    Some(out)
+    Some(truncate_utf8(&out, MAX_WORKING_NOTE_PROMPT_BYTES))
 }
 
 fn estimate_tokens(s: &str) -> usize {
@@ -1228,6 +1345,7 @@ pub fn list_memories(
 }
 
 /// Global preferences and corrections, injected into every agent's instructions.
+#[cfg(test)]
 pub fn standing_memories(ctx: &Ctx) -> String {
     let rows = ctx
         .db
@@ -1302,6 +1420,156 @@ pub fn agent_sessions(ctx: &Ctx, query: &str, repo_id: &str, limit: usize) -> Re
     search_sessions(ctx, None, query, None, true, Some(repo_id), limit)
 }
 
+#[derive(Clone)]
+struct CachedHalEvents {
+    stamp: (SystemTime, u64),
+    /// (role, excerpt <= 280 chars, lowercased full text)
+    entries: Vec<(String, String, String)>,
+}
+
+#[derive(Clone)]
+struct CachedJcodeSession {
+    stamp: (SystemTime, u64),
+    skip: bool,
+    working_dir: String,
+    short_name: String,
+    title: String,
+    session_id: String,
+    updated_at: Value,
+    meta_low: String,
+    /// (role, excerpt <= 280 chars, lowercased cleaned text)
+    texts: Vec<(String, String, String)>,
+}
+
+fn hal_session_cache() -> &'static Mutex<HashMap<PathBuf, CachedHalEvents>> {
+    static C: OnceLock<Mutex<HashMap<PathBuf, CachedHalEvents>>> = OnceLock::new();
+    C.get_or_init(Default::default)
+}
+
+fn jcode_session_cache() -> &'static Mutex<HashMap<PathBuf, CachedJcodeSession>> {
+    static C: OnceLock<Mutex<HashMap<PathBuf, CachedJcodeSession>>> = OnceLock::new();
+    C.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+static SESSION_FILE_PARSES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn load_hal_events_cached(path: &Path) -> Option<CachedHalEvents> {
+    let md = std::fs::metadata(path).ok()?;
+    let stamp = (md.modified().ok()?, md.len());
+    {
+        let cache = hal_session_cache().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(hit) = cache.get(path) {
+            if hit.stamp == stamp {
+                return Some(hit.clone());
+            }
+        }
+    }
+    let raw = std::fs::read_to_string(path).ok()?;
+    #[cfg(test)]
+    SESSION_FILE_PARSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut entries = vec![];
+    for line in raw.lines().take(200) {
+        let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+        let role = match v["t"].as_str() {
+            Some("user") => "user",
+            Some("assistant") => "assistant",
+            _ => continue,
+        };
+        let txt = v["text"].as_str().unwrap_or("").trim();
+        if txt.is_empty() {
+            continue;
+        }
+        entries.push((
+            role.to_string(),
+            txt.chars().take(280).collect::<String>(),
+            txt.to_lowercase(),
+        ));
+    }
+    let item = CachedHalEvents { stamp, entries };
+    let mut cache = hal_session_cache().lock().unwrap_or_else(|e| e.into_inner());
+    if cache.len() >= SESSION_CACHE_CAP {
+        cache.clear();
+    }
+    cache.insert(path.to_path_buf(), item.clone());
+    Some(item)
+}
+
+fn load_jcode_session_cached(path: &Path, stamp: (SystemTime, u64)) -> Option<CachedJcodeSession> {
+    {
+        let cache = jcode_session_cache().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(hit) = cache.get(path) {
+            if hit.stamp == stamp {
+                return Some(hit.clone());
+            }
+        }
+    }
+    let raw = std::fs::read_to_string(path).ok()?;
+    #[cfg(test)]
+    SESSION_FILE_PARSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let parsed = match serde_json::from_str::<Value>(&raw) {
+        Ok(v) if v["debug"].as_bool() != Some(true) && v["canary"].as_bool() != Some(true) => {
+            let wd = v["working_dir"].as_str().unwrap_or("").to_string();
+            let short = v["short_name"].as_str().unwrap_or("").to_string();
+            let title = v["title"].as_str().unwrap_or("").to_string();
+            let sid = v["id"].as_str().unwrap_or("").to_string();
+            let meta_low = format!("{short} {title} {wd} {sid}").to_lowercase();
+            let mut texts = vec![];
+            if let Some(msgs) = v["messages"].as_array() {
+                for m in msgs.iter().take(120) {
+                    let role = m["role"].as_str().unwrap_or("");
+                    if role != "user" && role != "assistant" {
+                        continue;
+                    }
+                    let Some(blocks) = m["content"].as_array() else { continue };
+                    for b in blocks {
+                        if b["type"].as_str() != Some("text") {
+                            continue;
+                        }
+                        let clean = strip_system_reminders(b["text"].as_str().unwrap_or(""));
+                        if clean.is_empty() {
+                            continue;
+                        }
+                        texts.push((
+                            role.to_string(),
+                            clean.chars().take(280).collect::<String>(),
+                            clean.to_lowercase(),
+                        ));
+                    }
+                }
+            }
+            CachedJcodeSession {
+                stamp,
+                skip: false,
+                working_dir: wd,
+                short_name: short,
+                title,
+                session_id: sid,
+                updated_at: v["updated_at"].clone(),
+                meta_low,
+                texts,
+            }
+        }
+        _ => CachedJcodeSession {
+            stamp,
+            skip: true,
+            working_dir: String::new(),
+            short_name: String::new(),
+            title: String::new(),
+            session_id: String::new(),
+            updated_at: Value::Null,
+            meta_low: String::new(),
+            texts: vec![],
+        },
+    };
+    let mut cache = jcode_session_cache().lock().unwrap_or_else(|e| e.into_inner());
+    if cache.len() >= SESSION_CACHE_CAP {
+        cache.clear();
+    }
+    cache.insert(path.to_path_buf(), parsed.clone());
+    Some(parsed)
+}
+
 fn search_sessions(ctx: &Ctx, home_dir: Option<&Path>, query: &str, project: Option<&str>, repo_only: bool, repo_id: Option<&str>, limit: usize) -> Result<Value, String> {
     let limit = limit.clamp(1, 25);
     let terms: Vec<String> = query
@@ -1346,26 +1614,15 @@ fn search_sessions(ctx: &Ctx, home_dir: Option<&Path>, query: &str, project: Opt
         // Agent recall provides orientation, not implicit access to raw conversations.
         if let Some(sid) = a["hal_session_id"].as_str().filter(|s| repo_id.is_none() && !s.is_empty()) {
             let ev_path = ctx.root.join("hal/sessions").join(sid).join("events.jsonl");
-            if let Ok(raw) = std::fs::read_to_string(&ev_path) {
-                for line in raw.lines().take(200) {
-                    let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
-                    let role = match v["t"].as_str() {
-                        Some("user") => "user",
-                        Some("assistant") => "assistant",
-                        _ => continue,
-                    };
-                    let txt = v["text"].as_str().unwrap_or("").trim();
-                    if txt.is_empty() {
-                        continue;
-                    }
-                    let low = txt.to_lowercase();
+            if let Some(cached) = load_hal_events_cached(&ev_path) {
+                for (role, excerpt, low) in &cached.entries {
                     let term_hits = terms.iter().filter(|t| low.contains(t.as_str())).count();
                     if terms.is_empty() || term_hits > 0 {
                         score += (term_hits as i64) * 10;
                         if excerpts.len() < 3 {
                             excerpts.push(json!({
                                 "role": role,
-                                "text": txt.chars().take(280).collect::<String>(),
+                                "text": excerpt,
                             }));
                         }
                     }
@@ -1390,9 +1647,9 @@ fn search_sessions(ctx: &Ctx, home_dir: Option<&Path>, query: &str, project: Opt
         }
     }
 
-    // 2. Jcode sessions (~/.jcode/sessions/*.json)
+    // 2. Jcode sessions (~/.jcode/sessions/*.json), cached by (path, mtime, len)
     if let Some(rd) = home_dir.and_then(|home| std::fs::read_dir(home.join(".jcode/sessions")).ok()) {
-        let mut files: Vec<(std::time::SystemTime, PathBuf)> = rd
+        let mut files: Vec<(SystemTime, u64, PathBuf)> = rd
             .flatten()
             .filter_map(|e| {
                 let p = e.path();
@@ -1400,59 +1657,37 @@ fn search_sessions(ctx: &Ctx, home_dir: Option<&Path>, query: &str, project: Opt
                 if !name.ends_with(".json") || name.contains("canary") {
                     return None;
                 }
-                let m = e.metadata().ok()?.modified().ok()?;
-                Some((m, p))
+                let md = e.metadata().ok()?;
+                let m = md.modified().ok()?;
+                Some((m, md.len(), p))
             })
             .collect();
         files.sort_by(|a, b| b.0.cmp(&a.0));
-        for (_, p) in files.into_iter().take(120) {
-            let Ok(raw) = std::fs::read_to_string(&p) else { continue };
-            let Ok(v) = serde_json::from_str::<Value>(&raw) else { continue };
-            if v["debug"].as_bool() == Some(true) || v["canary"].as_bool() == Some(true) {
+        for (mtime, len, p) in files.into_iter().take(120) {
+            let Some(sess) = load_jcode_session_cached(&p, (mtime, len)) else { continue };
+            if sess.skip {
                 continue;
             }
-            let wd = v["working_dir"].as_str().unwrap_or("");
-            let same_repo = matches_repo(wd, project);
+            let same_repo = matches_repo(&sess.working_dir, project);
             if repo_only && project.is_some() && !same_repo {
                 continue;
             }
-            let short = v["short_name"].as_str().unwrap_or("");
-            let title = v["title"].as_str().unwrap_or("");
-            let sid = v["id"].as_str().unwrap_or("");
-            let meta_low = format!("{short} {title} {wd} {sid}").to_lowercase();
             let mut score: i64 = if same_repo { 25 } else { 0 };
             for t in &terms {
-                if meta_low.contains(t) {
+                if sess.meta_low.contains(t) {
                     score += 15;
                 }
             }
             let mut excerpts = vec![];
-            if let Some(msgs) = v["messages"].as_array() {
-                for m in msgs.iter().take(120) {
-                    let role = m["role"].as_str().unwrap_or("");
-                    if role != "user" && role != "assistant" {
-                        continue;
-                    }
-                    let Some(blocks) = m["content"].as_array() else { continue };
-                    for b in blocks {
-                        if b["type"].as_str() != Some("text") {
-                            continue;
-                        }
-                        let clean = strip_system_reminders(b["text"].as_str().unwrap_or(""));
-                        if clean.is_empty() {
-                            continue;
-                        }
-                        let low = clean.to_lowercase();
-                        let hits = terms.iter().filter(|t| low.contains(t.as_str())).count();
-                        if terms.is_empty() || hits > 0 {
-                            score += (hits as i64) * 12;
-                            if excerpts.len() < 3 {
-                                excerpts.push(json!({
-                                    "role": role,
-                                    "text": clean.chars().take(280).collect::<String>(),
-                                }));
-                            }
-                        }
+            for (role, excerpt, low) in &sess.texts {
+                let hits = terms.iter().filter(|t| low.contains(t.as_str())).count();
+                if terms.is_empty() || hits > 0 {
+                    score += (hits as i64) * 12;
+                    if excerpts.len() < 3 {
+                        excerpts.push(json!({
+                            "role": role,
+                            "text": excerpt,
+                        }));
                     }
                 }
             }
@@ -1461,11 +1696,11 @@ fn search_sessions(ctx: &Ctx, home_dir: Option<&Path>, query: &str, project: Opt
                     score,
                     json!({
                         "source": "jcode",
-                        "session_id": sid,
-                        "name": short,
-                        "title": title,
-                        "working_dir": wd,
-                        "updated_at": v["updated_at"],
+                        "session_id": sess.session_id,
+                        "name": sess.short_name,
+                        "title": sess.title,
+                        "working_dir": sess.working_dir,
+                        "updated_at": sess.updated_at,
                         "same_repo": same_repo,
                         "excerpts": excerpts,
                     }),
@@ -1643,13 +1878,16 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
             consolidate_preview(ctx, &scope)
         }
         "consolidate_promote" => consolidate_promote(ctx, &crate::ctx::arg_str(&args, "id")?),
-        "sessions" => session_search(
-            ctx,
-            args["q"].as_str().unwrap_or(""),
-            args["project"].as_str(),
-            args["repo_only"].as_bool().unwrap_or(false),
-            args["limit"].as_u64().unwrap_or(8) as usize,
-        ),
+        "sessions" => {
+            let c = ctx.clone();
+            let q = args["q"].as_str().unwrap_or("").to_string();
+            let project = args["project"].as_str().map(str::to_string);
+            let repo_only = args["repo_only"].as_bool().unwrap_or(false);
+            let limit = args["limit"].as_u64().unwrap_or(8) as usize;
+            tokio::task::spawn_blocking(move || session_search(&c, &q, project.as_deref(), repo_only, limit))
+                .await
+                .map_err(|e| e.to_string())?
+        }
         _ => Err(format!("unknown library.{method}")),
     }
 }
@@ -1945,5 +2183,76 @@ mod tests {
         intention_add(&ctx, "repo:r2", "pre_release", "", "Run offline startup test with network disabled", "user").unwrap();
         let slate = build_context_slate(&ctx, Some("r2"), "", 2000, false, false).unwrap();
         assert_eq!(slate["intentions"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn working_note_and_reminders_are_bounded_and_scoped() {
+        let ctx = Ctx::test();
+        init(&ctx).unwrap();
+        let huge = "requirement detail ".repeat(250);
+        working_note_set(&ctx, "repo:ra", &huge, &huge, &huge, &huge, None, "user").unwrap();
+        let note = working_note_prompt(&ctx, "ra").expect("working note prompt");
+        assert!(note.len() <= MAX_WORKING_NOTE_PROMPT_BYTES, "len={}", note.len());
+        assert!(note.contains("... [truncated]"));
+        assert!(working_note_prompt(&ctx, "rb").is_none());
+
+        intention_add(&ctx, "repo:ra", "on_session_start", "", "Check migration scripts first", "user").unwrap();
+        intention_add(&ctx, "repo:rb", "on_session_start", "", "Sibling secret reminder", "user").unwrap();
+        intention_add(&ctx, "global", "on_session_start", "", "Always verify tests locally", "user").unwrap();
+        intention_add(&ctx, "repo:ra", "on_pr", "", "Run cargo clippy before PR", "user").unwrap();
+        intention_add(&ctx, "repo:ra", "pre_release", "release", "Check upgrade path", "user").unwrap();
+
+        let start_ra = session_start_reminders_prompt(&ctx, Some("ra")).unwrap();
+        assert!(start_ra.contains("Check migration scripts first") && start_ra.contains("Always verify tests locally"));
+        assert!(!start_ra.contains("Sibling secret reminder"));
+        let start_none = session_start_reminders_prompt(&ctx, None).unwrap();
+        assert!(start_none.contains("Always verify tests locally"));
+        assert!(!start_none.contains("Check migration scripts first") && !start_none.contains("Sibling secret reminder"));
+
+        let sub_plain = submit_reminders(&ctx, Some("ra"), "fix auth bug");
+        assert_eq!(sub_plain.len(), 1);
+        assert_eq!(sub_plain[0]["instruction"], "Run cargo clippy before PR");
+        let sub_rel = submit_reminders(&ctx, Some("ra"), "prepare release v2");
+        assert_eq!(sub_rel.len(), 2);
+        assert!(submit_reminders(&ctx, Some("rb"), "prepare release v2").is_empty());
+    }
+
+    #[test]
+    fn session_search_caches_unchanged_files_by_mtime() {
+        let ctx = Ctx::test();
+        init(&ctx).unwrap();
+        let home = fake_home();
+        let proj = home.join("Developer/philium").to_string_lossy().into_owned();
+        let before = SESSION_FILE_PARSES.load(std::sync::atomic::Ordering::Relaxed);
+        let first = session_search_at(&ctx, &home, "code_outline", Some(&proj), true, 5).unwrap();
+        let after_first = SESSION_FILE_PARSES.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(first.as_array().unwrap().len(), 1);
+        assert!(after_first > before, "first search should parse session file");
+
+        // Second search with unchanged file must hit cache and not re-parse.
+        let second = session_search_at(&ctx, &home, "bidirectional", Some(&proj), true, 5).unwrap();
+        let after_second = SESSION_FILE_PARSES.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(second.as_array().unwrap().len(), 1);
+        assert_eq!(after_second, after_first, "unchanged file must not be re-parsed");
+
+        // Updating file content/size invalidates cache and returns updated text.
+        let sess_path = home.join(".jcode/sessions/session_dolphin_1.json");
+        let updated = json!({
+            "id": "session_dolphin_1",
+            "short_name": "dolphin",
+            "title": "Updated session title",
+            "working_dir": proj,
+            "updated_at": "2026-04-20T12:00:00Z",
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "Fresh unique_cache_marker_9912"}]}
+            ]
+        });
+        std::fs::write(&sess_path, updated.to_string()).unwrap();
+        let third = session_search_at(&ctx, &home, "unique_cache_marker_9912", Some(&proj), true, 5).unwrap();
+        let after_third = SESSION_FILE_PARSES.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(third.as_array().unwrap().len(), 1);
+        assert!(after_third > after_second, "modified file must be re-parsed");
+
+        let _ = std::fs::remove_dir_all(home);
     }
 }

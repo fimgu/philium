@@ -2000,21 +2000,25 @@ pub struct Loaded {
     pub base: String,
 }
 
+fn load_sync(ctx: &Ctx, t: Target, include_view: bool) -> Result<Loaded, String> {
+    let wt = t.wt.as_ref().map(|w| (w.id.as_str(), w.path.as_path()));
+    let (view, base) = if include_view {
+        index_target(ctx, &t.repo_id, &t.repo_path, &t.branch, wt, true)?
+    } else {
+        let base = refresh_target(ctx, &t.repo_id, &t.repo_path, &t.branch, wt, true)?;
+        (View::default(), base)
+    };
+    let changed = t.wt.as_ref().map(|w| delta_files(&w.path, &base).len()).unwrap_or(0);
+    let header = format!("index {} up to date (checked {changed} changed files on disk)\n", &base[..base.len().min(8)]);
+    Ok(Loaded { header, t, view, base })
+}
+
+#[cfg(test)]
 async fn load(ctx: &Arc<Ctx>, t: Target, include_view: bool) -> Result<Loaded, String> {
     let c = ctx.clone();
-    let tt = t.clone();
-    let (view, base) = tokio::task::spawn_blocking(move || {
-        let wt = tt.wt.as_ref().map(|w| (w.id.as_str(), w.path.as_path()));
-        if include_view {
-            index_target(&c, &tt.repo_id, &tt.repo_path, &tt.branch, wt, true)
-        } else {
-            refresh_target(&c, &tt.repo_id, &tt.repo_path, &tt.branch, wt, true).map(|base| (View::default(), base))
-        }
-    })
-    .await
-    .map_err(|e| e.to_string())??;
-    let header = format!("index {} up to date (checked {} changed files on disk)\n", &base[..base.len().min(8)], t.wt.as_ref().map(|w| delta_files(&w.path, &base).len()).unwrap_or(0));
-    Ok(Loaded { header, t, view, base })
+    tokio::task::spawn_blocking(move || load_sync(&c, t, include_view))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 fn cap_of(args: &Value) -> usize {
@@ -2267,9 +2271,24 @@ pub fn tidy(ctx: &Ctx) -> Result<Option<String>, String> {
     if crate::storage::disk_free(&ctx.data_dir).is_some_and(|d| d < (kept as u64).saturating_mul(2)) {
         return Ok(Some(format!("Philium freed {} inside its database, but the disk is too full to give it back yet", gb(free))));
     }
-    ctx.db.with(|c| c.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM; PRAGMA wal_checkpoint(TRUNCATE);"))?;
+    let mut prev_freelist = ctx.db.with(|c| c.query_row("PRAGMA freelist_count", [], |r| r.get::<_, i64>(0)))?;
+    let _ = ctx.db.with(|c| c.execute_batch("PRAGMA auto_vacuum = INCREMENTAL;"));
+    for _ in 0..256 {
+        ctx.db.with(|c| c.execute_batch("PRAGMA incremental_vacuum(1024);"))?;
+        let cur_freelist = ctx.db.with(|c| c.query_row("PRAGMA freelist_count", [], |r| r.get::<_, i64>(0)))?;
+        if cur_freelist == 0 || cur_freelist >= prev_freelist {
+            break;
+        }
+        prev_freelist = cur_freelist;
+        breathe();
+    }
+    ctx.db.with(|c| c.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);"))?;
     let after = ctx.db.with(|c| size(c))?;
-    Ok(Some(format!("Philium shrank its database from {} to {}", gb(before), gb(after))))
+    if after < before {
+        Ok(Some(format!("Philium shrank its database from {} to {}", gb(before), gb(after))))
+    } else {
+        Ok(Some(format!("Philium freed {} inside its database for reuse", gb(free))))
+    }
 }
 
 const TIDY_MAX_FILES: i64 = 60_000;
@@ -2438,9 +2457,9 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
             Ok(json!({ "text": render_clashes(&cl, cap), "clashes": cl.iter().map(clash_json).collect::<Vec<_>>() }))
         }
         "reindex" => {
-            let t = resolve(ctx, &args)?;
             let c = ctx.clone();
             tokio::task::spawn_blocking(move || {
+                let t = resolve(&c, &args)?;
                 index_target(&c, &t.repo_id, &t.repo_path, &t.branch, t.wt.as_ref().map(|w| (w.id.as_str(), w.path.as_path())), true).map(|_| ())
             })
             .await
@@ -2448,69 +2467,71 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
             Ok(json!({ "ok": true }))
         }
         "status" | "map" | "find" | "refs" | "impact" | "tree" | "graph" => {
-            let t = resolve(ctx, &args)?;
-            // Status reports persisted counts, not an effective symbol/reference view.
-            let l = load(ctx, t, method != "status").await?;
-            match method {
-                "status" => {
-                    let c = |t: &str| ctx.db.query(&format!("SELECT count(*) AS n FROM {t} WHERE scope=?1"), [base_scope(&l.t.repo_id, &l.base)]).ok().and_then(|r| r.first().and_then(|x| x["n"].as_i64())).unwrap_or(0);
-                    let built = ctx.db.query("SELECT built_at FROM ci_snap WHERE repo_id=?1", [&l.t.repo_id]).ok().and_then(|r| r.first().and_then(|x| x["built_at"].as_i64()));
-                    let wt = l.t.wt.as_ref().map(|w| {
-                        let n = ctx.db.query("SELECT count(*) AS n FROM ci_files WHERE scope=?1", [wt_scope(&w.id)]).ok().and_then(|r| r.first().and_then(|x| x["n"].as_i64())).unwrap_or(0);
-                        let at = ctx.db.query("SELECT indexed_at FROM ci_wt WHERE wt_id=?1", [&w.id]).ok().and_then(|r| r.first().and_then(|x| x["indexed_at"].as_i64()));
-                        json!({ "id": w.id, "label": w.label, "delta_files": n, "indexed_at": at })
-                    });
-                    Ok(json!({ "repo_id": l.t.repo_id, "base_commit": l.base, "files": c("ci_files"), "syms": c("ci_syms"), "refs": c("ci_refs"), "built_at": built, "worktree": wt }))
-                }
-                "map" => Ok(json!({ "text": l.header.clone() + &render_map(&l.view, args["path"].as_str(), args["depth"].as_u64().unwrap_or(2) as usize, cap) })),
-                "find" => {
-                    let q = args["query"].as_str().ok_or("missing `query`")?;
-                    let items: Vec<Value> = find_items(&l.view, q, args["kind"].as_str()).into_iter().map(sym_json).collect();
-                    let root = l.t.wt.as_ref().map(|w| w.path.as_path()).unwrap_or(l.t.repo_path.as_path());
-                    Ok(json!({ "text": l.header.clone() + &render_find(&l.view, Some(root), q, args["kind"].as_str(), cap), "items": items }))
-                }
-                "refs" => {
-                    let s = args["symbol"].as_str().ok_or("missing `symbol`")?;
-                    let (defs, refs) = refs_of(&l.view, s);
-                    Ok(json!({
-                        "text": l.header.clone() + &render_refs(&l.view, s, cap),
-                        "defs": defs.into_iter().map(sym_json).collect::<Vec<_>>(),
-                        "refs": refs.into_iter().map(|h| json!({ "path": h.r.path, "line": h.r.line, "kind": h.r.kind, "from": h.r.from, "text": h.r.text, "exact": h.exact })).collect::<Vec<_>>(),
-                    }))
-                }
-                "impact" => {
-                    let cs = changes_of(&l)?;
-                    let ch = changed_syms(&l.view, &cs);
-                    let deps = dependents(&l.view, &ch);
-                    Ok(json!({
-                        "text": l.header.clone() + &render_impact(&l.view, &cs, cap),
-                        "changed": ch.into_iter().map(sym_json).collect::<Vec<_>>(),
-                        "dependents": deps.iter().map(|d| json!({ "path": d.path, "name": d.name, "line": d.line, "via": d.via, "depth": d.depth, "exact": d.exact })).collect::<Vec<_>>(),
-                    }))
-                }
-                "tree" => {
-                    let rank = rank_names(&l.view);
-                    let mut by: BTreeMap<&str, Vec<&Sym>> = BTreeMap::new();
-                    for s in &l.view.syms {
-                        by.entry(&s.path).or_default().push(s);
+            let c = ctx.clone();
+            let method = method.to_string();
+            tokio::task::spawn_blocking(move || {
+                let t = resolve(&c, &args)?;
+                // Status reports persisted counts, not an effective symbol/reference view.
+                let l = load_sync(&c, t, method != "status")?;
+                match method.as_str() {
+                    "status" => {
+                        let cnt = |tbl: &str| c.db.query(&format!("SELECT count(*) AS n FROM {tbl} WHERE scope=?1"), [base_scope(&l.t.repo_id, &l.base)]).ok().and_then(|r| r.first().and_then(|x| x["n"].as_i64())).unwrap_or(0);
+                        let built = c.db.query("SELECT built_at FROM ci_snap WHERE repo_id=?1", [&l.t.repo_id]).ok().and_then(|r| r.first().and_then(|x| x["built_at"].as_i64()));
+                        let wt = l.t.wt.as_ref().map(|w| {
+                            let n = c.db.query("SELECT count(*) AS n FROM ci_files WHERE scope=?1", [wt_scope(&w.id)]).ok().and_then(|r| r.first().and_then(|x| x["n"].as_i64())).unwrap_or(0);
+                            let at = c.db.query("SELECT indexed_at FROM ci_wt WHERE wt_id=?1", [&w.id]).ok().and_then(|r| r.first().and_then(|x| x["indexed_at"].as_i64()));
+                            json!({ "id": w.id, "label": w.label, "delta_files": n, "indexed_at": at })
+                        });
+                        Ok(json!({ "repo_id": l.t.repo_id, "base_commit": l.base, "files": cnt("ci_files"), "syms": cnt("ci_syms"), "refs": cnt("ci_refs"), "built_at": built, "worktree": wt }))
                     }
-                    let mut files: Vec<Value> = by
-                        .into_iter()
-                        .map(|(p, ss)| {
-                            let r: f64 = ss.iter().map(|s| rank.get(s.name.as_str()).copied().unwrap_or(0.0)).sum();
-                            json!({ "path": p, "rank": r, "syms": ss.iter().map(|s| json!({ "name": s.name, "kind": s.kind, "line": s.line, "end": s.end, "parent": s.parent })).collect::<Vec<_>>() })
-                        })
-                        .collect();
-                    let truncated = files.len() > 3000;
-                    files.truncate(3000);
-                    Ok(json!({ "files": files, "truncated": truncated, "base_commit": l.base }))
+                    "map" => Ok(json!({ "text": l.header.clone() + &render_map(&l.view, args["path"].as_str(), args["depth"].as_u64().unwrap_or(2) as usize, cap) })),
+                    "find" => {
+                        let q = args["query"].as_str().ok_or("missing `query`")?;
+                        let items: Vec<Value> = find_items(&l.view, q, args["kind"].as_str()).into_iter().map(sym_json).collect();
+                        let root = l.t.wt.as_ref().map(|w| w.path.as_path()).unwrap_or(l.t.repo_path.as_path());
+                        Ok(json!({ "text": l.header.clone() + &render_find(&l.view, Some(root), q, args["kind"].as_str(), cap), "items": items }))
+                    }
+                    "refs" => {
+                        let s = args["symbol"].as_str().ok_or("missing `symbol`")?;
+                        let (defs, refs) = refs_of(&l.view, s);
+                        Ok(json!({
+                            "text": l.header.clone() + &render_refs(&l.view, s, cap),
+                            "defs": defs.into_iter().map(sym_json).collect::<Vec<_>>(),
+                            "refs": refs.into_iter().map(|h| json!({ "path": h.r.path, "line": h.r.line, "kind": h.r.kind, "from": h.r.from, "text": h.r.text, "exact": h.exact })).collect::<Vec<_>>(),
+                        }))
+                    }
+                    "impact" => {
+                        let cs = changes_of(&l)?;
+                        let ch = changed_syms(&l.view, &cs);
+                        let deps = dependents(&l.view, &ch);
+                        Ok(json!({
+                            "text": l.header.clone() + &render_impact(&l.view, &cs, cap),
+                            "changed": ch.into_iter().map(sym_json).collect::<Vec<_>>(),
+                            "dependents": deps.iter().map(|d| json!({ "path": d.path, "name": d.name, "line": d.line, "via": d.via, "depth": d.depth, "exact": d.exact })).collect::<Vec<_>>(),
+                        }))
+                    }
+                    "tree" => {
+                        let rank = rank_names(&l.view);
+                        let mut by: BTreeMap<&str, Vec<&Sym>> = BTreeMap::new();
+                        for s in &l.view.syms {
+                            by.entry(&s.path).or_default().push(s);
+                        }
+                        let mut files: Vec<Value> = by
+                            .into_iter()
+                            .map(|(p, ss)| {
+                                let r: f64 = ss.iter().map(|s| rank.get(s.name.as_str()).copied().unwrap_or(0.0)).sum();
+                                json!({ "path": p, "rank": r, "syms": ss.iter().map(|s| json!({ "name": s.name, "kind": s.kind, "line": s.line, "end": s.end, "parent": s.parent })).collect::<Vec<_>>() })
+                            })
+                            .collect();
+                        let truncated = files.len() > 3000;
+                        files.truncate(3000);
+                        Ok(json!({ "files": files, "truncated": truncated, "base_commit": l.base }))
+                    }
+                    _ => Ok(build_graph(&c, &l, &args)),
                 }
-                _ => {
-                    let c = ctx.clone();
-                    let a = args.clone();
-                    tokio::task::spawn_blocking(move || build_graph(&c, &l, &a)).await.map_err(|e| e.to_string())
-                }
-            }
+            })
+            .await
+            .map_err(|e| e.to_string())?
         }
         _ => Err(format!("codeindex.{method}: unknown method")),
     }
@@ -2872,35 +2893,43 @@ pub fn mcp_tools() -> Vec<Value> {
 }
 
 pub async fn mcp_call(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Result<Value, String> {
-    let t = resolve_agent(ctx, agent)?;
-    let l = load(ctx, t, true).await?;
-    let cap = a["max_tokens"].as_u64().map(|n| n as usize).unwrap_or(4000).clamp(100, 60000);
-    let root = l.t.wt.as_ref().map(|w| w.path.as_path()).unwrap_or(l.t.repo_path.as_path());
-    let text = match name {
-        "code_map" => render_map(&l.view, a["path"].as_str(), a["depth"].as_u64().unwrap_or(2) as usize, cap),
-        "code_outline" => render_outline(&l.view, a["path"].as_str().ok_or("missing `path`")?, cap),
-        "code_symbol" => render_symbol(&l.view, root, a["symbol"].as_str().ok_or("missing `symbol`")?, a["path"].as_str(), cap),
-        "code_find" => render_find(&l.view, Some(root), a["query"].as_str().ok_or("missing `query`")?, a["kind"].as_str(), cap),
-        "code_refs" => render_refs(&l.view, a["symbol"].as_str().ok_or("missing `symbol`")?, cap),
-        "code_impact" => {
-            let mut imp = render_impact(&l.view, &changes_of(&l)?, cap);
-            if let Some(wt) = &l.t.wt {
-                if let Ok(clashes) = clash_changes(ctx, Some(&l.t.repo_id)) {
-                    let mine: Vec<&Clash> = clashes.iter().filter(|c| c.a == wt.label || c.b == wt.label).collect();
-                    if !mine.is_empty() {
-                        imp.push_str(&format!("\nactive clashes with other agents ({}):\n", mine.len()));
-                        for c in mine {
-                            imp.push_str(&format!("  {} {} x {}: {}\n", c.severity, c.a, c.b, c.detail.join("; ")));
+    let c = ctx.clone();
+    let agent = agent.to_string();
+    let name = name.to_string();
+    tokio::task::spawn_blocking(move || {
+        let t = resolve_agent(&c, &agent)?;
+        // `repo_context` inspects git/worktree landscape and branch diffs; it never reads `View`.
+        let l = load_sync(&c, t, name != "repo_context")?;
+        let cap = a["max_tokens"].as_u64().map(|n| n as usize).unwrap_or(4000).clamp(100, 60000);
+        let root = l.t.wt.as_ref().map(|w| w.path.as_path()).unwrap_or(l.t.repo_path.as_path());
+        let text = match name.as_str() {
+            "code_map" => render_map(&l.view, a["path"].as_str(), a["depth"].as_u64().unwrap_or(2) as usize, cap),
+            "code_outline" => render_outline(&l.view, a["path"].as_str().ok_or("missing `path`")?, cap),
+            "code_symbol" => render_symbol(&l.view, root, a["symbol"].as_str().ok_or("missing `symbol`")?, a["path"].as_str(), cap),
+            "code_find" => render_find(&l.view, Some(root), a["query"].as_str().ok_or("missing `query`")?, a["kind"].as_str(), cap),
+            "code_refs" => render_refs(&l.view, a["symbol"].as_str().ok_or("missing `symbol`")?, cap),
+            "code_impact" => {
+                let mut imp = render_impact(&l.view, &changes_of(&l)?, cap);
+                if let Some(wt) = &l.t.wt {
+                    if let Ok(clashes) = clash_changes(&c, Some(&l.t.repo_id)) {
+                        let mine: Vec<&Clash> = clashes.iter().filter(|cl| cl.a == wt.label || cl.b == wt.label).collect();
+                        if !mine.is_empty() {
+                            imp.push_str(&format!("\nactive clashes with other agents ({}):\n", mine.len()));
+                            for cl in mine {
+                                imp.push_str(&format!("  {} {} x {}: {}\n", cl.severity, cl.a, cl.b, cl.detail.join("; ")));
+                            }
                         }
                     }
                 }
+                imp
             }
-            imp
-        }
-        "repo_context" => render_repo_context(ctx, &l, &a, cap),
-        _ => return Err(format!("unknown tool {name}")),
-    };
-    Ok(Value::String(l.header.clone() + &text))
+            "repo_context" => render_repo_context(&c, &l, &a, cap),
+            _ => return Err(format!("unknown tool {name}")),
+        };
+        Ok(Value::String(l.header + &text))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 // ---------------------------------------------------------------- tests
@@ -3000,6 +3029,19 @@ mod tests {
         assert_eq!(restored.syms.len(), view.syms.len());
         assert_eq!(restored.refs.len(), view.refs.len());
         assert!(call(&f.ctx, "status", json!({"repo_id":"missing"})).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn repo_context_skips_full_view_load() {
+        let f = StatusFixture::new();
+        let (_, base) = index_target(&f.ctx, "status", &f.root, "main", None, true).unwrap();
+        let scope = base_scope("status", &base);
+        f.ctx.db.exec("INSERT INTO agents(id,name,model_ref,repo_id,created_at,last_active_at) VALUES('rc1','rc-agent','p/m','status',0,0)", []).unwrap();
+        // Poison ci_refs so load_view fails; repo_context must still succeed because it does not load View.
+        f.ctx.db.exec("INSERT INTO ci_refs VALUES(?1,'src/b.rs','helper','call','not-an-integer','helper()','caller',2)", [&scope]).unwrap();
+        assert!(load_view(&f.ctx, "status", &base, None).is_err());
+        let out = mcp_call(&f.ctx, "rc1", "repo_context", json!({"include_prs": false})).await.unwrap();
+        assert!(out.as_str().unwrap_or("").contains("repo: Fixture"), "{out}");
     }
 
     #[tokio::test]
