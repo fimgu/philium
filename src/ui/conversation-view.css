@@ -20,7 +20,8 @@
 .conv.conv-terminal .msg.user::before, .conv.conv-terminal .msg.assistant::before { display: block; font-size: 10px; font-weight: 600; letter-spacing: .06em; margin-bottom: 4px; }
 .conv.conv-terminal .msg.user::before { content: "YOU"; color: var(--accent); }
 .conv.conv-terminal .msg.assistant::before { content: "ASSISTANT"; color: var(--text-dim); }
-.conv.conv-terminal .msg.tool { border-color: var(--line); color: var(--text-dim); }
+.conv.conv-terminal .msg.tool { border-color: var(--line); color: var(--text-dim); padding: 4px 10px; }
+.conv.conv-terminal .msg.tool.is-bad { border-color: rgba(239, 123, 123, 0.55); }
 .conv.conv-terminal .msg.error { border-color: var(--danger); color: var(--danger); }
 .conv.conv-terminal .perm { border-radius: 0; }
 .conv.conv-terminal .conv-pre { font-family: inherit; margin: 6px 0; }

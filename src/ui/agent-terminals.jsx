@@ -18,11 +18,14 @@ export function localUrls(text) {
   return out;
 }
 
+import { cleanShellCommand } from "../lib/tool-presentation.js";
+
 function termLabel(t, agentName) {
   const title = t.title ?? "";
   if (title === `${agentName} shell`) return "Shell";
   const p = `${agentName}: `;
-  return title.startsWith(p) ? title.slice(p.length) : title;
+  const raw = title.startsWith(p) ? title.slice(p.length) : title;
+  return cleanShellCommand(raw, 42) || "Command";
 }
 
 export function AgentTerminals(props) {
@@ -52,7 +55,7 @@ export function AgentTerminals(props) {
     if (dirtyMain) { dirtyMain = false; refetchMain(); }
   });
   const [sel, setSel] = createSignal(null);
-  const [showDone, setShowDone] = createSignal(false);
+  const [showDone, setShowDone] = createSignal(null);
 
   // Main shell first, then running background terminals, then finished ones.
   const items = createMemo(() => {
@@ -60,10 +63,18 @@ export function AgentTerminals(props) {
     const rank = (t) => (t.id === mainId() ? 0 : t.state === "running" ? 1 : 2);
     return all.slice().sort((a, b) => rank(a) - rank(b) || b.created_at - a.created_at);
   });
-  const visible = createMemo(() => items().filter((t) => showDone() || t.state === "running" || t.id === sel()));
-  const done = () => items().filter((t) => t.state !== "running").length;
+  const runningCount = createMemo(() => items().filter((t) => t.state === "running").length);
+  const done = createMemo(() => items().filter((t) => t.state !== "running").length);
+  const failedDone = createMemo(() => items().filter((t) => t.state !== "running" && t.exit_code !== 0).length);
+  // Keep finished commands visible when nothing else is running or there are only a few tabs.
+  const effectiveShowDone = createMemo(() => {
+    const explicit = showDone();
+    if (explicit != null) return explicit;
+    return runningCount() === 0 || (done() > 0 && items().length <= 3);
+  });
+  const visible = createMemo(() => items().filter((t) => effectiveShowDone() || t.state === "running" || t.id === sel()));
   const current = createMemo(() => items().find((t) => t.id === sel()) ?? visible()[0] ?? items()[0]);
-  createEffect(on(() => props.id, () => setSel(null)));
+  createEffect(on(() => props.id, () => { setSel(null); setShowDone(null); }));
   // Follow the main shell when it appears.
   createEffect(on(mainId, (m) => { if (m && !sel()) setSel(m); }));
 
@@ -78,15 +89,27 @@ export function AgentTerminals(props) {
       <div class="aside-tabs">
         <For each={visible()}>
           {(t) => (
-            <button class={`aside-tab ${current()?.id === t.id ? "on" : ""}`} onClick={() => setSel(t.id)} title={t.title}>
+            <button
+              class={`aside-tab ${current()?.id === t.id ? "on" : ""} ${t.state !== "running" ? "is-done" : ""}`}
+              onClick={() => setSel(t.id)}
+              title={t.state !== "running" ? `${t.title} (exit ${t.exit_code ?? "?"})` : t.title}
+            >
               <span class={`tdot ${t.state === "running" ? "run" : t.exit_code === 0 ? "ok" : "bad"}`} />
               <span class="ellipsis">{termLabel(t, props.name)}</span>
+              <Show when={t.state !== "running" && t.exit_code != null && t.exit_code !== 0}>
+                <span class="aside-tab-exit">{t.exit_code}</span>
+              </Show>
             </button>
           )}
         </For>
-        <Show when={done() > 0}>
-          <button class="aside-tab ghost" onClick={() => setShowDone(!showDone())}>
-            {showDone() ? "Hide finished" : `${done()} finished`}
+        <Show when={done() > 0 && (runningCount() > 0 || items().length > 3)}>
+          <button
+            class="aside-tab ghost"
+            onClick={() => setShowDone(!effectiveShowDone())}
+            title={failedDone() > 0 ? `${done()} finished (${failedDone()} failed)` : `${done()} finished`}
+          >
+            <span>{effectiveShowDone() ? "Hide done" : "Done"}</span>
+            <span class={`aside-tab-count ${failedDone() > 0 ? "bad" : ""}`}>{done()}</span>
           </button>
         </Show>
         <div class="grow" />
@@ -104,9 +127,9 @@ export function AgentTerminals(props) {
         {(tid) => { const t = () => items().find((x) => x.id === tid) ?? {}; return (
           <div class="aside-term">
             <div class="aside-term-head">
-              <span class="mono xs faint ellipsis grow">{t().title}</span>
-              <span class={`xs ${t().state === "running" ? "ok-text" : "faint"}`}>
-                {t().state === "running" ? (tid === mainId() ? "Live, you can type here" : "Running") : `Exited ${t().exit_code ?? ""}`}
+              <span class="mono xs faint ellipsis grow" title={t().title}>{t().title}</span>
+              <span class={`xs ${t().state === "running" ? "ok-text" : t().exit_code === 0 ? "faint" : "bad-text"}`}>
+                {t().state === "running" ? (tid === mainId() ? "Live · type here" : "Running") : `Exit ${t().exit_code ?? ""}`}
               </span>
               <Show when={t().state === "running"}>
                 <button class="icon-btn" title="Stop this terminal" onClick={() => rpc("terminals.kill", { id: tid }).catch((e) => toast(String(e), "danger"))}>

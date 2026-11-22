@@ -118,8 +118,10 @@ test('Conversation Markdown DOM, streaming, unsafe content and clipboard matrix'
     await page.evaluate(() => window.setEvents([{type:'turn.started',turn_id:'active',seq:1},{type:'tool.started',call_id:'x',tool:'shell_run',arguments:{},seq:2},{type:'permission.requested',request_id:'p',action:'shell',resource:'test',seq:3}]));
     assert.equal(await page.$eval('.conversation-activity [role="status"]', el => el.textContent), 'Waiting for your approval');
     await page.click('.conversation-view-toggle button:nth-child(2)');
-    assert.equal(await page.$eval('.conv-tool-toggle', el => el.getAttribute('aria-expanded')), 'true');
+    assert.equal(await page.$eval('.conv-tool-toggle', el => el.getAttribute('aria-expanded')), 'false');
     await page.focus('.conv-tool-toggle');
+    await page.keyboard.press('Enter');
+    assert.equal(await page.$eval('.conv-tool-toggle', el => el.getAttribute('aria-expanded')), 'true');
     await page.keyboard.press('Enter');
     assert.equal(await page.$eval('.conv-tool-toggle', el => el.getAttribute('aria-expanded')), 'false');
     await page.evaluate(() => window.setEvents([{type:'turn.started',turn_id:'active',seq:1},{type:'model.delta',delta:'partial',seq:2},{type:'turn.cancelled',seq:3}]));
@@ -144,16 +146,25 @@ test('Conversation Markdown DOM, streaming, unsafe content and clipboard matrix'
       return controls.top >= conv.top && controls.bottom <= conv.bottom;
     }), true, 'view switch stays visible at bottom of long history');
     assert.match(await page.$eval('.assistant-markdown code', el => getComputedStyle(el).fontFamily), /monospace|Menlo/);
+    await page.evaluate(() => { const conv = document.querySelector('.conv'); conv.scrollTop = 0; conv.dispatchEvent(new Event('scroll')); });
+    await page.waitForSelector('.conv-jump');
+    assert.match(await page.$eval('.conv-jump', el => el.textContent), /Jump to latest/);
+    await page.click('.conv-jump');
+    await page.waitForFunction(() => !document.querySelector('.conv-jump'));
     await page.click('.conversation-view-toggle button:first-child');
     await page.evaluate(() => window.setEvents([
       {type:'tool.started', call_id:'shell-ui', tool:'mcp_philium_shell_run', arguments:{command:'printf hello'}, seq:1},
       {type:'tool.finished', call_id:'shell-ui', ok:true, result:{content:[{type:'text',text:JSON.stringify({output:'hello\n',running:true,exit_code:null})}]}, seq:2}
     ]));
+    await page.waitForSelector('.conv-tool-toggle');
+    assert.equal(await page.$eval('.conv-tool-toggle', el => el.getAttribute('aria-expanded')), 'false');
+    assert.equal(await page.$('.tool-command'), null);
+    assert.equal(await page.$('.tool-output-preview'), null);
+    assert.match(await page.$eval('.conv-tool-toggle', el => el.textContent), /\$ printf hello/);
+    assert.match(await page.$eval('.conv-tool-toggle', el => el.textContent), /still running/i);
+    await page.click('.conv-tool-toggle');
     await page.waitForSelector('.tool-command');
     assert.equal(await page.$eval('.tool-command', el => el.textContent), '$ printf hello');
-    assert.match(await page.$eval('.conv-tool-toggle', el => el.textContent), /Running at return/);
-    assert.match(await page.$eval('.tool-output-preview', el => el.textContent), /hello/);
-    await page.click('.conv-tool-toggle');
     assert.equal(await page.$eval('.tool-raw', el => el.open), false);
     assert.equal(await page.$eval('.conv-tool > .conv-pre', el => el.textContent), 'hello\n');
   } catch (error) { console.error(error); throw error; }

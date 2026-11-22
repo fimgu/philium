@@ -36,8 +36,20 @@ details.msg summary { cursor: pointer; display: flex; align-items: center; gap: 
 /* Keep commands in the conversation. The optional terminal is an inspector. */
 .agent-main .conv.conv-conversation .msg.assistant { border: 0; background: transparent; padding: 8px 0; max-width: 100%; }
 .agent-main .conv.conv-conversation .msg.user { border-radius: 10px; }
-.conv .msg.conv-tool { align-self: stretch; max-width: none; border: 0; border-left: 2px solid var(--line); border-radius: 0; background: transparent; padding: 8px 14px; }
-.conv-tool-toggle { width: 100%; }
+.conv .msg.conv-tool { align-self: stretch; max-width: none; border: 0; border-left: 2px solid var(--line); border-radius: 0; background: transparent; padding: 4px 10px; transition: border-color 120ms ease; }
+.conv .msg.conv-tool:hover { border-left-color: var(--text-faint); }
+.conv .msg.conv-tool.is-open { padding: 6px 10px 8px; }
+.conv .msg.conv-tool.is-bad { border-left-color: rgba(239, 123, 123, 0.55); }
+.conv-tool-toggle { width: 100%; min-height: 22px; gap: 7px; border-radius: 5px; }
+.conv-tool-toggle:hover .tool-summary { color: var(--text); }
+.tool-label { flex: none; font-weight: 600; color: var(--text); font-size: var(--fs-xs); }
+.tool-summary { font-family: var(--mono, ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace); font-size: var(--fs-xs); min-width: 0; }
+.tool-outcome { flex: none; padding: 1px 6px; border-radius: 4px; font-size: 11px; }
+.tool-outcome.bad { color: #f59898; background: rgba(239, 123, 123, 0.12); }
+.tool-dur { flex: none; font-variant-numeric: tabular-nums; }
+.tool-chevron { flex: none; font-size: 10px; opacity: 0.7; }
+.tool-status-line { margin-top: 2px; padding-left: 15px; line-height: 1.4; }
+.tool-error-line { margin-top: 2px; padding-left: 15px; font-family: var(--mono, ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace); color: #f59898; opacity: 0.9; line-height: 1.4; }
 .tool-command, .tool-output-preview, .conv .conv-pre { font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; font-size: 12px; line-height: 1.6; }
 .tool-command { margin: 8px 0 4px; color: var(--text); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 144px; overflow: auto; user-select: text; }
 .tool-output-preview { margin: 4px 0; padding-left: 12px; border-left: 1px solid var(--line); color: var(--text-dim); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 100px; overflow: auto; user-select: text; }
@@ -45,6 +57,25 @@ details.msg summary { cursor: pointer; display: flex; align-items: center; gap: 
 .tool-raw { margin-top: 10px; color: var(--text-faint); font-size: var(--fs-xs); }
 .tool-raw summary { cursor: pointer; }
 .agent-main .conversation-view-hint { display: none; }
+
+/* Floating jump-to-latest pill when scrolled up */
+.conv-jump-wrap {
+  position: sticky; bottom: 14px; z-index: 4;
+  display: flex; justify-content: center;
+  pointer-events: none; padding: 0 12px 6px;
+}
+.conv-jump {
+  pointer-events: auto;
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 5px 12px; border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--surface, #161922); color: var(--text);
+  font-size: var(--fs-xs); font-weight: 500; cursor: pointer;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.38);
+  transition: border-color 120ms ease, background 120ms ease, transform 120ms ease;
+}
+.conv-jump:hover { border-color: var(--accent); background: var(--surface-raised, #1e2330); transform: translateY(-1px); }
+.conv-jump:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 /* Agent split view: chat on the left, live terminal or browser on the right. */
 .agent-body { flex: 1; min-height: 0; display: flex; }
@@ -65,12 +96,26 @@ details.msg summary { cursor: pointer; display: flex; align-items: center; gap: 
 .aside-tab:hover { background: rgba(255,255,255,0.05); color: var(--text); }
 .aside-tab.on { background: rgba(255,255,255,0.08); color: var(--text); }
 .aside-tab.ghost { color: var(--text-faint); }
+.aside-tab.is-done { opacity: 0.78; }
+.aside-tab.is-done.on, .aside-tab.is-done:hover { opacity: 1; }
+.aside-tab-count {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 16px; height: 16px; padding: 0 5px; border-radius: 999px;
+  font-size: 10px; font-weight: 600; font-variant-numeric: tabular-nums;
+  background: rgba(255,255,255,0.08); color: var(--text-dim);
+}
+.aside-tab-count.bad { background: rgba(239, 123, 123, 0.16); color: #f59898; }
+.aside-tab-exit {
+  font-family: var(--mono); font-size: 10px; color: #f59898;
+  padding: 0 4px; border-radius: 3px; background: rgba(239, 123, 123, 0.14);
+}
 .tdot { width: 6px; height: 6px; border-radius: 50%; flex: none; background: var(--text-faint); }
 .tdot.run { background: #7fd5a1; box-shadow: 0 0 0 3px rgba(127,213,161,0.15); }
 .tdot.bad { background: #ef7b7b; }
 .aside-term { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .aside-term-head { display: flex; align-items: center; gap: 8px; padding: 6px 12px; flex: none; }
 .ok-text { color: #7fd5a1; }
+.bad-text { color: #f59898; }
 .icon-btn { display: inline-grid; place-items: center; width: 22px; height: 22px; border-radius: 6px; border: 0; background: transparent; color: var(--text-dim); cursor: pointer; }
 .icon-btn:hover { background: rgba(255,255,255,0.07); color: var(--text); }
 .termview { flex: 1; min-height: 0; display: flex; flex-direction: column; }

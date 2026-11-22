@@ -33,11 +33,21 @@ export function TermView(props) {
   let resizeRaf = 0, lastCols = 0, lastRows = 0;
   const queued = [];
   const [error, setError] = createSignal("");
+  const isNearBottom = () => {
+    const buf = term?.buffer?.active;
+    if (!buf) return true;
+    return buf.viewportY >= buf.baseY - 2;
+  };
   const append = (p) => {
     const data = decode(p.data);
     const end = p.offset ?? offset + data.length;
     const skip = Math.max(0, offset - (end - data.length));
-    if (end > offset) term?.write(data.subarray(skip));
+    if (end > offset && term) {
+      const follow = isNearBottom();
+      term.write(data.subarray(skip), () => {
+        if (!dead && follow) term.scrollToBottom();
+      });
+    }
     offset = Math.max(offset, end);
     props.onData?.(data);
   };
@@ -52,7 +62,9 @@ export function TermView(props) {
     const doResize = () => {
       resizeRaf = 0;
       if (dead || !el || !el.clientWidth || !el.clientHeight) return;
+      const follow = isNearBottom();
       try { fit.fit(); } catch { return; }
+      if (follow) term.scrollToBottom();
       if (props.running !== false && (term.cols !== lastCols || term.rows !== lastRows)) {
         lastCols = term.cols;
         lastRows = term.rows;
@@ -75,7 +87,9 @@ export function TermView(props) {
       const b = await rpc("terminals.buffer", { id: props.id });
       if (dead) return;
       const data = decode(b.data);
-      term.write(data);
+      term.write(data, () => {
+        if (!dead) term.scrollToBottom();
+      });
       props.onData?.(data);
       offset = b.offset ?? data.length;
     } catch (e) {
@@ -85,6 +99,7 @@ export function TermView(props) {
     for (const p of queued) append(p);
     queued.length = 0;
     doResize();
+    term?.scrollToBottom();
   });
   onCleanup(() => {
     dead = true;

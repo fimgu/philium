@@ -1,7 +1,7 @@
 // Conversation view built from HAL session events. Used by Agents and Chat.
 // Events are folded into items: user / assistant (streamed) / tool / file /
 // permission / error. Assistant Markdown is rendered without raw HTML.
-import { For, Index, Show, Switch, Match, batch, createSignal, createMemo, createComputed, createEffect, on, onCleanup } from "solid-js";
+import { For, Index, Show, Switch, Match, batch, createSignal, createMemo, createComputed, createEffect, on, onMount, onCleanup } from "solid-js";
 import { createStore } from "solid-js/store";
 import { Portal } from "solid-js/web";
 import { Badge, Button, toast } from "./kit.jsx";
@@ -76,30 +76,18 @@ export function fold(events) {
 // MCP tool names are mcp_philium_shell_run etc.; show the short form.
 const short = (t) => (t ?? "").replace(/^mcp_philium_/, "").replace(/^mcp_/, "");
 
-function argSummary(tool, args) {
-  if (!args || typeof args !== "object") return "";
-  const t = short(tool);
-  if (t === "shell_run") return args.command ?? "";
-  if (args.path) return args.path;
-  if (args.file_path) return args.file_path;
-  if (args.pattern) return args.pattern;
-  if (args.title) return args.title;
-  if (args.to) return `to ${args.to}`;
-  if (args.id) return args.id;
-  const s = JSON.stringify(args);
-  return s.length > 120 ? s.slice(0, 120) + "…" : s;
-}
-
-import { toolOutput, cleanTerminalText, shellStatus } from "../lib/tool-presentation.js";
+import { toolOutput, cleanTerminalText, summarizeTool } from "../lib/tool-presentation.js";
 
 function Tool(props) {
-  const [open, setOpen] = createSignal(null);
+  const [open, setOpen] = createSignal(false);
   const [rawOpen, setRawOpen] = createSignal(false);
-  const expanded = () => open() ?? props.terminal;
+  const expanded = () => !!open();
   const t = () => props.item;
-  const state = createMemo(() => (typeof shellStatus === "function" ? shellStatus(t().result) : null));
-  const resultText = createMemo(() => (typeof cleanTerminalText === "function" ? cleanTerminalText(toolOutput(t().result, t().out)) : ""));
   const active = () => props.active && !t().inactive;
+  const info = createMemo(() => (typeof summarizeTool === "function"
+    ? summarizeTool(t().tool, t().args, t().result, t().out, { running: t().running, ok: t().ok, active: active() })
+    : { label: "", summary: "", outcome: "", tone: "", errorHint: "" }));
+  const resultText = createMemo(() => (typeof cleanTerminalText === "function" ? cleanTerminalText(toolOutput(t().result, t().out)) : ""));
   const [elapsed, setElapsed] = createSignal(0);
   const [silent, setSilent] = createSignal(0);
   const activeCall = createMemo(() => (active() && !props.hidden && t().running ? t().seq : null));
@@ -125,30 +113,45 @@ function Tool(props) {
     }, 1000);
     onCleanup(() => clearInterval(timer));
   });
+  const dotTone = () => (info().tone === "busy" ? (active() ? "busy" : "") : info().tone === "bad" ? "bad" : info().tone === "ok" ? "live" : "");
+  const outcomeLabel = () => (info().outcome ? info().outcome.split(" · ")[0] : "");
+  const isShellLike = () => {
+    const n = typeof short === "function" ? short(t().tool) : "";
+    return n === "shell_run" || n === "surface_exec";
+  };
   return (
-    <div class="msg tool conv-tool">
-      <button type="button" class="row conv-tool-toggle" aria-expanded={!!expanded()} onClick={() => {
+    <div class={`msg tool conv-tool ${expanded() ? "is-open" : ""} ${info().tone === "bad" ? "is-bad" : ""}`}>
+      <button type="button" class="row conv-tool-toggle" aria-expanded={expanded()} onClick={() => {
         const next = !expanded();
         if (!next) setRawOpen(false);
         setOpen(next);
       }}>
-        <span class={`dot ${t().running ? active() ? "busy" : "" : t().ok === false || (state()?.startsWith("Exit ") && state() !== "Exit 0") ? "bad" : state() === "Still running" ? "" : "live"}`} />
-        <b>{short(t().tool) === "shell_run" ? "Shell" : short(t().tool) === "shell_read" ? "Shell output" : short(t().tool)}</b>
-        <span class="ellipsis dim grow">{t().args?.description ?? t().args?.intent ?? (short(t().tool) === "shell_run" ? t().args?.shell ?? "Command" : argSummary(t().tool, t().args))}</span>
-        <span class="xs dim">{t().running ? active() ? "Running" : "Unconfirmed" : t().ok === false ? "Failed" : (state() === "Still running" ? "Running at return" : state()) ?? "Returned"}</span>
-        <Show when={t().ms != null}><span class="faint xs">{(t().ms / 1000).toFixed(1)}s</span></Show>
-        <span class="dim" aria-hidden="true">{expanded() ? "▾" : "▸"}</span>
+        <span class={`dot ${dotTone()}`} />
+        <b class="tool-label">{info().label}</b>
+        <span class="ellipsis dim grow tool-summary" title={info().summary}>{info().summary}</span>
+        <span class={`xs tool-outcome ${info().tone === "bad" ? "bad" : "dim"}`}>{outcomeLabel()}</span>
+        <Show when={t().ms != null}><span class="faint xs tool-dur">{(t().ms / 1000).toFixed(1)}s</span></Show>
+        <span class="dim tool-chevron" aria-hidden="true">{expanded() ? "▾" : "▸"}</span>
       </button>
-      <Show when={short(t().tool) === "shell_run" && t().args?.command}><pre class="tool-command"><span class="dim">$ </span>{expanded() ? t().args.command : t().args.command.split("\n").slice(0, 2).join("\n").slice(0, 240)}</pre><Show when={!expanded() && (t().args.command.length > 240 || t().args.command.split("\n").length > 2)}><span class="tool-preview-label">Command shortened · expand to read all</span></Show></Show>
-      <Show when={!expanded() && resultText()}><pre class="tool-output-preview">{resultText().split("\n").slice(-4).join("\n").slice(-1200)}</pre><span class="tool-preview-label">Output preview · expand for details</span></Show>
       <Show when={t().running}>
-        <div class="xs dim" role="status">{active()
+        <div class="xs dim tool-status-line ellipsis" role="status">{active()
           ? `Awaiting tool completion · observed ${elapsed()}s${silent() >= 30 ? ` · No new output for ${silent()}s. It may be working or waiting for approval. This is not a completion signal.` : ""}`
           : "No tool completion recorded in loaded history."}</div>
       </Show>
+      <Show when={!expanded() && !t().running && info().tone === "bad" && info().errorHint}>
+        <div class="xs tool-error-line ellipsis" title={info().errorHint}>{info().errorHint}</div>
+      </Show>
       <Show when={expanded()}>
-        <Show when={short(t().tool) !== "shell_run"}><pre class="conv-pre">{JSON.stringify(t().args, null, 2)}</pre></Show>
-        <Show when={resultText()}><pre class="conv-pre">{resultText().slice(0, 20000)}</pre><Show when={resultText().length > 20000}><span class="xs dim">Showing the first 20,000 characters of tool output.</span></Show></Show>
+        <Show when={isShellLike() && t().args?.command}>
+          <pre class="tool-command"><span class="dim">$ </span>{t().args.command}</pre>
+        </Show>
+        <Show when={short(t().tool) !== "shell_run" && t().args && Object.keys(t().args).length > 0}>
+          <pre class="conv-pre">{JSON.stringify(t().args, null, 2)}</pre>
+        </Show>
+        <Show when={resultText()}>
+          <pre class="conv-pre">{resultText().slice(0, 20000)}</pre>
+          <Show when={resultText().length > 20000}><span class="xs dim">Showing the first 20,000 characters of tool output.</span></Show>
+        </Show>
         <details class="tool-raw" onToggle={(e) => setRawOpen(e.currentTarget.open)}><summary>Raw tool data</summary><Show when={rawOpen()}><pre class="conv-pre">{JSON.stringify({ arguments: t().args, result: t().result }, null, 2)?.slice(0, 20000)}</pre></Show></details>
       </Show>
     </div>
@@ -159,8 +162,63 @@ function Tool(props) {
  * props: events (array, reactive), onApprove(id, scope), onDeny(id), busy
  */
 export function Conversation(props) {
-  let el;
+  let el, timelineEl;
   const [store, setStore] = createStore({ items: [] });
+  const [stick, setStick] = createSignal(true);
+  let programmaticScroll = false;
+  let smoothScrolling = false;
+  let scrollRaf = 0;
+  let programmaticTimer = 0;
+  let lastScrollTop = 0;
+  let expectedScrollTop = 0;
+  let expectedScrollHeight = 0;
+  const scrollToBottom = (smooth = false) => {
+    if (!el) return;
+    if (programmaticTimer) { clearTimeout(programmaticTimer); programmaticTimer = 0; }
+    if (smooth && typeof el.scrollTo === "function") {
+      if (el.scrollHeight - el.scrollTop - el.clientHeight < 2) {
+        programmaticScroll = false;
+        smoothScrolling = false;
+        return;
+      }
+      programmaticScroll = true;
+      smoothScrolling = true;
+      expectedScrollTop = Math.max(0, el.scrollHeight - el.clientHeight);
+      expectedScrollHeight = el.scrollHeight;
+      lastScrollTop = el.scrollTop;
+      el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+      programmaticTimer = setTimeout(() => {
+        programmaticScroll = false;
+        smoothScrolling = false;
+        programmaticTimer = 0;
+      }, 450);
+    } else {
+      const before = el.scrollTop;
+      el.scrollTop = el.scrollHeight;
+      lastScrollTop = el.scrollTop;
+      if (el.scrollTop !== before) {
+        programmaticScroll = true;
+        smoothScrolling = false;
+        expectedScrollTop = el.scrollTop;
+        expectedScrollHeight = el.scrollHeight;
+        programmaticTimer = setTimeout(() => {
+          programmaticScroll = false;
+          smoothScrolling = false;
+          programmaticTimer = 0;
+        }, 40);
+      } else {
+        programmaticScroll = false;
+        smoothScrolling = false;
+      }
+    }
+  };
+  const scheduleScrollToBottom = () => {
+    if (!stick() || !el || scrollRaf) return;
+    scrollRaf = requestAnimationFrame(() => {
+      scrollRaf = 0;
+      if (stick()) scrollToBottom(false);
+    });
+  };
   const tools = new Map();
   let streamingIdx = -1;
   let turnText = false;
@@ -413,21 +471,69 @@ export function Conversation(props) {
       cursor = evs.length;
       firstEvent = cursor > 0 ? evs[0] : null;
       lastEvent = cursor > 0 ? evs[cursor - 1] : null;
+      setStick(true);
+      scheduleScrollToBottom();
     });
   });
 
-  const [stick, setStick] = createSignal(true);
-  createEffect(on(() => [store.items.length, store.items.at(-1)?.text?.length], () => {
-    if (stick() && el) queueMicrotask(() => (el.scrollTop = el.scrollHeight));
+  onMount(() => {
+    if (timelineEl && typeof ResizeObserver !== "undefined") {
+      const ro = new ResizeObserver(() => {
+        if (stick()) scheduleScrollToBottom();
+      });
+      ro.observe(timelineEl);
+      onCleanup(() => ro.disconnect());
+    }
+    if (stick()) scheduleScrollToBottom();
+  });
+  onCleanup(() => {
+    if (scrollRaf) cancelAnimationFrame(scrollRaf);
+    if (programmaticTimer) clearTimeout(programmaticTimer);
+  });
+
+  createEffect(on(() => {
+    const last = store.items.at(-1);
+    return [store.items.length, last?.text?.length, last?.out?.length, last?.result];
+  }, () => {
+    if (stick()) scheduleScrollToBottom();
   }));
   return (
-    <div class={`conv conv-${conversationView()}`} style={props.hidden ? { display: "none" } : undefined} ref={el} onScroll={(e) => {
-      const d = e.currentTarget;
-      setStick(d.scrollHeight - d.scrollTop - d.clientHeight < 60);
-    }}>
+    <div
+      class={`conv conv-${conversationView()}`}
+      style={props.hidden ? { display: "none" } : undefined}
+      ref={el}
+      onWheel={(e) => { if (e.deltaY < 0) { programmaticScroll = false; smoothScrolling = false; } }}
+      onPointerDown={() => { programmaticScroll = false; smoothScrolling = false; }}
+      onScroll={(e) => {
+        const d = e.currentTarget;
+        const atBottom = d.scrollHeight - d.scrollTop - d.clientHeight < 60;
+        const scrolledUp = d.scrollTop < lastScrollTop - 2;
+        if (programmaticScroll) {
+          const layoutGrewAfterSnap = !smoothScrolling && expectedScrollTop > 0 && Math.abs(d.scrollTop - expectedScrollTop) <= 4 && d.scrollHeight > expectedScrollHeight;
+          const userInterrupted = smoothScrolling
+            ? scrolledUp
+            : !atBottom && !layoutGrewAfterSnap;
+          if (userInterrupted) {
+            programmaticScroll = false;
+            smoothScrolling = false;
+            lastScrollTop = d.scrollTop;
+            setStick(false);
+          } else {
+            lastScrollTop = d.scrollTop;
+            if (atBottom) {
+              programmaticScroll = false;
+              smoothScrolling = false;
+            }
+          }
+          return;
+        }
+        lastScrollTop = d.scrollTop;
+        setStick(atBottom);
+      }}
+    >
       <ViewToggle />
       <Lightbox />
-      <div class="timeline">
+      <div class="timeline" ref={timelineEl}>
         <Show when={store.items.length === 0}>
           <div class="conv-empty">{props.emptyText ?? "No messages yet."}</div>
         </Show>
@@ -495,6 +601,13 @@ export function Conversation(props) {
         </Index>
         <ConversationActivity events={props.events ?? []} busy={props.busy} readOnly={props.readOnly || props.hidden} />
       </div>
+      <Show when={!stick() && store.items.length > 0}>
+        <div class="conv-jump-wrap">
+          <button type="button" class="conv-jump" onClick={() => { setStick(true); scrollToBottom(true); }}>
+            ↓ Jump to latest
+          </button>
+        </div>
+      </Show>
     </div>
   );
 }
