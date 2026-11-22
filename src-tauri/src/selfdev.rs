@@ -253,7 +253,7 @@ fn test(ctx: &Arc<Ctx>, id: &str) -> Result<Value, String> {
         "Improve: tests",
         &wt,
         "set -e; (cd src-tauri && cargo test); npm install --no-audit --no-fund; npx vite build",
-        vec![],
+        shared_target(ctx),
         r["agent_id"].as_str(),
     )?;
     set(ctx, id, "test_terminal", &t)?;
@@ -368,6 +368,14 @@ fn stage_preview_sidecar(wt: &Path, src: &Path, target: &str) -> Result<(), Stri
     Ok(())
 }
 
+// Every fresh worktree would otherwise compile all crates cold (many minutes).
+// Reuse the source checkout's debug target dir so only Philium itself rebuilds.
+fn shared_target(ctx: &Ctx) -> Vec<(String, String)> {
+    source_dir(ctx)
+        .map(|s| vec![("CARGO_TARGET_DIR".into(), s.join("src-tauri").join("target").to_string_lossy().into())])
+        .unwrap_or_default()
+}
+
 fn prepare_worktree(ctx: &Ctx, wt: &Path) -> Result<(), String> {
     let src = source_dir(ctx).ok_or("Philium source not found.")?;
     stage_preview_sidecar(wt, &src, env!("PHILIUM_TARGET_TRIPLE"))
@@ -385,14 +393,15 @@ fn preview(ctx: &Arc<Ctx>, id: &str) -> Result<Value, String> {
     std::fs::create_dir_all(base.join("data")).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(base.join("root")).map_err(|e| e.to_string())?;
     let port = 1420 + (crate::hal::random_token().as_bytes()[0] as u16 % 200) + 1;
-    let env = vec![
+    let mut env = shared_target(ctx);
+    env.extend([
         ("PHILIUM_PREVIEW".into(), "1".into()),
         ("PHILIUM_DATA_DIR".into(), base.join("data").to_string_lossy().into()),
         ("PHILIUM_ROOT".into(), base.join("root").to_string_lossy().into()),
         ("PHILIUM_DEV_PORT".into(), port.to_string()),
         ("CODEX_HOME".into(), base.join("empty-codex").to_string_lossy().into()),
         ("CLAUDE_CONFIG_DIR".into(), base.join("empty-claude").to_string_lossy().into()),
-    ];
+    ]);
     let cmd = format!(
         "npm install --no-audit --no-fund && npx tauri dev --config '{{\"identifier\":\"dev.gunnarsson.philium.preview\",\"build\":{{\"devUrl\":\"http://localhost:{port}\",\"beforeDevCommand\":\"npx vite --port {port} --strictPort\"}},\"app\":{{\"windows\":[{{\"title\":\"Philium preview\",\"width\":1200,\"height\":800}}]}}}}'"
     );
@@ -650,7 +659,7 @@ mod tests {
         let terminal = reply["terminal"].as_str().unwrap().to_string();
         cleanup.1 = Some(terminal.clone());
         assert_eq!(std::fs::read(wt.join(&relative)).unwrap(), std::fs::read(src.join(&relative)).unwrap());
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(240);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(900);
         let exit = loop {
             if let Some(exit) = term_exit(&ctx, &terminal) { break exit; }
             assert!(std::time::Instant::now() < deadline, "real selfdev.test timed out");
