@@ -600,6 +600,8 @@ pub struct RerankConfig {
     pub auth_token: Option<String>,
     pub model: String,
     pub model_version: String,
+    /// Set for the in-process cross-encoder: its data dir. HTTP fields are unused then.
+    pub local_dir: Option<std::path::PathBuf>,
 }
 
 fn rerank_http_client() -> &'static reqwest::Client {
@@ -664,6 +666,7 @@ pub fn resolve_rerank_config(ctx: &Ctx) -> Option<RerankConfig> {
                     auth_token: Some(ctx.gateway.token.clone()),
                     model: mid.to_string(),
                     model_version: format!("gateway:{}:{mid}", p.id),
+                    local_dir: None,
                 });
             }
         }
@@ -683,8 +686,19 @@ pub fn resolve_rerank_config(ctx: &Ctx) -> Option<RerankConfig> {
                 auth_token: auth,
                 model: mid.to_string(),
                 model_version: format!("local:{mid}"),
+                local_dir: None,
             });
         }
+    }
+
+    if crate::local_models::ready(ctx, &crate::local_models::RERANK) {
+        return Some(RerankConfig {
+            endpoint_url: String::new(),
+            auth_token: None,
+            model: crate::local_models::RERANK.label.to_string(),
+            model_version: crate::local_models::RERANK.version.to_string(),
+            local_dir: Some(ctx.data_dir.clone()),
+        });
     }
 
     let providers = crate::providers::all(ctx);
@@ -728,6 +742,7 @@ pub fn resolve_rerank_config(ctx: &Ctx) -> Option<RerankConfig> {
         auth_token: Some(ctx.gateway.token.clone()),
         model: mid.clone(),
         model_version: format!("gateway:{pid}:{mid}"),
+        local_dir: None,
     })
 }
 
@@ -781,6 +796,15 @@ pub async fn rerank_candidates_async(
         .map(|c| c["content"].as_str().unwrap_or("").to_string())
         .collect();
 
+    if let Some(dir) = cfg.local_dir.clone() {
+        let q = query.to_string();
+        let scored = tokio::task::spawn_blocking(move || crate::local_models::rerank(&dir, &q, &documents)).await;
+        return match scored {
+            Ok(Ok(entries)) => place_reranked(candidates, entries, req_top_n, top_n, cfg.model_version),
+            _ => (candidates.into_iter().take(top_n).collect(), None),
+        };
+    }
+
     let mut req = rerank_http_client().post(&cfg.endpoint_url).json(&json!({
         "model": cfg.model,
         "query": query,
@@ -798,10 +822,20 @@ pub async fn rerank_candidates_async(
     let Ok(body) = resp.json::<Value>().await else {
         return (candidates.into_iter().take(top_n).collect(), None);
     };
-    let Some(mut entries) = parse_rerank_entries(&body) else {
+    let Some(entries) = parse_rerank_entries(&body) else {
         return (candidates.into_iter().take(top_n).collect(), None);
     };
+    place_reranked(candidates, entries, req_top_n, top_n, cfg.model_version)
+}
 
+/// Order `candidates` by `(index, score)` entries. Only existing slots are used (ownership gate).
+fn place_reranked(
+    candidates: Vec<Value>,
+    mut entries: Vec<(usize, f64)>,
+    req_top_n: usize,
+    top_n: usize,
+    model_version: String,
+) -> (Vec<Value>, Option<String>) {
     entries.sort_by(|a, b| {
         b.1.partial_cmp(&a.1)
             .unwrap_or(std::cmp::Ordering::Equal)
@@ -830,7 +864,7 @@ pub async fn rerank_candidates_async(
         return (fallback, None);
     }
 
-    (reranked, Some(cfg.model_version))
+    (reranked, Some(model_version))
 }
 
 /// Read current embedding & cross-encoder reranker configuration and active backend status.
@@ -853,6 +887,7 @@ pub fn config_get(ctx: &Ctx) -> Value {
         "active_rerank_model": active_rerank,
         "mode": mode,
         "reranker_active": active_rerank.is_some(),
+        "local_models": crate::local_models::status(ctx),
     })
 }
 

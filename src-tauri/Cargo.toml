@@ -29,6 +29,7 @@ tree-sitter-typescript = "0.23.2"
 tree-sitter-javascript = "0.25.0"
 tree-sitter-python = "0.25.0"
 tree-sitter-go = "0.25.0"
+fastembed = { version = "=7.7.1", default-features = false, features = ["ort-download-binaries-rustls-tls", "hf-hub-rustls-tls"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"

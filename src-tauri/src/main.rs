@@ -41,6 +41,7 @@ mod graph;
 mod guard;
 mod hal;
 mod library;
+mod local_models;
 mod memory_consolidation;
 mod memory_ledger;
 mod memory_skills;
@@ -407,6 +408,10 @@ fn main() {
                 }
             }
 
+            // Memory's local embedder and reranker: fetched once in the background, then offline.
+            if !pilot::active() {
+                local_models::start(&ctx);
+            }
             #[cfg(unix)] managed::start_watcher(&ctx);
             app.manage(App { ctx: ctx.clone() });
             let c_desk = ctx.clone();

@@ -183,6 +183,8 @@ pub struct EmbeddingConfig {
     pub auth_token: Option<String>,
     pub model: String,
     pub model_version: String,
+    /// Set for the in-process model: its data dir. HTTP fields are unused then.
+    pub local_dir: Option<PathBuf>,
 }
 
 fn embed_http_client() -> &'static reqwest::Client {
@@ -251,6 +253,7 @@ pub fn resolve_embedding_config(ctx: &Ctx) -> Option<EmbeddingConfig> {
                     auth_token: Some(ctx.gateway.token.clone()),
                     model: mid.to_string(),
                     model_version: format!("gateway:{}:{}", p.id, mid),
+                    local_dir: None,
                 });
             }
         }
@@ -268,11 +271,23 @@ pub fn resolve_embedding_config(ctx: &Ctx) -> Option<EmbeddingConfig> {
                 auth_token: auth,
                 model: mid.to_string(),
                 model_version: format!("local:{mid}"),
+                local_dir: None,
             });
         }
     }
 
-    // 3. Auto-discover an embedding model on any enabled trusted OpenAI-compatible provider via gateway.
+    // 3. The in-process model, once downloaded and verified. Never leaves the machine.
+    if crate::local_models::ready(ctx, &crate::local_models::EMBED) {
+        return Some(EmbeddingConfig {
+            endpoint_url: String::new(),
+            auth_token: None,
+            model: crate::local_models::EMBED.label.to_string(),
+            model_version: crate::local_models::EMBED.version.to_string(),
+            local_dir: Some(ctx.data_dir.clone()),
+        });
+    }
+
+    // 4. Auto-discover an embedding model on any enabled trusted OpenAI-compatible provider via gateway.
     let providers = crate::providers::all(ctx);
     let mut best: Option<(u8, String, String)> = None;
     for p in providers {
@@ -299,6 +314,7 @@ pub fn resolve_embedding_config(ctx: &Ctx) -> Option<EmbeddingConfig> {
         auth_token: Some(ctx.gateway.token.clone()),
         model: mid.clone(),
         model_version: format!("gateway:{pid}:{mid}"),
+        local_dir: None,
     })
 }
 
@@ -337,6 +353,13 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 pub async fn embed_texts_async(cfg: &EmbeddingConfig, inputs: &[String]) -> Result<Vec<Vec<f32>>, String> {
     if inputs.is_empty() {
         return Ok(vec![]);
+    }
+    if let Some(dir) = cfg.local_dir.clone() {
+        let texts = inputs.to_vec();
+        let out = tokio::task::spawn_blocking(move || crate::local_models::embed(&dir, &texts))
+            .await
+            .map_err(|e| e.to_string())??;
+        return Ok(out.into_iter().map(normalize_l2).collect());
     }
     let mut req = embed_http_client()
         .post(&cfg.endpoint_url)
@@ -3556,6 +3579,18 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
             .await
         }
         "config_get" => Ok(crate::memory_ledger::config_get(ctx)),
+        "models_status" => Ok(crate::local_models::status(ctx)),
+        "models_download" => {
+            if let Some(on) = args["enabled"].as_bool() {
+                crate::local_models::set_enabled(ctx, on)?;
+                invalidate_vector_cache(ctx);
+            }
+            let c = ctx.clone();
+            tokio::spawn(async move {
+                crate::local_models::ensure(&c).await;
+            });
+            Ok(crate::local_models::status(ctx))
+        }
         "config_set" => {
             let res = crate::memory_ledger::config_set(ctx, &args)?;
             invalidate_vector_cache(ctx);
