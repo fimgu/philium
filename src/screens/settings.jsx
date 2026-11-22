@@ -5,6 +5,7 @@ import { useStore } from "../lib/store.js";
 import { useVisibleEvent } from "../lib/visibility.js";
 import "../styles/workspace.css";
 import { Storage } from "./storage.jsx";
+import { McpServersSection } from "./mcp-servers.jsx";
 
 function StrictSandboxSection(props) {
   const [sbStatus, setSbStatus] = createSignal(null);
@@ -673,6 +674,7 @@ export default function Settings() {
       </section>
       <StrictSandboxSection busy={busy()} />
       <PlaybooksSection busy={busy()} />
+      <McpServersSection repos={store.repos() ?? []} />
       <MemoryEmbeddingsSection providers={store.providers()} busy={busy()} />
       <section class="ws-section">
         <h2>Teardown</h2>
