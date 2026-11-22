@@ -102,6 +102,11 @@ impl Ctx {
     /// Append to the audit/event log shown on Home and in Activity.
     /// An entry is a record, not a dump: one larger than `EVENT_MAX` keeps its start and size.
     pub fn log_event(&self, kind: &str, agent_id: Option<&str>, body: &Value) {
+        let _ = self.log_event_id(kind, agent_id, body);
+    }
+
+    /// Append to the audit/event log and return its durable event reference (`evt:<rowid>`).
+    pub fn log_event_id(&self, kind: &str, agent_id: Option<&str>, body: &Value) -> Option<String> {
         let text = body.to_string();
         let (text, body) = if text.len() > EVENT_MAX {
             let mut cut = 4096;
@@ -113,11 +118,18 @@ impl Ctx {
         } else {
             (text, body.clone())
         };
-        let _ = self.db.exec(
-            "INSERT INTO events(ts,kind,agent_id,body) VALUES(?1,?2,?3,?4)",
-            rusqlite::params![crate::db::now(), kind, agent_id, text],
-        );
+        let event_id = self
+            .db
+            .with(|c| {
+                let mut st = c.prepare_cached("INSERT INTO events(ts,kind,agent_id,body) VALUES(?1,?2,?3,?4)")?;
+                st.execute(rusqlite::params![crate::db::now(), kind, agent_id, text])?;
+                Ok(c.last_insert_rowid())
+            })
+            .ok()
+            .filter(|id| *id > 0)
+            .map(|id| format!("evt:{id}"));
         self.emit("event", serde_json::json!({ "kind": kind, "agent_id": agent_id, "body": body }));
+        event_id
     }
 
     pub fn agent_dir(&self, name: &str) -> PathBuf {

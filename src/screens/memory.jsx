@@ -38,6 +38,7 @@ export default function Memory() {
   const [wnSaving, setWnSaving] = createSignal(false);
 
   const [intTrigger, setIntTrigger] = createSignal("pre_release");
+  const [intMatch, setIntMatch] = createSignal("");
   const [intText, setIntText] = createSignal("");
   const [intSaving, setIntSaving] = createSignal(false);
   const [conPreview, setConPreview] = createSignal(null);
@@ -73,7 +74,7 @@ export default function Memory() {
         q,
         budget_tokens: b,
         strict: false,
-        include_global: true,
+        include_global: !repoId,
       }, { local: true }).catch(() => null),
   );
   const [rulesData, { refetch: refetchRules }] = createResource(() => rpc("library.rules_get", {}, { local: true }).catch(() => null));
@@ -204,7 +205,13 @@ export default function Memory() {
     setIntSaving(true);
     try {
       const scope = activeRepoId() ? `repo:${activeRepoId()}` : "global";
-      await rpc("library.intention_add", { scope, trigger_kind: intTrigger(), instruction: txt });
+      await rpc("library.intention_add", {
+        scope,
+        trigger_kind: intTrigger(),
+        trigger_match: intMatch().trim(),
+        instruction: txt,
+      });
+      setIntMatch("");
       setIntText("");
       toast("Reminder added", "secure");
       refreshAll();
@@ -390,8 +397,15 @@ export default function Memory() {
                 </div>
 
                 <div class="col" style={{ gap: "6px" }}>
+                  <div class="row">
+                    <span class="xs dim grow">Retrieval</span>
+                    <span class="xs mono faint">{libStatus()?.embed_model || "Lexical (FTS5)"}</span>
+                  </div>
+                </div>
+
+                <div class="col" style={{ gap: "6px" }}>
                   <span class="xs dim">Reminders</span>
-                  <form class="row" style={{ gap: "6px" }} onSubmit={addIntention}>
+                  <form class="row" style={{ gap: "6px", "flex-wrap": "wrap" }} onSubmit={addIntention}>
                     <Select
                       value={intTrigger()}
                       onValue={setIntTrigger}
@@ -400,15 +414,19 @@ export default function Memory() {
                         { value: "on_pr", label: "On PR" },
                         { value: "on_error", label: "On error" },
                         { value: "on_session_start", label: "Start" },
+                        { value: "path_match", label: "Path" },
+                        { value: "on_compact", label: "Compact" },
                       ]}
                     />
-                    <Input value={intText()} onValue={setIntText} placeholder="Reminder…" style={{ flex: "1" }} />
+                    <Input mono value={intMatch()} onValue={setIntMatch} placeholder="Match (optional)" style={{ width: "130px" }} />
+                    <Input value={intText()} onValue={setIntText} placeholder="Reminder…" style={{ flex: "1", "min-width": "140px" }} />
                     <Button size="sm" variant="primary" type="submit" busy={intSaving()} disabled={!intText().trim()}>Add</Button>
                   </form>
                   <For each={intentions() ?? []}>
                     {(it) => (
                       <div class="row xs" style={{ padding: "4px 6px", background: "var(--bg-raised)", "border-radius": "6px" }}>
                         <Badge tone="accent">{it.trigger_kind}</Badge>
+                        <Show when={it.trigger_match}><span class="mem-key">{it.trigger_match}</span></Show>
                         <span class="grow">{it.instruction}</span>
                         <button type="button" class="icon-btn" onClick={() => removeIntention(it.id)}><Icon name="trash" size={11} /></button>
                       </div>
@@ -425,7 +443,12 @@ export default function Memory() {
                     <div class="row">
                       <span class="xs">{conPreview().proposals.length} duplicate(s)</span>
                       <div class="grow" />
-                      <Button size="sm" variant="primary" busy={conBusy()} onClick={() => promoteConsolidation(conPreview().id)}>Clean</Button>
+                      <Show
+                        when={conPreview()?.eval_report?.passed}
+                        fallback={<Badge tone="strict">Gate failed</Badge>}
+                      >
+                        <Button size="sm" variant="primary" busy={conBusy()} onClick={() => promoteConsolidation(conPreview().id)}>Clean</Button>
+                      </Show>
                     </div>
                   </Show>
                 </div>

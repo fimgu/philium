@@ -26,14 +26,14 @@ export function AgentContext(props) {
   const scope = () => (props.repoId ? `repo:${props.repoId}` : "global");
 
   const [slate, { refetch: refetchSlate }] = createResource(
-    () => [props.repoId || "", !!props.strict],
-    ([repoId, strict]) =>
+    () => [props.repoId || "", !!props.strict, props.modelRef || ""],
+    ([repoId, strict, modelRef]) =>
       rpc("library.context_slate", {
         repo_id: repoId || null,
         q: "",
-        budget_tokens: 2000,
+        model_ref: modelRef || null,
         strict,
-        include_global: true,
+        include_global: !repoId,
       }, { local: true }).catch(() => null),
   );
 
@@ -113,6 +113,11 @@ export function AgentContext(props) {
     return s?.budget_tokens ? Math.min(100, Math.round((s.used_tokens * 100) / s.budget_tokens)) : 0;
   };
 
+  const fmtBudget = () => {
+    const b = slate()?.budget_tokens ?? 2000;
+    return b % 1000 === 0 ? `${b / 1000}k` : `${(b / 1000).toFixed(1)}k`;
+  };
+
   const hasNote = () => {
     const n = note();
     return !!(n && (n.requirements || n.decisions || n.failed_attempts || n.next_steps));
@@ -139,7 +144,7 @@ export function AgentContext(props) {
         <div class="col" style={{ gap: "4px" }}>
           <div class="row xs dim">
             <span class="grow">Context</span>
-            <span class="mono">{slate()?.used_tokens ?? 0} / 2k</span>
+            <span class="mono">{slate()?.used_tokens ?? 0} / {fmtBudget()}</span>
           </div>
           <Meter value={pct()} tone={pct() > 85 ? "strict" : "secure"} />
         </div>

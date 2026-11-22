@@ -256,9 +256,22 @@ pub(crate) fn prompt_rules(ctx: &Ctx, strict: bool) -> String {
     format!("{}\n{}", shared_instructions(strict), crate::library::rules(ctx))
 }
 
-/// Post-prefix session context (reminders + bounded working note) placed AFTER `<!-- PHILIUM_CACHE_BREAK -->`
-/// so shared prefix KV caching stays intact. Strictly empty for Strict/untrusted agents.
+/// Post-prefix session context (due reminders + bounded working note + budgeted memory slate)
+/// placed AFTER `<!-- PHILIUM_CACHE_BREAK -->` so shared prefix KV caching stays intact.
+/// Strictly empty for Strict/untrusted agents.
+#[cfg(test)]
 pub(crate) fn agent_session_context(ctx: &Ctx, strict: bool, repo_id: Option<&str>) -> String {
+    agent_session_context_with_budget(ctx, strict, repo_id, None, "")
+}
+
+#[cfg(test)]
+pub(crate) fn agent_session_context_with_budget(
+    ctx: &Ctx,
+    strict: bool,
+    repo_id: Option<&str>,
+    model_ref: Option<&str>,
+    query: &str,
+) -> String {
     if strict {
         return String::new();
     }
@@ -269,6 +282,53 @@ pub(crate) fn agent_session_context(ctx: &Ctx, strict: bool, repo_id: Option<&st
     if let Some(rid) = repo_id.filter(|s| !s.is_empty()) {
         if let Some(note) = crate::library::working_note_prompt(ctx, rid) {
             out.push_str(&note);
+        }
+        let budget = crate::library::model_memory_budget(ctx, model_ref);
+        if let Ok(slate) = crate::library::build_context_slate(ctx, Some(rid), query, budget, false, false) {
+            // Keep rendered slate bounded cleanly to the per-model budget (~4 bytes/token, capped for prompt hygiene).
+            let max_slate_bytes = (budget * 4).clamp(1024, 12_000);
+            if let Some(block) = crate::library::format_slate_memories_prompt(&slate, max_slate_bytes) {
+                out.push_str(&block);
+            }
+        }
+    }
+    out
+}
+
+async fn agent_session_context_async(
+    ctx: &Arc<Ctx>,
+    strict: bool,
+    repo_id: Option<&str>,
+    model_ref: Option<&str>,
+    query: &str,
+) -> String {
+    if strict {
+        return String::new();
+    }
+    let mut out = String::new();
+    if let Some(reminders) = crate::library::session_start_reminders_prompt(ctx, repo_id) {
+        out.push_str(&reminders);
+    }
+    if let Some(rid) = repo_id.filter(|s| !s.is_empty()) {
+        if let Some(note) = crate::library::working_note_prompt(ctx, rid) {
+            out.push_str(&note);
+        }
+        let budget = crate::library::model_memory_budget(ctx, model_ref);
+        if let Ok(slate) = crate::library::build_context_slate_async(
+            ctx,
+            Some(rid),
+            query,
+            budget,
+            false,
+            false,
+            vec!["on_session_start".into()],
+        )
+        .await
+        {
+            let max_slate_bytes = (budget * 4).clamp(1024, 12_000);
+            if let Some(block) = crate::library::format_slate_memories_prompt(&slate, max_slate_bytes) {
+                out.push_str(&block);
+            }
         }
     }
     out
@@ -514,7 +574,8 @@ async fn provision(ctx: &Arc<Ctx>, id: &str, fresh: bool, brief: Option<String>)
     }
     extra.push_str("\n<!-- PHILIUM_CACHE_BREAK -->\n");
     extra.push_str(&agent_identity_tail(&name, &role, parent_name.as_deref(), worktree.as_deref()));
-    extra.push_str(&agent_session_context(ctx, strict, row["repo_id"].as_str()));
+    let seed_query = brief.as_deref().unwrap_or("");
+    extra.push_str(&agent_session_context_async(ctx, strict, row["repo_id"].as_str(), Some(&model_ref), seed_query).await);
     config["prompt"] = json!({ "extra": extra });
     if let Some(url) = ctx.mcp_url.get() {
         config["mcp"] = json!({ "servers": { "philium": {
@@ -767,6 +828,8 @@ fn on_hal_exit(ctx: &Arc<Ctx>, id: &str, hal: &Arc<Hal>, reason: &str) {
         crate::sandbox::revoke(&n);
     }
     crate::mcp::revoke(id);
+    crate::library::clear_agent_reminder_state(id);
+    crate::library::schedule_session_observe(ctx, id);
     crate::terminals::kill_agent(ctx, id);
     hal.stop();
     set_state(ctx, id, "failed");
@@ -910,8 +973,35 @@ fn apply_event(
         "turn.failed" => {
             ctx.log_event("agent_turn_failed", Some(id), &json!({ "error": ev["error"] }));
             let error = ev["error"].as_str().map(str::to_string).unwrap_or_else(|| ev["error"].to_string());
+            if let Some(arow) = get_row(ctx, id) {
+                if arow["strict"].as_i64() != Some(1) {
+                    let repo_id = arow["repo_id"].as_str().filter(|s| !s.is_empty());
+                    let rems = crate::library::error_reminders(ctx, repo_id, &error);
+                    if let Some(txt) = crate::library::format_trigger_reminders("on_error", &rems) {
+                        crate::library::push_agent_reminder(id, txt);
+                    }
+                }
+            }
             if rate_limited(&error) {
                 schedule_continue(ctx, id);
+            }
+            flush_now = true;
+        }
+        "context.compacted" => {
+            if let Some(arow) = get_row(ctx, id) {
+                if arow["strict"].as_i64() != Some(1) {
+                    crate::library::reset_agent_path_reminders(id);
+                    let repo_id = arow["repo_id"].as_str().filter(|s| !s.is_empty());
+                    let rems = crate::library::compaction_reminders(ctx, repo_id);
+                    if let Some(txt) = crate::library::format_trigger_reminders("on_compact", &rems) {
+                        crate::library::push_agent_reminder(id, txt);
+                    }
+                    if let Some(rid) = repo_id {
+                        if let Some(note) = crate::library::working_note_prompt(ctx, rid) {
+                            crate::library::push_agent_reminder(id, format!("[Post-compaction handoff]{note}"));
+                        }
+                    }
+                }
             }
             flush_now = true;
         }
@@ -921,6 +1011,7 @@ fn apply_event(
                 let _ = ctx.db.kv_set(&retry_key(id), "");
                 ctx.emit("agents:changed", json!({ "id": id }));
             }
+            crate::library::schedule_session_observe(ctx, id);
             flush_now = true;
         }
         _ => {}
@@ -1045,6 +1136,8 @@ pub fn stop(ctx: &Arc<Ctx>, id: &str, state: &str) {
         }
     }
     crate::mcp::revoke(id);
+    crate::library::clear_agent_reminder_state(id);
+    crate::library::schedule_session_observe(ctx, id);
     crate::terminals::kill_agent(ctx, id);
     crate::board::release_agent(ctx, id);
     set_state(ctx, id, state);
@@ -2208,6 +2301,43 @@ mod tests {
         // Strict agent NEVER receives reminders or working notes.
         assert!(agent_session_context(&ctx, true, Some("ra")).is_empty());
         assert!(agent_session_context(&ctx, true, None).is_empty());
+
+        // Repo memory slate is auto-injected after the cache break (never in prefix) with provenance tags,
+        // and per-model budget B scales with context window.
+        crate::library::save_structured(&ctx, crate::library::SaveOpts {
+            content: "Local mode must boot without internet access.",
+            category: "preference",
+            scope: "repo:ra",
+            source: "user",
+            trust_tier: "user_direct",
+            fact_key: Some("network.local"),
+            supersedes_id: None,
+            source_event_id: None,
+            provenance: Some("operator"),
+        }).unwrap();
+        let prefix2 = prompt_rules(&ctx, false);
+        assert!(!prefix2.contains("Local mode must boot without internet access."));
+        let tail2 = agent_session_context_with_budget(&ctx, false, Some("ra"), None, "internet");
+        assert!(tail2.contains("## Workspace memory slate"));
+        assert!(tail2.contains("Local mode must boot without internet access."));
+        assert!(tail2.contains("key=network.local"));
+        assert!(agent_session_context_with_budget(&ctx, true, Some("ra"), None, "internet").is_empty());
+
+        // context.compacted queues on_compact reminders for Standard agents and NEVER for Strict agents.
+        ctx.db.exec("INSERT INTO repos(id,name,path,added_at) VALUES('ra','ra','/tmp/ra',0)", []).unwrap();
+        ctx.db.exec(
+            "INSERT INTO agents(id,name,repo_id,model_ref,strict,state,created_at,last_active_at)
+             VALUES('std_c','std_c','ra','p/m',0,'running',0,0),('str_c','str_c','ra','p/m',1,'running',0,0)",
+            [],
+        ).unwrap();
+        crate::library::intention_add(&ctx, "repo:ra", "on_compact", "", "Re-verify offline tests after compaction", "user").unwrap();
+        let mut st = "running".to_string();
+        let mut dirty = false;
+        apply_event(&ctx, "std_c", &json!({"type": "context.compacted"}), &mut st, &mut dirty);
+        let q_std = crate::library::take_agent_reminders("std_c").expect("Standard agent gets compaction reminder");
+        assert!(q_std.contains("Re-verify offline tests after compaction"), "{q_std}");
+        apply_event(&ctx, "str_c", &json!({"type": "context.compacted"}), &mut st, &mut dirty);
+        assert!(crate::library::take_agent_reminders("str_c").is_none());
     }
 }
 

@@ -230,6 +230,7 @@ fn relocate(ctx: &Arc<Ctx>, id: &str, path: &str) -> Result<Value, String> {
         params![id, ds, remote, roots.join(",")],
     )?;
     ctx.log_event("repo_relocated", None, &json!({"id":id,"from":old_path,"to":ds}));
+    crate::library::sync_imported_repo_scopes(ctx);
     invalidate_status_cache();
     ctx.emit("workspace:changed", json!({"repo_id":id}));
     ctx.notify("workspace");
@@ -279,6 +280,7 @@ fn add_repo(ctx: &Arc<Ctx>, path: &str) -> Result<Value, String> {
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     ctx.db.exec("INSERT INTO repos(id,name,path,default_branch,remote_url,added_at) VALUES(?1,?2,?3,?4,?5,?6)", params![id,name,path_str,branch,remote,now()])?;
     let _ = ctx.db.exec("UPDATE repos SET root_commits=?2 WHERE id=?1", params![id, repo_identity(&path).0.join(",")]);
+    crate::library::sync_imported_repo_scopes(ctx);
     changed(ctx);
     repo(ctx, &id).ok_or_else(|| "Repository registration failed".into())
 }

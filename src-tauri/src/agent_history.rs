@@ -7,7 +7,7 @@ const MAX_EVENT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PAGE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_ATTACHMENT_BYTES: usize = 8 * 1024 * 1024;
 
-pub(super) fn events(ctx: &Ctx, raw: &str, after: i64, limit: i64) -> Result<Value, String> {
+pub(crate) fn events(ctx: &Ctx, raw: &str, after: i64, limit: i64) -> Result<Value, String> {
     let Some((path, session)) = locate(ctx, raw)? else { return Ok(json!([])) };
     with_db(&path, |db| read_events(db, &session, after, limit)).map_err(|e| {
         format!("Saved conversation unavailable: {e}. Retry, or restore the agent's saved HAL data.")

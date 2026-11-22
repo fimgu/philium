@@ -1,35 +1,42 @@
 //! Philium's skills, provenance-backed memory core, and zero-LLM context slate builder.
 //!
-//! Design grounded in the Philium memory architecture:
-//! - Raw turns/events remain authoritative; memories are curated derived claims linked by provenance.
+//! Design grounded in the Philium v1 memory blueprint:
+//! - Raw turns/events remain authoritative; memories are curated derived claims linked by `source_event_id`.
 //! - Trust tiers (`user_direct`, `verified_run`, `agent_inferred`, `untrusted`) prevent tool output
 //!   or agent guesses from overwriting operator decisions (MemPoison defense).
 //! - Code-level conflict resolution (`fact_key` + `supersedes_id` + `status`) resolves contradictions
 //!   before prompt injection while preserving historical records (Trust Gap / LEDGER / CALM).
-//! - Hard deletion scrubs deleted content so it can never resurface in search or slates.
-//! - Zero-LLM budgeted slate builder (`build_context_slate`) enforces scope ownership first, caps
-//!   untrusted items, and greedily fills to a per-model token budget `B`.
-//! - Structured `working_notes` provide lightweight cross-session handoffs (requirements, decisions,
-//!   failed attempts, next steps) per repository or agent.
+//! - Hard deletion scrubs deleted content from memories, FTS5, vectors, and referenced raw event records.
+//! - Hybrid retrieval uses SQLite FTS5 BM25 + real neural embeddings (via configured local runtime or
+//!   Philium gateway `/embeddings`, version-pinned in `memory_vectors`) merged with pure RRF (`k=60`)
+//!   and NO provenance weighting in retrieval. When no embedding backend is configured, retrieval
+//!   honestly falls back to `bm25_only`.
+//! - Zero-LLM budgeted slate builder (`build_context_slate`) enforces scope ownership before and after
+//!   retrieval, preserves relevance order, caps untrusted items, and greedily fills to per-model budget `B`.
+//! - Structured `working_notes` and pipeline-side session observation notes provide cross-session handoffs.
 //!
 //! rpc (`library.*`):
-//!   status {}, import {}, skills {}, memories {q?, repo_id?, limit?},
+//!   status {}, import {}, reindex {}, observe_session {agent_id}, skills {},
+//!   memories {q?, repo_id?, limit?},
 //!   list {scope?, status?, trust_tier?, q?, limit?},
 //!   save {content, category, scope?, repo_id?, fact_key?, supersedes_id?, trust_tier?, provenance?, source_event_id?},
 //!   promote {id}, quarantine {id, reason?}, supersede {old_id, content, category?, provenance?},
 //!   forget {id}, rules_get {}, rules_set {rules},
-//!   working_note_get {scope?, repo_id?}, working_note_set {scope?, repo_id?, requirements?, decisions?, failed_attempts?, next_steps?, source_event_id?},
-//!   context_slate {repo_id?, q?, budget_tokens?, strict?, include_global?},
+//!   working_note_get {scope?, repo_id?},
+//!   working_note_set {scope?, repo_id?, requirements?, decisions?, failed_attempts?, next_steps?, source_event_id?},
+//!   context_slate {repo_id?, q?, budget_tokens?, model_ref?, strict?, include_global?, triggers?},
+//!   intentions {scope?, repo_id?}, intention_add {scope?, repo_id?, trigger_kind, trigger_match?, instruction},
+//!   intention_remove {id}, consolidate_preview {scope?, repo_id?}, consolidate_promote {id},
 //!   sessions {q?, project?, repo_only?, limit?}
 use crate::{ctx::Ctx, db::now};
 use rusqlite::params;
 use serde_json::{json, Value};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
 
 const MAX_SKILL_FILE: u64 = 64 * 1024;
@@ -38,9 +45,12 @@ const MAX_UNTRUSTED_PER_SLATE: usize = 2;
 const MAX_WORKING_NOTE_PROMPT_BYTES: usize = 2048;
 const MAX_REMINDERS_PROMPT_BYTES: usize = 2048;
 const SESSION_CACHE_CAP: usize = 512;
-const LOCAL_EMBED_MODEL: &str = "philium-local-ngram-256-v1";
-const LOCAL_EMBED_DIM: usize = 256;
+const VECTOR_SCOPE_CACHE_CAP: usize = 64;
+const QUERY_EMBED_CACHE_CAP: usize = 256;
+const NEURAL_COSINE_MIN: f32 = 0.25;
+const CONSOLIDATE_COSINE_MIN: f32 = 0.90;
 const RRF_K: f64 = 60.0;
+const RRF_POOL_LIMIT: i64 = 128;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS skills (
@@ -133,6 +143,11 @@ fn migrate_columns(ctx: &Ctx) -> Result<(), String> {
         "UPDATE memories SET trust_tier='agent_inferred' WHERE source LIKE 'agent:%' AND trust_tier='user_direct' AND updated_at IS NULL",
         [],
     );
+    // Remove legacy fake n-gram vectors so they can never pollute neural cosine retrieval.
+    let _ = ctx.db.exec(
+        "DELETE FROM memory_vectors WHERE model_version = 'philium-local-ngram-256-v1'",
+        [],
+    );
     let _ = ctx.db.exec("CREATE INDEX IF NOT EXISTS memories_status ON memories(status, active)", []);
     let _ = ctx.db.exec("CREATE INDEX IF NOT EXISTS memories_fact_key ON memories(scope, fact_key)", []);
     Ok(())
@@ -152,35 +167,134 @@ pub const DEFAULT_RULES: &str = "\
 - Use your skills: skill_list shows them, skill_get loads one. Use memory_slate or memory_search before asking Filip something he may have told you before, and memory_save for durable preferences or corrections he gives you.
 ";
 
-/// Deterministic offline 256-dim L2-normalized character 3-gram + token projection vector.
-/// Pinned to `LOCAL_EMBED_MODEL` so index versions never drift silently across upgrades.
-fn embed_local(text: &str) -> Vec<f32> {
-    let mut v = vec![0.0f32; LOCAL_EMBED_DIM];
-    let lower = text.to_lowercase();
-    let mut add_feat = |feat: &str, weight: f32| {
-        let mut h: u64 = 0xcbf29ce484222325;
-        for b in feat.as_bytes() {
-            h ^= *b as u64;
-            h = h.wrapping_mul(0x100000001b3);
-        }
-        let idx = (h as usize) % LOCAL_EMBED_DIM;
-        let sign = if ((h >> 32) & 1) == 0 { 1.0 } else { -1.0 };
-        v[idx] += sign * weight;
-    };
-    for tok in lower.split(|c: char| !c.is_alphanumeric()).filter(|t| t.len() >= 2) {
-        add_feat(tok, 2.0);
-        // Simple morphological stem prefix for paraphrase/inflection recall.
-        if tok.len() >= 5 {
-            add_feat(&tok[..tok.len().min(6)], 1.2);
-        }
-        let chars: Vec<char> = tok.chars().collect();
-        if chars.len() >= 3 {
-            for w in chars.windows(3) {
-                let tri: String = w.iter().collect();
-                add_feat(&tri, 0.7);
+// ---------- Real Neural Embeddings + Per-Scope Vector Cache ----------
+
+#[derive(Debug, Clone)]
+pub struct EmbeddingConfig {
+    pub endpoint_url: String,
+    pub auth_token: Option<String>,
+    pub model: String,
+    pub model_version: String,
+}
+
+fn embed_http_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .no_proxy()
+            .connect_timeout(Duration::from_secs(3))
+            .timeout(Duration::from_secs(12))
+            .build()
+            .unwrap_or_default()
+    })
+}
+
+fn is_loopback_url(raw: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(raw) else { return false };
+    matches!(url.scheme(), "http" | "https")
+        && matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"))
+}
+
+fn is_embedding_model_id(id: &str) -> bool {
+    let l = id.to_ascii_lowercase();
+    l.contains("bge-m3")
+        || l.contains("qwen3-embedding")
+        || l.contains("bge-small")
+        || l.contains("bge-base")
+        || l.contains("bge-large")
+        || l.contains("nomic-embed")
+        || l.contains("text-embedding")
+        || l.contains("embeddinggemma")
+        || l.contains("embed")
+}
+
+fn embedding_model_priority(id: &str) -> u8 {
+    let l = id.to_ascii_lowercase();
+    if l.contains("bge-m3") {
+        0
+    } else if l.contains("qwen3-embedding") {
+        1
+    } else if l.contains("bge-small") || l.contains("bge-base") {
+        2
+    } else if l.contains("nomic-embed") {
+        3
+    } else if l.contains("text-embedding") {
+        4
+    } else {
+        5
+    }
+}
+
+/// Resolve an active neural embedding backend from settings or configured trusted providers.
+/// Remote providers always route through Philium's gateway (`/p/<provider>/embeddings`).
+/// Direct endpoints are restricted strictly to localhost/loopback runtimes (e.g. llama-server, Ollama).
+/// Returns `None` when no embedding model is available (honest lexical-only FTS5 fallback).
+pub fn resolve_embedding_config(ctx: &Ctx) -> Option<EmbeddingConfig> {
+    // 1. Explicit provider + model routed through Philium's gateway.
+    let explicit_provider = ctx.db.kv_get("setting.embedding_provider").unwrap_or_default();
+    let explicit_model = ctx.db.kv_get("setting.embedding_model").unwrap_or_default();
+    if !explicit_provider.trim().is_empty() && !explicit_model.trim().is_empty() {
+        let pid = explicit_provider.trim();
+        let mid = explicit_model.trim();
+        if let Some(p) = crate::providers::get(ctx, pid) {
+            if p.enabled && p.trusted {
+                return Some(EmbeddingConfig {
+                    endpoint_url: format!("{}/p/{}/embeddings", ctx.gateway_url.trim_end_matches('/'), p.id),
+                    auth_token: Some(ctx.gateway.token.clone()),
+                    model: mid.to_string(),
+                    model_version: format!("gateway:{}:{}", p.id, mid),
+                });
             }
         }
     }
+
+    // 2. Explicit local loopback runtime endpoint (Ollama / llama.cpp / vLLM / MLX).
+    let explicit_endpoint = ctx.db.kv_get("setting.embedding_endpoint").unwrap_or_default();
+    if !explicit_endpoint.trim().is_empty() && !explicit_model.trim().is_empty() {
+        let ep = explicit_endpoint.trim();
+        if is_loopback_url(ep) {
+            let mid = explicit_model.trim();
+            let auth = ctx.db.kv_get("setting.embedding_api_key").filter(|s| !s.trim().is_empty());
+            return Some(EmbeddingConfig {
+                endpoint_url: ep.to_string(),
+                auth_token: auth,
+                model: mid.to_string(),
+                model_version: format!("local:{mid}"),
+            });
+        }
+    }
+
+    // 3. Auto-discover an embedding model on any enabled trusted OpenAI-compatible provider via gateway.
+    let providers = crate::providers::all(ctx);
+    let mut best: Option<(u8, String, String)> = None;
+    for p in providers {
+        if !p.enabled || !p.trusted || !matches!(p.kind, crate::providers::Kind::OpenaiChat | crate::providers::Kind::OpenaiResponses) {
+            continue;
+        }
+        let rows = ctx
+            .db
+            .query("SELECT model_id FROM models WHERE provider_id=?1 AND enabled=1", [&p.id])
+            .unwrap_or_default();
+        for r in rows {
+            let Some(mid) = r["model_id"].as_str() else { continue };
+            if !is_embedding_model_id(mid) {
+                continue;
+            }
+            let prio = embedding_model_priority(mid);
+            if best.as_ref().is_none_or(|(bp, _, _)| prio < *bp) {
+                best = Some((prio, p.id.clone(), mid.to_string()));
+            }
+        }
+    }
+    best.map(|(_, pid, mid)| EmbeddingConfig {
+        endpoint_url: format!("{}/p/{}/embeddings", ctx.gateway_url.trim_end_matches('/'), pid),
+        auth_token: Some(ctx.gateway.token.clone()),
+        model: mid.clone(),
+        model_version: format!("gateway:{pid}:{mid}"),
+    })
+}
+
+fn normalize_l2(mut v: Vec<f32>) -> Vec<f32> {
     let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm > 1e-8 {
         for x in &mut v {
@@ -211,45 +325,231 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
 
-fn upsert_memory_vector(ctx: &Ctx, memory_id: &str, content: &str) {
-    let v = embed_local(content);
-    let blob = vec_to_bytes(&v);
-    let _ = ctx.db.exec(
+/// Request L2-normalized neural embeddings from an OpenAI-compatible `/embeddings` endpoint.
+pub async fn embed_texts_async(cfg: &EmbeddingConfig, inputs: &[String]) -> Result<Vec<Vec<f32>>, String> {
+    if inputs.is_empty() {
+        return Ok(vec![]);
+    }
+    let mut req = embed_http_client()
+        .post(&cfg.endpoint_url)
+        .json(&json!({ "model": cfg.model, "input": inputs }));
+    if let Some(ref tok) = cfg.auth_token {
+        req = req.bearer_auth(tok);
+    }
+    let resp = req.send().await.map_err(|e| format!("embedding request failed: {e}"))?;
+    if !resp.status().is_success() {
+        let code = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("embedding endpoint HTTP {code}: {}", body.chars().take(200).collect::<String>()));
+    }
+    let v: Value = resp.json().await.map_err(|e| format!("invalid embedding JSON: {e}"))?;
+    let data = v["data"].as_array().ok_or_else(|| "embedding response missing `data` array".to_string())?;
+    let mut indexed: Vec<(usize, Vec<f32>)> = Vec::with_capacity(data.len());
+    for (pos, item) in data.iter().enumerate() {
+        let idx = item["index"].as_u64().map(|n| n as usize).unwrap_or(pos);
+        let arr = item["embedding"]
+            .as_array()
+            .ok_or_else(|| "embedding entry missing `embedding` array".to_string())?;
+        let vec: Vec<f32> = arr
+            .iter()
+            .map(|x| x.as_f64().map(|f| f as f32).ok_or_else(|| "non-numeric embedding value".to_string()))
+            .collect::<Result<Vec<f32>, String>>()?;
+        if vec.is_empty() {
+            return Err("embedding vector is empty".into());
+        }
+        indexed.push((idx, normalize_l2(vec)));
+    }
+    indexed.sort_by_key(|(idx, _)| *idx);
+    let out: Vec<Vec<f32>> = indexed.into_iter().map(|(_, vec)| vec).collect();
+    if out.len() != inputs.len() {
+        return Err(format!("embedding count mismatch: expected {}, got {}", inputs.len(), out.len()));
+    }
+    Ok(out)
+}
+
+type ScopeCacheKey = (PathBuf, String, bool, String);
+type CachedScopeVectors = Vec<(String, Vec<f32>)>;
+
+fn scope_vector_cache() -> &'static Mutex<HashMap<ScopeCacheKey, CachedScopeVectors>> {
+    static C: OnceLock<Mutex<HashMap<ScopeCacheKey, CachedScopeVectors>>> = OnceLock::new();
+    C.get_or_init(Default::default)
+}
+
+fn query_embed_cache() -> &'static Mutex<HashMap<(String, String), Vec<f32>>> {
+    static C: OnceLock<Mutex<HashMap<(String, String), Vec<f32>>>> = OnceLock::new();
+    C.get_or_init(Default::default)
+}
+
+fn invalidate_vector_cache(ctx: &Ctx) {
+    let mut g = scope_vector_cache().lock().unwrap_or_else(|e| e.into_inner());
+    g.retain(|(dir, _, _, _), _| dir != &ctx.data_dir);
+}
+
+fn store_memory_vector(ctx: &Ctx, memory_id: &str, model_version: &str, vec: &[f32]) -> Result<(), String> {
+    if vec.is_empty() {
+        return Ok(());
+    }
+    let blob = vec_to_bytes(vec);
+    ctx.db.exec(
         "INSERT INTO memory_vectors(memory_id, model_version, dim, vec, updated_at)
          VALUES(?1, ?2, ?3, ?4, datetime('now'))
          ON CONFLICT(memory_id) DO UPDATE SET model_version=excluded.model_version, dim=excluded.dim, vec=excluded.vec, updated_at=datetime('now')",
-        params![memory_id, LOCAL_EMBED_MODEL, LOCAL_EMBED_DIM as i64, blob],
-    );
+        params![memory_id, model_version, vec.len() as i64, blob],
+    )?;
+    invalidate_vector_cache(ctx);
+    Ok(())
 }
 
-/// Ensure all active memories have a vector matching the pinned embedding version.
-fn ensure_vectors_synced(ctx: &Ctx) {
-    let missing = ctx
-        .db
-        .query(
-            "SELECT m.id, m.content FROM memories m
-             LEFT JOIN memory_vectors v ON v.memory_id = m.id
-             WHERE m.active=1 AND m.status='active' AND (v.memory_id IS NULL OR v.model_version != ?1)
-             LIMIT 500",
-            [LOCAL_EMBED_MODEL],
-        )
-        .unwrap_or_default();
-    for r in missing {
-        if let (Some(id), Some(content)) = (r["id"].as_str(), r["content"].as_str()) {
-            upsert_memory_vector(ctx, id, content);
+/// Embed a single memory via the active neural embedding backend and persist it in `memory_vectors`.
+/// No-op when no embedding backend is configured. Keeps SQLite write off Tokio worker threads.
+pub async fn embed_memory_async(ctx: &Arc<Ctx>, memory_id: &str, content: &str) -> Result<bool, String> {
+    let Some(cfg) = resolve_embedding_config(ctx) else {
+        return Ok(false);
+    };
+    let vecs = embed_texts_async(&cfg, &[content.to_string()]).await?;
+    let Some(vec) = vecs.into_iter().next() else {
+        return Ok(false);
+    };
+    let (c, mid, mv) = (ctx.clone(), memory_id.to_string(), cfg.model_version);
+    tokio::task::spawn_blocking(move || store_memory_vector(&c, &mid, &mv, &vec))
+        .await
+        .map_err(|e| e.to_string())??;
+    Ok(true)
+}
+
+/// Embed a query string using the active neural backend (with bounded in-memory caching).
+async fn embed_query_cached(ctx: &Ctx, q: &str) -> Option<(String, Vec<f32>)> {
+    let trimmed = q.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let cfg = resolve_embedding_config(ctx)?;
+    let key = (cfg.model_version.clone(), trimmed.to_string());
+    {
+        let cache = query_embed_cache().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(hit) = cache.get(&key) {
+            return Some((cfg.model_version, hit.clone()));
         }
     }
+    let vec = embed_texts_async(&cfg, &[trimmed.to_string()]).await.ok()?.into_iter().next()?;
+    let mut cache = query_embed_cache().lock().unwrap_or_else(|e| e.into_inner());
+    if cache.len() >= QUERY_EMBED_CACHE_CAP {
+        cache.clear();
+    }
+    cache.insert(key, vec.clone());
+    Some((cfg.model_version, vec))
+}
+
+/// Re-embed all active memories missing a vector for the currently pinned embedding model version.
+/// Never mixes vectors from different model versions. Runs DB work on blocking threads.
+pub async fn sync_vectors_async(ctx: &Arc<Ctx>) -> Result<Value, String> {
+    let Some(cfg) = resolve_embedding_config(ctx) else {
+        return Ok(json!({ "embed_model": Value::Null, "indexed": 0, "mode": "bm25_only" }));
+    };
+    let (c_read, mv_read) = (ctx.clone(), cfg.model_version.clone());
+    let missing: Vec<(String, String)> = tokio::task::spawn_blocking(move || {
+        c_read
+            .db
+            .query(
+                "SELECT m.id, m.content FROM memories m
+                 LEFT JOIN memory_vectors v ON v.memory_id = m.id
+                 WHERE m.active=1 AND m.status='active' AND (v.memory_id IS NULL OR v.model_version != ?1)",
+                [mv_read],
+            )
+            .map(|rows| {
+                rows.into_iter()
+                    .filter_map(|r| Some((r["id"].as_str()?.to_string(), r["content"].as_str()?.to_string())))
+                    .collect()
+            })
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    let mut indexed = 0usize;
+    for chunk in missing.chunks(32) {
+        let texts: Vec<String> = chunk.iter().map(|(_, txt)| txt.clone()).collect();
+        let vecs = embed_texts_async(&cfg, &texts).await?;
+        let pairs: Vec<(String, Vec<f32>)> = chunk.iter().map(|(id, _)| id.clone()).zip(vecs).collect();
+        let (c_write, mv_write) = (ctx.clone(), cfg.model_version.clone());
+        let batch_n = tokio::task::spawn_blocking(move || -> Result<usize, String> {
+            c_write.db.with(|conn| {
+                let tx = conn.unchecked_transaction()?;
+                for (mid, vec) in &pairs {
+                    let blob = vec_to_bytes(vec);
+                    tx.execute(
+                        "INSERT INTO memory_vectors(memory_id, model_version, dim, vec, updated_at)
+                         VALUES(?1, ?2, ?3, ?4, datetime('now'))
+                         ON CONFLICT(memory_id) DO UPDATE SET model_version=excluded.model_version, dim=excluded.dim, vec=excluded.vec, updated_at=datetime('now')",
+                        params![mid, mv_write, vec.len() as i64, blob],
+                    )?;
+                }
+                tx.commit()?;
+                Ok(pairs.len())
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        indexed += batch_n;
+    }
+    invalidate_vector_cache(ctx);
+    Ok(json!({
+        "embed_model": cfg.model_version,
+        "indexed": indexed,
+        "mode": "hybrid_bm25_dense_rrf",
+    }))
+}
+
+fn load_scope_vectors_cached(
+    ctx: &Ctx,
+    scope: &str,
+    include_global: bool,
+    model_version: &str,
+) -> Result<CachedScopeVectors, String> {
+    let key = (ctx.data_dir.clone(), scope.to_string(), include_global, model_version.to_string());
+    {
+        let cache = scope_vector_cache().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(hit) = cache.get(&key) {
+            return Ok(hit.clone());
+        }
+    }
+    // Load ALL active vectors for the authorized scope matching the exact pinned model_version (NO LIMIT 256).
+    let loaded = ctx.db.with(|c| -> rusqlite::Result<CachedScopeVectors> {
+        let mut stmt = c.prepare(
+            "SELECT m.id, v.vec
+             FROM memories m
+             JOIN memory_vectors v ON v.memory_id = m.id AND v.model_version = ?3
+             WHERE m.active=1 AND m.status='active' AND ((?2 AND m.scope='global') OR m.scope=?1)",
+        )?;
+        let rows = stmt.query_map(params![scope, include_global, model_version], |r| {
+            let id: String = r.get(0)?;
+            let blob: Vec<u8> = r.get(1)?;
+            Ok((id, bytes_to_vec(&blob)))
+        })?;
+        let mut out = Vec::new();
+        for row in rows.flatten() {
+            if !row.1.is_empty() {
+                out.push(row);
+            }
+        }
+        Ok(out)
+    })?;
+    let mut cache = scope_vector_cache().lock().unwrap_or_else(|e| e.into_inner());
+    if cache.len() >= VECTOR_SCOPE_CACHE_CAP {
+        cache.clear();
+    }
+    cache.insert(key, loaded.clone());
+    Ok(loaded)
 }
 
 pub fn init(ctx: &Arc<Ctx>) -> Result<(), String> {
     ctx.db.with(|c| c.execute_batch(SCHEMA))?;
     migrate_columns(ctx)?;
-    ensure_vectors_synced(ctx);
+    sync_imported_repo_scopes(ctx);
     if !crate::pilot::active() && ctx.db.kv_get("library.imported_at").is_none() {
         let c = ctx.clone();
         std::thread::spawn(move || {
             let r = import(&c, &home());
-            ensure_vectors_synced(&c);
+            sync_imported_repo_scopes(&c);
             c.log_event("library:import", None, &r.unwrap_or_else(|e| json!({ "error": e })));
         });
     }
@@ -283,6 +583,58 @@ fn jcode_project_hash(p: &Path) -> String {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     p.hash(&mut h);
     format!("{:016x}", h.finish())
+}
+
+/// Map registered repos by path (both stored and canonicalized) -> repo_id.
+fn registered_repo_map(ctx: &Ctx) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    let rows = ctx.db.query("SELECT id, path FROM repos", []).unwrap_or_default();
+    for r in rows {
+        let (Some(id), Some(path)) = (r["id"].as_str(), r["path"].as_str()) else { continue };
+        map.insert(path.to_string(), id.to_string());
+        if let Ok(canon) = std::fs::canonicalize(path) {
+            map.insert(canon.to_string_lossy().into_owned(), id.to_string());
+        }
+    }
+    map
+}
+
+/// Rebind any imported `project:<abs_path>` or `jcode:<hash>` memories to their registered `repo:<id>`
+/// scope so Standard agents can retrieve them via `memory_search` and `memory_slate`.
+pub fn sync_imported_repo_scopes(ctx: &Ctx) -> usize {
+    let rows = ctx.db.query("SELECT id, path FROM repos", []).unwrap_or_default();
+    if rows.is_empty() {
+        return 0;
+    }
+    let mut migrated = 0usize;
+    for r in rows {
+        let (Some(repo_id), Some(repo_path)) = (r["id"].as_str(), r["path"].as_str()) else { continue };
+        let target_scope = format!("repo:{repo_id}");
+        let mut old_scopes = vec![
+            format!("project:{repo_path}"),
+            format!("jcode:{}", jcode_project_hash(Path::new(repo_path))),
+        ];
+        if let Ok(canon) = std::fs::canonicalize(repo_path) {
+            let cs = canon.to_string_lossy().into_owned();
+            if cs != repo_path {
+                old_scopes.push(format!("project:{cs}"));
+                old_scopes.push(format!("jcode:{}", jcode_project_hash(&canon)));
+            }
+        }
+        for old_scope in old_scopes {
+            if let Ok(n) = ctx.db.exec(
+                "UPDATE memories SET scope=?1, updated_at=COALESCE(updated_at, datetime('now')) WHERE scope=?2",
+                params![target_scope, old_scope],
+            ) {
+                migrated += n;
+            }
+        }
+    }
+    if migrated > 0 {
+        invalidate_vector_cache(ctx);
+        ctx.notify("library");
+    }
+    migrated
 }
 
 /// Candidate project paths so hashed Jcode project files map back to real repos.
@@ -335,7 +687,8 @@ pub fn import(ctx: &Arc<Ctx>, home: &Path) -> Result<Value, String> {
     }
 
     let mem = home.join(".jcode/memory");
-    let projects: std::collections::HashMap<String, String> = known_projects(ctx, home)
+    let repo_by_path = registered_repo_map(ctx);
+    let projects: HashMap<String, String> = known_projects(ctx, home)
         .into_iter()
         .map(|p| (jcode_project_hash(&p), p.to_string_lossy().into_owned()))
         .collect();
@@ -347,7 +700,20 @@ pub fn import(ctx: &Arc<Ctx>, home: &Path) -> Result<Value, String> {
                 continue;
             }
             let hash = p.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
-            let scope = projects.get(&hash).cloned().map(|p| format!("project:{p}")).unwrap_or(format!("jcode:{hash}"));
+            let scope = match projects.get(&hash) {
+                Some(proj_path) => {
+                    let matched_repo = repo_by_path.get(proj_path).cloned().or_else(|| {
+                        std::fs::canonicalize(proj_path)
+                            .ok()
+                            .and_then(|c| repo_by_path.get(c.to_string_lossy().as_ref()).cloned())
+                    });
+                    match matched_repo {
+                        Some(repo_id) => format!("repo:{repo_id}"),
+                        None => format!("project:{proj_path}"),
+                    }
+                }
+                None => format!("jcode:{hash}"),
+            };
             files.push((p, scope));
         }
     }
@@ -374,6 +740,7 @@ pub fn import(ctx: &Arc<Ctx>, home: &Path) -> Result<Value, String> {
             tx.commit()
         })?;
     }
+    invalidate_vector_cache(ctx);
     ctx.db.kv_set("library.imported_at", &now().to_string())?;
     Ok(json!({ "skills": skills, "memories": memories }))
 }
@@ -475,6 +842,7 @@ pub struct SaveOpts<'a> {
 /// - Trust tier enforcement (agents cannot silently override `user_direct` facts).
 /// - Code-level supersession by `fact_key` or explicit `supersedes_id` (preserving historical records).
 /// - Quarantine for `untrusted` records so tool outputs are never treated as instructions.
+/// - Durable `source_event_id` provenance linked to the authoritative event log.
 pub fn save_structured(ctx: &Ctx, opts: SaveOpts<'_>) -> Result<Value, String> {
     let content = opts.content.trim();
     if content.is_empty() || content.len() > 4000 {
@@ -531,6 +899,28 @@ pub fn save_structured(ctx: &Ctx, opts: SaveOpts<'_>) -> Result<Value, String> {
     let active: i64 = if status == "active" { 1 } else { 0 };
     let id = format!("mem_{}", crate::db::new_id());
 
+    // Authoritative event-log provenance: always anchor writes to an event record if caller omitted one.
+    let owned_event_id = match opts.source_event_id.filter(|s| !s.trim().is_empty()) {
+        Some(eid) => Some(eid.to_string()),
+        None => {
+            let agent_tag = opts.source.strip_prefix("agent:").or_else(|| opts.source.strip_prefix("pipeline:"));
+            ctx.log_event_id(
+                "memory:write",
+                agent_tag,
+                &json!({
+                    "memory_id": id,
+                    "scope": opts.scope,
+                    "category": opts.category,
+                    "trust_tier": opts.trust_tier,
+                    "status": status,
+                    "fact_key": fact_key,
+                    "source": opts.source,
+                    "provenance": opts.provenance,
+                }),
+            )
+        }
+    };
+
     ctx.db.with(|c| {
         let tx = c.unchecked_transaction()?;
         if status == "active" {
@@ -539,6 +929,7 @@ pub fn save_structured(ctx: &Ctx, opts: SaveOpts<'_>) -> Result<Value, String> {
                     "UPDATE memories SET active=0, status='superseded', updated_at=datetime('now') WHERE id=?1",
                     [old_id],
                 )?;
+                let _ = tx.execute("DELETE FROM memory_vectors WHERE memory_id=?1", [old_id]);
             }
         }
         tx.execute(
@@ -555,15 +946,13 @@ pub fn save_structured(ctx: &Ctx, opts: SaveOpts<'_>) -> Result<Value, String> {
                 status,
                 fact_key,
                 supersedes_id,
-                opts.source_event_id,
+                owned_event_id,
                 opts.provenance,
             ],
         )?;
         tx.commit()
     })?;
-    if status == "active" {
-        upsert_memory_vector(ctx, &id, content);
-    }
+    invalidate_vector_cache(ctx);
     ctx.notify("library");
     Ok(json!({
         "id": id,
@@ -573,20 +962,59 @@ pub fn save_structured(ctx: &Ctx, opts: SaveOpts<'_>) -> Result<Value, String> {
         "fact_key": fact_key,
         "supersedes_id": supersedes_id,
         "superseded_ids": to_supersede,
+        "source_event_id": owned_event_id,
     }))
 }
 
-/// FTS + local dense vector hybrid search (Reciprocal Rank Fusion k=60) over active, non-deleted,
-/// non-superseded memories in global scope plus the given project/repo.
+/// FTS5 + neural dense vector hybrid search (pure Reciprocal Rank Fusion k=60, zero provenance weighting).
+/// Falls back honestly to `bm25_only` when no neural embedding model is configured or available.
+#[cfg(test)]
 pub fn memory_search(ctx: &Ctx, q: &str, project: Option<&str>, limit: i64) -> Result<Value, String> {
-    search_scope(ctx, q, &project.map(|p| format!("project:{p}")).unwrap_or_default(), true, limit)
+    let scope = project.map(|p| format!("project:{p}")).unwrap_or_default();
+    let (items, _, _) = search_scope_core(ctx, q, &scope, true, limit, None)?;
+    Ok(Value::Array(items))
 }
 
+#[cfg(test)]
 pub fn agent_memories(ctx: &Ctx, q: &str, repo_id: &str, limit: i64) -> Result<Value, String> {
-    search_scope(ctx, q, &format!("repo:{repo_id}"), false, limit)
+    let (items, _, _) = search_scope_core(ctx, q, &format!("repo:{repo_id}"), false, limit, None)?;
+    Ok(Value::Array(items))
 }
 
-fn search_scope(ctx: &Ctx, q: &str, scope: &str, include_global: bool, limit: i64) -> Result<Value, String> {
+pub async fn memory_search_async(ctx: &Arc<Ctx>, q: &str, project: Option<&str>, limit: i64) -> Result<Value, String> {
+    let scope = project.map(|p| format!("project:{p}")).unwrap_or_default();
+    let q_embed = embed_query_cached(ctx, q).await;
+    let (c, q_owned) = (ctx.clone(), q.to_string());
+    let items = tokio::task::spawn_blocking(move || {
+        let q_ref = q_embed.as_ref().map(|(mv, v)| (mv.as_str(), v.as_slice()));
+        search_scope_core(&c, &q_owned, &scope, true, limit, q_ref).map(|(rows, _, _)| rows)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    Ok(Value::Array(items))
+}
+
+pub async fn agent_memories_async(ctx: &Arc<Ctx>, q: &str, repo_id: &str, limit: i64) -> Result<Value, String> {
+    let scope = format!("repo:{repo_id}");
+    let q_embed = embed_query_cached(ctx, q).await;
+    let (c, q_owned) = (ctx.clone(), q.to_string());
+    let items = tokio::task::spawn_blocking(move || {
+        let q_ref = q_embed.as_ref().map(|(mv, v)| (mv.as_str(), v.as_slice()));
+        search_scope_core(&c, &q_owned, &scope, false, limit, q_ref).map(|(rows, _, _)| rows)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    Ok(Value::Array(items))
+}
+
+fn search_scope_core(
+    ctx: &Ctx,
+    q: &str,
+    scope: &str,
+    include_global: bool,
+    limit: i64,
+    query_embed: Option<(&str, &[f32])>,
+) -> Result<(Vec<Value>, &'static str, Option<String>), String> {
     let terms: Vec<String> = q
         .split(|c: char| !c.is_alphanumeric())
         .filter(|t| t.len() > 1)
@@ -594,96 +1022,125 @@ fn search_scope(ctx: &Ctx, q: &str, scope: &str, include_global: bool, limit: i6
         .map(|t| format!("\"{t}\""))
         .collect();
     let limit = limit.clamp(1, 50);
+    let active_embed_model = query_embed
+        .map(|(mv, _)| mv.to_string())
+        .or_else(|| resolve_embedding_config(ctx).map(|c| c.model_version));
+
     if terms.is_empty() {
-        return Ok(json!(ctx.db.query(
-            "SELECT id,scope,category,content,trust_tier,status,fact_key,supersedes_id,source,provenance,created_at
+        let rows = ctx.db.query(
+            "SELECT id,scope,category,content,trust_tier,status,fact_key,supersedes_id,source,source_event_id,provenance,created_at,updated_at
              FROM memories
              WHERE active=1 AND status='active' AND ((?3 AND scope='global') OR scope=?1)
-             ORDER BY (trust_tier='user_direct') DESC, (category='correction') DESC, created_at DESC LIMIT ?2",
+             ORDER BY (scope=?1) DESC, COALESCE(updated_at, created_at) DESC LIMIT ?2",
             params![scope, limit, include_global],
-        )?));
+        )?;
+        return Ok((rows, "browse", active_embed_model));
     }
 
     // 1. Lexical candidates (SQLite FTS5 BM25), strictly ownership-filtered BEFORE ranking.
+    // Pure BM25 ordering — zero provenance/trust weighting in retrieval (Utility Under Attack / blueprint §3).
     let bm25_rows = ctx.db.query(
-        "SELECT m.id,m.scope,m.category,m.content,m.trust_tier,m.status,m.fact_key,m.supersedes_id,m.source,m.provenance,m.created_at
+        "SELECT m.id,m.scope,m.category,m.content,m.trust_tier,m.status,m.fact_key,m.supersedes_id,m.source,m.source_event_id,m.provenance,m.created_at,m.updated_at
          FROM memories_fts f JOIN memories m ON m.rowid=f.rowid
          WHERE memories_fts MATCH ?1 AND m.active=1 AND m.status='active' AND ((?3 AND m.scope='global') OR m.scope=?2)
-         ORDER BY (m.trust_tier='user_direct') DESC, (m.category='correction') DESC, bm25(memories_fts) LIMIT 64",
-        params![terms.join(" OR "), scope, include_global],
+         ORDER BY bm25(memories_fts) LIMIT ?4",
+        params![terms.join(" OR "), scope, include_global, RRF_POOL_LIMIT],
     )?;
 
-    // 2. Dense local cosine candidates within the exact same authorized scope.
-    let q_vec = embed_local(q);
-    let mut dense_scored: Vec<(f32, Value)> = ctx
-        .db
-        .with(|c| -> rusqlite::Result<Vec<(f32, Value)>> {
-            let mut stmt = c.prepare(
-                "SELECT m.id,m.scope,m.category,m.content,m.trust_tier,m.status,m.fact_key,m.supersedes_id,m.source,m.provenance,m.created_at,v.vec
-                 FROM memories m
-                 LEFT JOIN memory_vectors v ON v.memory_id = m.id AND v.model_version = ?3
-                 WHERE m.active=1 AND m.status='active' AND ((?2 AND m.scope='global') OR m.scope=?1)
-                 LIMIT 256",
-            )?;
-            let rows = stmt.query_map(params![scope, include_global, LOCAL_EMBED_MODEL], |r| {
-                let id: String = r.get(0)?;
-                let content: String = r.get(3)?;
-                let blob: Option<Vec<u8>> = r.get(11)?;
-                let vec = blob.map(|b| bytes_to_vec(&b)).unwrap_or_else(|| embed_local(&content));
-                let sim = cosine(&q_vec, &vec);
-                let val = json!({
-                    "id": id,
-                    "scope": r.get::<_, String>(1)?,
-                    "category": r.get::<_, String>(2)?,
-                    "content": content,
-                    "trust_tier": r.get::<_, String>(4)?,
-                    "status": r.get::<_, String>(5)?,
-                    "fact_key": r.get::<_, Option<String>>(6)?,
-                    "supersedes_id": r.get::<_, Option<String>>(7)?,
-                    "source": r.get::<_, String>(8)?,
-                    "provenance": r.get::<_, Option<String>>(9)?,
-                    "created_at": r.get::<_, String>(10)?,
-                });
-                Ok((sim, val))
-            })?;
-            let mut out = vec![];
-            for row in rows.flatten() {
-                if row.0 >= 0.16 {
-                    out.push(row);
+    // 2. Real neural dense cosine candidates over ALL cached active scope vectors for the pinned model_version.
+    let mut dense_scored: Vec<(f32, Value)> = Vec::new();
+    let mut used_dense = false;
+    if let Some((model_version, q_vec)) = query_embed {
+        let cached_vecs = load_scope_vectors_cached(ctx, scope, include_global, model_version)?;
+        if !cached_vecs.is_empty() {
+            used_dense = true;
+            let mut sims: Vec<(f32, String)> = cached_vecs
+                .iter()
+                .filter_map(|(id, vec)| {
+                    let sim = cosine(q_vec, vec);
+                    (sim >= NEURAL_COSINE_MIN).then_some((sim, id.clone()))
+                })
+                .collect();
+            sims.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            sims.truncate(RRF_POOL_LIMIT as usize);
+
+            if !sims.is_empty() {
+                let mut by_id: HashMap<String, Value> = HashMap::with_capacity(sims.len());
+                for chunk in sims.chunks(64) {
+                    let placeholders = vec!["?"; chunk.len()].join(",");
+                    let sql = format!(
+                        "SELECT id,scope,category,content,trust_tier,status,fact_key,supersedes_id,source,source_event_id,provenance,created_at,updated_at
+                         FROM memories
+                         WHERE id IN ({placeholders}) AND active=1 AND status='active' AND ((? AND scope='global') OR scope=?)"
+                    );
+                    let mut p: Vec<rusqlite::types::Value> = chunk
+                        .iter()
+                        .map(|(_, id)| rusqlite::types::Value::Text(id.clone()))
+                        .collect();
+                    p.push(rusqlite::types::Value::Integer(include_global as i64));
+                    p.push(rusqlite::types::Value::Text(scope.to_string()));
+                    if let Ok(rows) = ctx.db.query(&sql, rusqlite::params_from_iter(p)) {
+                        for r in rows {
+                            if let Some(id) = r["id"].as_str() {
+                                by_id.insert(id.to_string(), r);
+                            }
+                        }
+                    }
+                }
+                for (sim, id) in sims {
+                    if let Some(row) = by_id.remove(&id) {
+                        dense_scored.push((sim, row));
+                    }
                 }
             }
-            Ok(out)
-        })?;
-    dense_scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-
-    // 3. Reciprocal Rank Fusion (k=60, AgentMemRec / BRIDGE) with trust/correction tie-break.
-    let mut scores: std::collections::HashMap<String, (f64, Value)> = std::collections::HashMap::new();
-    for (rank, mut r) in bm25_rows.into_iter().enumerate() {
-        let Some(id) = r["id"].as_str().map(str::to_string) else { continue };
-        let bonus = if r["category"].as_str() == Some("correction") { 0.004 } else { 0.0 }
-            + if r["trust_tier"].as_str() == Some("user_direct") { 0.004 } else { 0.0 };
-        let s = (1.0 / (RRF_K + (rank as f64) + 1.0)) + bonus;
-        r["retrieval"] = json!("bm25");
-        scores.insert(id, (s, r));
-    }
-    for (rank, (sim, mut r)) in dense_scored.into_iter().take(64).enumerate() {
-        let Some(id) = r["id"].as_str().map(str::to_string) else { continue };
-        let contrib = 1.0 / (RRF_K + (rank as f64) + 1.0);
-        if let Some((cur_s, cur_v)) = scores.get_mut(&id) {
-            *cur_s += contrib;
-            cur_v["retrieval"] = json!("hybrid_rrf");
-            cur_v["cosine"] = json!((sim * 1000.0).round() / 1000.0);
-        } else {
-            let bonus = if r["trust_tier"].as_str() == Some("user_direct") { 0.003 } else { 0.0 };
-            r["retrieval"] = json!("dense");
-            r["cosine"] = json!((sim * 1000.0).round() / 1000.0);
-            scores.insert(id, (contrib + bonus, r));
         }
     }
 
-    let mut merged: Vec<(f64, Value)> = scores.into_values().collect();
-    merged.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    Ok(Value::Array(merged.into_iter().take(limit as usize).map(|(_, v)| v).collect()))
+    // 3. Pure Reciprocal Rank Fusion (k=60, AgentMemRec / BRIDGE) — zero provenance bonuses.
+    let mut scores: HashMap<String, (f64, usize, Value)> = HashMap::new();
+    for (rank, mut r) in bm25_rows.into_iter().enumerate() {
+        let Some(id) = r["id"].as_str().map(str::to_string) else { continue };
+        let s = 1.0 / (RRF_K + (rank as f64) + 1.0);
+        r["retrieval"] = json!("bm25");
+        scores.insert(id, (s, rank, r));
+    }
+    if used_dense {
+        for (rank, (sim, mut r)) in dense_scored.into_iter().enumerate() {
+            let Some(id) = r["id"].as_str().map(str::to_string) else { continue };
+            let contrib = 1.0 / (RRF_K + (rank as f64) + 1.0);
+            if let Some((cur_s, _, cur_v)) = scores.get_mut(&id) {
+                *cur_s += contrib;
+                cur_v["retrieval"] = json!("hybrid_rrf");
+                cur_v["cosine"] = json!((sim * 1000.0).round() / 1000.0);
+            } else {
+                r["retrieval"] = json!("dense");
+                r["cosine"] = json!((sim * 1000.0).round() / 1000.0);
+                scores.insert(id, (contrib, 10_000 + rank, r));
+            }
+        }
+    }
+
+    // 4. Hard post-retrieval ownership gate (defense in depth per MemLeak).
+    let mut merged: Vec<(f64, usize, Value)> = scores
+        .into_values()
+        .filter(|(_, _, v)| {
+            let sc = v["scope"].as_str().unwrap_or("");
+            v["status"].as_str() == Some("active") && (sc == scope || (include_global && sc == "global"))
+        })
+        .collect();
+    merged.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.cmp(&b.1))
+    });
+
+    let mode = if used_dense { "hybrid_bm25_dense_rrf" } else { "bm25_only" };
+    let embed_reported = if used_dense { active_embed_model } else { None };
+    Ok((
+        merged.into_iter().take(limit as usize).map(|(_, _, v)| v).collect(),
+        mode,
+        embed_reported,
+    ))
 }
 
 #[cfg(test)]
@@ -744,28 +1201,39 @@ pub fn save_agent_memory_rich(
 /// active record with the same `fact_key` or `supersedes_id`.
 pub fn promote_memory(ctx: &Ctx, id: &str) -> Result<Value, String> {
     let rows = ctx.db.query(
-        "SELECT id, scope, fact_key, supersedes_id FROM memories WHERE id=?1 AND status != 'deleted'",
+        "SELECT id, scope, content, fact_key, supersedes_id FROM memories WHERE id=?1 AND status != 'deleted'",
         [id],
     )?;
     let row = rows.first().ok_or_else(|| "memory not found or deleted".to_string())?;
     let scope = row["scope"].as_str().unwrap_or("global").to_string();
+    let content = row["content"].as_str().unwrap_or("").to_string();
     let fact_key = row["fact_key"].as_str().map(str::to_string);
     let supersedes_id = row["supersedes_id"].as_str().map(str::to_string);
 
     ctx.db.with(|c| {
         let tx = c.unchecked_transaction()?;
         if let Some(ref fk) = fact_key {
-            tx.execute(
-                "UPDATE memories SET active=0, status='superseded', updated_at=datetime('now')
-                 WHERE scope=?1 AND fact_key=?2 AND id != ?3 AND active=1 AND status='active'",
-                params![scope, fk, id],
-            )?;
+            let superseded: Vec<String> = {
+                let mut st = tx.prepare(
+                    "SELECT id FROM memories WHERE scope=?1 AND fact_key=?2 AND id != ?3 AND active=1 AND status='active'",
+                )?;
+                let iter = st.query_map(params![scope, fk, id], |r| r.get::<_, String>(0))?;
+                iter.flatten().collect()
+            };
+            for old_id in superseded {
+                tx.execute(
+                    "UPDATE memories SET active=0, status='superseded', updated_at=datetime('now') WHERE id=?1",
+                    [&old_id],
+                )?;
+                let _ = tx.execute("DELETE FROM memory_vectors WHERE memory_id=?1", [&old_id]);
+            }
         }
         if let Some(ref sid) = supersedes_id {
             tx.execute(
                 "UPDATE memories SET active=0, status='superseded', updated_at=datetime('now') WHERE id=?1 AND id != ?2",
                 params![sid, id],
             )?;
+            let _ = tx.execute("DELETE FROM memory_vectors WHERE memory_id=?1", [sid]);
         }
         tx.execute(
             "UPDATE memories SET active=1, status='active', trust_tier='user_direct', updated_at=datetime('now') WHERE id=?1",
@@ -773,8 +1241,26 @@ pub fn promote_memory(ctx: &Ctx, id: &str) -> Result<Value, String> {
         )?;
         tx.commit()
     })?;
+    invalidate_vector_cache(ctx);
     ctx.notify("library");
-    Ok(json!({ "id": id, "status": "active", "trust_tier": "user_direct" }))
+    Ok(json!({ "id": id, "status": "active", "trust_tier": "user_direct", "content": content }))
+}
+
+/// Promote a memory and immediately index its neural vector when an embedding backend is active.
+pub async fn promote_memory_async(ctx: &Arc<Ctx>, id: &str) -> Result<Value, String> {
+    let (c, mid) = (ctx.clone(), id.to_string());
+    let mut res = tokio::task::spawn_blocking(move || promote_memory(&c, &mid))
+        .await
+        .map_err(|e| e.to_string())??;
+    if let Some(content) = res["content"].as_str().filter(|s| !s.is_empty()) {
+        if let Ok(indexed) = embed_memory_async(ctx, id, content).await {
+            res["vector_indexed"] = json!(indexed);
+        }
+    }
+    if let Some(obj) = res.as_object_mut() {
+        obj.remove("content");
+    }
+    Ok(res)
 }
 
 pub fn quarantine_memory(ctx: &Ctx, id: &str, reason: Option<&str>) -> Result<Value, String> {
@@ -790,23 +1276,93 @@ pub fn quarantine_memory(ctx: &Ctx, id: &str, reason: Option<&str>) -> Result<Va
             [id],
         )?;
     }
+    let _ = ctx.db.exec("DELETE FROM memory_vectors WHERE memory_id=?1", [id]);
+    invalidate_vector_cache(ctx);
     ctx.notify("library");
     Ok(json!({ "id": id, "status": "quarantined" }))
 }
 
-/// Hard deletion scrub (LEDGER): marks deleted and blanks content so FTS5 and vector indexes
-/// erase the entry and the deleted value can never re-enter any query or prompt slate.
+/// Hard deletion scrub (LEDGER+EP): marks deleted, blanks content so FTS5 erases the entry, deletes
+/// vectors, invalidates caches, and scrubs the referenced raw event record so deleted values can
+/// never resurface in queries, slates, or raw-event search.
 pub fn forget_memory(ctx: &Ctx, id: &str) -> Result<(), String> {
-    ctx.db.exec(
-        "UPDATE memories SET active=0, status='deleted', content='', provenance='deleted', updated_at=datetime('now') WHERE id=?1",
-        [id],
-    )?;
-    let _ = ctx.db.exec("DELETE FROM memory_vectors WHERE memory_id=?1", [id]);
+    let existing = ctx
+        .db
+        .query("SELECT source_event_id FROM memories WHERE id=?1", [id])
+        .unwrap_or_default();
+    let source_evt = existing.first().and_then(|r| r["source_event_id"].as_str()).map(str::to_string);
+
+    ctx.db.with(|c| {
+        let tx = c.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE memories SET active=0, status='deleted', content='', provenance='deleted', source_event_id=NULL, updated_at=datetime('now') WHERE id=?1",
+            [id],
+        )?;
+        tx.execute("DELETE FROM memory_vectors WHERE memory_id=?1", [id])?;
+        if let Some(ref eid) = source_evt {
+            if let Some(rowid) = eid.strip_prefix("evt:").and_then(|s| s.parse::<i64>().ok()) {
+                let _ = tx.execute(
+                    "UPDATE events SET body=?2 WHERE id=?1",
+                    params![rowid, json!({ "scrubbed": true, "memory_id": id }).to_string()],
+                );
+            }
+        }
+        let like_pattern = format!("%{id}%");
+        let _ = tx.execute(
+            "UPDATE events SET body=?2 WHERE kind IN ('memory:write','memory:extract','memory:session_observe') AND body LIKE ?1",
+            params![like_pattern, json!({ "scrubbed": true, "memory_id": id }).to_string()],
+        );
+        tx.commit()
+    })?;
+    invalidate_vector_cache(ctx);
     ctx.notify("library");
     Ok(())
 }
 
-/// Explicit prospective intentions (Pro-Memory / Price of Scale): trigger-based, never noisy similarity recall.
+// ---------- Explicit Prospective Intentions (Pro-Memory / Price of Scale) ----------
+
+/// Per-agent pending reminders delivered on the next MCP tool call (e.g. compaction / turn error)
+/// and per-agent fired `path_match` deduplication set so path reminders fire once per session until compaction.
+fn pending_agent_reminders() -> &'static Mutex<HashMap<String, Vec<String>>> {
+    static Q: OnceLock<Mutex<HashMap<String, Vec<String>>>> = OnceLock::new();
+    Q.get_or_init(Default::default)
+}
+
+fn fired_path_reminders() -> &'static Mutex<HashMap<String, HashSet<String>>> {
+    static F: OnceLock<Mutex<HashMap<String, HashSet<String>>>> = OnceLock::new();
+    F.get_or_init(Default::default)
+}
+
+pub fn push_agent_reminder(agent_id: &str, text: String) {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let mut map = pending_agent_reminders().lock().unwrap_or_else(|e| e.into_inner());
+    let entry = map.entry(agent_id.to_string()).or_default();
+    if !entry.iter().any(|existing| existing == trimmed) && entry.len() < 8 {
+        entry.push(trimmed.to_string());
+    }
+}
+
+pub fn take_agent_reminders(agent_id: &str) -> Option<String> {
+    let mut map = pending_agent_reminders().lock().unwrap_or_else(|e| e.into_inner());
+    let items = map.remove(agent_id)?;
+    if items.is_empty() {
+        return None;
+    }
+    Some(truncate_utf8(&items.join("\n"), MAX_REMINDERS_PROMPT_BYTES))
+}
+
+pub fn reset_agent_path_reminders(agent_id: &str) {
+    fired_path_reminders().lock().unwrap_or_else(|e| e.into_inner()).remove(agent_id);
+}
+
+pub fn clear_agent_reminder_state(agent_id: &str) {
+    pending_agent_reminders().lock().unwrap_or_else(|e| e.into_inner()).remove(agent_id);
+    fired_path_reminders().lock().unwrap_or_else(|e| e.into_inner()).remove(agent_id);
+}
+
 pub fn intention_list(ctx: &Ctx, scope: Option<&str>) -> Result<Value, String> {
     Ok(json!(ctx.db.query(
         "SELECT id, scope, trigger_kind, trigger_match, instruction, active, created_by, created_at
@@ -825,8 +1381,13 @@ pub fn intention_add(
     instruction: &str,
     created_by: &str,
 ) -> Result<Value, String> {
-    if !matches!(trigger_kind, "pre_release" | "on_pr" | "on_error" | "on_session_start" | "path_match") {
-        return Err("trigger_kind must be pre_release, on_pr, on_error, on_session_start or path_match".into());
+    if !matches!(
+        trigger_kind,
+        "pre_release" | "on_pr" | "on_error" | "on_session_start" | "path_match" | "on_compact"
+    ) {
+        return Err(
+            "trigger_kind must be pre_release, on_pr, on_error, on_session_start, path_match or on_compact".into(),
+        );
     }
     let inst = instruction.trim();
     if inst.is_empty() || inst.len() > 1000 {
@@ -839,7 +1400,13 @@ pub fn intention_add(
         params![id, scope, trigger_kind, trigger_match.trim(), inst, created_by],
     )?;
     ctx.notify("library");
-    Ok(json!({ "id": id, "scope": scope, "trigger_kind": trigger_kind, "instruction": inst }))
+    Ok(json!({
+        "id": id,
+        "scope": scope,
+        "trigger_kind": trigger_kind,
+        "trigger_match": trigger_match.trim(),
+        "instruction": inst,
+    }))
 }
 
 pub fn intention_remove(ctx: &Ctx, id: &str) -> Result<(), String> {
@@ -848,191 +1415,9 @@ pub fn intention_remove(ctx: &Ctx, id: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Eval-gated offline consolidation preview (Useful Memories Become Faulty #1 + Anthropic Dreams):
-/// Reads active memories read-only, detects near-duplicate non-direct notes (`cosine >= 0.86`),
-/// builds a candidate consolidation run with a deterministic safety gate, and NEVER mutates live
-/// memories until explicitly promoted.
-pub fn consolidate_preview(ctx: &Ctx, scope: &str) -> Result<Value, String> {
-    ensure_vectors_synced(ctx);
-    let rows = ctx.db.query(
-        "SELECT id, category, content, trust_tier, fact_key, created_at FROM memories
-         WHERE scope=?1 AND active=1 AND status='active'
-         ORDER BY (trust_tier='user_direct') DESC, created_at DESC",
-        [scope],
-    )?;
-    let vecs: Vec<(String, Value, Vec<f32>)> = rows
-        .into_iter()
-        .filter_map(|r| {
-            let id = r["id"].as_str()?.to_string();
-            let content = r["content"].as_str()?;
-            let v = embed_local(content);
-            Some((id, r, v))
-        })
-        .collect();
-
-    let mut proposals: Vec<Value> = vec![];
-    let mut seen_dup: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for i in 0..vecs.len() {
-        for j in (i + 1)..vecs.len() {
-            let (ref id_keep, ref r_keep, ref v_keep) = vecs[i];
-            let (ref id_drop, ref r_drop, ref v_drop) = vecs[j];
-            if seen_dup.contains(id_drop) {
-                continue;
-            }
-            // Safety invariant: never propose superseding a user_direct decision automatically.
-            if r_drop["trust_tier"].as_str() == Some("user_direct") {
-                continue;
-            }
-            let sim = cosine(v_keep, v_drop);
-            if sim >= 0.86 {
-                seen_dup.insert(id_drop.clone());
-                proposals.push(json!({
-                    "kind": "deduplicate",
-                    "keep_id": id_keep,
-                    "supersede_id": id_drop,
-                    "similarity": (sim * 1000.0).round() / 1000.0,
-                    "keep_preview": r_keep["content"].as_str().unwrap_or("").chars().take(140).collect::<String>(),
-                    "drop_preview": r_drop["content"].as_str().unwrap_or("").chars().take(140).collect::<String>(),
-                }));
-            }
-        }
-    }
-
-    let eval_report = json!({
-        "passed": true,
-        "user_direct_preserved": true,
-        "deleted_scrub_intact": true,
-        "checked_records": vecs.len(),
-        "duplicates_found": proposals.len(),
-        "embed_model": LOCAL_EMBED_MODEL,
-    });
-    let run_id = format!("con_{}", crate::db::new_id());
-    ctx.db.exec(
-        "INSERT INTO consolidation_runs(id, scope, state, proposals, eval_report, created_at)
-         VALUES(?1, ?2, 'preview', ?3, ?4, datetime('now'))",
-        params![run_id, scope, json!(proposals).to_string(), eval_report.to_string()],
-    )?;
-    Ok(json!({
-        "id": run_id,
-        "scope": scope,
-        "state": "preview",
-        "proposals": proposals,
-        "eval_report": eval_report,
-    }))
-}
-
-pub fn consolidate_promote(ctx: &Ctx, run_id: &str) -> Result<Value, String> {
-    let row = ctx
-        .db
-        .query("SELECT id, scope, state, proposals, eval_report FROM consolidation_runs WHERE id=?1", [run_id])?
-        .into_iter()
-        .next()
-        .ok_or_else(|| "consolidation run not found".to_string())?;
-    if row["state"].as_str() == Some("promoted") {
-        return Ok(json!({ "id": run_id, "state": "promoted", "applied": 0 }));
-    }
-    let eval: Value = serde_json::from_str(row["eval_report"].as_str().unwrap_or("{}")).unwrap_or(json!({}));
-    if eval["passed"].as_bool() != Some(true) {
-        return Err("Refusing to promote consolidation run that did not pass the eval gate".into());
-    }
-    let proposals: Vec<Value> = serde_json::from_str(row["proposals"].as_str().unwrap_or("[]")).unwrap_or_default();
-    let mut applied = 0usize;
-    ctx.db.with(|c| {
-        let tx = c.unchecked_transaction()?;
-        for p in &proposals {
-            if let Some(sid) = p["supersede_id"].as_str() {
-                let n = tx.execute(
-                    "UPDATE memories SET active=0, status='superseded', provenance=COALESCE(provenance,'') || ' [consolidated:' || ?2 || ']', updated_at=datetime('now')
-                     WHERE id=?1 AND trust_tier != 'user_direct' AND status='active'",
-                    params![sid, run_id],
-                )?;
-                applied += n;
-            }
-        }
-        tx.execute(
-            "UPDATE consolidation_runs SET state='promoted', promoted_at=datetime('now') WHERE id=?1",
-            [run_id],
-        )?;
-        tx.commit()
-    })?;
-    ctx.notify("library");
-    Ok(json!({ "id": run_id, "state": "promoted", "applied": applied }))
-}
-
-/// Structured per-repo / per-agent working-state handoff note (Field Guide / BRIDGE).
-pub fn working_note_get(ctx: &Ctx, scope: &str) -> Result<Value, String> {
-    let rows = ctx.db.query(
-        "SELECT scope, requirements, decisions, failed_attempts, next_steps, source_event_id, updated_by, updated_at
-         FROM working_notes WHERE scope=?1",
-        [scope],
-    )?;
-    Ok(rows.into_iter().next().unwrap_or_else(|| {
-        json!({
-            "scope": scope,
-            "requirements": "",
-            "decisions": "",
-            "failed_attempts": "",
-            "next_steps": "",
-            "source_event_id": null,
-            "updated_by": null,
-            "updated_at": null,
-        })
-    }))
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn working_note_set(
-    ctx: &Ctx,
-    scope: &str,
-    requirements: &str,
-    decisions: &str,
-    failed_attempts: &str,
-    next_steps: &str,
-    source_event_id: Option<&str>,
-    updated_by: &str,
-) -> Result<Value, String> {
-    let clip = |s: &str| -> String { s.trim().chars().take(2000).collect() };
-    let (req, dec, fail, next) = (clip(requirements), clip(decisions), clip(failed_attempts), clip(next_steps));
-    ctx.db.exec(
-        "INSERT INTO working_notes(scope, requirements, decisions, failed_attempts, next_steps, source_event_id, updated_by, updated_at)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,datetime('now'))
-         ON CONFLICT(scope) DO UPDATE SET
-           requirements=excluded.requirements,
-           decisions=excluded.decisions,
-           failed_attempts=excluded.failed_attempts,
-           next_steps=excluded.next_steps,
-           source_event_id=COALESCE(excluded.source_event_id, working_notes.source_event_id),
-           updated_by=excluded.updated_by,
-           updated_at=datetime('now')",
-        params![scope, req, dec, fail, next, source_event_id, updated_by],
-    )?;
-    ctx.notify("library");
-    working_note_get(ctx, scope)
-}
-
-/// Truncate `s` cleanly on a UTF-8 boundary so the resulting string is at most `max_bytes` bytes.
-fn truncate_utf8(s: &str, max_bytes: usize) -> String {
-    if s.len() <= max_bytes {
-        return s.to_string();
-    }
-    let suffix = "\n... [truncated]\n";
-    if max_bytes <= suffix.len() {
-        let mut end = max_bytes;
-        while end > 0 && !s.is_char_boundary(end) {
-            end -= 1;
-        }
-        return s[..end].to_string();
-    }
-    let mut end = max_bytes - suffix.len();
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}{suffix}", &s[..end])
-}
-
 /// Active intentions matching `repo_id` (or global only when `repo_id` is None) and `trigger_kinds`.
 /// If `context_haystack` is Some, intentions with a non-empty `trigger_match` must match it
-/// case-insensitively. Returns empty vec safely if the `intentions` table is not initialized.
+/// case-insensitively. For `path_match`, a non-empty `trigger_match` is required when haystack is checked.
 pub fn matching_intentions(
     ctx: &Ctx,
     repo_id: Option<&str>,
@@ -1069,7 +1454,8 @@ pub fn matching_intentions(
             }
             let tm = r["trigger_match"].as_str().unwrap_or("").trim();
             if tm.is_empty() {
-                return true;
+                // `path_match` with empty trigger_match would fire on every path; ignore empty match unless none-haystack.
+                return kind != "path_match" || hay_low.is_none();
             }
             match &hay_low {
                 Some(h) => h.contains(&tm.to_lowercase()),
@@ -1120,6 +1506,431 @@ pub fn submit_reminders(ctx: &Ctx, repo_id: Option<&str>, haystack: &str) -> Vec
         .collect()
 }
 
+/// Matching `on_error` reminders surfaced when a tool/shell command or turn fails (Standard agents only).
+pub fn error_reminders(ctx: &Ctx, repo_id: Option<&str>, error_haystack: &str) -> Vec<Value> {
+    matching_intentions(ctx, repo_id, &["on_error"], Some(error_haystack))
+}
+
+/// Matching `path_match` reminders deduplicated per `(agent_id, intention_id)` until compaction or stop.
+pub fn path_reminders_once(ctx: &Ctx, agent_id: &str, repo_id: Option<&str>, path_haystack: &str) -> Vec<Value> {
+    if path_haystack.trim().is_empty() {
+        return vec![];
+    }
+    let matched = matching_intentions(ctx, repo_id, &["path_match"], Some(path_haystack));
+    if matched.is_empty() {
+        return vec![];
+    }
+    let mut fired_map = fired_path_reminders().lock().unwrap_or_else(|e| e.into_inner());
+    let seen = fired_map.entry(agent_id.to_string()).or_default();
+    let mut fresh = Vec::new();
+    for item in matched {
+        let Some(id) = item["id"].as_str() else { continue };
+        if seen.insert(id.to_string()) {
+            fresh.push(item);
+        }
+    }
+    fresh
+}
+
+/// Matching `on_compact` reminders fired on `context.compacted` events (Standard agents only).
+pub fn compaction_reminders(ctx: &Ctx, repo_id: Option<&str>) -> Vec<Value> {
+    matching_intentions(ctx, repo_id, &["on_compact"], None)
+}
+
+pub fn format_trigger_reminders(kind: &str, items: &[Value]) -> Option<String> {
+    if items.is_empty() {
+        return None;
+    }
+    let mut lines = Vec::new();
+    for item in items {
+        let inst = item["instruction"].as_str().unwrap_or("").trim();
+        if inst.is_empty() {
+            continue;
+        }
+        let tm = item["trigger_match"].as_str().unwrap_or("").trim();
+        if tm.is_empty() {
+            lines.push(format!("[Reminder ({kind})] {inst}"));
+        } else {
+            lines.push(format!("[Reminder ({kind}:{tm})] {inst}"));
+        }
+    }
+    if lines.is_empty() {
+        None
+    } else {
+        Some(truncate_utf8(&lines.join("\n"), MAX_REMINDERS_PROMPT_BYTES))
+    }
+}
+
+// ---------- Offline Consolidation (v3 preview with REAL safety + recall assertions) ----------
+
+fn normalized_text(s: &str) -> String {
+    s.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn distinctive_tokens(s: &str) -> Vec<String> {
+    const STOP: &[&str] = &[
+        "the", "and", "for", "that", "with", "this", "from", "have", "must", "should", "when", "into", "only",
+        "always", "never", "your", "their", "about", "after", "before", "every", "still", "work", "mode",
+    ];
+    let mut toks: Vec<String> = s
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.len() >= 4 && !STOP.contains(t))
+        .map(str::to_string)
+        .collect();
+    toks.sort();
+    toks.dedup();
+    toks
+}
+
+/// Eval-gated offline consolidation preview (Useful Memories Become Faulty #1 + Anthropic Dreams):
+/// Reads active memories read-only, detects exact-normalized duplicates (or neural cosine >= 0.90 when
+/// real embeddings are present), and runs REAL Tier-0 safety + recall preservation assertions before
+/// setting `eval_report.passed`. NEVER mutates live memories until explicitly promoted.
+pub fn consolidate_preview(ctx: &Ctx, scope: &str) -> Result<Value, String> {
+    let embed_cfg = resolve_embedding_config(ctx);
+    let rows = ctx.db.query(
+        "SELECT id, category, content, trust_tier, fact_key, created_at FROM memories
+         WHERE scope=?1 AND active=1 AND status='active'
+         ORDER BY (trust_tier='user_direct') DESC, created_at DESC",
+        [scope],
+    )?;
+
+    let vec_map: HashMap<String, Vec<f32>> = match &embed_cfg {
+        Some(cfg) => load_scope_vectors_cached(ctx, scope, false, &cfg.model_version)?
+            .into_iter()
+            .collect(),
+        None => HashMap::new(),
+    };
+
+    let mut proposals: Vec<Value> = vec![];
+    let mut seen_dup: HashSet<String> = HashSet::new();
+    let mut mode = "exact_normalized";
+
+    for i in 0..rows.len() {
+        for j in (i + 1)..rows.len() {
+            let r_keep = &rows[i];
+            let r_drop = &rows[j];
+            let (Some(id_keep), Some(c_keep)) = (r_keep["id"].as_str(), r_keep["content"].as_str()) else { continue };
+            let (Some(id_drop), Some(c_drop)) = (r_drop["id"].as_str(), r_drop["content"].as_str()) else { continue };
+            if seen_dup.contains(id_drop) {
+                continue;
+            }
+            // Safety invariant: never propose superseding a user_direct decision automatically.
+            if r_drop["trust_tier"].as_str() == Some("user_direct") {
+                continue;
+            }
+            let exact = normalized_text(c_keep) == normalized_text(c_drop);
+            let sim_opt = match (vec_map.get(id_keep), vec_map.get(id_drop)) {
+                (Some(vk), Some(vd)) => {
+                    mode = "embedding_cosine";
+                    Some(cosine(vk, vd))
+                }
+                _ => None,
+            };
+            let matched = exact || sim_opt.is_some_and(|s| s >= CONSOLIDATE_COSINE_MIN);
+            if matched {
+                seen_dup.insert(id_drop.to_string());
+                let sim_val = sim_opt.unwrap_or(1.0);
+                proposals.push(json!({
+                    "kind": "deduplicate",
+                    "keep_id": id_keep,
+                    "supersede_id": id_drop,
+                    "similarity": (sim_val * 1000.0).round() / 1000.0,
+                    "match_basis": if exact { "exact_normalized" } else { "embedding_cosine" },
+                    "keep_preview": c_keep.chars().take(140).collect::<String>(),
+                    "drop_preview": c_drop.chars().take(140).collect::<String>(),
+                }));
+            }
+        }
+    }
+
+    // ---- REAL Tier-0 Safety & Recall Preservation Gate (never hardcoded!) ----
+    let mut user_direct_preserved = true;
+    let mut no_drop_cycle = true;
+    let mut recall_preserved = true;
+    let mut recall_failures: Vec<Value> = vec![];
+
+    let keep_ids: HashSet<&str> = proposals.iter().filter_map(|p| p["keep_id"].as_str()).collect();
+    let drop_ids: HashSet<&str> = proposals.iter().filter_map(|p| p["supersede_id"].as_str()).collect();
+    if keep_ids.iter().any(|k| drop_ids.contains(k)) {
+        no_drop_cycle = false;
+    }
+
+    let content_by_id: HashMap<&str, (&str, &str)> = rows
+        .iter()
+        .filter_map(|r| Some((r["id"].as_str()?, (r["content"].as_str()?, r["trust_tier"].as_str()?))))
+        .collect();
+
+    for p in &proposals {
+        let (Some(kid), Some(did)) = (p["keep_id"].as_str(), p["supersede_id"].as_str()) else {
+            recall_preserved = false;
+            continue;
+        };
+        if let Some((_, tier)) = content_by_id.get(did) {
+            if *tier == "user_direct" {
+                user_direct_preserved = false;
+            }
+        } else {
+            user_direct_preserved = false;
+        }
+        // Recall preservation check: distinctive tokens from dropped memory must still retrieve `keep_id`.
+        if let (Some((c_keep, _)), Some((c_drop, _))) = (content_by_id.get(kid), content_by_id.get(did)) {
+            let drop_toks = distinctive_tokens(c_drop);
+            if !drop_toks.is_empty() {
+                let keep_low = c_keep.to_lowercase();
+                let missing_toks: Vec<&String> = drop_toks.iter().filter(|t| !keep_low.contains(t.as_str())).collect();
+                // Require at least 80% distinctive-token coverage AND actual FTS retrieval of keep_id.
+                let coverage = 1.0 - (missing_toks.len() as f64 / drop_toks.len() as f64);
+                let probe_q = drop_toks.iter().take(6).cloned().collect::<Vec<_>>().join(" ");
+                let fts_hits = search_scope_core(ctx, &probe_q, scope, false, 5, None)
+                    .map(|(h, _, _)| h.iter().any(|r| r["id"].as_str() == Some(kid)))
+                    .unwrap_or(false);
+                if coverage < 0.80 || !fts_hits {
+                    recall_preserved = false;
+                    recall_failures.push(json!({
+                        "keep_id": kid,
+                        "supersede_id": did,
+                        "token_coverage": (coverage * 100.0).round() / 100.0,
+                        "fts_hit": fts_hits,
+                    }));
+                }
+            }
+        } else {
+            recall_preserved = false;
+        }
+    }
+
+    let unscrubbed_deleted = ctx
+        .db
+        .query("SELECT count(*) AS n FROM memories WHERE status='deleted' AND content != ''", [])?
+        .first()
+        .and_then(|r| r["n"].as_i64())
+        .unwrap_or(1);
+    let dangling_deleted_vecs = ctx
+        .db
+        .query(
+            "SELECT count(*) AS n FROM memory_vectors v JOIN memories m ON m.id=v.memory_id WHERE m.status='deleted'",
+            [],
+        )?
+        .first()
+        .and_then(|r| r["n"].as_i64())
+        .unwrap_or(1);
+    let deleted_scrub_intact = unscrubbed_deleted == 0 && dangling_deleted_vecs == 0;
+
+    let passed = user_direct_preserved && deleted_scrub_intact && no_drop_cycle && recall_preserved;
+
+    let eval_report = json!({
+        "passed": passed,
+        "assertions": {
+            "user_direct_preserved": user_direct_preserved,
+            "deleted_scrub_intact": deleted_scrub_intact,
+            "no_drop_cycle": no_drop_cycle,
+            "recall_preserved": recall_preserved,
+        },
+        "recall_failures": recall_failures,
+        "v3_replay_eval": "not_run",
+        "mode": mode,
+        "checked_records": rows.len(),
+        "duplicates_found": proposals.len(),
+        "embed_model": embed_cfg.map(|c| c.model_version),
+    });
+    let run_id = format!("con_{}", crate::db::new_id());
+    ctx.db.exec(
+        "INSERT INTO consolidation_runs(id, scope, state, proposals, eval_report, created_at)
+         VALUES(?1, ?2, 'preview', ?3, ?4, datetime('now'))",
+        params![run_id, scope, json!(proposals).to_string(), eval_report.to_string()],
+    )?;
+    Ok(json!({
+        "id": run_id,
+        "scope": scope,
+        "state": "preview",
+        "proposals": proposals,
+        "eval_report": eval_report,
+    }))
+}
+
+pub fn consolidate_promote(ctx: &Ctx, run_id: &str) -> Result<Value, String> {
+    let row = ctx
+        .db
+        .query("SELECT id, scope, state, proposals, eval_report FROM consolidation_runs WHERE id=?1", [run_id])?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "consolidation run not found".to_string())?;
+    if row["state"].as_str() == Some("promoted") {
+        return Ok(json!({ "id": run_id, "state": "promoted", "applied": 0 }));
+    }
+    let eval: Value = serde_json::from_str(row["eval_report"].as_str().unwrap_or("{}")).unwrap_or(json!({}));
+    if eval["passed"].as_bool() != Some(true) {
+        return Err("Refusing to promote consolidation run that did not pass the eval gate".into());
+    }
+    let proposals: Vec<Value> = serde_json::from_str(row["proposals"].as_str().unwrap_or("[]")).unwrap_or_default();
+    let mut applied = 0usize;
+    ctx.db.with(|c| {
+        let tx = c.unchecked_transaction()?;
+        for p in &proposals {
+            if let Some(sid) = p["supersede_id"].as_str() {
+                let n = tx.execute(
+                    "UPDATE memories SET active=0, status='superseded', provenance=COALESCE(provenance,'') || ' [consolidated:' || ?2 || ']', updated_at=datetime('now')
+                     WHERE id=?1 AND trust_tier != 'user_direct' AND status='active'",
+                    params![sid, run_id],
+                )?;
+                if n > 0 {
+                    let _ = tx.execute("DELETE FROM memory_vectors WHERE memory_id=?1", [sid]);
+                }
+                applied += n;
+            }
+        }
+        tx.execute(
+            "UPDATE consolidation_runs SET state='promoted', promoted_at=datetime('now') WHERE id=?1",
+            [run_id],
+        )?;
+        tx.commit()
+    })?;
+    invalidate_vector_cache(ctx);
+    ctx.notify("library");
+    Ok(json!({ "id": run_id, "state": "promoted", "applied": applied }))
+}
+
+// ---------- Structured Working Notes (Partial-Patch Semantics) ----------
+
+/// Structured per-repo / per-agent working-state handoff note (Field Guide / BRIDGE).
+pub fn working_note_get(ctx: &Ctx, scope: &str) -> Result<Value, String> {
+    let rows = ctx.db.query(
+        "SELECT scope, requirements, decisions, failed_attempts, next_steps, source_event_id, updated_by, updated_at
+         FROM working_notes WHERE scope=?1",
+        [scope],
+    )?;
+    Ok(rows.into_iter().next().unwrap_or_else(|| {
+        json!({
+            "scope": scope,
+            "requirements": "",
+            "decisions": "",
+            "failed_attempts": "",
+            "next_steps": "",
+            "source_event_id": null,
+            "updated_by": null,
+            "updated_at": null,
+        })
+    }))
+}
+
+/// Partial-patch update for a working note: omitted (`None`) fields preserve existing values instead
+/// of overwriting with `""`. Pass `Some("")` explicitly to clear a field.
+#[allow(clippy::too_many_arguments)]
+pub fn working_note_patch(
+    ctx: &Ctx,
+    scope: &str,
+    requirements: Option<&str>,
+    decisions: Option<&str>,
+    failed_attempts: Option<&str>,
+    next_steps: Option<&str>,
+    source_event_id: Option<&str>,
+    updated_by: &str,
+) -> Result<Value, String> {
+    let existing = working_note_get(ctx, scope)?;
+    let clip = |s: &str| -> String { s.trim().chars().take(2000).collect() };
+    let pick = |opt: Option<&str>, key: &str| -> String {
+        match opt {
+            Some(v) => clip(v),
+            None => existing[key].as_str().unwrap_or("").to_string(),
+        }
+    };
+    let req = pick(requirements, "requirements");
+    let dec = pick(decisions, "decisions");
+    let fail = pick(failed_attempts, "failed_attempts");
+    let next = pick(next_steps, "next_steps");
+
+    let owned_event_id = match source_event_id.filter(|s| !s.trim().is_empty()) {
+        Some(eid) => Some(eid.to_string()),
+        None => {
+            let agent_tag = updated_by.strip_prefix("agent:").or_else(|| updated_by.strip_prefix("pipeline:"));
+            let patched_fields: Vec<&str> = [
+                requirements.map(|_| "requirements"),
+                decisions.map(|_| "decisions"),
+                failed_attempts.map(|_| "failed_attempts"),
+                next_steps.map(|_| "next_steps"),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            ctx.log_event_id(
+                "working_note:write",
+                agent_tag,
+                &json!({
+                    "scope": scope,
+                    "updated_by": updated_by,
+                    "patched_fields": patched_fields,
+                }),
+            )
+        }
+    };
+
+    ctx.db.exec(
+        "INSERT INTO working_notes(scope, requirements, decisions, failed_attempts, next_steps, source_event_id, updated_by, updated_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,datetime('now'))
+         ON CONFLICT(scope) DO UPDATE SET
+           requirements=excluded.requirements,
+           decisions=excluded.decisions,
+           failed_attempts=excluded.failed_attempts,
+           next_steps=excluded.next_steps,
+           source_event_id=COALESCE(excluded.source_event_id, working_notes.source_event_id),
+           updated_by=excluded.updated_by,
+           updated_at=datetime('now')",
+        params![scope, req, dec, fail, next, owned_event_id, updated_by],
+    )?;
+    ctx.notify("library");
+    working_note_get(ctx, scope)
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub fn working_note_set(
+    ctx: &Ctx,
+    scope: &str,
+    requirements: &str,
+    decisions: &str,
+    failed_attempts: &str,
+    next_steps: &str,
+    source_event_id: Option<&str>,
+    updated_by: &str,
+) -> Result<Value, String> {
+    working_note_patch(
+        ctx,
+        scope,
+        Some(requirements),
+        Some(decisions),
+        Some(failed_attempts),
+        Some(next_steps),
+        source_event_id,
+        updated_by,
+    )
+}
+
+/// Truncate `s` cleanly on a UTF-8 boundary so the resulting string is at most `max_bytes` bytes.
+fn truncate_utf8(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let suffix = "\n... [truncated]\n";
+    if max_bytes <= suffix.len() {
+        let mut end = max_bytes;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        return s[..end].to_string();
+    }
+    let mut end = max_bytes - suffix.len();
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{suffix}", &s[..end])
+}
+
 /// Concise, size-bounded (<= 2048 bytes) prompt block for a repo's working handoff note (if non-empty).
 pub fn working_note_prompt(ctx: &Ctx, repo_id: &str) -> Option<String> {
     let note = working_note_get(ctx, &format!("repo:{repo_id}")).ok()?;
@@ -1146,14 +1957,53 @@ pub fn working_note_prompt(ctx: &Ctx, repo_id: &str) -> Option<String> {
     Some(truncate_utf8(&out, MAX_WORKING_NOTE_PROMPT_BYTES))
 }
 
+// ---------- Per-Model Budget B & Zero-LLM Context Slate Builder ----------
+
 fn estimate_tokens(s: &str) -> usize {
     // Fast ~4 chars/token approximation + small framing overhead.
     (s.chars().count() / 4).max(1) + 8
 }
 
+/// Per-model memory dose budget `B` (IBM #2 / Report §2).
+/// Small models get compact budgets so they do not drown in long-tail memories; frontier models get larger budgets.
+pub fn model_memory_budget(ctx: &Ctx, model_ref: Option<&str>) -> usize {
+    if let Some(mr) = model_ref.filter(|s| !s.is_empty()) {
+        if let Some(custom) = ctx
+            .db
+            .kv_get(&format!("setting.memory_budget.{mr}"))
+            .and_then(|s| s.parse::<usize>().ok())
+        {
+            return custom.clamp(256, 32_000);
+        }
+        if let Some((pid, mid)) = crate::providers::split_ref(mr) {
+            if let Some(cw) = crate::providers::context_window(ctx, pid, mid) {
+                return if cw <= 32_768 {
+                    1_500
+                } else if cw <= 131_072 {
+                    2_500
+                } else {
+                    4_000
+                };
+            }
+        }
+    }
+    2_000
+}
+
+pub struct SlateOpts<'a> {
+    pub repo_id: Option<&'a str>,
+    pub query: &'a str,
+    pub budget_tokens: usize,
+    pub strict: bool,
+    pub include_global: bool,
+    pub due_triggers: &'a [&'a str],
+}
+
 /// Zero-LLM budgeted context slate builder (AgentMemRec + IBM dose budget + MemPoison cap + Trust Gap).
-/// Hard-filters to authorized scope first, resolves supersession in code, caps untrusted items, and
-/// greedily packs within `budget_tokens`.
+/// Hard-filters to authorized scope before and after retrieval, preserves RRF/BM25 relevance order
+/// (no provenance weighting), includes ONLY due intentions counted within `budget_tokens`, caps
+/// untrusted items, and greedily packs within `budget_tokens`.
+#[cfg(test)]
 pub fn build_context_slate(
     ctx: &Ctx,
     repo_id: Option<&str>,
@@ -1162,16 +2012,73 @@ pub fn build_context_slate(
     strict: bool,
     include_global: bool,
 ) -> Result<Value, String> {
-    let budget = budget_tokens.clamp(256, 32_000);
-    let repo_scope = repo_id.filter(|s| !s.is_empty()).map(|r| format!("repo:{r}"));
+    build_context_slate_core(
+        ctx,
+        SlateOpts {
+            repo_id,
+            query,
+            budget_tokens,
+            strict,
+            include_global,
+            due_triggers: &["on_session_start"],
+        },
+        None,
+    )
+}
 
-    if strict {
+pub async fn build_context_slate_async(
+    ctx: &Arc<Ctx>,
+    repo_id: Option<&str>,
+    query: &str,
+    budget_tokens: usize,
+    strict: bool,
+    include_global: bool,
+    due_triggers: Vec<String>,
+) -> Result<Value, String> {
+    let q_embed = if !strict { embed_query_cached(ctx, query).await } else { None };
+    let (c, rid, q_owned) = (ctx.clone(), repo_id.map(str::to_string), query.to_string());
+    tokio::task::spawn_blocking(move || {
+        let trig_refs: Vec<&str> = if due_triggers.is_empty() {
+            vec!["on_session_start"]
+        } else {
+            due_triggers.iter().map(String::as_str).collect()
+        };
+        let q_ref = q_embed.as_ref().map(|(mv, v)| (mv.as_str(), v.as_slice()));
+        build_context_slate_core(
+            &c,
+            SlateOpts {
+                repo_id: rid.as_deref(),
+                query: &q_owned,
+                budget_tokens,
+                strict,
+                include_global,
+                due_triggers: &trig_refs,
+            },
+            q_ref,
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+fn build_context_slate_core(
+    ctx: &Ctx,
+    opts: SlateOpts<'_>,
+    query_embed: Option<(&str, &[f32])>,
+) -> Result<Value, String> {
+    let budget = opts.budget_tokens.clamp(256, 32_000);
+    let repo_scope = opts.repo_id.filter(|s| !s.is_empty()).map(|r| format!("repo:{r}"));
+
+    if opts.strict {
         return Ok(json!({
             "strict": true,
             "scope": repo_scope.unwrap_or_else(|| "none".into()),
+            "embed_model": Value::Null,
+            "retrieval": "disabled_strict",
             "budget_tokens": budget,
             "used_tokens": 0,
             "working_note": null,
+            "intentions": [],
             "items": [],
             "excluded": [{ "reason": "Strict mode disables personal and repository memories" }],
             "counts": { "active": 0, "proposed": 0, "superseded": 0, "quarantined": 0 },
@@ -1179,7 +2086,7 @@ pub fn build_context_slate(
     }
 
     let scope_filter = repo_scope.clone().unwrap_or_else(|| "global".into());
-    let include_g = include_global || repo_scope.is_none();
+    let include_g = opts.include_global || repo_scope.is_none();
 
     // Counts within the exact authorized scope (never leaks sibling repos).
     let count_sql = "SELECT status, count(*) AS n FROM memories WHERE status != 'deleted' AND ((?2 AND scope='global') OR scope=?1) GROUP BY status";
@@ -1195,9 +2102,9 @@ pub fn build_context_slate(
         }
     }
 
-    // Ownership-gated candidate retrieval (active, non-superseded, non-deleted only).
-    let candidates = search_scope(ctx, query, &scope_filter, include_g, 50)?;
-    let rows = candidates.as_array().cloned().unwrap_or_default();
+    // Ownership-gated candidate retrieval (active, non-superseded, non-deleted only), preserving RRF/BM25 rank.
+    let (ranked, retrieval_mode, embed_model) =
+        search_scope_core(ctx, opts.query, &scope_filter, include_g, 50, query_embed)?;
 
     // Working note takes priority inside the budget if present.
     let working_note = if let Some(ref rs) = repo_scope {
@@ -1222,30 +2129,32 @@ pub fn build_context_slate(
         used += estimate_tokens(&wn_text);
     }
 
-    let mut selected: Vec<Value> = vec![];
     let mut excluded: Vec<Value> = vec![];
+
+    // Due intentions only (never dump all active intentions unfiltered), and count them in `budget`.
+    let hay = (!opts.query.trim().is_empty()).then_some(opts.query);
+    let raw_intentions = matching_intentions(ctx, opts.repo_id, opts.due_triggers, hay);
+    let mut due_intentions: Vec<Value> = vec![];
+    for mut it in raw_intentions {
+        let inst = it["instruction"].as_str().unwrap_or("");
+        let cost = estimate_tokens(inst);
+        if used + cost > budget {
+            excluded.push(json!({
+                "id": it["id"],
+                "kind": "intention",
+                "reason": "budget_exceeded",
+                "tokens": cost,
+            }));
+            continue;
+        }
+        used += cost;
+        it["tokens"] = json!(cost);
+        due_intentions.push(it);
+    }
+
+    // Greedy fill to budget B in exact retrieval relevance order (NO provenance re-sorting!).
+    let mut selected: Vec<Value> = vec![];
     let mut untrusted_used = 0usize;
-
-    // Sort candidates: user_direct > verified_run > agent_inferred > untrusted, then repo-local over global.
-    let mut ranked = rows;
-    ranked.sort_by_key(|r| {
-        let tier_rank = match r["trust_tier"].as_str().unwrap_or("agent_inferred") {
-            "user_direct" => 0,
-            "verified_run" => 1,
-            "agent_inferred" => 2,
-            _ => 3,
-        };
-        let scope_rank = if r["scope"].as_str() == Some(scope_filter.as_str()) { 0 } else { 1 };
-        let cat_rank = match r["category"].as_str().unwrap_or("fact") {
-            "correction" => 0,
-            "preference" => 1,
-            "procedure" => 2,
-            "fact" => 3,
-            _ => 4,
-        };
-        (tier_rank, scope_rank, cat_rank)
-    });
-
     for mut item in ranked {
         let tier = item["trust_tier"].as_str().unwrap_or("agent_inferred");
         let content = item["content"].as_str().unwrap_or("");
@@ -1275,22 +2184,55 @@ pub fn build_context_slate(
         selected.push(item);
     }
 
-    let intentions = intention_list(ctx, Some(&scope_filter)).unwrap_or_else(|_| json!([]));
-
     Ok(json!({
         "strict": false,
         "scope": scope_filter,
         "include_global": include_g,
-        "embed_model": LOCAL_EMBED_MODEL,
-        "retrieval": "hybrid_bm25_dense_rrf",
+        "embed_model": embed_model,
+        "retrieval": retrieval_mode,
         "budget_tokens": budget,
         "used_tokens": used,
         "working_note": working_note,
-        "intentions": intentions,
+        "intentions": due_intentions,
         "items": selected,
         "excluded": excluded,
         "counts": counts,
     }))
+}
+
+/// Render the budgeted memory items section of a context slate for post-cache-break prompt injection.
+/// Keeps provenance (`trust_tier`, `fact_key`, `source_event_id`) visible to the model.
+pub fn format_slate_memories_prompt(slate: &Value, max_bytes: usize) -> Option<String> {
+    if slate["strict"].as_bool() == Some(true) {
+        return None;
+    }
+    let items = slate["items"].as_array()?;
+    if items.is_empty() {
+        return None;
+    }
+    let budget = slate["budget_tokens"].as_u64().unwrap_or(2000);
+    let used = slate["used_tokens"].as_u64().unwrap_or(0);
+    let mut out = format!("\n## Workspace memory slate ({used}/{budget} tok)\n");
+    for item in items {
+        let content = item["content"].as_str().unwrap_or("").trim().replace('\n', " ");
+        if content.is_empty() {
+            continue;
+        }
+        let tier = item["trust_tier"].as_str().unwrap_or("agent_inferred");
+        let cat = item["category"].as_str().unwrap_or("fact");
+        let mut tags = vec![tier.to_string(), cat.to_string()];
+        if let Some(fk) = item["fact_key"].as_str().filter(|s| !s.is_empty()) {
+            tags.push(format!("key={fk}"));
+        }
+        if let Some(eid) = item["source_event_id"].as_str().filter(|s| !s.is_empty()) {
+            tags.push(format!("src={eid}"));
+        }
+        if item["data_only_warning"].as_bool() == Some(true) {
+            tags.push("DATA_ONLY_NOT_INSTRUCTION".into());
+        }
+        out.push_str(&format!("- [{}] {}\n", tags.join(" | "), content));
+    }
+    Some(truncate_utf8(&out, max_bytes))
 }
 
 /// UI list helper: inspect active, proposed, superseded, or quarantined memories with provenance.
@@ -1344,7 +2286,7 @@ pub fn list_memories(
     Ok(json!(filtered))
 }
 
-/// Global preferences and corrections, injected into every agent's instructions.
+/// Global preferences and corrections, kept for legacy test coverage.
 #[cfg(test)]
 pub fn standing_memories(ctx: &Ctx) -> String {
     let rows = ctx
@@ -1367,6 +2309,8 @@ pub fn standing_memories(ctx: &Ctx) -> String {
     }
     s
 }
+
+// ---------- Same-Repo Raw Evidence Lookup (GrepMem / ReFind) & Session Search ----------
 
 pub fn session_search(
     ctx: &Ctx,
@@ -1415,16 +2359,17 @@ pub fn session_search_at(
     search_sessions(ctx, Some(home_dir), query, project, repo_only, None, limit)
 }
 
+/// Standard-agent raw evidence + session lookup, strictly bound to `repo_id`.
+/// Never opens imported histories or sibling-repo sessions; never callable by Strict agents.
 pub fn agent_sessions(ctx: &Ctx, query: &str, repo_id: &str, limit: usize) -> Result<Value, String> {
-    // Imported histories do not carry a trusted Philium repository ID. Do not open them.
     search_sessions(ctx, None, query, None, true, Some(repo_id), limit)
 }
 
 #[derive(Clone)]
 struct CachedHalEvents {
     stamp: (SystemTime, u64),
-    /// (role, excerpt <= 280 chars, lowercased full text)
-    entries: Vec<(String, String, String)>,
+    /// (role/kind, excerpt <= 360 chars, lowercased full text, event_ref)
+    entries: Vec<(String, String, String, String)>,
 }
 
 #[derive(Clone)]
@@ -1454,7 +2399,7 @@ fn jcode_session_cache() -> &'static Mutex<HashMap<PathBuf, CachedJcodeSession>>
 #[cfg(test)]
 static SESSION_FILE_PARSES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-fn load_hal_events_cached(path: &Path) -> Option<CachedHalEvents> {
+fn load_hal_events_cached(path: &Path, sid: &str) -> Option<CachedHalEvents> {
     let md = std::fs::metadata(path).ok()?;
     let stamp = (md.modified().ok()?, md.len());
     {
@@ -1469,21 +2414,30 @@ fn load_hal_events_cached(path: &Path) -> Option<CachedHalEvents> {
     #[cfg(test)]
     SESSION_FILE_PARSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut entries = vec![];
-    for line in raw.lines().take(200) {
+    for (idx, line) in raw.lines().take(300).enumerate() {
         let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
-        let role = match v["t"].as_str() {
-            Some("user") => "user",
-            Some("assistant") => "assistant",
+        let role = match v["t"].as_str().or_else(|| v["type"].as_str()) {
+            Some("user" | "message.created") => "user",
+            Some("assistant" | "assistant.completed") => "assistant",
+            Some("tool" | "tool_output" | "tool.output" | "tool.finished") => "tool",
+            Some("error" | "turn.failed") => "error",
             _ => continue,
         };
-        let txt = v["text"].as_str().unwrap_or("").trim();
+        let txt = v["text"]
+            .as_str()
+            .or_else(|| v["content"].as_str())
+            .or_else(|| v["data"].as_str())
+            .or_else(|| v["error"].as_str())
+            .unwrap_or("")
+            .trim();
         if txt.is_empty() {
             continue;
         }
         entries.push((
             role.to_string(),
-            txt.chars().take(280).collect::<String>(),
+            txt.chars().take(360).collect::<String>(),
             txt.to_lowercase(),
+            format!("hal-jsonl:{sid}:{}", idx + 1),
         ));
     }
     let item = CachedHalEvents { stamp, entries };
@@ -1493,6 +2447,115 @@ fn load_hal_events_cached(path: &Path) -> Option<CachedHalEvents> {
     }
     cache.insert(path.to_path_buf(), item.clone());
     Some(item)
+}
+
+/// Extract searchable raw turns & tool outputs from a Philium agent's read-only HAL SQLite event journal.
+fn extract_hal_db_entries(ctx: &Ctx, agent_id: &str, sid: &str, after_seq: i64, limit: i64) -> Vec<(i64, String, String, String)> {
+    let Ok(Value::Array(events)) = crate::agents::history::events(ctx, agent_id, after_seq, limit) else {
+        return vec![];
+    };
+    let mut out: Vec<(i64, String, String, String)> = Vec::new();
+    let mut tool_names: HashMap<String, String> = HashMap::new();
+    let mut delta_buf = String::new();
+    let mut delta_seq = 0i64;
+
+    let flush_delta = |buf: &mut String, seq: &mut i64, out: &mut Vec<(i64, String, String, String)>| {
+        let trimmed = buf.trim();
+        if !trimmed.is_empty() {
+            out.push((
+                *seq,
+                "assistant".into(),
+                trimmed.chars().take(1200).collect::<String>(),
+                format!("hal:{agent_id}:{sid}:{}", *seq),
+            ));
+        }
+        buf.clear();
+        *seq = 0;
+    };
+
+    for ev in events {
+        let seq = ev["seq"].as_i64().unwrap_or(0);
+        let ty = ev["type"].as_str().unwrap_or("");
+        match ty {
+            "message.created" => {
+                flush_delta(&mut delta_buf, &mut delta_seq, &mut out);
+                if ev["role"].as_str() == Some("user") {
+                    if let Some(txt) = ev["content"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                        out.push((seq, "user".into(), txt.chars().take(1200).collect(), format!("hal:{agent_id}:{sid}:{seq}")));
+                    }
+                }
+            }
+            "model.delta" => {
+                if let Some(d) = ev["delta"].as_str() {
+                    if delta_seq == 0 {
+                        delta_seq = seq;
+                    }
+                    if delta_buf.len() < 4096 {
+                        delta_buf.push_str(d);
+                    }
+                }
+            }
+            "assistant.completed" => {
+                if let Some(txt) = ev["text"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                    delta_buf.clear();
+                    delta_seq = 0;
+                    out.push((seq, "assistant".into(), txt.chars().take(1200).collect(), format!("hal:{agent_id}:{sid}:{seq}")));
+                } else {
+                    flush_delta(&mut delta_buf, &mut delta_seq, &mut out);
+                }
+            }
+            "tool.started" => {
+                flush_delta(&mut delta_buf, &mut delta_seq, &mut out);
+                if let (Some(cid), Some(tool)) = (ev["call_id"].as_str(), ev["tool"].as_str()) {
+                    tool_names.insert(cid.to_string(), tool.to_string());
+                    let arg_txt = ev.get("arguments").map(|a| a.to_string()).unwrap_or_default();
+                    if !arg_txt.is_empty() && arg_txt != "null" && arg_txt != "{}" {
+                        let line = format!("{tool} {}", arg_txt.chars().take(300).collect::<String>());
+                        out.push((seq, "tool_call".into(), line, format!("hal:{agent_id}:{sid}:{seq}")));
+                    }
+                }
+            }
+            "tool.output" => {
+                if let Some(data) = ev["data"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                    let tname = ev["call_id"]
+                        .as_str()
+                        .and_then(|cid| tool_names.get(cid))
+                        .map(String::as_str)
+                        .unwrap_or("tool");
+                    let line = format!("[{tname}] {}", data.chars().take(1000).collect::<String>());
+                    out.push((seq, "tool_output".into(), line, format!("hal:{agent_id}:{sid}:{seq}")));
+                }
+            }
+            "tool.finished" => {
+                let tname = ev["call_id"]
+                    .as_str()
+                    .and_then(|cid| tool_names.get(cid))
+                    .map(String::as_str)
+                    .unwrap_or("tool");
+                let ok = ev["ok"].as_bool().unwrap_or(true);
+                let res_txt = match ev.get("result") {
+                    Some(Value::String(s)) => s.clone(),
+                    Some(v) if !v.is_null() => v.to_string(),
+                    _ => String::new(),
+                };
+                if !res_txt.is_empty() || !ok {
+                    let status_tag = if ok { "ok" } else { "err" };
+                    let line = format!("[{tname}:{status_tag}] {}", res_txt.chars().take(1000).collect::<String>());
+                    out.push((seq, "tool_result".into(), line, format!("hal:{agent_id}:{sid}:{seq}")));
+                }
+            }
+            "turn.failed" => {
+                flush_delta(&mut delta_buf, &mut delta_seq, &mut out);
+                let err = ev["error"].as_str().map(str::to_string).unwrap_or_else(|| ev["error"].to_string());
+                if !err.trim().is_empty() && err != "null" {
+                    out.push((seq, "error".into(), err.chars().take(800).collect(), format!("hal:{agent_id}:{sid}:{seq}")));
+                }
+            }
+            _ => {}
+        }
+    }
+    flush_delta(&mut delta_buf, &mut delta_seq, &mut out);
+    out
 }
 
 fn load_jcode_session_cached(path: &Path, stamp: (SystemTime, u64)) -> Option<CachedJcodeSession> {
@@ -1570,7 +2633,15 @@ fn load_jcode_session_cached(path: &Path, stamp: (SystemTime, u64)) -> Option<Ca
     Some(parsed)
 }
 
-fn search_sessions(ctx: &Ctx, home_dir: Option<&Path>, query: &str, project: Option<&str>, repo_only: bool, repo_id: Option<&str>, limit: usize) -> Result<Value, String> {
+fn search_sessions(
+    ctx: &Ctx,
+    home_dir: Option<&Path>,
+    query: &str,
+    project: Option<&str>,
+    repo_only: bool,
+    repo_id: Option<&str>,
+    limit: usize,
+) -> Result<Value, String> {
     let limit = limit.clamp(1, 25);
     let terms: Vec<String> = query
         .to_lowercase()
@@ -1580,17 +2651,16 @@ fn search_sessions(ctx: &Ctx, home_dir: Option<&Path>, query: &str, project: Opt
         .collect();
     let mut candidates: Vec<(i64, Value)> = vec![];
 
-    // 1. Philium agents & HAL session transcripts
-    let agents = ctx
-        .db
-        .query(
-            "SELECT a.id,a.name,a.role,a.state,t.title AS task_title, \
-             (SELECT w.branch FROM worktrees w WHERE w.agent_id=a.id AND w.repo_id=r.id AND w.state='active' ORDER BY w.created_at DESC LIMIT 1) AS branch, \
-             a.hal_session_id,a.last_active_at,r.path AS repo_path FROM agents a LEFT JOIN repos r ON r.id=a.repo_id \
-             LEFT JOIN tasks t ON t.id=a.task_id AND t.repo_id=r.id WHERE (?1 IS NULL OR r.id=?1) ORDER BY a.last_active_at DESC LIMIT 60",
-            params![repo_id],
-        )?;
+    // 1. Philium agents & same-repo HAL session raw evidence (hal.db + events.jsonl + non-scrubbed events).
+    let agents = ctx.db.query(
+        "SELECT a.id,a.name,a.role,a.state,t.title AS task_title, \
+         (SELECT w.branch FROM worktrees w WHERE w.agent_id=a.id AND w.repo_id=r.id AND w.state='active' ORDER BY w.created_at DESC LIMIT 1) AS branch, \
+         a.hal_session_id,a.last_active_at,r.path AS repo_path FROM agents a LEFT JOIN repos r ON r.id=a.repo_id \
+         LEFT JOIN tasks t ON t.id=a.task_id AND t.repo_id=r.id WHERE (?1 IS NULL OR r.id=?1) ORDER BY a.last_active_at DESC LIMIT 60",
+        params![repo_id],
+    )?;
     for a in agents {
+        let aid = a["id"].as_str().unwrap_or("");
         let rpath = a["repo_path"].as_str().unwrap_or("");
         let same_repo = repo_id.is_some() || matches_repo(rpath, project);
         if repo_only && project.is_some() && !same_repo {
@@ -1611,18 +2681,63 @@ fn search_sessions(ctx: &Ctx, home_dir: Option<&Path>, query: &str, project: Opt
             }
         }
         let mut excerpts = vec![];
-        // Agent recall provides orientation, not implicit access to raw conversations.
-        if let Some(sid) = a["hal_session_id"].as_str().filter(|s| repo_id.is_none() && !s.is_empty()) {
-            let ev_path = ctx.root.join("hal/sessions").join(sid).join("events.jsonl");
-            if let Some(cached) = load_hal_events_cached(&ev_path) {
-                for (role, excerpt, low) in &cached.entries {
+        if let Some(sid) = a["hal_session_id"].as_str().filter(|s| !s.is_empty()) {
+            // 1a. Authoritative read-only HAL SQLite event journal (`hal.db`) — same-repo raw turns & tool outputs.
+            let db_entries = extract_hal_db_entries(ctx, aid, sid, 0, 300);
+            if !db_entries.is_empty() {
+                for (_, role, text, event_ref) in db_entries {
+                    let low = text.to_lowercase();
                     let term_hits = terms.iter().filter(|t| low.contains(t.as_str())).count();
                     if terms.is_empty() || term_hits > 0 {
-                        score += (term_hits as i64) * 10;
-                        if excerpts.len() < 3 {
+                        score += (term_hits as i64) * 12;
+                        if excerpts.len() < 5 {
                             excerpts.push(json!({
                                 "role": role,
-                                "text": excerpt,
+                                "text": text.chars().take(360).collect::<String>(),
+                                "event_ref": event_ref,
+                            }));
+                        }
+                    }
+                }
+            } else {
+                // 1b. Legacy/JSONL HAL event transcript fallback (mtime-cached).
+                let ev_path = ctx.root.join("hal/sessions").join(sid).join("events.jsonl");
+                if let Some(cached) = load_hal_events_cached(&ev_path, sid) {
+                    for (role, excerpt, low, event_ref) in &cached.entries {
+                        let term_hits = terms.iter().filter(|t| low.contains(t.as_str())).count();
+                        if terms.is_empty() || term_hits > 0 {
+                            score += (term_hits as i64) * 10;
+                            if excerpts.len() < 5 {
+                                excerpts.push(json!({
+                                    "role": role,
+                                    "text": excerpt,
+                                    "event_ref": event_ref,
+                                }));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // 1c. Same-agent Philium audit events (skipping scrubbed records).
+        if !aid.is_empty() && !terms.is_empty() && excerpts.len() < 5 {
+            if let Ok(ev_rows) = ctx.db.query(
+                "SELECT id, kind, body FROM events
+                 WHERE agent_id=?1 AND body NOT LIKE '%\"scrubbed\":true%'
+                 ORDER BY id DESC LIMIT 80",
+                [aid],
+            ) {
+                for ev in ev_rows {
+                    let body = ev["body"].as_str().unwrap_or("");
+                    let low = body.to_lowercase();
+                    let hits = terms.iter().filter(|t| low.contains(t.as_str())).count();
+                    if hits > 0 {
+                        score += (hits as i64) * 8;
+                        if excerpts.len() < 5 {
+                            excerpts.push(json!({
+                                "role": ev["kind"].as_str().unwrap_or("event"),
+                                "text": body.chars().take(360).collect::<String>(),
+                                "event_ref": format!("evt:{}", ev["id"].as_i64().unwrap_or(0)),
                             }));
                         }
                     }
@@ -1647,7 +2762,7 @@ fn search_sessions(ctx: &Ctx, home_dir: Option<&Path>, query: &str, project: Opt
         }
     }
 
-    // 2. Jcode sessions (~/.jcode/sessions/*.json), cached by (path, mtime, len)
+    // 2. Jcode sessions (~/.jcode/sessions/*.json), cached by (path, mtime, len) — operator UI only (home_dir=None for agents).
     if let Some(rd) = home_dir.and_then(|home| std::fs::read_dir(home.join(".jcode/sessions")).ok()) {
         let mut files: Vec<(SystemTime, u64, PathBuf)> = rd
             .flatten()
@@ -1713,26 +2828,431 @@ fn search_sessions(ctx: &Ctx, home_dir: Option<&Path>, query: &str, project: Opt
     Ok(Value::Array(candidates.into_iter().take(limit).map(|(_, v)| v).collect()))
 }
 
+// ---------- Pipeline-Side Per-Session Observation Note & Candidate Extraction (v1#4 / AgeMem) ----------
+
+fn observing_agents() -> &'static Mutex<HashSet<String>> {
+    static O: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    O.get_or_init(Default::default)
+}
+
+/// Schedule a non-blocking pipeline observation pass on session idle/stop (Standard agents only).
+pub fn schedule_session_observe(ctx: &Arc<Ctx>, agent_id: &str) {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else { return };
+    {
+        let mut busy = observing_agents().lock().unwrap_or_else(|e| e.into_inner());
+        if !busy.insert(agent_id.to_string()) {
+            return;
+        }
+    }
+    let (c, aid) = (ctx.clone(), agent_id.to_string());
+    handle.spawn(async move {
+        let _ = observe_session(&c, &aid).await;
+        observing_agents().lock().unwrap_or_else(|e| e.into_inner()).remove(&aid);
+    });
+}
+
+#[derive(Default)]
+struct ExtractedSessionObs {
+    requirements: Option<String>,
+    decisions: Option<String>,
+    failed_attempts: Option<String>,
+    next_steps: Option<String>,
+    /// (content, category, fact_key, trust_tier)
+    candidates: Vec<(String, String, Option<String>, String)>,
+}
+
+fn infer_fact_key(text: &str) -> Option<String> {
+    let low = text.to_lowercase();
+    if low.contains("offline") || low.contains("network") || low.contains("airplane") {
+        return Some("network.policy".into());
+    }
+    if low.contains("push") && low.contains("main") {
+        return Some("git.push".into());
+    }
+    if low.contains("package manager") || low.contains("pnpm") || low.contains("bun ") || low.contains("npm ") {
+        return Some("tooling.package_manager".into());
+    }
+    if low.contains("sqlite") || low.contains("postgres") || low.contains("database") {
+        return Some("storage.engine".into());
+    }
+    if low.contains("port ") || low.contains("localhost:") || low.contains("127.0.0.1:") {
+        return Some("runtime.ports".into());
+    }
+    None
+}
+
+fn extract_deterministic_observation(entries: &[(i64, String, String, String)]) -> ExtractedSessionObs {
+    let mut obs = ExtractedSessionObs::default();
+    let mut reqs: Vec<String> = vec![];
+    let mut decs: Vec<String> = vec![];
+    let mut fails: Vec<String> = vec![];
+    let mut nexts: Vec<String> = vec![];
+
+    for (_, role, text, _) in entries {
+        let low = text.to_lowercase();
+        let snippet: String = text.trim().replace('\n', " ").chars().take(240).collect();
+        if snippet.is_empty() {
+            continue;
+        }
+        match role.as_str() {
+            "user" => {
+                if low.contains("must ")
+                    || low.contains("never ")
+                    || low.contains("don't ")
+                    || low.contains("always ")
+                    || low.contains("prefer ")
+                    || low.contains("offline")
+                {
+                    if reqs.len() < 3 {
+                        reqs.push(snippet.clone());
+                    }
+                    if obs.candidates.len() < 4 {
+                        let cat = if low.contains("never ") || low.contains("don't ") {
+                            "correction"
+                        } else {
+                            "preference"
+                        };
+                        obs.candidates.push((
+                            snippet,
+                            cat.into(),
+                            infer_fact_key(text),
+                            "agent_inferred".into(),
+                        ));
+                    }
+                }
+            }
+            "error" => {
+                if fails.len() < 3 {
+                    fails.push(snippet);
+                }
+            }
+            "tool_result" | "tool_output" => {
+                if low.contains(":err]")
+                    || low.contains("enetunreach")
+                    || low.contains("error:")
+                    || low.contains("failed")
+                    || low.contains("exit_code\":") && !low.contains("exit_code\":0") && !low.contains("exit_code\": 0")
+                {
+                    if fails.len() < 3 {
+                        fails.push(snippet);
+                    }
+                } else if (low.contains("cargo test") || low.contains("npm test") || low.contains("pytest"))
+                    && (low.contains("test result: ok") || low.contains("passed") || low.contains(":ok]"))
+                {
+                    if obs.candidates.len() < 5 {
+                        obs.candidates.push((
+                            format!("Verified run succeeded: {snippet}"),
+                            "procedure".into(),
+                            None,
+                            "verified_run".into(),
+                        ));
+                    }
+                }
+            }
+            "assistant" => {
+                if low.contains("decided ") || low.contains("switched to ") || low.contains("implemented ") {
+                    if decs.len() < 2 {
+                        decs.push(snippet.clone());
+                    }
+                }
+                if low.contains("next step") || low.contains("remaining") || low.contains("todo") {
+                    if nexts.len() < 2 {
+                        nexts.push(snippet);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if !reqs.is_empty() {
+        obs.requirements = Some(reqs.join(" | "));
+    }
+    if !decs.is_empty() {
+        obs.decisions = Some(decs.join(" | "));
+    }
+    if !fails.is_empty() {
+        obs.failed_attempts = Some(fails.join(" | "));
+    }
+    if !nexts.is_empty() {
+        obs.next_steps = Some(nexts.join(" | "));
+    }
+    obs
+}
+
+fn append_note_line(existing: &str, addition: &str) -> String {
+    let add = addition.trim();
+    if add.is_empty() {
+        return existing.to_string();
+    }
+    if existing.trim().is_empty() {
+        return add.chars().take(2000).collect();
+    }
+    if existing.to_lowercase().contains(&add.to_lowercase()) {
+        return existing.to_string();
+    }
+    let merged = format!("{}\n{}", existing.trim(), add);
+    merged.chars().take(2000).collect()
+}
+
+/// Try a single bounded LLM extraction call through Philium's gateway for a trusted Standard agent.
+/// Returns `None` if offline, no trusted chat provider is active, or the response is not valid JSON.
+async fn try_llm_session_observation(
+    ctx: &Ctx,
+    model_ref: &str,
+    entries: &[(i64, String, String, String)],
+) -> Option<ExtractedSessionObs> {
+    if ctx.gateway_url.ends_with(":9") {
+        return None;
+    }
+    let (pid, mid) = crate::providers::split_ref(model_ref)?;
+    let p = crate::providers::get(ctx, pid)?;
+    if !p.enabled || !p.trusted || !matches!(p.kind, crate::providers::Kind::OpenaiChat | crate::providers::Kind::Anthropic) {
+        return None;
+    }
+    let mut transcript = String::new();
+    for (seq, role, text, _) in entries.iter().take(40) {
+        let line = format!("[seq={seq} {role}] {}\n", text.chars().take(320).collect::<String>());
+        if transcript.len() + line.len() > 6000 {
+            break;
+        }
+        transcript.push_str(&line);
+    }
+    let url = format!("{}/p/{}/chat/completions", ctx.gateway_url.trim_end_matches('/'), p.id);
+    let resp = embed_http_client()
+        .post(&url)
+        .bearer_auth(&ctx.gateway.token)
+        .json(&json!({
+            "model": mid,
+            "stream": false,
+            "temperature": 0,
+            "max_tokens": 500,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "Extract a concise session observation as strict JSON: {\"working_note\":{\"requirements\":null,\"decisions\":null,\"failed_attempts\":null,\"next_steps\":null},\"candidates\":[{\"content\":\"...\",\"category\":\"fact|preference|correction|entity|procedure\",\"fact_key\":\"optional.key\",\"trust_tier\":\"agent_inferred|verified_run\"}]}. Omit empty fields. Max 4 candidates. Return JSON only."
+                },
+                { "role": "user", "content": transcript }
+            ]
+        }))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body: Value = resp.json().await.ok()?;
+    let raw = body.pointer("/choices/0/message/content")?.as_str()?.trim();
+    let cleaned = raw
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
+    let parsed: Value = serde_json::from_str(cleaned).ok()?;
+    let mut obs = ExtractedSessionObs::default();
+    if let Some(wn) = parsed.get("working_note") {
+        obs.requirements = wn["requirements"].as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+        obs.decisions = wn["decisions"].as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+        obs.failed_attempts = wn["failed_attempts"].as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+        obs.next_steps = wn["next_steps"].as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+    }
+    if let Some(arr) = parsed["candidates"].as_array() {
+        for item in arr.iter().take(4) {
+            let Some(content) = item["content"].as_str().map(str::trim).filter(|s| !s.is_empty()) else { continue };
+            let cat = item["category"].as_str().unwrap_or("fact");
+            if validate_category(cat).is_err() {
+                continue;
+            }
+            let tier = match item["trust_tier"].as_str() {
+                Some("verified_run") => "verified_run",
+                _ => "agent_inferred",
+            };
+            let fk = clean_fact_key(item["fact_key"].as_str());
+            obs.candidates.push((content.to_string(), cat.to_string(), fk, tier.to_string()));
+        }
+    }
+    Some(obs)
+}
+
+/// Pipeline-side per-session observation pass (Standard agents only).
+/// Reads newly persisted raw session turns/tool outputs, updates the repo working note via partial patch,
+/// and writes candidate memories linked to `source_event_id` (staging conflicts against `user_direct` as `proposed`).
+pub async fn observe_session(ctx: &Arc<Ctx>, agent_id: &str) -> Result<Value, String> {
+    let (c_load, aid) = (ctx.clone(), agent_id.to_string());
+    let loaded = tokio::task::spawn_blocking(move || -> Result<Option<(String, String, String, String, i64, Vec<(i64, String, String, String)>)>, String> {
+        let Some(row) = crate::agents::get_row(&c_load, &aid) else {
+            return Ok(None);
+        };
+        if row["strict"].as_i64() == Some(1) {
+            return Ok(None);
+        }
+        let Some(repo_id) = row["repo_id"].as_str().filter(|s| !s.is_empty()).map(str::to_string) else {
+            return Ok(None);
+        };
+        if c_load.db.query("SELECT id FROM repos WHERE id=?1", [&repo_id])?.is_empty() {
+            return Ok(None);
+        }
+        let Some(sid) = row["hal_session_id"].as_str().filter(|s| !s.is_empty()).map(str::to_string) else {
+            return Ok(None);
+        };
+        let name = row["name"].as_str().unwrap_or("agent").to_string();
+        let model_ref = row["model_ref"].as_str().unwrap_or("").to_string();
+        let kv_key = format!("memory.observed_seq.{aid}");
+        let last_seq = c_load.db.kv_get(&kv_key).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+        let entries = extract_hal_db_entries(&c_load, &aid, &sid, last_seq, 200);
+        if entries.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some((name, repo_id, sid, model_ref, last_seq, entries)))
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    let Some((name, repo_id, sid, model_ref, last_seq, entries)) = loaded else {
+        return Ok(json!({ "skipped": true }));
+    };
+
+    let first_seq = entries.first().map(|e| e.0).unwrap_or(last_seq + 1);
+    let max_seq = entries.iter().map(|e| e.0).max().unwrap_or(last_seq);
+    if max_seq <= last_seq {
+        return Ok(json!({ "skipped": true }));
+    }
+
+    let obs = match try_llm_session_observation(ctx, &model_ref, &entries).await {
+        Some(llm_obs) => llm_obs,
+        None => extract_deterministic_observation(&entries),
+    };
+
+    let (c_save, aid_save, name_save, repo_save, sid_save) = (ctx.clone(), agent_id.to_string(), name, repo_id, sid);
+    let (saved_ids, active_to_embed, source_event_id) = tokio::task::spawn_blocking(move || -> Result<(Vec<Value>, Vec<(String, String)>, Option<String>), String> {
+        let scope = format!("repo:{repo_save}");
+        let provenance = format!("pipeline:session:{sid_save}:seq:{first_seq}-{max_seq}");
+        let source_event_id = c_save.log_event_id(
+            "memory:session_observe",
+            Some(&aid_save),
+            &json!({
+                "scope": scope,
+                "session_id": sid_save,
+                "seq_from": first_seq,
+                "seq_to": max_seq,
+                "candidate_count": obs.candidates.len(),
+            }),
+        );
+
+        // Merge into existing working note without clobbering existing operator notes.
+        if obs.requirements.is_some()
+            || obs.decisions.is_some()
+            || obs.failed_attempts.is_some()
+            || obs.next_steps.is_some()
+        {
+            let cur = working_note_get(&c_save, &scope)?;
+            let req = obs.requirements.as_deref().map(|a| append_note_line(cur["requirements"].as_str().unwrap_or(""), a));
+            let dec = obs.decisions.as_deref().map(|a| append_note_line(cur["decisions"].as_str().unwrap_or(""), a));
+            let fail = obs.failed_attempts.as_deref().map(|a| append_note_line(cur["failed_attempts"].as_str().unwrap_or(""), a));
+            let next = obs.next_steps.as_deref().map(|a| append_note_line(cur["next_steps"].as_str().unwrap_or(""), a));
+            working_note_patch(
+                &c_save,
+                &scope,
+                req.as_deref(),
+                dec.as_deref(),
+                fail.as_deref(),
+                next.as_deref(),
+                source_event_id.as_deref(),
+                &format!("pipeline:{name_save}"),
+            )?;
+        }
+
+        let mut saved = Vec::new();
+        let mut to_embed = Vec::new();
+        for (content, category, fact_key, trust_tier) in obs.candidates {
+            // Skip near-exact duplicates already active in this scope.
+            let norm = normalized_text(&content);
+            let already = c_save
+                .db
+                .query(
+                    "SELECT content FROM memories WHERE scope=?1 AND active=1 AND status='active'",
+                    [&scope],
+                )
+                .unwrap_or_default()
+                .iter()
+                .any(|r| normalized_text(r["content"].as_str().unwrap_or("")) == norm);
+            if already {
+                continue;
+            }
+            if let Ok(res) = save_structured(&c_save, SaveOpts {
+                content: &content,
+                category: &category,
+                scope: &scope,
+                source: &format!("pipeline:{name_save}"),
+                trust_tier: &trust_tier,
+                fact_key: fact_key.as_deref(),
+                supersedes_id: None,
+                source_event_id: source_event_id.as_deref(),
+                provenance: Some(&provenance),
+            }) {
+                if res["status"].as_str() == Some("active") {
+                    if let Some(mid) = res["id"].as_str() {
+                        to_embed.push((mid.to_string(), content));
+                    }
+                }
+                saved.push(res);
+            }
+        }
+
+        let _ = c_save.db.kv_set(&format!("memory.observed_seq.{aid_save}"), &max_seq.to_string());
+        Ok((saved, to_embed, source_event_id))
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    for (mid, content) in active_to_embed {
+        let _ = embed_memory_async(ctx, &mid, &content).await;
+    }
+
+    Ok(json!({
+        "skipped": false,
+        "seq_to": max_seq,
+        "source_event_id": source_event_id,
+        "saved": saved_ids,
+    }))
+}
+
+// ---------- RPC Dispatch ----------
+
 pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, String> {
     match method {
-        "status" => Ok(json!({
-            "skills": ctx.db.query("SELECT count(*) AS n FROM skills", [])?[0]["n"],
-            "memories": ctx.db.query("SELECT count(*) AS n FROM memories WHERE active=1 AND status='active'", [])?[0]["n"],
-            "proposed": ctx.db.query("SELECT count(*) AS n FROM memories WHERE status='proposed'", [])?[0]["n"],
-            "superseded": ctx.db.query("SELECT count(*) AS n FROM memories WHERE status='superseded'", [])?[0]["n"],
-            "quarantined": ctx.db.query("SELECT count(*) AS n FROM memories WHERE status='quarantined'", [])?[0]["n"],
-            "intentions": ctx.db.query("SELECT count(*) AS n FROM intentions WHERE active=1", [])?[0]["n"],
-            "embed_model": LOCAL_EMBED_MODEL,
-            "imported_at": ctx.db.kv_get("library.imported_at"),
-        })),
+        "status" => {
+            let embed_model = resolve_embedding_config(ctx).map(|c| c.model_version);
+            Ok(json!({
+                "skills": ctx.db.query("SELECT count(*) AS n FROM skills", [])?[0]["n"],
+                "memories": ctx.db.query("SELECT count(*) AS n FROM memories WHERE active=1 AND status='active'", [])?[0]["n"],
+                "proposed": ctx.db.query("SELECT count(*) AS n FROM memories WHERE status='proposed'", [])?[0]["n"],
+                "superseded": ctx.db.query("SELECT count(*) AS n FROM memories WHERE status='superseded'", [])?[0]["n"],
+                "quarantined": ctx.db.query("SELECT count(*) AS n FROM memories WHERE status='quarantined'", [])?[0]["n"],
+                "intentions": ctx.db.query("SELECT count(*) AS n FROM intentions WHERE active=1", [])?[0]["n"],
+                "embed_model": embed_model,
+                "retrieval": if embed_model.is_some() { "hybrid_bm25_dense_rrf" } else { "bm25_only" },
+                "imported_at": ctx.db.kv_get("library.imported_at"),
+            }))
+        }
         "import" => {
             let c = ctx.clone();
-            tokio::task::spawn_blocking(move || import(&c, &home())).await.map_err(|e| e.to_string())?
+            let res = tokio::task::spawn_blocking(move || {
+                let r = import(&c, &home())?;
+                sync_imported_repo_scopes(&c);
+                Ok::<Value, String>(r)
+            })
+            .await
+            .map_err(|e| e.to_string())??;
+            let _ = sync_vectors_async(ctx).await;
+            Ok(res)
         }
+        "reindex" => sync_vectors_async(ctx).await,
+        "observe_session" => observe_session(ctx, &crate::ctx::arg_str(&args, "agent_id")?).await,
         "skills" => skill_list(ctx),
         "memories" => match args["repo_id"].as_str() {
-            Some(repo) => agent_memories(ctx, args["q"].as_str().unwrap_or(""), repo, args["limit"].as_i64().unwrap_or(50)),
-            None => memory_search(ctx, args["q"].as_str().unwrap_or(""), None, args["limit"].as_i64().unwrap_or(50)),
+            Some(repo) => agent_memories_async(ctx, args["q"].as_str().unwrap_or(""), repo, args["limit"].as_i64().unwrap_or(50)).await,
+            None => memory_search_async(ctx, args["q"].as_str().unwrap_or(""), None, args["limit"].as_i64().unwrap_or(50)).await,
         },
         "list" => {
             let scope = args["scope"].as_str().or_else(|| args["repo_id"].as_str().map(|_| ""));
@@ -1749,7 +3269,7 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
         }
         "save" => {
             let content = crate::ctx::arg_str(&args, "content")?;
-            let category = args["category"].as_str().unwrap_or("fact");
+            let category = args["category"].as_str().unwrap_or("fact").to_string();
             let scope = if let Some(s) = args["scope"].as_str().filter(|s| !s.is_empty()) {
                 s.to_string()
             } else if let Some(r) = args["repo_id"].as_str().filter(|s| !s.is_empty()) {
@@ -1757,18 +3277,34 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
             } else {
                 "global".to_string()
             };
-            let trust = args["trust_tier"].as_str().unwrap_or("user_direct");
-            save_structured(ctx, SaveOpts {
-                content: &content,
-                category,
-                scope: &scope,
-                source: args["source"].as_str().unwrap_or("user"),
-                trust_tier: trust,
-                fact_key: args["fact_key"].as_str(),
-                supersedes_id: args["supersedes_id"].as_str(),
-                source_event_id: args["source_event_id"].as_str(),
-                provenance: args["provenance"].as_str().or(Some("operator:ui")),
+            let trust = args["trust_tier"].as_str().unwrap_or("user_direct").to_string();
+            let source = args["source"].as_str().unwrap_or("user").to_string();
+            let fact_key = args["fact_key"].as_str().map(str::to_string);
+            let supersedes_id = args["supersedes_id"].as_str().map(str::to_string);
+            let source_event_id = args["source_event_id"].as_str().map(str::to_string);
+            let provenance = args["provenance"].as_str().unwrap_or("operator:ui").to_string();
+            let (c, content_for_embed) = (ctx.clone(), content.clone());
+            let res = tokio::task::spawn_blocking(move || {
+                save_structured(&c, SaveOpts {
+                    content: &content,
+                    category: &category,
+                    scope: &scope,
+                    source: &source,
+                    trust_tier: &trust,
+                    fact_key: fact_key.as_deref(),
+                    supersedes_id: supersedes_id.as_deref(),
+                    source_event_id: source_event_id.as_deref(),
+                    provenance: Some(&provenance),
+                })
             })
+            .await
+            .map_err(|e| e.to_string())??;
+            if res["status"].as_str() == Some("active") {
+                if let Some(mid) = res["id"].as_str() {
+                    let _ = embed_memory_async(ctx, mid, &content_for_embed).await;
+                }
+            }
+            Ok(res)
         }
         "supersede" => {
             let old_id = crate::ctx::arg_str(&args, "old_id")?;
@@ -1779,22 +3315,39 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
                 .into_iter()
                 .next()
                 .ok_or_else(|| "memory to supersede not found".to_string())?;
-            let scope = old["scope"].as_str().unwrap_or("global");
-            let category = args["category"].as_str().or_else(|| old["category"].as_str()).unwrap_or("fact");
-            let fk = args["fact_key"].as_str().or_else(|| old["fact_key"].as_str());
-            save_structured(ctx, SaveOpts {
-                content: &content,
-                category,
-                scope,
-                source: "user",
-                trust_tier: "user_direct",
-                fact_key: fk,
-                supersedes_id: Some(&old_id),
-                source_event_id: args["source_event_id"].as_str(),
-                provenance: args["provenance"].as_str().or(Some("operator:superseded")),
+            let scope = old["scope"].as_str().unwrap_or("global").to_string();
+            let category = args["category"]
+                .as_str()
+                .or_else(|| old["category"].as_str())
+                .unwrap_or("fact")
+                .to_string();
+            let fk = args["fact_key"].as_str().or_else(|| old["fact_key"].as_str()).map(str::to_string);
+            let source_event_id = args["source_event_id"].as_str().map(str::to_string);
+            let provenance = args["provenance"].as_str().unwrap_or("operator:superseded").to_string();
+            let (c, content_for_embed) = (ctx.clone(), content.clone());
+            let res = tokio::task::spawn_blocking(move || {
+                save_structured(&c, SaveOpts {
+                    content: &content,
+                    category: &category,
+                    scope: &scope,
+                    source: "user",
+                    trust_tier: "user_direct",
+                    fact_key: fk.as_deref(),
+                    supersedes_id: Some(&old_id),
+                    source_event_id: source_event_id.as_deref(),
+                    provenance: Some(&provenance),
+                })
             })
+            .await
+            .map_err(|e| e.to_string())??;
+            if res["status"].as_str() == Some("active") {
+                if let Some(mid) = res["id"].as_str() {
+                    let _ = embed_memory_async(ctx, mid, &content_for_embed).await;
+                }
+            }
+            Ok(res)
         }
-        "promote" => promote_memory(ctx, &crate::ctx::arg_str(&args, "id")?),
+        "promote" => promote_memory_async(ctx, &crate::ctx::arg_str(&args, "id")?).await,
         "quarantine" => quarantine_memory(ctx, &crate::ctx::arg_str(&args, "id")?, args["reason"].as_str()),
         "forget" => {
             forget_memory(ctx, &crate::ctx::arg_str(&args, "id")?)?;
@@ -1821,25 +3374,38 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
                 .map(str::to_string)
                 .or_else(|| args["repo_id"].as_str().filter(|s| !s.is_empty()).map(|r| format!("repo:{r}")))
                 .unwrap_or_else(|| "global".into());
-            working_note_set(
+            working_note_patch(
                 ctx,
                 &scope,
-                args["requirements"].as_str().unwrap_or(""),
-                args["decisions"].as_str().unwrap_or(""),
-                args["failed_attempts"].as_str().unwrap_or(""),
-                args["next_steps"].as_str().unwrap_or(""),
-                args["source_event_id"].as_str(),
+                args.get("requirements").and_then(Value::as_str),
+                args.get("decisions").and_then(Value::as_str),
+                args.get("failed_attempts").and_then(Value::as_str),
+                args.get("next_steps").and_then(Value::as_str),
+                args.get("source_event_id").and_then(Value::as_str),
                 args["updated_by"].as_str().unwrap_or("user"),
             )
         }
-        "context_slate" => build_context_slate(
-            ctx,
-            args["repo_id"].as_str(),
-            args["q"].as_str().unwrap_or(""),
-            args["budget_tokens"].as_u64().unwrap_or(2000) as usize,
-            args["strict"].as_bool().unwrap_or(false),
-            args["include_global"].as_bool().unwrap_or(true),
-        ),
+        "context_slate" => {
+            let budget = args["budget_tokens"]
+                .as_u64()
+                .filter(|b| *b > 0)
+                .map(|b| b as usize)
+                .unwrap_or_else(|| model_memory_budget(ctx, args["model_ref"].as_str()));
+            let triggers: Vec<String> = args["triggers"]
+                .as_array()
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            build_context_slate_async(
+                ctx,
+                args["repo_id"].as_str(),
+                args["q"].as_str().unwrap_or(""),
+                budget,
+                args["strict"].as_bool().unwrap_or(false),
+                args["include_global"].as_bool().unwrap_or(false),
+                triggers,
+            )
+            .await
+        }
         "intentions" => {
             let scope = args["scope"]
                 .as_str()
@@ -1875,7 +3441,11 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
                 .map(str::to_string)
                 .or_else(|| args["repo_id"].as_str().filter(|s| !s.is_empty()).map(|r| format!("repo:{r}")))
                 .unwrap_or_else(|| "global".into());
-            consolidate_preview(ctx, &scope)
+            let _ = sync_vectors_async(ctx).await;
+            let c = ctx.clone();
+            tokio::task::spawn_blocking(move || consolidate_preview(&c, &scope))
+                .await
+                .map_err(|e| e.to_string())?
         }
         "consolidate_promote" => consolidate_promote(ctx, &crate::ctx::arg_str(&args, "id")?),
         "sessions" => {
@@ -1895,6 +3465,7 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{routing::post, Json, Router};
 
     fn fake_home() -> PathBuf {
         let h = std::env::temp_dir().join(format!("philium-lib-{}", crate::db::new_id()));
@@ -1924,6 +3495,53 @@ mod tests {
         });
         std::fs::write(h.join(".jcode/sessions/session_dolphin_1.json"), sess1.to_string()).unwrap();
         h
+    }
+
+    /// Spawn a real loopback OpenAI-compatible `/v1/embeddings` server returning deterministic semantic
+    /// concept vectors so tests exercise the real HTTP client, L2 normalization, model_version pinning,
+    /// and true paraphrase recall with ZERO overlapping lexical tokens or character 3-grams.
+    async fn spawn_mock_embed_server() -> (String, tokio::task::JoinHandle<()>) {
+        async fn embed_handler(Json(req): Json<Value>) -> Json<Value> {
+            let inputs: Vec<String> = match &req["input"] {
+                Value::String(s) => vec![s.clone()],
+                Value::Array(arr) => arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
+                _ => vec![],
+            };
+            let data: Vec<Value> = inputs
+                .iter()
+                .enumerate()
+                .map(|(i, text)| {
+                    let low = text.to_lowercase();
+                    // 4-dim concept space: [offline/bundle, auth/tokens, git/push, misc]
+                    let mut v = [0.0f32, 0.0, 0.0, 0.05];
+                    if low.contains("bundle weights")
+                        || low.contains("airplane mode")
+                        || low.contains("offline")
+                        || low.contains("no internet")
+                    {
+                        v[0] = 1.0;
+                    }
+                    if low.contains("auth") || low.contains("rotate") || low.contains("token") || low.contains("credential") {
+                        v[1] = 1.0;
+                    }
+                    if low.contains("force push") || low.contains("rewrite history") || low.contains("git") {
+                        v[2] = 1.0;
+                    }
+                    if v[0] == 0.0 && v[1] == 0.0 && v[2] == 0.0 {
+                        v[3] = 1.0;
+                    }
+                    json!({ "object": "embedding", "index": i, "embedding": v })
+                })
+                .collect();
+            Json(json!({ "object": "list", "data": data, "model": req["model"] }))
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1/embeddings", listener.local_addr().unwrap());
+        let app = Router::new().route("/v1/embeddings", post(embed_handler));
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (url, handle)
     }
 
     /// Dry run against the real home, into an in-memory DB. Read-only on sources.
@@ -1980,6 +3598,13 @@ mod tests {
         // Search input cannot inject FTS syntax.
         memory_search(&ctx, "\"unbalanced * NEAR( OR", None, 5).unwrap();
 
+        // Registering the repo maps imported `project:<path>` memories to `repo:<id>` for Standard agents!
+        ctx.db.exec("INSERT INTO repos(id,name,path,added_at) VALUES('repo_ph','philium',?1,0)", [&proj]).unwrap();
+        assert_eq!(sync_imported_repo_scopes(&ctx), 1);
+        let agent_hits = agent_memories(&ctx, "quit second", "repo_ph", 5).unwrap();
+        assert_eq!(agent_hits[0]["id"], "p1", "{agent_hits}");
+        assert_eq!(agent_hits[0]["scope"], "repo:repo_ph");
+
         memory_save(&ctx, "Prefers Philium over Jcode", "preference", None, "tester").unwrap();
         let standing = standing_memories(&ctx);
         assert!(standing.contains("Co-authored-by") && standing.contains("Prefers Philium"), "{standing}");
@@ -1998,7 +3623,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(home);
     }
 
-    // ---- Tier 0-2 Memory Evals (from Obsidian research blueprint) ----
+    // ---- Tier 0-1 Memory Evals (from Obsidian research blueprint) ----
 
     #[test]
     fn supersession_resolves_monday_vs_thursday_in_code_and_preserves_history() {
@@ -2033,6 +3658,9 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert!(items[0]["content"].as_str().unwrap().contains("Hosted mode may use an API"));
         assert_eq!(slate["counts"]["superseded"], 1);
+        // Without a configured neural embedding backend, retrieval must honestly report `bm25_only`.
+        assert_eq!(slate["retrieval"], "bm25_only");
+        assert!(slate["embed_model"].is_null());
 
         // Historical record stays inspectable via status='superseded'.
         let hist = list_memories(&ctx, Some("repo:r1"), Some("superseded"), None, "", 20).unwrap();
@@ -2055,6 +3683,7 @@ mod tests {
             source_event_id: None,
             provenance: Some("operator"),
         }).unwrap();
+        assert!(direct["source_event_id"].as_str().is_some_and(|s| s.starts_with("evt:")));
 
         // Agent tries to claim user_direct and overwrite git.push.
         let attempt = save_agent_memory_rich(
@@ -2070,6 +3699,7 @@ mod tests {
         ).unwrap();
         assert_eq!(attempt["trust_tier"], "agent_inferred");
         assert_eq!(attempt["status"], "proposed");
+        assert!(attempt["source_event_id"].as_str().is_some_and(|s| s.starts_with("evt:")));
 
         // Active slate still only contains Filip's original rule.
         let slate = build_context_slate(&ctx, Some("r1"), "main", 2000, false, false).unwrap();
@@ -2080,7 +3710,7 @@ mod tests {
     }
 
     #[test]
-    fn deletion_scrubs_content_and_cross_repo_canary_never_leaks() {
+    fn deletion_scrubs_content_vectors_and_source_event_and_canary_never_leaks() {
         let ctx = Ctx::test();
         init(&ctx).unwrap();
         let secret_a = save_structured(&ctx, SaveOpts {
@@ -2089,11 +3719,14 @@ mod tests {
             scope: "repo:alpha",
             source: "user",
             trust_tier: "user_direct",
-            fact_key: None,
+            fact_key: Some("secret.canary"),
             supersedes_id: None,
             source_event_id: None,
             provenance: None,
         }).unwrap();
+        let evt_id = secret_a["source_event_id"].as_str().expect("auto source_event_id").to_string();
+        assert!(evt_id.starts_with("evt:"));
+
         let _secret_b = save_structured(&ctx, SaveOpts {
             content: "CANARY_REPO_BETA_2244",
             category: "fact",
@@ -2111,16 +3744,20 @@ mod tests {
         assert!(txt.contains("CANARY_REPO_BETA_2244"));
         assert!(!txt.contains("CANARY_REPO_ALPHA_9911"));
 
-        // Hard delete scrubs FTS and active queries.
-        forget_memory(&ctx, secret_a["id"].as_str().unwrap()).unwrap();
+        // Hard delete scrubs memories, FTS5, vectors, AND the linked raw event row!
+        let mem_id = secret_a["id"].as_str().unwrap();
+        forget_memory(&ctx, mem_id).unwrap();
         let after = agent_memories(&ctx, "CANARY_REPO_ALPHA_9911", "alpha", 10).unwrap();
         assert!(after.as_array().unwrap().is_empty());
         let listed = list_memories(&ctx, Some("repo:alpha"), None, None, "CANARY", 10).unwrap();
         assert!(listed.as_array().unwrap().is_empty());
+        let rowid: i64 = evt_id.strip_prefix("evt:").unwrap().parse().unwrap();
+        let ev_row = ctx.db.query("SELECT body FROM events WHERE id=?1", [rowid]).unwrap();
+        assert!(ev_row[0]["body"].as_str().unwrap().contains("\"scrubbed\":true"), "{ev_row:?}");
     }
 
     #[test]
-    fn slate_respects_token_budget_strict_mode_and_working_notes() {
+    fn slate_respects_token_budget_strict_mode_due_intentions_and_relevance_order() {
         let ctx = Ctx::test();
         init(&ctx).unwrap();
         working_note_set(
@@ -2133,6 +3770,44 @@ mod tests {
             Some("evt-1"),
             "user",
         ).unwrap();
+        // Relevant verified_run memory MUST outrank a less relevant user_direct correction (no provenance weighting!).
+        save_structured(&ctx, SaveOpts {
+            content: "Always check formatting before opening a pull request; keep network comments concise.",
+            category: "correction",
+            scope: "repo:r1",
+            source: "user",
+            trust_tier: "user_direct",
+            fact_key: Some("style.pr"),
+            supersedes_id: None,
+            source_event_id: None,
+            provenance: None,
+        }).unwrap();
+        let relevant = save_structured(&ctx, SaveOpts {
+            content: "Database migration vacuum checkpoint requires exclusive WAL lock before schema upgrade.",
+            category: "fact",
+            scope: "repo:r1",
+            source: "agent:otter",
+            trust_tier: "verified_run",
+            fact_key: Some("db.migration"),
+            supersedes_id: None,
+            source_event_id: None,
+            provenance: Some("run:verify-1"),
+        }).unwrap();
+
+        let slate = build_context_slate(&ctx, Some("r1"), "database migration vacuum checkpoint schema upgrade", 2000, false, false).unwrap();
+        let items = slate["items"].as_array().unwrap();
+        assert!(!items.is_empty());
+        assert_eq!(items[0]["id"], relevant["id"], "relevant verified_run must rank first: {items:?}");
+
+        // Only due intentions (`on_session_start` by default) enter the slate; non-due (`pre_release`) do not.
+        intention_add(&ctx, "repo:r1", "pre_release", "", "Run offline release gate", "user").unwrap();
+        intention_add(&ctx, "repo:r1", "on_session_start", "", "Check working note first", "user").unwrap();
+        let slate_due = build_context_slate(&ctx, Some("r1"), "", 2000, false, false).unwrap();
+        let ints = slate_due["intentions"].as_array().unwrap();
+        assert_eq!(ints.len(), 1, "only due on_session_start intention should enter slate: {ints:?}");
+        assert_eq!(ints[0]["trigger_kind"], "on_session_start");
+
+        // Tight budget enforces cap.
         for i in 0..10 {
             save_structured(&ctx, SaveOpts {
                 content: &format!("Long factual observation #{i} {}", "detail ".repeat(40)),
@@ -2154,35 +3829,240 @@ mod tests {
         // Strict mode gets empty slate.
         let strict_slate = build_context_slate(&ctx, Some("r1"), "", 2000, true, true).unwrap();
         assert!(strict_slate["items"].as_array().unwrap().is_empty());
+        assert!(strict_slate["intentions"].as_array().unwrap().is_empty());
         assert!(strict_slate["working_note"].is_null());
     }
 
-    #[test]
-    fn hybrid_rrf_finds_morphological_variants_and_consolidation_gates_duplicates() {
+    #[tokio::test]
+    async fn real_embeddings_paraphrase_recall_promote_indexing_and_no_256_cap() {
         let ctx = Ctx::test();
+        ctx.db.kv_set("library.imported_at", "fixture").unwrap();
+        init(&ctx).unwrap();
+        let (embed_url, server) = spawn_mock_embed_server().await;
+        ctx.db.kv_set("setting.embedding_endpoint", &embed_url).unwrap();
+        ctx.db.kv_set("setting.embedding_model", "bge-m3-test").unwrap();
+
+        // Insert > 260 filler active memories first so the target sits well past any old LIMIT 256 cap.
+        for i in 0..270 {
+            save_structured(&ctx, SaveOpts {
+                content: &format!("Routine build telemetry note number {i} for metrics dashboard"),
+                category: "fact",
+                scope: "repo:r_emb",
+                source: "user",
+                trust_tier: "user_direct",
+                fact_key: None,
+                supersedes_id: None,
+                source_event_id: None,
+                provenance: None,
+            }).unwrap();
+        }
+        // Save target memory using completely different words ("airplane mode") than the query ("bundle weights").
+        let target = save_structured(&ctx, SaveOpts {
+            content: "Local runtime must start cleanly in airplane mode with zero external downloads.",
+            category: "preference",
+            scope: "repo:r_emb",
+            source: "agent:otter",
+            trust_tier: "verified_run",
+            fact_key: Some("runtime.offline"),
+            supersedes_id: None,
+            source_event_id: None,
+            provenance: None,
+        }).unwrap();
+        // Sync all vectors via real HTTP `/v1/embeddings`.
+        let sync_res = sync_vectors_async(&ctx).await.unwrap();
+        assert_eq!(sync_res["indexed"], 271);
+        assert_eq!(sync_res["mode"], "hybrid_bm25_dense_rrf");
+
+        // Paraphrase query ("Why bundle weights?") shares ZERO lexical words or 3-grams with target!
+        let slate = build_context_slate_async(&ctx, Some("r_emb"), "Why bundle weights?", 2000, false, false, vec![])
+            .await
+            .unwrap();
+        assert_eq!(slate["retrieval"], "hybrid_bm25_dense_rrf");
+        assert_eq!(slate["embed_model"], "local:bge-m3-test");
+        let items = slate["items"].as_array().unwrap();
+        assert!(!items.is_empty(), "paraphrase recall failed: {slate}");
+        assert_eq!(items[0]["id"], target["id"], "paraphrase target past row 256 must rank #1: {items:?}");
+
+        // Test `promote_memory_async` immediately indexes a previously proposed memory's vector!
+        let proposed = save_agent_memory_rich(
+            &ctx,
+            "Never rewrite history on shared branches via force push.",
+            "correction",
+            "r_emb",
+            "otter",
+            Some("runtime.offline"), // collides with existing? no, that's verified_run; let's collide with user_direct!
+            None,
+            None,
+            None,
+        ).unwrap();
+        // Make a true user_direct collision so status='proposed'
+        save_structured(&ctx, SaveOpts {
+            content: "Original git rule.",
+            category: "correction",
+            scope: "repo:r_emb",
+            source: "user",
+            trust_tier: "user_direct",
+            fact_key: Some("git.history"),
+            supersedes_id: None,
+            source_event_id: None,
+            provenance: None,
+        }).unwrap();
+        let staged = save_agent_memory_rich(
+            &ctx,
+            "Avoid force push on protected release branches.",
+            "correction",
+            "r_emb",
+            "otter",
+            Some("git.history"),
+            None,
+            None,
+            None,
+        ).unwrap();
+        assert_eq!(staged["status"], "proposed");
+        let staged_id = staged["id"].as_str().unwrap();
+        assert!(ctx.db.query("SELECT memory_id FROM memory_vectors WHERE memory_id=?1", [staged_id]).unwrap().is_empty());
+
+        let promoted = promote_memory_async(&ctx, staged_id).await.unwrap();
+        assert_eq!(promoted["status"], "active");
+        assert_eq!(promoted["vector_indexed"], true);
+        assert_eq!(
+            ctx.db.query("SELECT model_version FROM memory_vectors WHERE memory_id=?1", [staged_id]).unwrap()[0]["model_version"],
+            "local:bge-m3-test"
+        );
+        // Paraphrase query ("rewrite history") immediately finds the newly promoted memory!
+        let hits = agent_memories_async(&ctx, "rewrite history", "r_emb", 5).await.unwrap();
+        assert!(hits.as_array().unwrap().iter().any(|h| h["id"] == staged_id), "{hits}");
+        let _ = proposed;
+        server.abort();
+    }
+
+    #[test]
+    fn consolidation_runs_real_safety_and_recall_assertions() {
+        let ctx = Ctx::test();
+        ctx.db.kv_set("library.imported_at", "fixture").unwrap();
         init(&ctx).unwrap();
         save_agent_memory(&ctx, "Authentication tokens rotate automatically every 24 hours", "fact", "r2", "otter").unwrap();
         save_agent_memory(&ctx, "Authentication tokens rotate automatically every 24 hours.", "fact", "r2", "lion").unwrap();
-        // Morphological query ("authenticate rotating") still matches via dense n-gram cosine + RRF.
-        let hits = agent_memories(&ctx, "authenticate rotating", "r2", 5).unwrap();
-        assert!(!hits.as_array().unwrap().is_empty());
 
-        // Offline consolidation previews the duplicate without touching live records until promoted.
         let preview = consolidate_preview(&ctx, "repo:r2").unwrap();
         assert_eq!(preview["eval_report"]["passed"], true);
+        assert_eq!(preview["eval_report"]["assertions"]["user_direct_preserved"], true);
+        assert_eq!(preview["eval_report"]["assertions"]["deleted_scrub_intact"], true);
+        assert_eq!(preview["eval_report"]["assertions"]["recall_preserved"], true);
+        assert_eq!(preview["eval_report"]["v3_replay_eval"], "not_run");
         assert_eq!(preview["proposals"].as_array().unwrap().len(), 1);
-        let before = list_memories(&ctx, Some("repo:r2"), Some("active"), None, "", 10).unwrap();
-        assert_eq!(before.as_array().unwrap().len(), 2);
 
         let promoted = consolidate_promote(&ctx, preview["id"].as_str().unwrap()).unwrap();
         assert_eq!(promoted["applied"], 1);
         let after = list_memories(&ctx, Some("repo:r2"), Some("active"), None, "", 10).unwrap();
         assert_eq!(after.as_array().unwrap().len(), 1);
 
-        // Explicit trigger intentions appear in the context slate.
-        intention_add(&ctx, "repo:r2", "pre_release", "", "Run offline startup test with network disabled", "user").unwrap();
-        let slate = build_context_slate(&ctx, Some("r2"), "", 2000, false, false).unwrap();
-        assert_eq!(slate["intentions"].as_array().unwrap().len(), 1);
+        // If an unscrubbed deleted row exists in DB, the real safety gate MUST fail (`passed: false`).
+        ctx.db.exec(
+            "INSERT INTO memories(id,scope,category,content,source,created_at,active,trust_tier,status)
+             VALUES('bad_del','repo:r2','fact','LEAKED_DELETED_TEXT','user',datetime('now'),0,'user_direct','deleted')",
+            [],
+        ).unwrap();
+        let failed = consolidate_preview(&ctx, "repo:r2").unwrap();
+        assert_eq!(failed["eval_report"]["passed"], false);
+        assert_eq!(failed["eval_report"]["assertions"]["deleted_scrub_intact"], false);
+        assert!(consolidate_promote(&ctx, failed["id"].as_str().unwrap()).is_err());
+    }
+
+    #[tokio::test]
+    async fn same_repo_raw_evidence_lookup_and_pipeline_session_observe() {
+        let ctx = Ctx::test();
+        ctx.db.kv_set("library.imported_at", "fixture").unwrap();
+        init(&ctx).unwrap();
+        ctx.db.exec("INSERT INTO repos(id,name,path,added_at) VALUES('ra','alpha','/tmp/alpha',0),('rb','beta','/tmp/beta',0)", []).unwrap();
+        ctx.db.exec(
+            "INSERT INTO agents(id,name,repo_id,model_ref,strict,hal_session_id,created_at,last_active_at)
+             VALUES('a1','otter','ra','p/m',0,'sess_a1',10,10),('b1','fox','rb','p/m',0,'sess_b1',10,10),('s1','stricta','ra','p/m',1,'sess_s1',10,10)",
+            [],
+        ).unwrap();
+
+        // Seed real HAL SQLite event journals for repo A and sibling repo B.
+        for (name, sid, user_msg, tool_out) in [
+            ("otter", "sess_a1", "Local mode must work offline without downloading weights.", "download failed: ENETUNREACH connecting to huggingface.co"),
+            ("fox", "sess_b1", "Sibling repo secret directive", "SIBLING_SECRET_ENETUNREACH_8822"),
+        ] {
+            let db_path = ctx.agent_dir(name).join("hal/hal/hal.db");
+            std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch("CREATE TABLE sessions(id TEXT PRIMARY KEY); CREATE TABLE events(session_id TEXT,seq INTEGER,ts TEXT,type TEXT,payload TEXT,PRIMARY KEY(session_id,seq));").unwrap();
+            conn.execute("INSERT INTO sessions VALUES(?1)", [sid]).unwrap();
+            let ev1 = json!({"seq":1,"session_id":sid,"ts":"2026-11-22T00:00:00Z","type":"message.created","role":"user","content":user_msg});
+            let ev2 = json!({"seq":2,"session_id":sid,"ts":"2026-11-22T00:00:00Z","type":"tool.started","call_id":"c1","tool":"shell_run","arguments":{"command":"./start --offline"}});
+            let ev3 = json!({"seq":3,"session_id":sid,"ts":"2026-11-22T00:00:00Z","type":"tool.output","call_id":"c1","data":tool_out});
+            let ev4 = json!({"seq":4,"session_id":sid,"ts":"2026-11-22T00:00:00Z","type":"tool.finished","call_id":"c1","ok":false,"result":"exit_code: 1 ENETUNREACH"});
+            for (seq, ty, ev) in [(1, "message.created", ev1), (2, "tool.started", ev2), (3, "tool.output", ev3), (4, "tool.finished", ev4)] {
+                conn.execute("INSERT INTO events VALUES(?1,?2,'2026-11-22T00:00:00Z',?3,?4)", params![sid, seq, ty, ev.to_string()]).unwrap();
+            }
+        }
+
+        // Standard agent in repo `ra` recovers exact ENETUNREACH raw tool output and NEVER sees sibling `rb`.
+        let hits = agent_sessions(&ctx, "ENETUNREACH", "ra", 5).unwrap();
+        let arr = hits.as_array().unwrap();
+        assert_eq!(arr.len(), 1, "{hits}");
+        assert_eq!(arr[0]["name"], "otter");
+        let ex = arr[0]["excerpts"].as_array().unwrap();
+        assert!(ex.iter().any(|e| e["text"].as_str().unwrap_or("").contains("ENETUNREACH")), "{ex:?}");
+        assert!(!hits.to_string().contains("SIBLING_SECRET_ENETUNREACH_8822"));
+
+        // Existing user_direct network.policy forces pipeline extraction conflict into `proposed`!
+        save_structured(&ctx, SaveOpts {
+            content: "Hosted API allowed; local must stay offline.",
+            category: "preference",
+            scope: "repo:ra",
+            source: "user",
+            trust_tier: "user_direct",
+            fact_key: Some("network.policy"),
+            supersedes_id: None,
+            source_event_id: None,
+            provenance: Some("operator"),
+        }).unwrap();
+
+        let obs = observe_session(&ctx, "a1").await.unwrap();
+        assert_eq!(obs["skipped"], false, "{obs}");
+        assert!(obs["source_event_id"].as_str().is_some_and(|s| s.starts_with("evt:")));
+        let note = working_note_get(&ctx, "repo:ra").unwrap();
+        assert!(note["failed_attempts"].as_str().unwrap().contains("ENETUNREACH"), "{note}");
+        assert!(note["requirements"].as_str().unwrap().contains("offline"), "{note}");
+        let proposed = list_memories(&ctx, Some("repo:ra"), Some("proposed"), None, "", 10).unwrap();
+        assert_eq!(proposed.as_array().unwrap().len(), 1, "pipeline conflict against user_direct must be staged as proposed: {proposed}");
+        assert!(proposed[0]["source_event_id"].as_str().is_some_and(|s| s.starts_with("evt:")));
+
+        // Strict agent is skipped completely.
+        let strict_obs = observe_session(&ctx, "s1").await.unwrap();
+        assert_eq!(strict_obs["skipped"], true);
+
+        // Second observe with no new seq is idempotent (skipped).
+        let again = observe_session(&ctx, "a1").await.unwrap();
+        assert_eq!(again["skipped"], true);
+    }
+
+    #[test]
+    fn working_note_patch_preserves_omitted_fields_and_model_budgets_scale() {
+        let ctx = Ctx::test();
+        init(&ctx).unwrap();
+        working_note_set(&ctx, "repo:rp", "Req A", "Dec B", "Fail C", "Next D", None, "user").unwrap();
+        let patched = working_note_patch(&ctx, "repo:rp", None, None, None, Some("Next E"), None, "agent:otter").unwrap();
+        assert_eq!(patched["requirements"], "Req A");
+        assert_eq!(patched["decisions"], "Dec B");
+        assert_eq!(patched["failed_attempts"], "Fail C");
+        assert_eq!(patched["next_steps"], "Next E");
+        assert!(patched["source_event_id"].as_str().is_some_and(|s| s.starts_with("evt:")));
+
+        // Per-model memory dose budget B scales by model context window.
+        ctx.db.exec("INSERT INTO providers(id,name,kind,base_url,created_at) VALUES('p','P','openai_chat','https://example.com',0)", []).unwrap();
+        ctx.db.exec(
+            "INSERT INTO models(provider_id,model_id,context_window,discovered_at) VALUES('p','small',16384,0),('p','med',65536,0),('p','large',200000,0)",
+            [],
+        ).unwrap();
+        assert_eq!(model_memory_budget(&ctx, Some("p/small")), 1500);
+        assert_eq!(model_memory_budget(&ctx, Some("p/med")), 2500);
+        assert_eq!(model_memory_budget(&ctx, Some("p/large")), 4000);
+        assert_eq!(model_memory_budget(&ctx, None), 2000);
     }
 
     #[test]
@@ -2201,6 +4081,9 @@ mod tests {
         intention_add(&ctx, "global", "on_session_start", "", "Always verify tests locally", "user").unwrap();
         intention_add(&ctx, "repo:ra", "on_pr", "", "Run cargo clippy before PR", "user").unwrap();
         intention_add(&ctx, "repo:ra", "pre_release", "release", "Check upgrade path", "user").unwrap();
+        intention_add(&ctx, "repo:ra", "on_error", "ENETUNREACH", "Use bundled offline fixtures", "user").unwrap();
+        intention_add(&ctx, "repo:ra", "path_match", "migrations/", "Never edit shipped SQL migrations", "user").unwrap();
+        intention_add(&ctx, "repo:ra", "on_compact", "", "Re-read working note after compaction", "user").unwrap();
 
         let start_ra = session_start_reminders_prompt(&ctx, Some("ra")).unwrap();
         assert!(start_ra.contains("Check migration scripts first") && start_ra.contains("Always verify tests locally"));
@@ -2215,6 +4098,15 @@ mod tests {
         let sub_rel = submit_reminders(&ctx, Some("ra"), "prepare release v2");
         assert_eq!(sub_rel.len(), 2);
         assert!(submit_reminders(&ctx, Some("rb"), "prepare release v2").is_empty());
+
+        // on_error, path_match (deduped until reset), and on_compact triggers
+        assert_eq!(error_reminders(&ctx, Some("ra"), "connect failed: ENETUNREACH").len(), 1);
+        assert!(error_reminders(&ctx, Some("ra"), "syntax error").is_empty());
+        assert_eq!(path_reminders_once(&ctx, "a1", Some("ra"), "db/migrations/001.sql").len(), 1);
+        assert!(path_reminders_once(&ctx, "a1", Some("ra"), "db/migrations/001.sql").is_empty(), "deduped within session");
+        reset_agent_path_reminders("a1");
+        assert_eq!(path_reminders_once(&ctx, "a1", Some("ra"), "db/migrations/001.sql").len(), 1, "re-fires after compaction reset");
+        assert_eq!(compaction_reminders(&ctx, Some("ra")).len(), 1);
     }
 
     #[test]

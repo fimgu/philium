@@ -116,7 +116,22 @@ pub async fn dispatch(ctx: &Arc<Ctx>, agent: &str, req: Value) -> Option<Value> 
                 "UPDATE agents SET last_active_at=?2 WHERE id=?1",
                 rusqlite::params![agent, crate::db::now()],
             );
-            let r = call_tool(ctx, agent, &name, args).await;
+            let r = call_tool(ctx, agent, &name, args.clone()).await;
+            let (is_err, error_text) = match &r {
+                Err(e) => (true, e.clone()),
+                Ok(v) => {
+                    let exit_err = v
+                        .get("exit_code")
+                        .and_then(Value::as_i64)
+                        .is_some_and(|code| code != 0);
+                    if exit_err {
+                        let out = v["output"].as_str().unwrap_or("");
+                        (true, format!("exit_code={} {}", v["exit_code"], out.chars().take(500).collect::<String>()))
+                    } else {
+                        (false, String::new())
+                    }
+                }
+            };
             let mut res = match r {
                 Ok(v) if v.get("__mcp_content").is_some() => {
                     json!({ "content": v["__mcp_content"].clone(), "isError": false })
@@ -134,6 +149,40 @@ pub async fn dispatch(ctx: &Arc<Ctx>, agent: &str, req: Value) -> Option<Value> 
             // call, whatever the tool, so it can stop before the two changes collide.
             if let (Some(note), Some(items)) = (crate::codeindex::take_notes(agent), res["content"].as_array_mut()) {
                 items.push(json!({ "type": "text", "text": note }));
+            }
+            // Event-driven prospective reminders (on_error, path_match, queued on_compact) for Standard agents ONLY.
+            if let Ok(arow) = agent_row(ctx, agent) {
+                if arow["strict"].as_i64() != Some(1) {
+                    let repo_id = arow["repo_id"].as_str().filter(|s| !s.is_empty());
+                    if let Some(items) = res["content"].as_array_mut() {
+                        if let Some(queued) = crate::library::take_agent_reminders(agent) {
+                            items.push(json!({ "type": "text", "text": queued }));
+                        }
+                        if is_err {
+                            let err_rems = crate::library::error_reminders(ctx, repo_id, &error_text);
+                            if let Some(txt) = crate::library::format_trigger_reminders("on_error", &err_rems) {
+                                items.push(json!({ "type": "text", "text": txt }));
+                            }
+                        }
+                        let path_hay = [
+                            args["path"].as_str(),
+                            args["file_path"].as_str(),
+                            args["cwd"].as_str(),
+                            args["command"].as_str(),
+                            args["symbol"].as_str(),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                        if !path_hay.trim().is_empty() {
+                            let path_rems = crate::library::path_reminders_once(ctx, agent, repo_id, &path_hay);
+                            if let Some(txt) = crate::library::format_trigger_reminders("path_match", &path_rems) {
+                                items.push(json!({ "type": "text", "text": txt }));
+                            }
+                        }
+                    }
+                }
             }
             Ok(res)
         }
@@ -194,7 +243,7 @@ pub fn tool_list() -> Vec<Value> {
           json!({ "content": s, "category": s, "project": b, "fact_key": s, "supersedes_id": s, "trust_tier": s, "provenance": s }), &["content", "category"]),
         t("working_note_get", "Read the structured working-state handoff note (requirements, current decisions, failed attempts, next steps) for this repository.",
           json!({}), &[]),
-        t("working_note_set", "Update the structured working-state handoff note for this repository so future sessions resume cleanly.",
+        t("working_note_set", "Partially update the structured working-state handoff note for this repository; omitted fields preserve their existing values.",
           json!({ "requirements": s, "decisions": s, "failed_attempts": s, "next_steps": s }), &[]),
         t("review_plan", "Release review, orchestrator only: write the plan once, riskiest check first. Each item is {title, detail (what to verify and how)}. The checks appear on the board and in Review.",
           json!({ "items": { "type": "array", "items": { "type": "object" } } }), &["items"]),
@@ -203,7 +252,7 @@ pub fn tool_list() -> Vec<Value> {
         t("review_report", "Release review, orchestrator: save the final report in Markdown, verdict first.", json!({ "markdown": s }), &["markdown"]),
         t("checks_propose", "Propose release checks for your checkout: facts that must be true in every release. Send {contracts:{schema?,cases:[...]}} once, when asked to draft checks. A person reviews and confirms them in Review; nothing counts before that.",
           json!({ "contracts": { "type": "object" } }), &["contracts"]),
-        t("session_search", "Search Philium session metadata (agent, task, branch) bound to this repository ID. Raw conversations and imported histories are not included.",
+        t("session_search", "Search same-repository Philium sessions and bounded raw turn/tool-output excerpts bound to this repository ID. Cross-repo and imported histories are excluded.",
           json!({ "q": s, "repo_only": b, "limit": i }), &[]),
         t("resource_register", "Declare something you created outside Philium's tools (container, process, temp dir) so it is cleaned up with you. Use kind_cluster for managed clusters.",
           json!({ "kind": s, "handle": s, "note": s }), &["kind", "handle"]),
@@ -481,23 +530,34 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
                 return Err("Repository identity is unavailable".into());
             }
             match name {
-                "memory_search" => crate::library::agent_memories(ctx, arg(&a, "q")?, repo, a["limit"].as_i64().unwrap_or(10)),
-                "memory_slate" => crate::library::build_context_slate(
-                    ctx,
-                    Some(repo),
-                    a["q"].as_str().unwrap_or(""),
-                    a["budget_tokens"].as_u64().unwrap_or(2000) as usize,
-                    false,
-                    false,
-                ),
+                "memory_search" => {
+                    crate::library::agent_memories_async(ctx, arg(&a, "q")?, repo, a["limit"].as_i64().unwrap_or(10)).await
+                }
+                "memory_slate" => {
+                    let budget = a["budget_tokens"]
+                        .as_u64()
+                        .filter(|b| *b > 0)
+                        .map(|b| b as usize)
+                        .unwrap_or_else(|| crate::library::model_memory_budget(ctx, row["model_ref"].as_str()));
+                    crate::library::build_context_slate_async(
+                        ctx,
+                        Some(repo),
+                        a["q"].as_str().unwrap_or(""),
+                        budget,
+                        false,
+                        false,
+                        vec![],
+                    )
+                    .await
+                }
                 "working_note_get" => crate::library::working_note_get(ctx, &format!("repo:{repo}")),
-                "working_note_set" => crate::library::working_note_set(
+                "working_note_set" => crate::library::working_note_patch(
                     ctx,
                     &format!("repo:{repo}"),
-                    a["requirements"].as_str().unwrap_or(""),
-                    a["decisions"].as_str().unwrap_or(""),
-                    a["failed_attempts"].as_str().unwrap_or(""),
-                    a["next_steps"].as_str().unwrap_or(""),
+                    a.get("requirements").and_then(Value::as_str),
+                    a.get("decisions").and_then(Value::as_str),
+                    a.get("failed_attempts").and_then(Value::as_str),
+                    a.get("next_steps").and_then(Value::as_str),
                     None,
                     &format!("agent:{me}"),
                 ),
@@ -513,17 +573,34 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
                 }
                 _ => {
                     if a["project"] == false { return Err("Global memory writes are unavailable".into()); }
-                    crate::library::save_agent_memory_rich(
-                        ctx,
-                        arg(&a, "content")?,
-                        arg(&a, "category")?,
-                        repo,
-                        &me,
-                        a["fact_key"].as_str(),
-                        a["supersedes_id"].as_str(),
-                        a["trust_tier"].as_str(),
-                        a["provenance"].as_str(),
-                    )
+                    let content = arg(&a, "content")?.to_string();
+                    let category = arg(&a, "category")?.to_string();
+                    let fact_key = a["fact_key"].as_str().map(str::to_string);
+                    let supersedes_id = a["supersedes_id"].as_str().map(str::to_string);
+                    let trust_tier = a["trust_tier"].as_str().map(str::to_string);
+                    let provenance = a["provenance"].as_str().map(str::to_string);
+                    let (c, repo_s, me_s, content_embed) = (ctx.clone(), repo.to_string(), me.clone(), content.clone());
+                    let res = tokio::task::spawn_blocking(move || {
+                        crate::library::save_agent_memory_rich(
+                            &c,
+                            &content,
+                            &category,
+                            &repo_s,
+                            &me_s,
+                            fact_key.as_deref(),
+                            supersedes_id.as_deref(),
+                            trust_tier.as_deref(),
+                            provenance.as_deref(),
+                        )
+                    })
+                    .await
+                    .map_err(|e| e.to_string())??;
+                    if res["status"].as_str() == Some("active") {
+                        if let Some(mid) = res["id"].as_str() {
+                            let _ = crate::library::embed_memory_async(ctx, mid, &content_embed).await;
+                        }
+                    }
+                    Ok(res)
                 }
             }
         }
@@ -720,6 +797,42 @@ mod tests {
         assert_ne!(call("s2", "board_claim", json!({"id":"t_strict"})).await["result"]["isError"], true);
         let sub_strict: Value = serde_json::from_str(&text(&call("s2", "board_submit", json!({"id":"t_strict","summary":"Ready for release"})).await)).unwrap();
         assert!(sub_strict.get("reminders").is_none(), "Strict board_submit must never include reminders: {sub_strict}");
+
+        // Partial-patch working_note_set preserves omitted fields instead of wiping them with "".
+        let wn1: Value = serde_json::from_str(&text(&call("t1", "working_note_set", json!({
+            "requirements": "Offline startup required",
+            "decisions": "Use SQLite FTS5",
+            "failed_attempts": "ENETUNREACH on HF download",
+            "next_steps": "Run smoke test"
+        })).await)).unwrap();
+        assert_eq!(wn1["requirements"], "Offline startup required");
+        assert!(wn1["source_event_id"].as_str().is_some_and(|s| s.starts_with("evt:")));
+        let wn2: Value = serde_json::from_str(&text(&call("t1", "working_note_set", json!({
+            "next_steps": "Verify release bundle"
+        })).await)).unwrap();
+        assert_eq!(wn2["requirements"], "Offline startup required");
+        assert_eq!(wn2["decisions"], "Use SQLite FTS5");
+        assert_eq!(wn2["failed_attempts"], "ENETUNREACH on HF download");
+        assert_eq!(wn2["next_steps"], "Verify release bundle");
+
+        // on_error and path_match reminders fire on MCP tool calls for Standard agents ONLY, NEVER Strict.
+        crate::library::intention_add(&ctx, "repo:ra", "on_error", "unavailable", "Check workspace task ID before retrying", "user").unwrap();
+        crate::library::intention_add(&ctx, "repo:ra", "path_match", "migrations/", "Do not edit applied migrations", "user").unwrap();
+        let err_std = call("t1", "board_get", json!({"id": "b"})).await;
+        assert_eq!(err_std["result"]["isError"], true);
+        let err_blocks: Vec<&str> = err_std["result"]["content"].as_array().unwrap().iter().filter_map(|c| c["text"].as_str()).collect();
+        assert!(err_blocks.iter().any(|b| b.contains("Check workspace task ID before retrying")), "{err_blocks:?}");
+        let err_strict = call("s2", "board_get", json!({"id": "b"})).await;
+        let strict_blocks: Vec<&str> = err_strict["result"]["content"].as_array().unwrap().iter().filter_map(|c| c["text"].as_str()).collect();
+        assert!(!strict_blocks.iter().any(|b| b.contains("Check workspace task ID")), "{strict_blocks:?}");
+
+        let path_std = call("t1", "code_outline", json!({"path": "db/migrations/001.sql"})).await;
+        let path_blocks: Vec<&str> = path_std["result"]["content"].as_array().unwrap().iter().filter_map(|c| c["text"].as_str()).collect();
+        assert!(path_blocks.iter().any(|b| b.contains("Do not edit applied migrations")), "{path_blocks:?}");
+        // Deduped on immediate second call to the same path.
+        let path_again = call("t1", "code_outline", json!({"path": "db/migrations/001.sql"})).await;
+        let again_blocks: Vec<&str> = path_again["result"]["content"].as_array().unwrap().iter().filter_map(|c| c["text"].as_str()).collect();
+        assert!(!again_blocks.iter().any(|b| b.contains("Do not edit applied migrations")), "{again_blocks:?}");
     }
 
     #[test]

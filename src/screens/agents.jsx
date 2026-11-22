@@ -692,7 +692,7 @@ function AgentView(props) {
           <Show when={aside() === "context"}>
             <div class="aside-body">
               <Suspense fallback={<div class="small dim" role="status">Loading context slate…</div>}>
-                <AgentContext agentId={props.id} name={a()?.name} repoId={a()?.repo_id} repoName={a()?.repo_name} strict={!!a()?.strict} />
+                <AgentContext agentId={props.id} name={a()?.name} repoId={a()?.repo_id} repoName={a()?.repo_name} modelRef={a()?.model_ref} strict={!!a()?.strict} />
               </Suspense>
             </div>
           </Show>
