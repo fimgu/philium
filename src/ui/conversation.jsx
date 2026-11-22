@@ -155,12 +155,6 @@ function Tool(props) {
   );
 }
 
-function isSameEvent(a, b) {
-  if (a === b) return true;
-  if (!a || !b) return false;
-  return a.seq != null && a.seq === b.seq && a.type === b.type && a.delta === b.delta && a.content === b.content && a.data === b.data && a.ok === b.ok && a.decision === b.decision;
-}
-
 /**
  * props: events (array, reactive), onApprove(id, scope), onDeny(id), busy
  */
@@ -171,7 +165,7 @@ export function Conversation(props) {
   let streamingIdx = -1;
   let turnText = false;
   let cursor = 0;
-  let firstSeq = undefined;
+  let firstEvent = null;
   let lastEvent = null;
 
   const endPendingTools = () => {
@@ -298,11 +292,11 @@ export function Conversation(props) {
       const canAppend =
         cursor === 0
           ? store.items.length === 0
-          : evs.length >= cursor && evs[0]?.seq === firstSeq && isSameEvent(evs[cursor - 1], lastEvent);
+          : evs.length >= cursor && evs[0] === firstEvent && evs[cursor - 1] === lastEvent;
       if (canAppend) {
         for (let i = cursor; i < evs.length; i++) applyEvent(evs[i]);
         cursor = evs.length;
-        firstSeq = evs[0]?.seq;
+        firstEvent = cursor > 0 ? evs[0] : null;
         lastEvent = cursor > 0 ? evs[cursor - 1] : null;
         return;
       }
@@ -417,7 +411,7 @@ export function Conversation(props) {
         }
       }
       cursor = evs.length;
-      firstSeq = evs[0]?.seq;
+      firstEvent = cursor > 0 ? evs[0] : null;
       lastEvent = cursor > 0 ? evs[cursor - 1] : null;
     });
   });
