@@ -693,6 +693,10 @@ async fn provision(ctx: &Arc<Ctx>, id: &str, fresh: bool, brief: Option<String>)
     }
     extra.push_str("\n<!-- PHILIUM_CACHE_BREAK -->\n");
     extra.push_str(&agent_identity_tail(&name, &role, parent_name.as_deref(), worktree.as_deref()));
+    if crate::board::grill_me_enabled(ctx, id, row["repo_id"].as_str()) {
+        extra.push_str("\n## Grill-me mode (enabled)\n");
+        extra.push_str(crate::board::GRILL_ME);
+    }
     let seed_query = brief.as_deref().unwrap_or("");
     extra.push_str(&agent_session_context_async(ctx, strict, row["repo_id"].as_str(), Some(&model_ref), seed_query).await);
     if let Some(grants_block) = crate::access::active_grants_prompt(ctx, id) {

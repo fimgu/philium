@@ -617,12 +617,17 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
                 "source": "Philium built-in",
                 "policy_sha256": crate::board::review_policy_digest(),
             });
+            let builtin_grill = json!({
+                "name": "grill-me",
+                "description": "Challenge the user's reasoning before acting on a plan",
+                "source": "Philium built-in",
+            });
             if name == "skill_list" {
-                let mut list = vec![builtin_review];
+                let mut list = vec![builtin_review, builtin_grill];
                 if !strict {
                     if let Ok(Value::Array(imported)) = crate::library::skill_list(ctx) {
                         for item in imported {
-                            if item["name"].as_str() != Some("review-pr") {
+                            if !matches!(item["name"].as_str(), Some("review-pr" | "grill-me")) {
                                 list.push(item);
                             }
                         }
@@ -634,6 +639,12 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
             if requested == "review-pr" {
                 let mut result = builtin_review;
                 result["body"] = json!(crate::board::REVIEW_POLICY);
+                result["files"] = json!({});
+                return Ok(result);
+            }
+            if requested == "grill-me" {
+                let mut result = builtin_grill;
+                result["body"] = json!(crate::board::GRILL_ME);
                 result["files"] = json!({});
                 return Ok(result);
             }
@@ -946,14 +957,21 @@ mod tests {
 
         let std_list: Value = serde_json::from_str(&text(&call("t1", "skill_list", json!({})).await)).unwrap();
         let std_names: Vec<&str> = std_list.as_array().unwrap().iter().map(|s| s["name"].as_str().unwrap()).collect();
-        assert_eq!(std_names, vec!["review-pr", "make-plan"]);
+        assert_eq!(std_names, vec!["review-pr", "grill-me", "make-plan"]);
         let std_imported: Value = serde_json::from_str(&text(&call("t1", "skill_get", json!({"name":"make-plan"})).await)).unwrap();
         assert_eq!(std_imported["body"], "# Plan steps");
         assert_eq!(std_imported["files"]["check.sh"], "echo plan");
 
         let strict_list: Value = serde_json::from_str(&text(&call("s2", "skill_list", json!({})).await)).unwrap();
         let strict_names: Vec<&str> = strict_list.as_array().unwrap().iter().map(|s| s["name"].as_str().unwrap()).collect();
-        assert_eq!(strict_names, vec!["review-pr"]);
+        assert_eq!(strict_names, vec!["review-pr", "grill-me"]);
+        let strict_grill: Value = serde_json::from_str(&text(&call("s2", "skill_get", json!({"name":"grill-me"})).await)).unwrap();
+        assert_eq!(strict_grill["body"], crate::board::GRILL_ME);
+        assert!(!crate::board::grill_me_enabled(&ctx, "s2", Some("ra")));
+        ctx.db.kv_set("setting.grill_me.repo.ra", "on").unwrap();
+        assert!(crate::board::grill_me_enabled(&ctx, "s2", Some("ra")));
+        ctx.db.kv_set("setting.grill_me.agent.s2", "0").unwrap();
+        assert!(!crate::board::grill_me_enabled(&ctx, "s2", Some("ra")));
         let strict_builtin: Value = serde_json::from_str(&text(&call("s2", "skill_get", json!({"name":"review-pr"})).await)).unwrap();
         assert_eq!(strict_builtin["body"], crate::board::REVIEW_POLICY);
         assert_eq!(call("s2", "skill_get", json!({"name":"make-plan"})).await["result"]["isError"], true);

@@ -699,6 +699,18 @@ pub fn thread(ctx: &Arc<Ctx>, a: &str, b: &str, limit: i64) -> Result<Value, Str
 }
 
 pub(crate) const REVIEW_POLICY: &str = include_str!("../playbooks/review_pr.md");
+pub(crate) const GRILL_ME: &str = include_str!("../playbooks/grill_me.md");
+
+/// Grill-me mode: per-agent setting `grill_me.agent.<id>` overrides per-repo `grill_me.repo.<id>`.
+/// Values "1"/"on"/"true" enable, anything else disables. Default off.
+pub(crate) fn grill_me_enabled(ctx: &crate::ctx::Ctx, agent_id: &str, repo_id: Option<&str>) -> bool {
+    let on = |v: String| matches!(v.trim(), "1" | "on" | "true");
+    let agent = ctx.setting(&format!("grill_me.agent.{agent_id}"), "");
+    if !agent.is_empty() {
+        return on(agent);
+    }
+    repo_id.map(|r| on(ctx.setting(&format!("grill_me.repo.{r}"), ""))).unwrap_or(false)
+}
 pub(crate) fn review_policy_digest() -> String {
     static DIGEST: OnceLock<String> = OnceLock::new();
     DIGEST
