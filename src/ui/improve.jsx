@@ -51,6 +51,9 @@ function Item(props) {
     }
   });
   const s = () => st() ?? {};
+  const [showDiff, setShowDiff] = createSignal(false);
+  const [diff, { refetch: refetchDiff }] = createResource(() => showDiff() && props.id, (id) => rpc("selfdev.diff", { id }).catch((e) => ({ error: String(e) })));
+  useEvent("selfdev:changed", (p) => p.id === props.id && showDiff() && refetchDiff());
   // Covers an exit arriving before the preview RPC has stored its terminal ID.
   const poll = setInterval(() => { if (s().preview === "active") refetch(); }, 2000);
   onCleanup(() => clearInterval(poll));
@@ -86,10 +89,42 @@ function Item(props) {
           })}>Roll back</Button>
         </Show>
         <Show when={s().state === "rolled_back" && s().build === "passed"}><Button size="sm" onClick={() => rpc("selfdev.restart")}>Restart Philium</Button></Show>
+        <Show when={s().files?.length || s().agent_id}><Button size="sm" variant="ghost" onClick={() => setShowDiff(!showDiff())}>{showDiff() ? "Hide diff" : "View diff"}</Button></Show>
         <For each={[["test_terminal", "Test output"], ["preview_terminal", "Preview output"], ["build_terminal", "Build output"]]}>{([key, label]) =>
           <Show when={s()[key]}><Button size="sm" variant="ghost" onClick={() => { closeImprove(); go("terminals", { id: s()[key] }); }}><Icon name="terminal" size={12} /> {label}</Button></Show>
         }</For>
       </div>
+      <Show when={showDiff()}><DiffView data={diff()} files={s().files} /></Show>
+    </div>
+  );
+}
+
+function lineStyle(l) {
+  if (l.startsWith("+++") || l.startsWith("---")) return { color: "var(--fg-dim, inherit)", "font-weight": "600" };
+  if (l.startsWith("diff ")) return { "font-weight": "700", "border-top": "1px solid var(--border, #8884)", "padding-top": "4px", "margin-top": "4px" };
+  if (l.startsWith("@@")) return { color: "var(--accent, #58a6ff)" };
+  if (l.startsWith("+")) return { background: "rgba(46,160,67,.15)" };
+  if (l.startsWith("-")) return { background: "rgba(248,81,73,.15)" };
+  return {};
+}
+
+function DiffView(props) {
+  const lines = () => (props.data?.patch ?? "").split("\n");
+  return (
+    <div style={{ display: "grid", gap: "6px" }}>
+      <Show when={props.data} fallback={<span class="small dim">Loading diff...</span>}>
+        <Show when={!props.data.error} fallback={<span class="small danger">{props.data.error}</span>}>
+          <Show when={props.files?.length}>
+            <div class="small dim">Files changed: <For each={props.files}>{(f) => <code style={{ "margin-right": "6px" }}>{f}</code>}</For></div>
+          </Show>
+          <Show when={props.data.stat}><pre class="xs" style={{ margin: 0, "white-space": "pre-wrap" }}>{props.data.stat}</pre></Show>
+          <Show when={props.data.patch} fallback={<span class="small dim">No changes yet.</span>}>
+            <pre class="xs" style={{ margin: 0, "max-height": "420px", overflow: "auto", "font-family": "var(--mono, ui-monospace, monospace)" }}>
+              <For each={lines()}>{(l) => <div style={{ ...lineStyle(l), "white-space": "pre" }}>{l || " "}</div>}</For>
+            </pre>
+          </Show>
+        </Show>
+      </Show>
     </div>
   );
 }

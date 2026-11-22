@@ -211,7 +211,7 @@ fn request(ctx: &Arc<Ctx>, text: &str, context: &Value, model: Option<String>) -
          Request from the user:\n{text}\n\nWhere they were: {context}\n\n\
          Rules:\n\
          - Keep the existing design system (src/ui/kit.jsx, src/styles). No em dashes in UI text.\n\
-         - Run `cargo test` in src-tauri and `npx vite build` before you say you are done.\n\
+         - Run `cargo test <module>::` for modules you touched in src-tauri and `npx vite build` before you say you are done.\n\
          - Commit on your branch with a plain message. No Co-authored-by or agent signatures.\n\
          - Do not change gateway, guard, providers, sandbox, mcp or agents code unless the request needs it; if you do, explain why in your final message.\n\
          - When finished, say DONE and summarize what changed and how to try it."
@@ -242,23 +242,55 @@ fn request(ctx: &Arc<Ctx>, text: &str, context: &Value, model: Option<String>) -
 
 fn test(ctx: &Arc<Ctx>, id: &str) -> Result<Value, String> {
     let r = row(ctx, id)?;
-    let (wt, _) = worktree(ctx, r["agent_id"].as_str().unwrap_or_default())?;
+    let (wt, branch) = worktree(ctx, r["agent_id"].as_str().unwrap_or_default())?;
     if !git(&wt, &["status", "--porcelain"])?.is_empty() {
         return Err("The agent has uncommitted changes. Ask it to commit first.".into());
     }
     let head = git(&wt, &["rev-parse", "HEAD"])?;
+    let (_, src) = source_repo(ctx)?;
+    let files = changed_files(&src, &branch)?;
     prepare_worktree(ctx, &wt)?;
     let t = sh(
         ctx,
         "Improve: tests",
         &wt,
-        "set -e; (cd src-tauri && cargo test); npm install --no-audit --no-fund; npx vite build",
+        &gate_command(&files),
         shared_target(ctx),
         r["agent_id"].as_str(),
     )?;
     set(ctx, id, "test_terminal", &t)?;
     set(ctx, id, "tested_commit", &head)?;
     Ok(json!({ "terminal": t }))
+}
+
+/// Fast test gate: type-check everything (including tests), then run only the
+/// Rust test modules the diff touched, plus the frontend build and node tests
+/// when the frontend changed. The full suite takes far too long per change.
+pub fn gate_command(files: &[String]) -> String {
+    let mut mods: Vec<String> = files
+        .iter()
+        .filter_map(|f| f.strip_prefix("src-tauri/src/"))
+        .filter_map(|f| f.strip_suffix(".rs"))
+        .filter_map(|f| {
+            let m = f.split('/').next().unwrap_or(f);
+            (!matches!(m, "main" | "lib") && m.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')).then(|| format!("{m}::"))
+        })
+        .collect();
+    mods.sort();
+    mods.dedup();
+    let mut cmd = String::from("set -e; (cd src-tauri && cargo check --tests");
+    if !mods.is_empty() {
+        cmd += &format!(" && cargo test -- {}", mods.join(" "));
+    }
+    cmd += ")";
+    let front = files.iter().any(|f| f.starts_with("src/") || matches!(f.as_str(), "package.json" | "package-lock.json" | "vite.config.js" | "index.html"));
+    if front {
+        cmd += "; npm install --no-audit --no-fund; npx vite build";
+        if files.iter().any(|f| f.starts_with("src/")) {
+            cmd += "; node --test $(find src -name '*.test.js' -not -path '*/node_modules/*')";
+        }
+    }
+    cmd
 }
 
 // A live CLI process is not proof that the preview window is ready.
@@ -799,6 +831,18 @@ mod tests {
         assert_eq!(row(&ctx, &id).unwrap()["state"], "rejected");
         assert!(!wt.exists(), "worktree removed on discard");
         println!("improver e2e: request, agent commit in {}, diff, tests {}, accept, rollback, discard OK", wt.display(), "passed");
+    }
+
+    #[test]
+    fn gate_runs_only_touched_modules() {
+        let f = |v: &[&str]| gate_command(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let c = f(&["src-tauri/src/selfdev.rs", "src-tauri/src/agents/x.rs", "src-tauri/src/main.rs"]);
+        assert!(c.contains("cargo check --tests"), "{c}");
+        assert!(c.contains("cargo test -- agents:: selfdev::"), "{c}");
+        assert!(!c.contains("vite"), "{c}");
+        let c = f(&["src/ui/improve.jsx"]);
+        assert!(!c.contains("cargo test"), "{c}");
+        assert!(c.contains("npx vite build") && c.contains("node --test"), "{c}");
     }
 
     #[test]
