@@ -1348,12 +1348,16 @@ mod tests {
             .await
             .unwrap()
         });
+        // Bounded: if the request task fails before it registers, fail fast instead of hanging.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let req_id = loop {
             let pending = crate::access::call(&ctx_dec, "pending", json!({"agent_id":"fe1"})).await.unwrap();
             if let Some(id) = pending.as_array().and_then(|a| a.first()).and_then(|r| r["id"].as_str()) {
                 assert_eq!(crate::attention::needing_you(&ctx_dec), 1);
                 break id.to_string();
             }
+            assert!(!req_task.is_finished(), "access_request returned without a pending request");
+            assert!(std::time::Instant::now() < deadline, "timed out waiting for pending access request");
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         };
         let dec = crate::access::call(&ctx, "decide", json!({"request_id": req_id, "decision": "approve", "lifetime": "session"})).await.unwrap();

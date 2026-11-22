@@ -373,10 +373,12 @@ mod tests {
         }
         assert!(running.await.unwrap().unwrap().to_string().contains("metadata-ok"));
         let started = Instant::now();
-        let partial = run(&ctx, &agent, MAIN, "sleep 31; echo long-job-done", None, Duration::from_secs(900)).await.unwrap();
+        // The 30s cap itself is covered by foreground_wait_stays_below_transport_timeout; here a 1s budget
+        // exercises the same partial-return path without a 30s fixed wait.
+        let partial = run(&ctx, &agent, MAIN, "sleep 2; echo long-job-done", None, Duration::from_secs(1)).await.unwrap();
         let elapsed = started.elapsed();
-        assert!(elapsed >= Duration::from_secs(29) && elapsed < Duration::from_secs(31), "foreground response took {elapsed:?}");
-        println!("requested_wait=900s actual_response={elapsed:?} running={} finished={}", partial["running"], partial["finished"]);
+        assert!(elapsed >= Duration::from_millis(900) && elapsed < Duration::from_secs(2), "foreground response took {elapsed:?}");
+        println!("requested_wait=1s actual_response={elapsed:?} running={} finished={}", partial["running"], partial["finished"]);
         assert_eq!(partial["finished"], false);
         assert_eq!(partial["running"], true);
         assert_eq!(partial["terminal"], id);

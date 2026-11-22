@@ -16,6 +16,10 @@ use std::{
 };
 static REAP_QUEUE: Mutex<()> = Mutex::new(());
 const HOUR: i64 = 3_600_000;
+/// 100 ms polls after SIGTERM before SIGKILL (5 s; shortened in tests).
+const TERM_GRACE_POLLS: u32 = if cfg!(test) { 10 } else { 50 };
+/// 100 ms polls for a stopped agent's command to exit on its own (3 s; shortened in tests).
+const EXIT_GRACE_POLLS: u32 = if cfg!(test) { 10 } else { 30 };
 
 fn schema(ctx: &Arc<Ctx>) -> Result<(), String> {
     ctx.db.with(|c|c.execute_batch("CREATE TABLE IF NOT EXISTS teardown_proposals (id TEXT PRIMARY KEY, resource_id TEXT NOT NULL, reason TEXT NOT NULL, unsaved INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL DEFAULT 'pending', created_at INTEGER NOT NULL); CREATE UNIQUE INDEX IF NOT EXISTS proposal_pending ON teardown_proposals(resource_id) WHERE state='pending';"))
@@ -359,7 +363,7 @@ fn stop_process(r: &Value) -> Result<(), String> {
         pid.to_string()
     };
     command("kill", &["-TERM", "--", &target])?;
-    for _ in 0..50 {
+    for _ in 0..TERM_GRACE_POLLS {
         let live = if let Some(group) = m["pgid"].as_i64() {
             group_alive(group)?
         } else {
@@ -652,7 +656,7 @@ fn end_agent_process(r: &Value) -> Result<(), String> {
     if pid <= 1 || pid == std::process::id() as i64 {
         return Ok(());
     }
-    for _ in 0..30 {
+    for _ in 0..EXIT_GRACE_POLLS {
         if identity(pid).is_none() {
             return Ok(());
         }
@@ -1221,7 +1225,7 @@ mod tests {
         let _ = child.kill();
         let status = child.wait().unwrap();
         assert!(result.is_ok(), "{result:?}");
-        assert!(started.elapsed() >= Duration::from_secs(5));
+        assert!(started.elapsed() >= Duration::from_millis(100 * TERM_GRACE_POLLS as u64));
         assert_eq!(status.signal(), Some(9));
         release(&ctx, &id);
         std::fs::remove_dir_all(ctx.root.parent().unwrap()).unwrap();

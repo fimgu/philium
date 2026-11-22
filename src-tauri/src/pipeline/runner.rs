@@ -136,7 +136,12 @@ async fn kill_group(pid: u32) {
     unsafe {
         libc::killpg(pid as i32, libc::SIGTERM);
     }
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // Give the group up to 3 s to exit, but return as soon as it is gone.
+    let until = Instant::now() + Duration::from_secs(3);
+    // SAFETY: signal 0 only probes whether the group still exists.
+    while Instant::now() < until && unsafe { libc::killpg(pid as i32, 0) } == 0 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     unsafe {
         libc::killpg(pid as i32, libc::SIGKILL);
     }
@@ -276,7 +281,7 @@ async fn wait_ready(probe: &str, s: &Services, workdir: &Path, rundir: &Path, ho
         if ok {
             return Ok(());
         }
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
     Err(format!("not ready after {READY_SECS} s: {probe}"))
 }
