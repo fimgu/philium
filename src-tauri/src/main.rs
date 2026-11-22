@@ -359,6 +359,7 @@ fn main() {
             let db = db::Db::open(&data_dir.join("philium.db")).map_err(|e| format!("database: {e}"))?;
             let ctx = Ctx::new(db, data_dir, philium_root(), gateway.clone(), gateway_url);
             ctx.set_handle(app.handle().clone());
+            oauth::init_claude_version(&ctx);
             attention::refresh(&ctx);
             let c_learn = ctx.clone();
             gateway.set_learned_efforts_cb(Arc::new(move |pid, mid, levels| {
