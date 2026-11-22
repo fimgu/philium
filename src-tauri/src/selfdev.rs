@@ -495,6 +495,11 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
             let id = arg_str(&args, "id")?;
             tokio::task::spawn_blocking(move || test(&c, &id)).await.map_err(|e| e.to_string())?
         }
+        // What the agent changed versus the source checkout, for review before accepting.
+        "diff" => {
+            let r = row(ctx, &arg_str(&args, "id")?)?;
+            crate::agents::call(ctx, "diff", json!({ "id": r["agent_id"] })).await
+        }
         "preview" => {
             let c = ctx.clone();
             let id = arg_str(&args, "id")?;
@@ -674,6 +679,132 @@ mod tests {
         assert_eq!(status["tested_commit"], head);
         crate::terminals::call(&ctx, "remove", json!({"id":terminal})).await.unwrap();
         cleanup.1 = None;
+    }
+
+    /// The whole improver as a user drives it, against the real HAL sidecar, gateway, MCP
+    /// and terminals: request -> agent edits a tooltip in its own worktree of a disposable
+    /// clone and commits -> diff -> real tests -> accept (merge) -> reject cleans up.
+    /// A scripted stand-in model plays the agent. Run via scripts/selfdev-e2e.sh.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "real HAL sidecar, disposable Philium clone and real cargo/npm; run scripts/selfdev-e2e.sh"]
+    async fn improver_end_to_end_tooltip_change() {
+        use crate::gateway::{Gateway, Route};
+        use crate::guard::GuardMode;
+        use crate::providers::{Kind, Provider};
+        use std::time::{Duration, Instant};
+        assert!(crate::hal::server_path().is_file(), "HAL sidecar required");
+        let src = PathBuf::from(std::env::var_os("PHILIUM_SELFDEV_TEST_SOURCE").expect("disposable source clone"));
+        let scratch = PathBuf::from(std::env::var_os("PHILIUM_SELFDEV_TEST_SCRATCH").expect("scratch dir"));
+        let skip_tests = std::env::var_os("PHILIUM_SELFDEV_SKIP_REAL_TESTS").is_some();
+        let commit = "perl -pi -e 's/title=\"Improve Philium\"/title=\"Improve Philium (ask an agent)\"/' src/main.jsx && git add src/main.jsx && git -c user.name=Agent -c user.email=agent@example.invalid commit -qm 'Clearer Improve tooltip' && echo COMMITTED";
+        let app = axum::Router::new().route("/v1/{*rest}", axum::routing::any(move |body: String| async move {
+            let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+            if v["stream"] != json!(true) {
+                return ([("content-type", "application/json")], r#"{"data":[{"id":"up-model"}]}"#.to_string());
+            }
+            let tools = v["messages"].as_array().map(|m| m.iter().filter(|m| m["role"] == "tool").count()).unwrap_or(0);
+            let delta = if tools == 0 {
+                let args = json!({"command": commit, "timeout_secs": 60}).to_string();
+                json!({"tool_calls":[{"index":0,"id":"call_0","type":"function","function":{"name":"mcp_philium_shell_run","arguments":args}}]})
+            } else {
+                json!({"role":"assistant","content":"DONE. Tooltip on the Improve button now reads Improve Philium (ask an agent)."})
+            };
+            let fin = if delta.get("tool_calls").is_some() { "tool_calls" } else { "stop" };
+            ([("content-type", "text/event-stream")], format!("data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                json!({"choices":[{"index":0,"delta":delta,"finish_reason":null}]}),
+                json!({"choices":[{"index":0,"delta":{},"finish_reason":fin}],"usage":{"prompt_tokens":2,"completion_tokens":2}}))
+            )
+        }));
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up = format!("http://{}/v1", l.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        let gw = Gateway::new(crate::hal::random_token(), None);
+        let gl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gurl = format!("http://{}", gl.local_addr().unwrap());
+        let r = gw.router();
+        tokio::spawn(async move { axum::serve(gl, r).await.unwrap() });
+        let ctx = Ctx::new(crate::db::Db::memory(), scratch.join("data"), scratch.join("root"), gw.clone(), gurl);
+        let ml = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        ctx.mcp_url.set(format!("http://{}/mcp", ml.local_addr().unwrap())).unwrap();
+        let mr = crate::mcp::router(ctx.clone());
+        tokio::spawn(async move { axum::serve(ml, mr).await.unwrap() });
+        ctx.db.kv_set("library.imported_at", "fixture").unwrap();
+        for f in [crate::library::init, crate::codeindex::init, crate::terminals::init, crate::workspace::init, crate::board::init, crate::reaper::init, init] {
+            f(&ctx).unwrap();
+        }
+        let p = Provider { id: "stub".into(), name: "Stub".into(), kind: Kind::OpenaiChat, base_url: up, trusted: true, guard: GuardMode::Redact, enabled: true, default_model: Some("up-model".into()) };
+        crate::providers::upsert(&ctx, &p).unwrap();
+        gw.set_routes(vec![Route { provider: p, api_key: Some("fixture".into()) }]);
+        ctx.db.kv_set("setting.selfdev.source", &src.to_string_lossy()).unwrap();
+        let base = git(&src, &["rev-parse", "HEAD"]).unwrap();
+
+        // 1. The user asks from the Improve dialog.
+        assert_eq!(call(&ctx, "source", json!({})).await.unwrap(), json!(src.to_string_lossy()));
+        let req = call(&ctx, "request", json!({"text": "Change the Improve button tooltip to say Improve Philium (ask an agent)", "context": {"screen": "home"}, "model": "stub/up-model"})).await.unwrap();
+        let id = req["id"].as_str().unwrap().to_string();
+        let agent = req["agent"]["id"].as_str().unwrap().to_string();
+        struct Stop(Arc<Ctx>, String);
+        impl Drop for Stop { fn drop(&mut self) { crate::agents::stop(&self.0, &self.1, "stopped"); crate::terminals::kill_agent(&self.0, &self.1); } }
+        let _stop = Stop(ctx.clone(), agent.clone());
+
+        // 2. The agent works in its own worktree and commits.
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let st = loop {
+            if let Some(e) = ctx.db.kv_get(&format!("agent_error.{agent}")).filter(|e| !e.is_empty()) { panic!("agent failed: {e}"); }
+            let st = call(&ctx, "get", json!({"id": id})).await.unwrap();
+            if st["files"].as_array().is_some_and(|f| !f.is_empty()) && st["dirty"] == false { break st; }
+            assert!(Instant::now() < deadline, "agent never committed: {st}");
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        };
+        assert_eq!(st["state"], "building");
+        assert_eq!(st["files"], json!(["src/main.jsx"]), "{st}");
+        assert_eq!(st["flagged"], json!([]));
+        let (wt, _) = worktree(&ctx, &agent).unwrap();
+        assert_ne!(wt, src, "agent must work in a separate worktree");
+        assert!(std::fs::read_to_string(src.join("src/main.jsx")).unwrap().contains("title=\"Improve Philium\""), "source untouched before accept");
+
+        // 3. The diff the user reviews.
+        let diff = call(&ctx, "diff", json!({"id": id})).await.unwrap();
+        assert!(diff["patch"].as_str().unwrap().contains("+            <button class=\"icon-btn\" onClick={() => improve()} title=\"Improve Philium (ask an agent)\">"), "{diff}");
+
+        // 4. Accept is refused until tests pass on this exact commit.
+        assert!(call(&ctx, "accept", json!({"id": id})).await.unwrap_err().contains("Run the tests first"));
+        let t = call(&ctx, "test", json!({"id": id})).await.unwrap()["terminal"].as_str().unwrap().to_string();
+        if skip_tests {
+            crate::terminals::kill(&ctx, &t).unwrap();
+            ctx.db.exec("UPDATE terminals SET state='exited', exit_code=0 WHERE id=?1", [&t]).unwrap();
+        } else {
+            let deadline = Instant::now() + Duration::from_secs(1500);
+            let exit = loop {
+                if let Some(x) = term_exit(&ctx, &t) { break x; }
+                assert!(Instant::now() < deadline, "tests timed out");
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            };
+            let out = crate::terminals::snapshot(&ctx, &t, 64 * 1024).unwrap_or_default();
+            assert_eq!(exit, 0, "selfdev tests failed:\n{out}");
+        }
+        let st = call(&ctx, "get", json!({"id": id})).await.unwrap();
+        assert_eq!((st["tests"].clone(), st["tested_commit"].clone()), (json!("passed"), st["head"].clone()), "{st}");
+
+        // 5. Accept merges into the source checkout and starts a rebuild (stopped here).
+        let acc = call(&ctx, "accept", json!({"id": id})).await.unwrap();
+        crate::terminals::kill(&ctx, acc["build_terminal"].as_str().unwrap()).unwrap();
+        assert_eq!(acc["previous"], json!(base));
+        assert!(std::fs::read_to_string(src.join("src/main.jsx")).unwrap().contains("title=\"Improve Philium (ask an agent)\""));
+        assert_eq!(row(&ctx, &id).unwrap()["state"], "accepted");
+
+        // 6. Roll back adds a revert commit.
+        let rb = call(&ctx, "rollback", json!({"id": id})).await.unwrap();
+        crate::terminals::kill(&ctx, rb["build_terminal"].as_str().unwrap()).unwrap();
+        assert!(std::fs::read_to_string(src.join("src/main.jsx")).unwrap().contains("title=\"Improve Philium\""));
+
+        // 7. Discard: the agent and its worktree go away.
+        let mut rep = call(&ctx, "reject", json!({"id": id})).await.unwrap();
+        if rep["needs_confirmation"] == true { rep = call(&ctx, "reject", json!({"id": id, "force": true})).await.unwrap(); }
+        assert_ne!(rep["needs_confirmation"], true, "{rep}");
+        assert_eq!(row(&ctx, &id).unwrap()["state"], "rejected");
+        assert!(!wt.exists(), "worktree removed on discard");
+        println!("improver e2e: request, agent commit in {}, diff, tests {}, accept, rollback, discard OK", wt.display(), if skip_tests { "skipped" } else { "passed" });
     }
 
     #[test]
