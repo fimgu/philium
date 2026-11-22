@@ -583,7 +583,7 @@ export default function Memory() {
         <Show when={models() && modelsInfo().state !== "ready"}>
           <div class="mem-models-banner">
             <span class="grow">
-              <span class="dim">Local search models</span> <span class="faint">{modelsInfo().text}</span>
+              <span class="dim">Local search models</span> <span class="dim" title={models()?.embed?.error || models()?.rerank?.error || ""}>{modelsInfo().text}</span>
             </span>
             <Show when={modelsInfo().action}>
               <Button size="sm" variant="ghost" busy={modelsBusy()} onClick={downloadModels}>{modelsInfo().action}</Button>
@@ -680,11 +680,11 @@ export default function Memory() {
                       return (
                         <div class={`mem-card hover-actions ${m.status}`}>
                           <div class="mem-head">
-                            <strong class="mem-title grow">{title}</strong>
+                            <strong class="mem-title grow">{m.title ? title : ""}</strong>
                             <Show when={m.category}><span class="mem-cat">{categoryLabel(m.category)}</span></Show>
                             <Show when={when}><span class="xs faint" title={m.updated_at || m.created_at}>{when}</span></Show>
                           </div>
-                          <Show when={m.content && m.content.trim() !== title}>
+                          <Show when={!m.title || (m.content && m.content.trim() !== title)}>
                             <div class="mem-body">{m.content}</div>
                           </Show>
                           <Show when={chips.shown.length}>

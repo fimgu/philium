@@ -34,7 +34,7 @@ function LocalModelsRow() {
         <span class="xs faint">On-device embedding and reranking, about 90 MB, downloaded once.</span>
       </div>
       <div class="ws-actions">
-        <Badge tone={info().state === "ready" ? "secure" : info().state === "failed" ? "strict" : ""}>{info().text}</Badge>
+        <Badge title={st()?.embed?.error || st()?.rerank?.error || ""} tone={info().state === "ready" ? "secure" : info().state === "failed" ? "strict" : ""}>{info().text}</Badge>
         <Show when={info().action}>
           <Button size="sm" busy={busy()} onClick={download}>{info().action}</Button>
         </Show>
