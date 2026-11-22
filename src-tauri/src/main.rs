@@ -382,6 +382,16 @@ fn main() {
                 ("workday", workday::init),
                 ("access", access::init),
                 ("library", library::init),
+            });
+
+            // Keep philium.db-wal from growing without bound between restarts.
+            let c_wal = ctx.clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+                    let c = c_wal.clone();
+                    let _ = tokio::task::spawn_blocking(move || c.db.with(|x| x.execute_batch("PRAGMA wal_checkpoint(PASSIVE);"))).await;
+                }
                 ("surfaces", surfaces::init),
                 ("providers", providers::init),
                 ("sandbox", sandbox::init),

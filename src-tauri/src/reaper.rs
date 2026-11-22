@@ -816,7 +816,7 @@ fn orphans(ctx: &Arc<Ctx>) -> Result<Value, String> {
             }
         }
     }
-    if resolve_bin("docker").is_some() {
+    if resolve_bin("docker").is_some() && docker_up() {
         match command(
             "docker",
             &[
@@ -1249,4 +1249,15 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(ctx.root.parent().unwrap());
     }
+}
+
+/// Docker CLI present but daemon down: skip quietly instead of reporting an error every sweep.
+fn docker_up() -> bool {
+    std::process::Command::new("docker")
+        .args(["info", "--format", "{{.ServerVersion}}"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }

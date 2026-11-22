@@ -23,6 +23,7 @@ const ACTIONS: &[(&str, &str)] = &[
     ("agents.spawn", "Started an agent"),
     ("agents.send", "Sent a message to an agent"),
     ("agents.cancel", "Interrupted an agent's turn"),
+    ("agents.compact", "Compacted an agent's context"),
     ("agents.stop", "Stopped an agent"),
     ("agents.resume", "Resumed an agent"),
     ("agents.remove", "Removed an agent"),
