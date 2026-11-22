@@ -388,6 +388,10 @@ pub(crate) fn agent_session_context_with_budget(
             if let Some(block) = crate::library::format_slate_memories_prompt(&slate, max_slate_bytes) {
                 out.push_str(&block);
             }
+            let shown: Vec<String> = slate["items"].as_array().map(|a| a.iter().filter_map(|i| i["id"].as_str().map(str::to_string)).collect()).unwrap_or_default();
+            if let Some(index) = crate::library::memory_index_prompt(ctx, rid, &shown, 40, 4000) {
+                out.push_str(&index);
+            }
         }
     }
     out
@@ -427,6 +431,10 @@ async fn agent_session_context_async(
             let max_slate_bytes = (budget * 4).clamp(1024, 12_000);
             if let Some(block) = crate::library::format_slate_memories_prompt(&slate, max_slate_bytes) {
                 out.push_str(&block);
+            }
+            let shown: Vec<String> = slate["items"].as_array().map(|a| a.iter().filter_map(|i| i["id"].as_str().map(str::to_string)).collect()).unwrap_or_default();
+            if let Some(index) = crate::library::memory_index_prompt(ctx, rid, &shown, 40, 4000) {
+                out.push_str(&index);
             }
         }
         if let Ok(dose) = crate::memory_skills::select_skill_dose(ctx, rid, query, model_ref) {

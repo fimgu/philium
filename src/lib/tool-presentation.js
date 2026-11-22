@@ -235,6 +235,12 @@ export function summarizeTool(tool, args, result, out = "", meta = null) {
       summary = truncate(parts.join(" ") || "save memory", 84);
       break;
     }
+    case "memory_get": {
+      label = "Memory";
+      const n = Array.isArray(a.ids) ? a.ids.length : 0;
+      summary = n === 1 ? "read 1 memory" : `read ${n} memories`;
+      break;
+    }
     case "memory_as_of":
       label = "Memory";
       summary = truncate(`as of ${a.at || ""}${a.q ? ` · ${collapseWs(a.q)}` : ""}`.trim(), 84);

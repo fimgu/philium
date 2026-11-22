@@ -241,6 +241,8 @@ pub fn tool_list() -> Vec<Value> {
           json!({ "q": s, "budget_tokens": i, "repo": s }), &[]),
         t("memory_save", "Save a repository-scoped memory. Give a short title and the repo-relative files it concerns. Optional fact_key enables code-level supersession; optional valid_from/valid_to set temporal validity. Category: decision, bugfix, discovery, architecture, gotcha, preference, correction, procedure, fact, entity.",
           json!({ "content": s, "category": s, "title": s, "files": { "type": "array", "items": { "type": "string" } }, "project": b, "fact_key": s, "supersedes_id": s, "trust_tier": s, "provenance": s, "valid_from": s, "valid_to": s }), &["content", "category"]),
+        t("memory_get", "Read full memory records by id (ids come from the Memory index in your context). This repository only.",
+          json!({ "ids": { "type": "array", "items": { "type": "string" } } }), &["ids"]),
         t("memory_as_of", "Point-in-time historical query over this repository's fact ledger (includes superseded facts valid at `at`).",
           json!({ "at": s, "q": s, "limit": i }), &["at"]),
         t("memory_procedures", "Fetch verified active procedures for this repository sized to your model's measured skill dose.",
@@ -660,7 +662,7 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
             let repo = row["repo_id"].as_str().filter(|id| !id.is_empty()).ok_or("Release checks belong to a registered checkout")?;
             crate::release_sql::propose(ctx, repo, &me, &a["contracts"])
         }
-        "memory_search" | "memory_slate" | "memory_save" | "memory_as_of" | "memory_procedures" | "working_note_get" | "working_note_set" | "session_search" => {
+        "memory_search" | "memory_get" | "memory_slate" | "memory_save" | "memory_as_of" | "memory_procedures" | "working_note_get" | "working_note_set" | "session_search" => {
             // Personal memory and past sessions never go to agents on untrusted (Strict) providers.
             if row["strict"].as_i64() == Some(1) {
                 return Err("memory and past sessions are not available to Strict agents".into());
@@ -716,6 +718,10 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
                     )
                     .await
                     .map(tag_ext)
+                }
+                "memory_get" => {
+                    let ids: Vec<String> = a["ids"].as_array().map(|v| v.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default();
+                    crate::library::agent_memory_get(ctx, repo, &ids)
                 }
                 "memory_as_of" => crate::memory_ledger::query_as_of(
                     ctx,
@@ -1057,6 +1063,13 @@ mod tests {
         let procs_std = text(&call("t1", "memory_procedures", json!({"q": "offline"})).await);
         assert!(procs_std.contains("Offline startup check"), "{procs_std}");
         assert_eq!(call("s2", "memory_procedures", json!({"q": "offline"})).await["result"]["isError"], true);
+
+        // Progressive disclosure: memory_get returns full records for this repo only, never a sibling's, never to Strict.
+        let mine = crate::library::save_agent_memory_rich(&ctx, "Index detail for ra", "decision", "ra", "owl", None, None, None, None).unwrap();
+        let theirs = crate::library::save_agent_memory_rich(&ctx, "SIBLING_ONLY_DETAIL", "decision", "rb", "ibis", None, None, None, None).unwrap();
+        let got = text(&call("t1", "memory_get", json!({"ids": [mine["id"], theirs["id"]]})).await);
+        assert!(got.contains("Index detail for ra") && !got.contains("SIBLING_ONLY_DETAIL"), "{got}");
+        assert_eq!(call("s2", "memory_get", json!({"ids": [mine["id"]]})).await["result"]["isError"], true);
     }
 
     #[test]

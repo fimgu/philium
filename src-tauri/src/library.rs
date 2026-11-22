@@ -2450,6 +2450,63 @@ pub fn format_slate_memories_prompt(slate: &Value, max_bytes: usize) -> Option<S
     Some(truncate_utf8(&out, max_bytes))
 }
 
+/// Progressive disclosure: a compact index (id, category, title, files) of this repository's other
+/// active memories, so the agent can pull full text with `memory_get` only when it needs it.
+/// Repo scope only; callers must already have excluded Strict agents.
+pub fn memory_index_prompt(ctx: &Ctx, repo_id: &str, exclude: &[String], max_items: usize, max_bytes: usize) -> Option<String> {
+    let rows = ctx
+        .db
+        .query(
+            "SELECT id, category, title, content, files FROM memories
+             WHERE scope=?1 AND status='active' AND active=1
+             ORDER BY COALESCE(updated_at, created_at) DESC LIMIT 200",
+            [format!("repo:{repo_id}")],
+        )
+        .ok()?;
+    let mut out = String::new();
+    let mut n = 0;
+    for r in &rows {
+        let id = r["id"].as_str().unwrap_or("");
+        if id.is_empty() || exclude.iter().any(|e| e == id) {
+            continue;
+        }
+        let title = r["title"].as_str().filter(|s| !s.trim().is_empty()).map(str::to_string).unwrap_or_else(|| {
+            let c = r["content"].as_str().unwrap_or("").trim().replace('\n', " ");
+            truncate_utf8(&c, 80)
+        });
+        let files: Vec<String> = r["files"].as_str().and_then(|f| serde_json::from_str(f).ok()).unwrap_or_default();
+        let mut line = format!("- {id} · {} · {}", r["category"].as_str().unwrap_or("fact"), title.trim());
+        if !files.is_empty() {
+            line.push_str(&format!(" · {}", files.iter().take(3).cloned().collect::<Vec<_>>().join(", ")));
+        }
+        line.push('\n');
+        if out.len() + line.len() > max_bytes {
+            break;
+        }
+        out.push_str(&line);
+        n += 1;
+        if n >= max_items {
+            break;
+        }
+    }
+    (n > 0).then(|| format!("\n## Memory index (more in this repo; read with `memory_get {{ids}}`)\n{out}"))
+}
+
+/// Full records for ids from the memory index, hard-gated to this repository's scope.
+pub fn agent_memory_get(ctx: &Ctx, repo_id: &str, ids: &[String]) -> Result<Value, String> {
+    let scope = format!("repo:{repo_id}");
+    let mut out = Vec::new();
+    for id in ids.iter().take(20) {
+        let rows = ctx.db.query(
+            "SELECT id, category, title, content, files, fact_key, trust_tier, status, created_at, updated_at
+             FROM memories WHERE id=?1 AND scope=?2 AND status != 'deleted'",
+            params![id, scope],
+        )?;
+        out.extend(rows);
+    }
+    Ok(Value::Array(out))
+}
+
 /// UI list helper: inspect active, proposed, superseded, or quarantined memories with provenance.
 pub fn list_memories(
     ctx: &Ctx,
@@ -4592,6 +4649,31 @@ mod tests {
             assert_eq!(first_json_object(&t), Some(json!({"a":1})), "{body}");
         }
         assert_eq!(first_json_object("x {\"s\":\"}{\"} y"), Some(json!({"s":"}{"})));
+    }
+
+    #[test]
+    fn memory_index_is_repo_scoped_titled_and_bounded() {
+        let ctx = Ctx::test();
+        ctx.db.kv_set("library.imported_at", "fixture").unwrap();
+        init(&ctx).unwrap();
+        fn opts<'a>(content: &'a str, scope: &'a str) -> SaveOpts<'a> {
+            SaveOpts { content, category: "decision", scope, source: "agent:x", trust_tier: "agent_inferred", fact_key: None, supersedes_id: None, source_event_id: None, provenance: None }
+        }
+        let meta = MemoryMeta { title: Some("Use pnpm".into()), files: vec!["package.json".into()] };
+        let a = save_structured_meta(&ctx, opts("long body about pnpm", "repo:ra"), &meta).unwrap();
+        let shown = save_structured(&ctx, opts("already in the slate", "repo:ra")).unwrap();
+        save_structured(&ctx, opts("SIBLING_INDEX_SECRET", "repo:rb")).unwrap();
+        save_structured(&ctx, opts("GLOBAL_INDEX_SECRET", "global")).unwrap();
+        let idx = memory_index_prompt(&ctx, "ra", &[shown["id"].as_str().unwrap().to_string()], 40, 4000).unwrap();
+        assert!(idx.contains(&format!("- {} · decision · Use pnpm · package.json", a["id"].as_str().unwrap())), "{idx}");
+        assert!(!idx.contains("long body") && !idx.contains("already in the slate"), "{idx}");
+        assert!(!idx.contains("SIBLING_INDEX_SECRET") && !idx.contains("GLOBAL_INDEX_SECRET"), "{idx}");
+        for i in 0..100 {
+            save_structured(&ctx, opts(&format!("filler memory number {i} with some words"), "repo:ra")).unwrap();
+        }
+        let big = memory_index_prompt(&ctx, "ra", &[], 40, 4000).unwrap();
+        assert!(big.len() < 4200 && big.lines().filter(|l| l.starts_with("- ")).count() <= 40);
+        assert!(memory_index_prompt(&ctx, "nope", &[], 40, 4000).is_none());
     }
 
     /// Real gateway in front of fake subscription upstreams (Claude OAuth Messages JSON, ChatGPT
