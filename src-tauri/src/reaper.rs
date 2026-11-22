@@ -9,7 +9,7 @@ use crate::{
 use rusqlite::params;
 use serde_json::{json, Value};
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{Arc, Mutex},
     time::Duration,
@@ -56,8 +56,61 @@ pub fn init(ctx: &Arc<Ctx>) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     Ok(())
 }
+fn is_executable(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// Resolve a CLI binary across `PATH` plus common macOS GUI app-bundle locations
+/// (`~/.orbstack/bin`, `/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`, `/bin`).
+fn resolve_bin(prog: &str) -> Option<PathBuf> {
+    if prog.is_empty() {
+        return None;
+    }
+    if prog.contains('/') || prog.contains(std::path::MAIN_SEPARATOR) {
+        let p = PathBuf::from(prog);
+        return is_executable(&p).then_some(p);
+    }
+    if let Some(path_var) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let cand = dir.join(prog);
+            if is_executable(&cand) {
+                return Some(cand);
+            }
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let cand = PathBuf::from(home).join(".orbstack/bin").join(prog);
+        if is_executable(&cand) {
+            return Some(cand);
+        }
+    }
+    for dir in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"] {
+        let cand = Path::new(dir).join(prog);
+        if is_executable(&cand) {
+            return Some(cand);
+        }
+    }
+    None
+}
+
 fn command(program: &str, args: &[&str]) -> Result<String, String> {
-    let o = Command::new(program)
+    let bin = resolve_bin(program)
+        .ok_or_else(|| format!("{program}: No such file or directory"))?;
+    let o = Command::new(&bin)
         .args(args)
         .stdin(Stdio::null())
         .output()
@@ -763,40 +816,44 @@ fn orphans(ctx: &Arc<Ctx>) -> Result<Value, String> {
             }
         }
     }
-    match command(
-        "docker",
-        &[
-            "ps",
-            "-a",
-            "--filter",
-            "label=philium.agent",
-            "--format",
-            "{{.ID}}\t{{.Names}}\t{{.Label \"philium.agent\"}}",
-        ],
-    ) {
-        Ok(s) => {
-            for line in s.lines() {
-                let p = line.split('\t').collect::<Vec<_>>();
-                if let Some(id) = p.first() {
-                    if !known("container", id)
-                        && !p.get(1).map(|n| known("container", n)).unwrap_or(false)
-                    {
-                        found.push(json!({"kind":"container","handle":id,"name":p.get(1),"agent":p.get(2)}));
+    if resolve_bin("docker").is_some() {
+        match command(
+            "docker",
+            &[
+                "ps",
+                "-a",
+                "--filter",
+                "label=philium.agent",
+                "--format",
+                "{{.ID}}\t{{.Names}}\t{{.Label \"philium.agent\"}}",
+            ],
+        ) {
+            Ok(s) => {
+                for line in s.lines() {
+                    let p = line.split('\t').collect::<Vec<_>>();
+                    if let Some(id) = p.first() {
+                        if !known("container", id)
+                            && !p.get(1).map(|n| known("container", n)).unwrap_or(false)
+                        {
+                            found.push(json!({"kind":"container","handle":id,"name":p.get(1),"agent":p.get(2)}));
+                        }
                     }
                 }
             }
+            Err(e) => errors.push(e),
         }
-        Err(e) => errors.push(e),
     }
-    match command("kind", &["get", "clusters"]) {
-        Ok(s) => {
-            for name in s.lines().filter(|n| n.starts_with("philium-")) {
-                if !known("kind_cluster", name) {
-                    found.push(json!({"kind":"kind_cluster","handle":name}));
+    if resolve_bin("kind").is_some() {
+        match command("kind", &["get", "clusters"]) {
+            Ok(s) => {
+                for name in s.lines().filter(|n| n.starts_with("philium-")) {
+                    if !known("kind_cluster", name) {
+                        found.push(json!({"kind":"kind_cluster","handle":name}));
+                    }
                 }
             }
+            Err(e) => errors.push(e),
         }
-        Err(e) => errors.push(e),
     }
     // Registered Git worktrees can survive manual moves, so also compare Git's own registry.
     for r in ctx.db.query("SELECT * FROM repos", [])? {
@@ -1168,5 +1225,28 @@ mod tests {
         assert_eq!(status.signal(), Some(9));
         release(&ctx, &id);
         std::fs::remove_dir_all(ctx.root.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn resolve_bin_finds_standard_tools_and_handles_missing_binaries() {
+        assert!(resolve_bin("sh").is_some());
+        assert!(resolve_bin("ps").is_some());
+        assert!(resolve_bin("").is_none());
+        assert!(resolve_bin("philium-definitely-missing-runtime-xyz").is_none());
+        let err = command("philium-definitely-missing-runtime-xyz", &[]).unwrap_err();
+        assert!(err.contains("No such file or directory"), "{err}");
+
+        let ctx = Ctx::test();
+        schema(&ctx).unwrap();
+        let scan = orphans(&ctx).unwrap();
+        let errs = scan["errors"].as_array().unwrap();
+        for e in errs {
+            let s = e.as_str().unwrap_or("");
+            assert!(
+                !s.contains("No such file or directory"),
+                "orphan scan must not report NotFound errors for missing optional runtimes: {errs:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(ctx.root.parent().unwrap());
     }
 }

@@ -69,8 +69,6 @@ CREATE TABLE IF NOT EXISTS memories (
   valid_from TEXT,
   valid_to TEXT);
 CREATE INDEX IF NOT EXISTS memories_scope ON memories(scope);
-CREATE INDEX IF NOT EXISTS memories_status ON memories(status, active);
-CREATE INDEX IF NOT EXISTS memories_fact_key ON memories(scope, fact_key);
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(content, content='memories', content_rowid='rowid');
 CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
   INSERT INTO memories_fts(rowid, content) VALUES (new.rowid, new.content); END;
@@ -130,6 +128,8 @@ fn migrate_columns(ctx: &Ctx) -> Result<(), String> {
         ("source_event_id", "ALTER TABLE memories ADD COLUMN source_event_id TEXT"),
         ("provenance", "ALTER TABLE memories ADD COLUMN provenance TEXT"),
         ("updated_at", "ALTER TABLE memories ADD COLUMN updated_at TEXT"),
+        ("valid_from", "ALTER TABLE memories ADD COLUMN valid_from TEXT"),
+        ("valid_to", "ALTER TABLE memories ADD COLUMN valid_to TEXT"),
     ];
     for (name, sql) in additions {
         if !cols.iter().any(|c| c == name) {
@@ -150,10 +150,16 @@ fn migrate_columns(ctx: &Ctx) -> Result<(), String> {
         "DELETE FROM memory_vectors WHERE model_version = 'philium-local-ngram-256-v1'",
         [],
     );
-    let _ = ctx.db.exec("CREATE INDEX IF NOT EXISTS memories_status ON memories(status, active)", []);
-    let _ = ctx.db.exec("CREATE INDEX IF NOT EXISTS memories_fact_key ON memories(scope, fact_key)", []);
     Ok(())
 }
+
+/// Indexes over columns that legacy databases only gain in `migrate_columns`. They must never live
+/// in `SCHEMA`: on a pre-v1 `memories` table the batch would abort with `no such column: status`
+/// before any later table (working notes, vectors, intentions, ledger, procedures) is created.
+const POST_MIGRATION_INDEXES: &str = "
+CREATE INDEX IF NOT EXISTS memories_status ON memories(status, active);
+CREATE INDEX IF NOT EXISTS memories_fact_key ON memories(scope, fact_key);
+";
 
 /// Standing rules every agent gets, adapted from the user's Jcode overlay to
 /// Philium's tools. Editable via setting `agent_rules`.
@@ -544,11 +550,24 @@ fn load_scope_vectors_cached(
 }
 
 pub fn init(ctx: &Arc<Ctx>) -> Result<(), String> {
+    // A legacy database may carry `memories` rows from before the FTS index existed; the external
+    // content table is created empty, so rebuild it once or those rows stay invisible to BM25.
+    let fts_missing = ctx
+        .db
+        .query("SELECT 1 AS x FROM sqlite_master WHERE name='memories_fts'", [])
+        .map(|r| r.is_empty())
+        .unwrap_or(false);
     ctx.db.with(|c| c.execute_batch(SCHEMA))?;
+    if fts_missing {
+        let _ = ctx.db.exec("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')", []);
+    }
     migrate_columns(ctx)?;
+    ctx.db.with(|c| c.execute_batch(POST_MIGRATION_INDEXES))?;
     crate::memory_ledger::init(ctx)?;
     crate::memory_skills::init(ctx)?;
     crate::memory_consolidation::init(ctx)?;
+    // Idempotent: remaps previously imported `project:<abs_path>` / `jcode:<hash>` rows onto
+    // their registered `repo:<id>` scopes (no-op when nothing matches).
     sync_imported_repo_scopes(ctx);
     if !crate::pilot::active() && ctx.db.kv_get("library.imported_at").is_none() {
         let c = ctx.clone();
@@ -4352,6 +4371,65 @@ mod tests {
         // Second observe with no new seq is idempotent (skipped).
         let again = observe_session(&ctx, "a1").await.unwrap();
         assert_eq!(again["skipped"], true);
+    }
+
+    #[test]
+    fn migrates_legacy_v0_memories_schema_cleanly() {
+        let ctx = Ctx::test();
+        // Exact v0 shape: no status / fact_key / trust_tier / valid_from / valid_to, no FTS.
+        ctx.db
+            .with(|c| {
+                c.execute_batch(
+                    "CREATE TABLE memories (
+                       id TEXT PRIMARY KEY, scope TEXT NOT NULL, category TEXT NOT NULL, content TEXT NOT NULL,
+                       source TEXT NOT NULL, created_at TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1);
+                     CREATE INDEX memories_scope ON memories(scope);
+                     INSERT INTO memories(id,scope,category,content,source,created_at,active) VALUES
+                       ('legacy1','project:/fixture/legacy-repo','fact','Legacy zebrafinch build uses ninja','jcode','2025-01-01 00:00:00',1),
+                       ('legacy2','global','preference','Retired legacy preference','jcode','2025-01-02 00:00:00',0);
+                     INSERT INTO repos(id,name,path,added_at) VALUES('lr','legacy-repo','/fixture/legacy-repo',0);",
+                )
+            })
+            .unwrap();
+
+        init(&ctx).expect("init must migrate a v0 memories table");
+        // Idempotent on a second boot.
+        init(&ctx).expect("init must be idempotent");
+
+        let cols: Vec<String> = ctx
+            .db
+            .query("PRAGMA table_info(memories)", [])
+            .unwrap()
+            .into_iter()
+            .filter_map(|r| r["name"].as_str().map(str::to_string))
+            .collect();
+        for want in ["trust_tier", "status", "fact_key", "supersedes_id", "source_event_id", "provenance", "updated_at", "valid_from", "valid_to"] {
+            assert!(cols.iter().any(|c| c == want), "missing column {want}: {cols:?}");
+        }
+        for table in ["working_notes", "memory_vectors", "intentions", "consolidation_runs", "learned_procedures", "memory_rollbacks", "memory_versions"] {
+            let n = ctx.db.query("SELECT 1 AS x FROM sqlite_master WHERE type='table' AND name=?1", [table]).unwrap().len();
+            assert_eq!(n, 1, "missing table {table}");
+        }
+        for index in ["memories_status", "memories_fact_key"] {
+            let n = ctx.db.query("SELECT 1 AS x FROM sqlite_master WHERE type='index' AND name=?1", [index]).unwrap().len();
+            assert_eq!(n, 1, "missing index {index}");
+        }
+
+        // Legacy rows were backfilled and the imported project scope was remapped to the repo.
+        let rows = ctx.db.query("SELECT id, scope, status, trust_tier FROM memories ORDER BY id", []).unwrap();
+        assert_eq!(rows[0]["scope"], "repo:lr");
+        assert_eq!(rows[0]["status"], "active");
+        assert_eq!(rows[0]["trust_tier"], "user_direct");
+        assert_eq!(rows[1]["status"], "deleted");
+
+        let note = working_note_patch(&ctx, "repo:lr", Some("Keep ninja"), None, None, Some("Port CI"), None, "user").unwrap();
+        assert_eq!(note["requirements"], "Keep ninja");
+        assert_eq!(note["next_steps"], "Port CI");
+
+        let slate = build_context_slate(&ctx, Some("lr"), "zebrafinch build", 2000, false, true).unwrap();
+        let text = slate.to_string();
+        assert!(text.contains("Legacy zebrafinch build uses ninja"), "legacy row must be retrievable: {text}");
+        assert!(!text.contains("Retired legacy preference"));
     }
 
     #[test]

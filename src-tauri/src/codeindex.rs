@@ -2548,6 +2548,97 @@ pub fn map_tokens(context_window: Option<i64>) -> usize {
     }
 }
 
+const MAX_FALLBACK_FILES: usize = 40;
+const MAX_FALLBACK_DEPTH: usize = 4;
+const MAX_FALLBACK_VISITED: usize = 2000;
+
+fn is_secret_or_noise_file(rel: &str, name: &str) -> bool {
+    let low = name.to_ascii_lowercase();
+    low.starts_with(".env")
+        || low == ".ds_store"
+        || low == ".npmrc"
+        || low == ".netrc"
+        || low == "id_rsa"
+        || low == "id_ed25519"
+        || low == "credentials.json"
+        || inspect::private_name(Path::new(rel))
+}
+
+/// Concise level-order file tree for repositories with no indexed code symbols (e.g. hardware,
+/// KiCad, docs, or unsupported languages). Never follows symlinks and skips build/secret paths.
+fn fallback_project_files(root: &Path) -> Option<String> {
+    if !root.is_dir() {
+        return None;
+    }
+    let mut files: Vec<String> = Vec::new();
+    let mut omitted: usize = 0;
+    let mut visited: usize = 0;
+    let mut queue: std::collections::VecDeque<(PathBuf, String, usize)> = std::collections::VecDeque::new();
+    queue.push_back((root.to_path_buf(), String::new(), 0));
+
+    while let Some((dir, prefix, depth)) = queue.pop_front() {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        let mut entries: Vec<(String, PathBuf, std::fs::FileType)> = Vec::new();
+        for entry in rd.flatten() {
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_symlink() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            entries.push((name, entry.path(), ft));
+        }
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+        for (name, path, ft) in entries {
+            visited += 1;
+            if visited > MAX_FALLBACK_VISITED {
+                break;
+            }
+            let rel = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            if ft.is_dir() {
+                if SKIP_DIRS.contains(&name.as_str())
+                    || name.starts_with(".git")
+                    || inspect::private_name(Path::new(&rel))
+                {
+                    continue;
+                }
+                if depth < MAX_FALLBACK_DEPTH {
+                    queue.push_back((path, rel, depth + 1));
+                }
+            } else if ft.is_file() {
+                if is_secret_or_noise_file(&rel, &name) {
+                    continue;
+                }
+                if files.len() < MAX_FALLBACK_FILES {
+                    files.push(rel);
+                } else {
+                    omitted += 1;
+                }
+            }
+        }
+        if visited > MAX_FALLBACK_VISITED {
+            break;
+        }
+    }
+
+    if files.is_empty() {
+        return None;
+    }
+    let mut body = files.join("\n");
+    if omitted > 0 {
+        body.push_str(&format!("\n... (+{omitted} more files)"));
+    }
+    Some(format!(
+        "\n## Project files\n\
+         No indexed code symbols were found in this repository; showing representative project files.\n\
+         ```\n{body}\n```\n"
+    ))
+}
+
 /// The codebase map in a repo agent's system prompt, so its first turn knows where the
 /// code that matters is without a tool call. `tokens` bounds it. Agents that coordinate
 /// others (`landscape`) also get the worktrees and branches. A worker hears of a clash
@@ -2567,11 +2658,7 @@ pub fn prompt_map(ctx: &Ctx, repo_id: &str, wt_path: Option<&Path>, tokens: usiz
         (None, Some(_)) => return None,
         _ => None,
     };
-    let (view, _) = index_target(ctx, &t.repo_id, &t.repo_path, &t.branch, wt_arg, false).ok()?;
-    if view.syms.is_empty() {
-        return None;
-    }
-    let map = render_brief_map(&view, tokens);
+    let view = index_target(ctx, &t.repo_id, &t.repo_path, &t.branch, wt_arg, false).ok().map(|(v, _)| v);
     let mut landscape_block = String::new();
     if let Some(land) = landscape.then(|| crate::workspace::repo_landscape(ctx, repo_id, false).ok()).flatten() {
         let mut lines = vec![];
@@ -2629,15 +2716,24 @@ pub fn prompt_map(ctx: &Ctx, repo_id: &str, wt_path: Option<&Path>, tokens: usiz
             );
         }
     }
-    // The map comes first: it is the same for every role, so workers and coordinators on
-    // a repo share more of the prompt prefix the provider caches.
-    Some(format!(
-        "\n## Codebase map\n\
-         Built from the code by Philium, ranked by how often each symbol is used. Line spans can move as code changes: `code_symbol` reads the current source.\n\
-         ```\n{}\
-         ```\n{}",
-        map, landscape_block
-    ))
+    if let Some(view) = view.filter(|v| !v.syms.is_empty()) {
+        let map = render_brief_map(&view, tokens);
+        // The map comes first: it is the same for every role, so workers and coordinators on
+        // a repo share more of the prompt prefix the provider caches.
+        return Some(format!(
+            "\n## Codebase map\n\
+             Built from the code by Philium, ranked by how often each symbol is used. Line spans can move as code changes: `code_symbol` reads the current source.\n\
+             ```\n{}\
+             ```\n{}",
+            map, landscape_block
+        ));
+    }
+    let root = wt_path.unwrap_or(&t.repo_path);
+    match fallback_project_files(root) {
+        Some(tree) => Some(format!("{tree}{landscape_block}")),
+        None if !landscape_block.is_empty() => Some(landscape_block),
+        None => None,
+    }
 }
 
 fn render_repo_context(ctx: &Ctx, l: &Loaded, a: &Value, cap: usize) -> String {
@@ -3057,6 +3153,47 @@ mod tests {
         assert_eq!(restored.syms.len(), view.syms.len());
         assert_eq!(restored.refs.len(), view.refs.len());
         assert!(call(&f.ctx, "status", json!({"repo_id":"missing"})).await.is_err());
+    }
+
+    #[test]
+    fn prompt_map_falls_back_to_project_files_for_non_code_repos() {
+        let ctx = fresh_ctx();
+        let d = crate::ctx::test_dir("ci-pcb");
+        std::fs::create_dir_all(d.join("schematics")).unwrap();
+        std::fs::create_dir_all(d.join("node_modules/pkg")).unwrap();
+        std::fs::create_dir_all(d.join("target/debug")).unwrap();
+        std::fs::create_dir_all(d.join(".venv/bin")).unwrap();
+        sh(&d, &["init", "-q", "-b", "main"]);
+        std::fs::write(d.join("README.md"), "# Watch PCB\n").unwrap();
+        std::fs::write(d.join("board.kicad_pcb"), "(kicad_pcb (version 20240108))\n").unwrap();
+        std::fs::write(d.join("schematics/power.kicad_sch"), "(kicad_sch)\n").unwrap();
+        std::fs::write(d.join(".env"), "API_KEY=secret\n").unwrap();
+        std::fs::write(d.join(".env.local"), "TOKEN=secret\n").unwrap();
+        std::fs::write(d.join("private.pem"), "-----BEGIN KEY-----\n").unwrap();
+        std::fs::write(d.join("node_modules/pkg/index.txt"), "dep").unwrap();
+        std::fs::write(d.join("target/debug/out.bin"), "bin").unwrap();
+        std::fs::write(d.join(".venv/bin/activate"), "sh").unwrap();
+        sh(&d, &["add", "README.md", "board.kicad_pcb", "schematics/power.kicad_sch"]);
+        sh(&d, &["commit", "-q", "-m", "init pcb"]);
+
+        ctx.db
+            .exec(
+                "INSERT INTO repos(id,name,path,default_branch,added_at) VALUES('pcb','watch-pcb',?1,'main',0)",
+                [d.to_str().unwrap()],
+            )
+            .unwrap();
+
+        let map = prompt_map(&ctx, "pcb", None, 4000, false).expect("non-code repo should get a fallback project file map");
+        assert!(map.contains("## Project files"), "{map}");
+        assert!(map.contains("README.md"), "{map}");
+        assert!(map.contains("board.kicad_pcb"), "{map}");
+        assert!(map.contains("schematics/power.kicad_sch"), "{map}");
+        for forbidden in [".env", "private.pem", "node_modules", "target/debug", ".venv", ".git"] {
+            assert!(!map.contains(forbidden), "fallback map leaked {forbidden}: {map}");
+        }
+
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(ctx.data_dir.parent().unwrap());
     }
 
     #[tokio::test]
