@@ -21,6 +21,8 @@ export { agentHue, AgentChip, RoleBadge, KvBadge, WarningPills, SpawnModal };
 
 const AgentTerminals = lazy(() => import("../ui/agent-terminals.jsx").then((m) => ({ default: m.AgentTerminals })));
 const AgentBrowser = lazy(() => import("../ui/agent-browser.jsx").then((m) => ({ default: m.AgentBrowser })));
+const AgentContext = lazy(() => import("../ui/agent-context.jsx").then((m) => ({ default: m.AgentContext })));
+const AgentSurfaces = lazy(() => import("../ui/agent-surfaces.jsx").then((m) => ({ default: m.AgentSurfaces })));
 
 const STATE = {
   provisioning: ["busy", "Starting"],
@@ -230,14 +232,14 @@ function Details(props) {
         <div><div class="xs faint">Started</div><div class="small">{fmt.ago(a().created_at)}</div></div>
       </div>
 
-      <h3 class="section-title">Kubernetes-in-Docker (kind) Test Clusters</h3>
+      <h3 class="section-title">kind clusters</h3>
       <div class="card" style={{ padding: "12px", "margin-bottom": "12px" }}>
         <div class="row" style={{ "margin-bottom": "8px", "flex-wrap": "wrap" }}>
           <span class="small dim grow">
-            Spin up an isolated <code class="mono">kind</code> Kubernetes cluster pre-mapped to this agent's port range (<code class="mono">:{a().port_base + 10}</code> HTTP, <code class="mono">:{a().port_base + 11}</code> HTTPS) and registered with the Reaper for automatic teardown.
+            Isolated cluster on ports <code class="mono">:{a().port_base + 10}</code> / <code class="mono">:{a().port_base + 11}</code>.
           </span>
           <Button size="sm" variant="primary" disabled={!canChangeClusters()} busy={kindBusy()} onClick={createKind}>
-            <Icon name="plus" size={11} /> Create kind Cluster
+            <Icon name="plus" size={11} /> Create cluster
           </Button>
         </div>
         <Show when={host()?.pilot}><p class="small faint">Cluster inventory is read-only in this pilot.</p></Show>
@@ -512,6 +514,66 @@ function AgentView(props) {
     go("agents", {});
   };
 
+  const toggleAside = (panel) => setAside(aside() === panel ? "none" : panel);
+
+  const handleSlashRemember = async (raw) => {
+    if (!raw) {
+      setAside("context");
+      toast("Usage: /remember [fact_key=]decision text", "info");
+      return false;
+    }
+    if (a()?.strict) {
+      toast("Strict agents cannot write to personal or repository memory.", "danger");
+      return false;
+    }
+    let factKey = null;
+    let body = raw;
+    const eq = raw.indexOf("=");
+    if (eq > 0 && eq < 48 && /^[a-zA-Z0-9._:/-]+$/.test(raw.slice(0, eq).trim())) {
+      factKey = raw.slice(0, eq).trim();
+      body = raw.slice(eq + 1).trim();
+    }
+    if (!body) return false;
+    try {
+      const scope = a()?.repo_id ? `repo:${a().repo_id}` : "global";
+      await rpc("library.save", {
+        content: body,
+        category: "preference",
+        scope,
+        fact_key: factKey,
+        trust_tier: "user_direct",
+        provenance: `slash:remember:${a()?.name || "agent"}`,
+      });
+      toast(`Saved direct decision${factKey ? ` (${factKey})` : ""} (0 tokens)`, "secure");
+      setAside("context");
+      return true;
+    } catch (e) {
+      toast(String(e), "danger");
+      return false;
+    }
+  };
+
+  const handleSlashFork = async (brief) => {
+    try {
+      const cur = a();
+      const forked = await rpc("agents.spawn", {
+        role: cur?.role || "worker",
+        repo_id: cur?.repo_id || null,
+        model: cur?.model_ref || null,
+        strict: !!cur?.strict,
+        base: cur?.branch || null,
+        brief: brief || `Forked from ${cur?.name}. Check memory_slate and working_note_get for current state.`,
+      });
+      toast(`Forked ${cur?.name} -> ${forked.name}`, "secure");
+      store.refetchAgents?.();
+      go("agents", { id: forked.id });
+      return true;
+    } catch (e) {
+      toast(String(e), "danger");
+      return false;
+    }
+  };
+
   return (
     <div class="agent-view">
       <div class="agent-head">
@@ -540,12 +602,21 @@ function AgentView(props) {
           <span class="mono xs faint ellipsis">{`${a()?.repo_name || ""}#${a()?.branch}`}</span>
         </Show>
         <div class="grow" />
-        <Segmented value={tab()} onChange={setTab} options={[{ value: "chat", label: "Conversation" }, { value: "terms", label: "Commands" }, { value: "changes", label: "Changes" }, { value: "info", label: "Details" }]} />
-        <Segmented value={aside()} onChange={setAside} options={[
-          { value: "terminal", label: <span class="row gap-4" title="Open the agent's live terminal alongside its conversation"><Icon name="terminal" size={12} /> Live shell</span> },
-          { value: "browser", label: <span class="row gap-4" title="The agent's live browser"><Icon name="globe" size={12} /> Browser<Show when={browserPing()}><span class="ping" /></Show></span> },
-          { value: "none", label: <span title="Hide the side panel and focus on the conversation">Hide panel</span> },
-        ]} />
+        <Segmented value={tab()} onChange={setTab} options={[{ value: "chat", label: "Chat" }, { value: "terms", label: "Commands" }, { value: "changes", label: "Changes" }, { value: "info", label: "Details" }]} />
+        <div class="segmented" role="group" aria-label="Inspector panel">
+          <button type="button" class={aside() === "terminal" ? "on" : ""} onClick={() => toggleAside("terminal")} title="Toggle live shell alongside chat">
+            <span class="row gap-4"><Icon name="terminal" size={12} /> Shell</span>
+          </button>
+          <button type="button" class={aside() === "browser" ? "on" : ""} onClick={() => toggleAside("browser")} title="Toggle isolated agent browser">
+            <span class="row gap-4"><Icon name="globe" size={12} /> Browser<Show when={browserPing()}><span class="ping" /></Show></span>
+          </button>
+          <button type="button" class={aside() === "surfaces" ? "on" : ""} onClick={() => toggleAside("surfaces")} title="Isolated apps (KiCad, DBeaver, Chromium)">
+            <span class="row gap-4"><Icon name="layers" size={12} /> Apps</span>
+          </button>
+          <button type="button" class={aside() === "context" ? "on" : ""} onClick={() => toggleAside("context")} title="Workspace memory & notes">
+            <span class="row gap-4"><Icon name="brain" size={12} /> Memory</span>
+          </button>
+        </div>
         <Show when={live()} fallback={<Button size="sm" onClick={() => rpc("agents.resume", { id: props.id }, { action: true }).catch((e) => toast(String(e), "danger"))}><Icon name="play" size={11} /> Resume</Button>}>
           <Button size="sm" onClick={() => rpc("agents.stop", { id: props.id }, { action: true }).catch((e) => toast(String(e), "danger"))}><Icon name="stop" size={11} /> Stop</Button>
         </Show>
@@ -588,7 +659,8 @@ function AgentView(props) {
               onTakeQueued={(q) => rpc("agents.queue_take", { id: props.id, item: q.id }).then((r) => r?.text).catch((e) => { toast(String(e), "danger"); return null; })}
               onRemoveQueued={(q) => rpc("agents.queue_remove", { id: props.id, item: q.id }).catch((e) => toast(String(e), "danger"))} onCancel={() => rpc("agents.cancel", { id: props.id }, { action: true }).catch((e) => toast(String(e), "danger"))}
               effort={effort()} speed={effortSpeed(effort())} effortOptions={activeModel()?.effort_details ?? []} effortPending={effortPending()} onEffort={changeEffort} onSpeed={changeEffort} onSlashModel={handleSlashModel}
-              placeholder={live() ? `Message ${a()?.name ?? ""} (or /effort, /model)` : "Agent is stopped"} />
+              onSlashContext={() => setAside("context")} onSlashRemember={handleSlashRemember} onSlashFork={handleSlashFork} onSlashCompact={() => { setAside("context"); toast("Update project notes to compact session state.", "info"); }}
+              placeholder={live() ? `Message ${a()?.name ?? ""}…` : "Stopped"} />
           </Show>
           <Show when={tab() === "terms"}><Terminals id={props.id} /></Show>
           <Show when={tab() === "changes"}><Changes id={props.id} agent={a()} onOpenShell={() => setAside("terminal")} /></Show>
@@ -607,6 +679,20 @@ function AgentView(props) {
             <div class="aside-body">
               <Suspense fallback={<div class="small dim" role="status">Loading browser…</div>}>
                 <AgentBrowser agent={props.id} name={a()?.name} strict={a()?.strict} provider={a()?.model_ref?.split("/")[0]} active={screenVisible() && aside() === "browser"} visible={screenVisible() && aside() === "browser"} onActivity={() => setBrowserPing(true)} />
+              </Suspense>
+            </div>
+          </Show>
+          <Show when={aside() === "surfaces"}>
+            <div class="aside-body">
+              <Suspense fallback={<div class="small dim" role="status">Loading isolated apps…</div>}>
+                <AgentSurfaces agentId={props.id} repoId={a()?.repo_id} />
+              </Suspense>
+            </div>
+          </Show>
+          <Show when={aside() === "context"}>
+            <div class="aside-body">
+              <Suspense fallback={<div class="small dim" role="status">Loading context slate…</div>}>
+                <AgentContext agentId={props.id} name={a()?.name} repoId={a()?.repo_id} repoName={a()?.repo_name} strict={!!a()?.strict} />
               </Suspense>
             </div>
           </Show>

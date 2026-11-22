@@ -52,6 +52,7 @@ mod selfdev;
 mod pilot;
 mod stats;
 mod storage;
+mod surfaces;
 mod terminals;
 mod workday;
 mod workspace;
@@ -189,6 +190,7 @@ async fn rpc_inner(app: &App, method: String, args: Option<Value>) -> Result<Val
         "storage" => storage::call(&ctx, m, args).await,
         "reaper" => reaper::call(&ctx, m, args).await,
         "library" => library::call(&ctx, m, args).await,
+        "surfaces" => surfaces::call(&ctx, m, args).await,
         "selfdev" => selfdev::call(&ctx, m, args).await,
         "mcp" => mcp::call(&ctx, m, args).await,
         "workday" => workday::call(&ctx, m, args).await,
@@ -369,9 +371,10 @@ fn main() {
             });
 
             // Module init. Failures are logged, never fatal: the UI shows them.
-            let inits: [(&str, fn(&Arc<Ctx>) -> Result<(), String>); 17] = [
+            let inits: [(&str, fn(&Arc<Ctx>) -> Result<(), String>); 18] = [
                 ("workday", workday::init),
                 ("library", library::init),
+                ("surfaces", surfaces::init),
                 ("providers", providers::init),
                 ("sandbox", sandbox::init),
                 ("mcp", mcp::init),

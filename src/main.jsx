@@ -18,26 +18,30 @@ import "./lib/alerts.js";
 import "./styles/tokens.css";
 import "./styles/components.css";
 import "./styles/sheet.css";
+import "./styles/surfaces-memory.css";
 
 const SCREENS = [
   { id: "home", label: "Home", icon: "home", group: "work", load: () => import("./screens/home.jsx") },
   { id: "agents", label: "Agents", icon: "agents", group: "work", load: () => import("./screens/agents.jsx") },
   { id: "board", label: "Board", icon: "board", group: "work", load: () => import("./screens/board.jsx") },
   { id: "review", label: "Review", icon: "pr", group: "work", load: () => import("./screens/review.jsx") },
-  { id: "environments", label: "Environments", icon: "shield", group: "work", load: () => import("./screens/environments.jsx") },
-  { id: "chat", label: "Chat", icon: "chat", group: "work", load: () => import("./screens/chat.jsx") },
-  { id: "terminals", label: "Terminals", icon: "terminal", group: "tools", load: () => import("./screens/terminals.jsx") },
-  { id: "browser", label: "Browser", icon: "globe", group: "tools", load: () => import("./screens/browser.jsx") },
-  { id: "repos", label: "Repos", icon: "repo", group: "tools", load: () => import("./screens/repos.jsx") },
-  { id: "code", label: "Code", icon: "graph", group: "tools", load: () => import("./screens/code.jsx") },
-  { id: "activity", label: "Activity", icon: "activity", group: "watch", load: () => import("./screens/activity.jsx") },
-  { id: "stats", label: "Stats", icon: "stats", group: "watch", load: () => import("./screens/stats.jsx") },
-  { id: "workday", label: "Workday", icon: "grid", group: "watch", load: () => import("./screens/workday.jsx") },
-  { id: "providers", label: "Providers", icon: "key", group: "setup", load: () => import("./screens/providers.jsx") },
-  { id: "settings", label: "Settings", icon: "settings", group: "setup", load: () => import("./screens/settings.jsx") },
+  { id: "code", label: "Code", icon: "graph", group: "workbench", load: () => import("./screens/code.jsx") },
+  { id: "terminals", label: "Terminals", icon: "terminal", group: "workbench", load: () => import("./screens/terminals.jsx") },
+  { id: "browser", label: "Browser", icon: "globe", group: "workbench", load: () => import("./screens/browser.jsx") },
+  { id: "surfaces", label: "Apps", icon: "layers", group: "workbench", load: () => import("./screens/surfaces.jsx") },
+  { id: "memory", label: "Memory", icon: "brain", group: "workbench", load: () => import("./screens/memory.jsx") },
+  { id: "chat", label: "Chat", icon: "chat", group: "more", load: () => import("./screens/chat.jsx") },
+  { id: "environments", label: "Environments", icon: "shield", group: "more", load: () => import("./screens/environments.jsx") },
+  { id: "repos", label: "Repos", icon: "repo", group: "more", load: () => import("./screens/repos.jsx") },
+  { id: "activity", label: "Activity", icon: "activity", group: "more", load: () => import("./screens/activity.jsx") },
+  { id: "stats", label: "Stats", icon: "stats", group: "more", load: () => import("./screens/stats.jsx") },
+  { id: "workday", label: "Workday", icon: "grid", group: "more", load: () => import("./screens/workday.jsx") },
+  { id: "providers", label: "Providers", icon: "key", group: "more", load: () => import("./screens/providers.jsx") },
+  { id: "settings", label: "Settings", icon: "settings", group: "more", load: () => import("./screens/settings.jsx") },
 ];
 const COMPONENTS = Object.fromEntries(SCREENS.map((s) => [s.id, lazy(s.load)]));
-const GROUPS = [["work", "Work"], ["tools", "Tools"], ["watch", "Observe"], ["setup", "Setup"]];
+const PRIMARY_GROUPS = [["work", "Work"], ["workbench", "Workbench"]];
+const MORE_IDS = new Set(SCREENS.filter((s) => s.group === "more").map((s) => s.id));
 
 function Palette(props) {
   const store = useStore();
@@ -108,6 +112,14 @@ function App() {
   const status = store.status;
   const labels = createMemo(() => repoLabels(store.repos() ?? []));
   const [palette, setPalette] = createSignal(false);
+  const [moreOpen, setMoreOpenRaw] = createSignal(localStorage.getItem("philium.sidebarMore") === "1" || MORE_IDS.has(route()));
+  const setMoreOpen = (next) => {
+    setMoreOpenRaw(next);
+    localStorage.setItem("philium.sidebarMore", next ? "1" : "0");
+  };
+  createEffect(() => {
+    if (MORE_IDS.has(route()) && !moreOpen()) setMoreOpenRaw(true);
+  });
   const [attempts, setAttempts] = createSignal({});
   const [visited, setVisited] = createSignal([route()]);
   createEffect(() => {
@@ -182,7 +194,7 @@ function App() {
             </For>
           </select>
         </div>
-        <For each={GROUPS}>
+        <For each={PRIMARY_GROUPS}>
           {([g, label]) => (
             <>
               <div class="nav-section">{label}</div>
@@ -206,18 +218,33 @@ function App() {
             </>
           )}
         </For>
+        <button type="button" class="nav-group-toggle" aria-expanded={moreOpen()} onClick={() => setMoreOpen(!moreOpen())}>
+          <Icon name={moreOpen() ? "chevronDown" : "chevronRight"} size={12} />
+          <span class="grow">More</span>
+        </button>
+        <Show when={moreOpen()}>
+          <For each={SCREENS.filter((s) => s.group === "more")}>
+            {(s) => (
+              <button class={`nav-item ${route() === s.id ? "on" : ""}`} onClick={() => go(s.id)}>
+                <Icon name={s.icon} /> {s.label}
+              </button>
+            )}
+          </For>
+        </Show>
         <div class="sidebar-foot">
-          <button class="nav-item" onClick={() => { const next = !soundEnabled(); setSoundEnabled(next); if (next) playSound("done"); }} title="Toggle audio chimes for agent approvals, completions, and errors">
-            <Icon name={soundEnabled() ? "activity" : "stop"} /> {soundEnabled() ? "Sounds on" : "Sounds muted"}
-          </button>
-          <button class="nav-item" onClick={() => improve()}><Icon name="spark" /> Improve Philium</button>
-          <button class="nav-item" onClick={() => setPalette(true)}><Icon name="search" /> Commands <span class="count kbd">⌘K</span></button>
-          <Show when={status()}>
-            <div class="row" title={status().desk?.error ?? "Harness running"}>
-              <span class={`dot ${status().desk?.ok ? "live" : "bad"}`} />
-              <span>{status().desk?.ok ? "Gateway protected" : "Harness offline"}</span>
-            </div>
-          </Show>
+          <div class="sidebar-foot-bar">
+            <Show when={status()}>
+              <span class="row grow" style={{ gap: "6px", "padding-left": "4px" }} title={status().desk?.error ?? "Gateway protected"}>
+                <span class={`dot ${status().desk?.ok ? "live" : "bad"}`} />
+                <span class="xs">{status().desk?.ok ? "Protected" : "Offline"}</span>
+              </span>
+            </Show>
+            <button class="icon-btn" onClick={() => setPalette(true)} title="Command palette (⌘K)"><Icon name="search" size={14} /></button>
+            <button class="icon-btn" onClick={() => improve()} title="Improve Philium"><Icon name="spark" size={14} /></button>
+            <button class="icon-btn" onClick={() => { const next = !soundEnabled(); setSoundEnabled(next); if (next) playSound("done"); }} title={soundEnabled() ? "Mute sounds" : "Enable sounds"}>
+              <Icon name={soundEnabled() ? "activity" : "stop"} size={13} />
+            </button>
+          </div>
         </div>
       </nav>
       <main class="main">

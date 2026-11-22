@@ -29,6 +29,11 @@ const P = {
   send: "M10 16V4m0 0-5 5m5-5 5 5",
   pr: "M6 3v14M6 3a2 2 0 1 0 0 .01M14 17a2 2 0 1 0 0 .01M14 15V8a2 2 0 0 0-2-2H9",
   grid: "M3 3h6v6H3zM11 3h6v6h-6zM3 11h6v6H3zM11 11h6v6h-6z",
+  brain: "M7.5 4a3 3 0 0 0-3 3c0 .8.3 1.5.8 2A3 3 0 0 0 4 11.5a3 3 0 0 0 3 3h1V4zm5 0a3 3 0 0 1 3 3c0 .8-.3 1.5-.8 2a3 3 0 0 1 1.3 2.5 3 3 0 0 1-3 3h-1V4zM10 4v12",
+  layers: "M10 3 3 7l7 4 7-4-7-4zM3 11l7 4 7-4M3 15l7 4 7-4",
+  check: "M4.5 10.5 8.2 14.2 15.5 6.5",
+  chevronDown: "M5.5 7.5 10 12l4.5-4.5",
+  chevronRight: "M7.5 5.5 12 10l-4.5 4.5",
 };
 
 export function Icon(props) {

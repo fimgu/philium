@@ -1,0 +1,258 @@
+/* Memory, Context Slate Inspector, and Embedded App Surfaces styles. */
+
+.ctx-panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  overflow: auto;
+  padding: 12px 14px 18px;
+  gap: 14px;
+}
+
+.ctx-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--line);
+}
+
+.ctx-budget {
+  display: grid;
+  gap: 6px;
+  padding: 10px 12px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+
+.ctx-section {
+  display: grid;
+  gap: 8px;
+}
+
+.ctx-section-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: var(--fs-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-faint);
+}
+
+.mem-card {
+  display: grid;
+  gap: 6px;
+  padding: 10px 12px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  transition: border-color 120ms var(--ease), background 120ms var(--ease);
+}
+
+.mem-card:hover {
+  border-color: var(--line-strong);
+}
+
+.mem-card.proposed {
+  border-color: rgba(245, 180, 84, 0.45);
+  background: rgba(245, 180, 84, 0.05);
+}
+
+.mem-card.quarantined {
+  border-color: rgba(255, 107, 107, 0.4);
+  background: rgba(255, 107, 107, 0.05);
+}
+
+.mem-card.superseded {
+  opacity: 0.72;
+}
+
+.mem-body {
+  font-size: var(--fs);
+  line-height: 1.5;
+  color: var(--text);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+.mem-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-size: var(--fs-xs);
+  color: var(--text-faint);
+}
+
+.mem-key {
+  font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--bg-sunken);
+  border: 1px solid var(--line);
+  color: var(--text-dim);
+}
+
+.mem-quick-form {
+  display: grid;
+  gap: 8px;
+  padding: 10px 12px;
+  background: var(--bg-raised);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+
+.mem-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.4fr) minmax(300px, 0.9fr);
+  gap: 16px;
+  align-items: start;
+}
+
+@media (max-width: 1100px) {
+  .mem-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.note-fields {
+  display: grid;
+  gap: 8px;
+}
+
+.note-fields .textarea {
+  min-height: 54px;
+  font-size: var(--fs-s);
+}
+
+/* ---------- Embedded App Surfaces ---------- */
+.surf-shell {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.surf-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-raised);
+  flex: none;
+  flex-wrap: wrap;
+}
+
+.surf-stage {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: #060709;
+  position: relative;
+}
+
+.surf-frame {
+  flex: 1;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  background: #060709;
+}
+
+.surf-catalog {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 12px;
+}
+
+.surf-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  transition: border-color 140ms var(--ease), transform 140ms var(--ease), background 140ms var(--ease);
+}
+
+.surf-card:hover {
+  border-color: var(--line-strong);
+  background: var(--surface-hover);
+}
+
+.surf-card-desc {
+  font-size: var(--fs-s);
+  color: var(--text-dim);
+  line-height: 1.45;
+  margin: 0;
+  flex: 1;
+}
+
+.surf-aside-list {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  overflow: auto;
+  flex: 1;
+}
+
+/* ---------- Sidebar collapsible group ---------- */
+.nav-group-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  margin-top: 10px;
+  padding: 6px 10px 4px;
+  border: 0;
+  background: transparent;
+  color: var(--text-faint);
+  font-size: var(--fs-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  cursor: pointer;
+  text-align: left;
+  border-radius: var(--radius-s);
+  transition: color 120ms var(--ease), background 120ms var(--ease);
+}
+
+.nav-group-toggle:hover {
+  color: var(--text-dim);
+  background: var(--surface);
+}
+
+.hover-actions .card-actions {
+  opacity: 0;
+  transition: opacity 120ms var(--ease);
+}
+
+.hover-actions:hover .card-actions,
+.hover-actions:focus-within .card-actions {
+  opacity: 1;
+}
+
+.quiet-details summary {
+  list-style: none;
+}
+
+.quiet-details summary::-webkit-details-marker {
+  display: none;
+}
+
+.sidebar-foot-bar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 6px 2px;
+  border-top: 1px solid var(--line);
+}
+

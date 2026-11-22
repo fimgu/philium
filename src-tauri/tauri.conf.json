@@ -14,7 +14,7 @@
       { "title": "Philium", "width": 1200, "height": 800, "minWidth": 800, "minHeight": 500, "dragDropEnabled": false }
     ],
     "security": {
-      "csp": "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; connect-src ipc: http://ipc.localhost"
+      "csp": "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; connect-src ipc: http://ipc.localhost; frame-src http://127.0.0.1:*"
     }
   },
   "bundle": {

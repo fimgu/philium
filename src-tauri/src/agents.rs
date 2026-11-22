@@ -491,6 +491,11 @@ async fn provision(ctx: &Arc<Ctx>, id: &str, fresh: bool, brief: Option<String>)
         if let Some(cmap) = cmap {
             extra.push_str(&cmap);
         }
+        if !strict {
+            if let Some(note) = crate::library::working_note_prompt(ctx, repo_id) {
+                extra.push_str(&note);
+            }
+        }
     }
     extra.push_str("\n<!-- PHILIUM_CACHE_BREAK -->\n");
     extra.push_str(&agent_identity_tail(&name, &role, parent_name.as_deref(), worktree.as_deref()));
@@ -504,11 +509,13 @@ async fn provision(ctx: &Arc<Ctx>, id: &str, fresh: bool, brief: Option<String>)
         }}});
     }
 
+    let _ = crate::surfaces::ensure_shims(ctx);
     let path = format!(
         "{}:{}",
         ctx.data_dir.join("bin").display(),
         std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into())
     );
+    let open_shim = crate::surfaces::open_shim_path(ctx).to_string_lossy().into_owned();
     let mut env = vec![
         ("PHILIUM_AGENT".to_string(), name.clone()),
         ("PHILIUM_PORT_BASE".into(), port.to_string()),
@@ -516,6 +523,7 @@ async fn provision(ctx: &Arc<Ctx>, id: &str, fresh: bool, brief: Option<String>)
         ("TMPDIR".into(), tmp.to_string_lossy().into()),
         ("KUBECONFIG".into(), dir.join("kubeconfig").to_string_lossy().into()),
         ("COMPOSE_PROJECT_NAME".into(), format!("philium-{name}")),
+        ("BROWSER".into(), open_shim),
         ("PATH".into(), path),
     ];
     if strict {
