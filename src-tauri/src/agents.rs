@@ -738,7 +738,6 @@ async fn provision(ctx: &Arc<Ctx>, id: &str, fresh: bool, brief: Option<String>)
         ("BROWSER".into(), open_shim),
         ("PATH".into(), path),
     ];
-    if strict {
     // Agent worktrees of one repo share a target dir so each new worktree does not compile cold.
     if let Some(rid) = row["repo_id"].as_str() {
         let t = ctx.data_dir.join("cargo-target").join(rid);
@@ -746,6 +745,7 @@ async fn provision(ctx: &Arc<Ctx>, id: &str, fresh: bool, brief: Option<String>)
             env.push(("CARGO_TARGET_DIR".into(), t.to_string_lossy().into()));
         }
     }
+    if strict {
         env.extend(crate::sandbox::env(ctx, &name));
     }
     let mut launch_env = env.clone();
@@ -1777,11 +1777,11 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
             ctx.emit("agents:queue", json!({ "id": id }));
             Ok(if method == "queue_take" { json!({ "text": row["text"] }) } else { Value::Null })
         }
-        "cancel" => {
         "compact" => {
             let r = rt(&id()?)?;
             r.hal.call(reqwest::Method::POST, &format!("/sessions/{}/compact", r.session), Some(json!({}))).await
         }
+        "cancel" => {
             let r = rt(&id()?)?;
             r.hal.call(reqwest::Method::POST, &format!("/sessions/{}/cancel", r.session), None).await
         }
