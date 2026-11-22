@@ -239,8 +239,8 @@ pub fn tool_list() -> Vec<Value> {
           json!({ "q": s, "limit": i, "repo": s }), &["q"]),
         t("memory_slate", "Fetch a pre-resolved, provenance-tagged, token-budgeted context slate (current decisions, working handoff note, and repo facts) for this workspace, or a granted external repo (`repo`, requires `context` scope, Standard only).",
           json!({ "q": s, "budget_tokens": i, "repo": s }), &[]),
-        t("memory_save", "Save a repository-scoped memory. Optional fact_key enables code-level supersession; optional valid_from/valid_to set temporal validity. Category: fact, preference, correction, entity, procedure.",
-          json!({ "content": s, "category": s, "project": b, "fact_key": s, "supersedes_id": s, "trust_tier": s, "provenance": s, "valid_from": s, "valid_to": s }), &["content", "category"]),
+        t("memory_save", "Save a repository-scoped memory. Give a short title and the repo-relative files it concerns. Optional fact_key enables code-level supersession; optional valid_from/valid_to set temporal validity. Category: decision, bugfix, discovery, architecture, gotcha, preference, correction, procedure, fact, entity.",
+          json!({ "content": s, "category": s, "title": s, "files": { "type": "array", "items": { "type": "string" } }, "project": b, "fact_key": s, "supersedes_id": s, "trust_tier": s, "provenance": s, "valid_from": s, "valid_to": s }), &["content", "category"]),
         t("memory_as_of", "Point-in-time historical query over this repository's fact ledger (includes superseded facts valid at `at`).",
           json!({ "at": s, "q": s, "limit": i }), &["at"]),
         t("memory_procedures", "Fetch verified active procedures for this repository sized to your model's measured skill dose.",
@@ -762,6 +762,10 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
                     let provenance = a["provenance"].as_str().map(str::to_string);
                     let valid_from = a["valid_from"].as_str().filter(|s| !s.trim().is_empty()).map(str::to_string);
                     let valid_to = a["valid_to"].as_str().filter(|s| !s.trim().is_empty()).map(str::to_string);
+                    let meta = crate::library::MemoryMeta {
+                        title: a["title"].as_str().map(str::to_string),
+                        files: a["files"].as_array().map(|v| v.iter().filter_map(|f| f.as_str().map(str::to_string)).collect()).unwrap_or_default(),
+                    };
                     let (c, repo_s, me_s, content_embed) = (ctx.clone(), repo.to_string(), me.clone(), content.clone());
                     let res = tokio::task::spawn_blocking(move || {
                         let saved = crate::library::save_agent_memory_rich(
@@ -775,6 +779,9 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
                             trust_tier.as_deref(),
                             provenance.as_deref(),
                         )?;
+                        if let Some(mid) = saved["id"].as_str() {
+                            crate::library::set_memory_meta(&c, mid, &meta)?;
+                        }
                         if valid_from.is_some() || valid_to.is_some() {
                             if let Some(mid) = saved["id"].as_str() {
                                 crate::memory_ledger::set_validity(&c, mid, valid_from.as_deref(), valid_to.as_deref())?;

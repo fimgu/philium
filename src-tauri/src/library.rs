@@ -67,7 +67,9 @@ CREATE TABLE IF NOT EXISTS memories (
   provenance TEXT,
   updated_at TEXT,
   valid_from TEXT,
-  valid_to TEXT);
+  valid_to TEXT,
+  title TEXT,
+  files TEXT);
 CREATE INDEX IF NOT EXISTS memories_scope ON memories(scope);
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(content, content='memories', content_rowid='rowid');
 CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
@@ -130,6 +132,8 @@ fn migrate_columns(ctx: &Ctx) -> Result<(), String> {
         ("updated_at", "ALTER TABLE memories ADD COLUMN updated_at TEXT"),
         ("valid_from", "ALTER TABLE memories ADD COLUMN valid_from TEXT"),
         ("valid_to", "ALTER TABLE memories ADD COLUMN valid_to TEXT"),
+        ("title", "ALTER TABLE memories ADD COLUMN title TEXT"),
+        ("files", "ALTER TABLE memories ADD COLUMN files TEXT"),
     ];
     for (name, sql) in additions {
         if !cols.iter().any(|c| c == name) {
@@ -848,9 +852,36 @@ pub fn skill_get(ctx: &Ctx, name: &str) -> Result<Value, String> {
     Ok(r)
 }
 
+pub const CATEGORIES: [&str; 10] =
+    ["fact", "preference", "correction", "entity", "procedure", "decision", "bugfix", "discovery", "architecture", "gotcha"];
+
+/// Short display/index metadata for a memory: a title (<=80 chars) and the repo-relative files it
+/// concerns (<=8, stored as a JSON array). Both are optional and never used for ranking.
+#[derive(Default, Clone)]
+pub struct MemoryMeta {
+    pub title: Option<String>,
+    pub files: Vec<String>,
+}
+
+fn clean_meta(meta: &MemoryMeta) -> (Option<String>, Option<String>) {
+    let title = meta
+        .title
+        .as_deref()
+        .map(|t| t.trim().replace('\n', " ").chars().take(80).collect::<String>())
+        .filter(|t| !t.is_empty());
+    let files: Vec<String> = meta
+        .files
+        .iter()
+        .map(|f| f.trim().trim_start_matches("./").to_string())
+        .filter(|f| !f.is_empty() && f.len() <= 200 && !f.starts_with('/') && !f.contains(".."))
+        .take(8)
+        .collect();
+    (title, (!files.is_empty()).then(|| serde_json::to_string(&files).unwrap_or_default()))
+}
+
 fn validate_category(category: &str) -> Result<(), String> {
-    if !matches!(category, "fact" | "preference" | "correction" | "entity" | "procedure") {
-        return Err("category must be fact, preference, correction, entity or procedure".into());
+    if !CATEGORIES.contains(&category) {
+        return Err(format!("category must be one of: {}", CATEGORIES.join(", ")));
     }
     Ok(())
 }
@@ -892,6 +923,12 @@ pub struct SaveOpts<'a> {
 /// - Quarantine for `untrusted` records so tool outputs are never treated as instructions.
 /// - Durable `source_event_id` provenance linked to the authoritative event log.
 pub fn save_structured(ctx: &Ctx, opts: SaveOpts<'_>) -> Result<Value, String> {
+    save_structured_meta(ctx, opts, &MemoryMeta::default())
+}
+
+/// `save_structured` plus optional title/files index metadata.
+pub fn save_structured_meta(ctx: &Ctx, opts: SaveOpts<'_>, meta: &MemoryMeta) -> Result<Value, String> {
+    let (title, files) = clean_meta(meta);
     let content = opts.content.trim();
     if content.is_empty() || content.len() > 4000 {
         return Err("memory must be 1-4000 characters".into());
@@ -981,8 +1018,8 @@ pub fn save_structured(ctx: &Ctx, opts: SaveOpts<'_>) -> Result<Value, String> {
             }
         }
         tx.execute(
-            "INSERT INTO memories(id,scope,category,content,source,created_at,active,trust_tier,status,fact_key,supersedes_id,source_event_id,provenance,updated_at)
-             VALUES(?1,?2,?3,?4,?5,datetime('now'),?6,?7,?8,?9,?10,?11,?12,datetime('now'))",
+            "INSERT INTO memories(id,scope,category,content,source,created_at,active,trust_tier,status,fact_key,supersedes_id,source_event_id,provenance,updated_at,title,files)
+             VALUES(?1,?2,?3,?4,?5,datetime('now'),?6,?7,?8,?9,?10,?11,?12,datetime('now'),?13,?14)",
             params![
                 id,
                 opts.scope,
@@ -996,6 +1033,8 @@ pub fn save_structured(ctx: &Ctx, opts: SaveOpts<'_>) -> Result<Value, String> {
                 supersedes_id,
                 owned_event_id,
                 opts.provenance,
+                title,
+                files,
             ],
         )?;
         tx.commit()
@@ -1011,6 +1050,7 @@ pub fn save_structured(ctx: &Ctx, opts: SaveOpts<'_>) -> Result<Value, String> {
         "status": status,
         "trust_tier": opts.trust_tier,
         "fact_key": fact_key,
+        "title": title,
         "supersedes_id": supersedes_id,
         "superseded_ids": to_supersede,
         "source_event_id": owned_event_id,
@@ -1084,7 +1124,7 @@ fn search_scope_core(
 
     if terms.is_empty() {
         let sql = format!(
-            "SELECT m.id,m.scope,m.category,m.content,m.trust_tier,m.status,m.fact_key,m.supersedes_id,m.source,m.source_event_id,m.provenance,m.created_at,m.updated_at,m.valid_from,m.valid_to
+            "SELECT m.id,m.scope,m.category,m.content,m.trust_tier,m.status,m.fact_key,m.supersedes_id,m.source,m.source_event_id,m.provenance,m.created_at,m.updated_at,m.valid_from,m.valid_to,m.title,m.files
              FROM memories m
              WHERE m.active=1 AND m.status='active' AND ({valid_now}) AND ((?3 AND m.scope='global') OR m.scope=?1)
              ORDER BY (m.scope=?1) DESC, COALESCE(m.updated_at, m.created_at) DESC LIMIT ?2"
@@ -1096,7 +1136,7 @@ fn search_scope_core(
     // 1. Lexical candidates (SQLite FTS5 BM25), strictly ownership-filtered BEFORE ranking.
     // Pure BM25 ordering — zero provenance/trust weighting in retrieval (Utility Under Attack / blueprint §3).
     let bm25_sql = format!(
-        "SELECT m.id,m.scope,m.category,m.content,m.trust_tier,m.status,m.fact_key,m.supersedes_id,m.source,m.source_event_id,m.provenance,m.created_at,m.updated_at,m.valid_from,m.valid_to
+        "SELECT m.id,m.scope,m.category,m.content,m.trust_tier,m.status,m.fact_key,m.supersedes_id,m.source,m.source_event_id,m.provenance,m.created_at,m.updated_at,m.valid_from,m.valid_to,m.title,m.files
          FROM memories_fts f JOIN memories m ON m.rowid=f.rowid
          WHERE memories_fts MATCH ?1 AND m.active=1 AND m.status='active' AND ({valid_now}) AND ((?3 AND m.scope='global') OR m.scope=?2)
          ORDER BY bm25(memories_fts) LIMIT ?4"
@@ -1128,7 +1168,7 @@ fn search_scope_core(
                 for chunk in sims.chunks(64) {
                     let placeholders = vec!["?"; chunk.len()].join(",");
                     let sql = format!(
-                        "SELECT id,scope,category,content,trust_tier,status,fact_key,supersedes_id,source,source_event_id,provenance,created_at,updated_at
+                        "SELECT id,scope,category,content,trust_tier,status,fact_key,supersedes_id,source,source_event_id,provenance,created_at,updated_at,title,files
                          FROM memories
                          WHERE id IN ({placeholders}) AND active=1 AND status='active' AND ((? AND scope='global') OR scope=?)"
                     );
@@ -1254,6 +1294,19 @@ pub fn save_agent_memory_rich(
         source_event_id: None,
         provenance,
     })
+}
+
+/// Attach title/files index metadata to an existing memory (same cleaning as on save).
+pub fn set_memory_meta(ctx: &Ctx, id: &str, meta: &MemoryMeta) -> Result<(), String> {
+    let (title, files) = clean_meta(meta);
+    if title.is_none() && files.is_none() {
+        return Ok(());
+    }
+    ctx.db.exec(
+        "UPDATE memories SET title=COALESCE(?2,title), files=COALESCE(?3,files) WHERE id=?1",
+        params![id, title, files],
+    )?;
+    Ok(())
 }
 
 /// Promote a `proposed` or `quarantined` memory to `active` (operator action), superseding any prior
@@ -2409,7 +2462,7 @@ pub fn list_memories(
     let limit = limit.clamp(1, 200);
     let q_trim = q.trim().to_lowercase();
     let rows = ctx.db.query(
-        "SELECT id, scope, category, content, source, created_at, active, trust_tier, status, fact_key, supersedes_id, source_event_id, provenance, updated_at, valid_from, valid_to
+        "SELECT id, scope, category, content, source, created_at, active, trust_tier, status, fact_key, supersedes_id, source_event_id, provenance, updated_at, valid_from, valid_to, title, files
          FROM memories
          WHERE status != 'deleted'
            AND (?1 IS NULL OR scope=?1)
@@ -3019,8 +3072,15 @@ struct ExtractedSessionObs {
     decisions: Option<String>,
     failed_attempts: Option<String>,
     next_steps: Option<String>,
-    /// (content, category, fact_key, trust_tier)
-    candidates: Vec<(String, String, Option<String>, String)>,
+    candidates: Vec<ObsCandidate>,
+}
+
+struct ObsCandidate {
+    content: String,
+    category: String,
+    fact_key: Option<String>,
+    trust_tier: String,
+    meta: MemoryMeta,
 }
 
 fn infer_fact_key(text: &str) -> Option<String> {
@@ -3074,12 +3134,13 @@ fn extract_deterministic_observation(entries: &[(i64, String, String, String)]) 
                         } else {
                             "preference"
                         };
-                        obs.candidates.push((
-                            snippet,
-                            cat.into(),
-                            infer_fact_key(text),
-                            "agent_inferred".into(),
-                        ));
+                        obs.candidates.push(ObsCandidate {
+                            content: snippet,
+                            category: cat.into(),
+                            fact_key: infer_fact_key(text),
+                            trust_tier: "agent_inferred".into(),
+                            meta: MemoryMeta::default(),
+                        });
                     }
                 }
             }
@@ -3102,12 +3163,13 @@ fn extract_deterministic_observation(entries: &[(i64, String, String, String)]) 
                     && (low.contains("test result: ok") || low.contains("passed") || low.contains(":ok]"))
                 {
                     if obs.candidates.len() < 5 {
-                        obs.candidates.push((
-                            format!("Verified run succeeded: {snippet}"),
-                            "procedure".into(),
-                            None,
-                            "verified_run".into(),
-                        ));
+                        obs.candidates.push(ObsCandidate {
+                            content: format!("Verified run succeeded: {snippet}"),
+                            category: "procedure".into(),
+                            fact_key: None,
+                            trust_tier: "verified_run".into(),
+                            meta: MemoryMeta::default(),
+                        });
                     }
                 }
             }
@@ -3157,83 +3219,227 @@ fn append_note_line(existing: &str, addition: &str) -> String {
     merged.chars().take(2000).collect()
 }
 
+/// Cheapest sibling model on the same provider for background observation: a small, fast tier
+/// when the provider offers one, otherwise the agent's own model. Never crosses providers.
+fn observation_model(ctx: &Ctx, pid: &str, agent_model: &str) -> String {
+    const CHEAP: [&str; 6] = ["haiku", "flash-lite", "flash", "mini", "luna", "nano"];
+    let ids: Vec<String> = ctx
+        .db
+        .query("SELECT model_id FROM models WHERE provider_id=?1 AND enabled=1", [pid])
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|r| r["model_id"].as_str().map(str::to_string))
+        .collect();
+    for tag in CHEAP {
+        if agent_model.to_lowercase().contains(tag) {
+            return agent_model.to_string();
+        }
+        let mut hits: Vec<&String> = ids.iter().filter(|m| m.to_lowercase().contains(tag)).collect();
+        // Prefer the newest-looking id (lexicographically largest) within a tier.
+        hits.sort();
+        if let Some(m) = hits.last() {
+            return (*m).clone();
+        }
+    }
+    agent_model.to_string()
+}
+
+/// Concatenated assistant text from any wire shape the gateway can return: chat.completions JSON,
+/// chat.completions SSE, OpenAI Responses JSON/SSE, or Anthropic Messages JSON.
+fn completion_text(body: &str) -> Option<String> {
+    let trimmed = body.trim_start();
+    if !trimmed.starts_with('{') {
+        let mut out = String::new();
+        let mut done_text: Option<String> = None;
+        for line in body.lines() {
+            let Some(data) = line.strip_prefix("data:").map(str::trim) else { continue };
+            let Ok(v) = serde_json::from_str::<Value>(data) else { continue };
+            if let Some(t) = v.pointer("/choices/0/delta/content").and_then(Value::as_str) {
+                out.push_str(t);
+            } else if v["type"] == "response.output_text.delta" {
+                out.push_str(v["delta"].as_str().unwrap_or(""));
+            } else if v["type"] == "response.output_text.done" {
+                done_text = v["text"].as_str().map(str::to_string);
+            } else if v["type"] == "content_block_delta" {
+                out.push_str(v.pointer("/delta/text").and_then(Value::as_str).unwrap_or(""));
+            }
+        }
+        let text = if out.trim().is_empty() { done_text.unwrap_or_default() } else { out };
+        return (!text.trim().is_empty()).then_some(text);
+    }
+    let v: Value = serde_json::from_str(trimmed).ok()?;
+    if let Some(t) = v.pointer("/choices/0/message/content").and_then(Value::as_str) {
+        return Some(t.to_string());
+    }
+    if let Some(t) = v["output_text"].as_str() {
+        return Some(t.to_string());
+    }
+    let mut out = String::new();
+    for item in v["output"].as_array().into_iter().flatten() {
+        for c in item["content"].as_array().into_iter().flatten() {
+            out.push_str(c["text"].as_str().unwrap_or(""));
+        }
+    }
+    for c in v["content"].as_array().into_iter().flatten() {
+        if c["type"] == "text" {
+            out.push_str(c["text"].as_str().unwrap_or(""));
+        }
+    }
+    (!out.trim().is_empty()).then_some(out)
+}
+
+/// The first balanced top-level JSON object in a model reply (tolerates fences and prose).
+fn first_json_object(raw: &str) -> Option<Value> {
+    let start = raw.find('{')?;
+    let (mut depth, mut in_str, mut esc) = (0i32, false, false);
+    for (i, ch) in raw[start..].char_indices() {
+        if in_str {
+            match (esc, ch) {
+                (true, _) => esc = false,
+                (false, '\\') => esc = true,
+                (false, '"') => in_str = false,
+                _ => {}
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_str = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return serde_json::from_str(&raw[start..start + i + 1]).ok();
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+const OBSERVE_PROMPT: &str = "You maintain an engineering memory for one repository. From the session transcript, extract only durable knowledge a future agent in this repo would need. Skip chit-chat, transient status and anything already obvious from the code.\n\
+Return strict JSON only:\n\
+{\"working_note\":{\"requirements\":null,\"decisions\":null,\"failed_attempts\":null,\"next_steps\":null},\
+\"observations\":[{\"title\":\"<=80 chars\",\"category\":\"decision|bugfix|discovery|architecture|gotcha|preference|correction|procedure|fact|entity\",\"content\":\"1-3 sentences, self-contained\",\"files\":[\"repo/relative/path\"],\"fact_key\":\"optional.dotted.key for facts that can change\",\"trust_tier\":\"agent_inferred|verified_run\"}]}\n\
+Rules: at most 5 observations; use verified_run only when a command in the transcript succeeded and proves it; use fact_key only for a single current value (e.g. tooling.package_manager); working_note fields are one short line each or null; never include secrets, tokens or personal data.";
+
 /// Try a single bounded LLM extraction call through Philium's gateway for a trusted Standard agent.
-/// Returns `None` if offline, no trusted chat provider is active, or the response is not valid JSON.
+/// Works with every provider kind the gateway serves (API keys and subscriptions), using a cheap
+/// sibling model when one exists. Returns `None` when offline, untrusted, or the reply is unusable.
 async fn try_llm_session_observation(
     ctx: &Ctx,
     model_ref: &str,
     entries: &[(i64, String, String, String)],
 ) -> Option<ExtractedSessionObs> {
-    if ctx.gateway_url.ends_with(":9") {
+    if ctx.gateway_url.ends_with(":9") || ctx.gateway_url.is_empty() {
         return None;
     }
-    let (pid, mid) = crate::providers::split_ref(model_ref)?;
+    let (pid, agent_mid) = crate::providers::split_ref(model_ref)?;
     let p = crate::providers::get(ctx, pid)?;
-    if !p.enabled || !p.trusted || !matches!(p.kind, crate::providers::Kind::OpenaiChat | crate::providers::Kind::Anthropic) {
+    if !p.enabled || !p.trusted {
         return None;
     }
+    let mid = observation_model(ctx, pid, agent_mid);
     let mut transcript = String::new();
-    for (seq, role, text, _) in entries.iter().take(40) {
-        let line = format!("[seq={seq} {role}] {}\n", text.chars().take(320).collect::<String>());
-        if transcript.len() + line.len() > 6000 {
+    for (seq, role, text, _) in entries.iter().take(60) {
+        let line = format!("[seq={seq} {role}] {}\n", text.chars().take(400).collect::<String>());
+        if transcript.len() + line.len() > 9000 {
             break;
         }
         transcript.push_str(&line);
     }
-    let url = format!("{}/p/{}/chat/completions", ctx.gateway_url.trim_end_matches('/'), p.id);
-    let resp = embed_http_client()
+    use crate::providers::Kind;
+    let base = format!("{}/p/{}", ctx.gateway_url.trim_end_matches('/'), p.id);
+    let (url, body) = match p.kind {
+        Kind::OpenaiResponses | Kind::ChatgptOauth => (
+            format!("{base}/responses"),
+            json!({
+                "model": mid,
+                "stream": p.kind == Kind::ChatgptOauth,
+                "store": false,
+                "instructions": OBSERVE_PROMPT,
+                "input": [{ "role": "user", "content": [{ "type": "input_text", "text": transcript }] }],
+            }),
+        ),
+        // chat.completions; the gateway translates for Anthropic, Claude and Antigravity.
+        _ => (
+            format!("{base}/chat/completions"),
+            json!({
+                "model": mid,
+                "stream": false,
+                "temperature": 0,
+                "max_tokens": 1200,
+                "messages": [
+                    { "role": "system", "content": OBSERVE_PROMPT },
+                    { "role": "user", "content": transcript }
+                ]
+            }),
+        ),
+    };
+    let resp = observe_http_client()
         .post(&url)
         .bearer_auth(&ctx.gateway.token)
-        .json(&json!({
-            "model": mid,
-            "stream": false,
-            "temperature": 0,
-            "max_tokens": 500,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "Extract a concise session observation as strict JSON: {\"working_note\":{\"requirements\":null,\"decisions\":null,\"failed_attempts\":null,\"next_steps\":null},\"candidates\":[{\"content\":\"...\",\"category\":\"fact|preference|correction|entity|procedure\",\"fact_key\":\"optional.key\",\"trust_tier\":\"agent_inferred|verified_run\"}]}. Omit empty fields. Max 4 candidates. Return JSON only."
-                },
-                { "role": "user", "content": transcript }
-            ]
-        }))
+        .header("x-philium-agent", "memory-observer")
+        .json(&body)
         .send()
         .await
         .ok()?;
     if !resp.status().is_success() {
+        ctx.log_event("memory:observe_llm_failed", None, &json!({ "provider": p.id, "model": mid, "status": resp.status().as_u16() }));
         return None;
     }
-    let body: Value = resp.json().await.ok()?;
-    let raw = body.pointer("/choices/0/message/content")?.as_str()?.trim();
-    let cleaned = raw
-        .trim_start_matches("```json")
-        .trim_start_matches("```")
-        .trim_end_matches("```")
-        .trim();
-    let parsed: Value = serde_json::from_str(cleaned).ok()?;
-    let mut obs = ExtractedSessionObs::default();
-    if let Some(wn) = parsed.get("working_note") {
-        obs.requirements = wn["requirements"].as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
-        obs.decisions = wn["decisions"].as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
-        obs.failed_attempts = wn["failed_attempts"].as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
-        obs.next_steps = wn["next_steps"].as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
-    }
-    if let Some(arr) = parsed["candidates"].as_array() {
-        for item in arr.iter().take(4) {
-            let Some(content) = item["content"].as_str().map(str::trim).filter(|s| !s.is_empty()) else { continue };
-            let cat = item["category"].as_str().unwrap_or("fact");
-            if validate_category(cat).is_err() {
-                continue;
-            }
-            let tier = match item["trust_tier"].as_str() {
-                Some("verified_run") => "verified_run",
-                _ => "agent_inferred",
-            };
-            let fk = clean_fact_key(item["fact_key"].as_str());
-            obs.candidates.push((content.to_string(), cat.to_string(), fk, tier.to_string()));
-        }
-    }
+    let text = resp.text().await.ok()?;
+    let parsed = first_json_object(&completion_text(&text)?)?;
+    let obs = parse_observation(&parsed);
+    ctx.log_event("memory:observe_llm", None, &json!({ "provider": p.id, "model": mid, "observations": obs.candidates.len() }));
     Some(obs)
+}
+
+fn observe_http_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .no_proxy()
+            .connect_timeout(Duration::from_secs(3))
+            .timeout(Duration::from_secs(90))
+            .build()
+            .unwrap_or_default()
+    })
+}
+
+fn parse_observation(parsed: &Value) -> ExtractedSessionObs {
+    let mut obs = ExtractedSessionObs::default();
+    let field = |v: &Value| v.as_str().map(str::trim).filter(|s| !s.is_empty() && *s != "null").map(|s| s.chars().take(400).collect::<String>());
+    if let Some(wn) = parsed.get("working_note") {
+        obs.requirements = field(&wn["requirements"]);
+        obs.decisions = field(&wn["decisions"]);
+        obs.failed_attempts = field(&wn["failed_attempts"]);
+        obs.next_steps = field(&wn["next_steps"]);
+    }
+    let items = parsed["observations"].as_array().or(parsed["candidates"].as_array());
+    for item in items.into_iter().flatten().take(5) {
+        let Some(content) = item["content"].as_str().map(str::trim).filter(|s| !s.is_empty()) else { continue };
+        let cat = item["category"].as_str().unwrap_or("fact").trim().to_lowercase();
+        if validate_category(&cat).is_err() {
+            continue;
+        }
+        let tier = match item["trust_tier"].as_str() {
+            Some("verified_run") => "verified_run",
+            _ => "agent_inferred",
+        };
+        let files = item["files"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|f| f.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+        obs.candidates.push(ObsCandidate {
+            content: content.chars().take(1200).collect(),
+            category: cat,
+            fact_key: clean_fact_key(item["fact_key"].as_str()),
+            trust_tier: tier.into(),
+            meta: MemoryMeta { title: item["title"].as_str().map(str::to_string), files },
+        });
+    }
+    obs
 }
 
 /// Pipeline-side per-session observation pass (Standard agents only).
@@ -3326,7 +3532,7 @@ pub async fn observe_session(ctx: &Arc<Ctx>, agent_id: &str) -> Result<Value, St
 
         let mut saved = Vec::new();
         let mut to_embed = Vec::new();
-        for (content, category, fact_key, trust_tier) in obs.candidates {
+        for ObsCandidate { content, category, fact_key, trust_tier, meta } in obs.candidates {
             // Skip near-exact duplicates already active in this scope.
             let norm = normalized_text(&content);
             let already = c_save
@@ -3341,7 +3547,7 @@ pub async fn observe_session(ctx: &Arc<Ctx>, agent_id: &str) -> Result<Value, St
             if already {
                 continue;
             }
-            if let Ok(res) = save_structured(&c_save, SaveOpts {
+            if let Ok(res) = save_structured_meta(&c_save, SaveOpts {
                 content: &content,
                 category: &category,
                 scope: &scope,
@@ -3351,7 +3557,7 @@ pub async fn observe_session(ctx: &Arc<Ctx>, agent_id: &str) -> Result<Value, St
                 supersedes_id: None,
                 source_event_id: source_event_id.as_deref(),
                 provenance: Some(&provenance),
-            }) {
+            }, &meta) {
                 if res["status"].as_str() == Some("active") {
                     if let Some(mid) = res["id"].as_str() {
                         to_embed.push((mid.to_string(), content));
@@ -4371,6 +4577,141 @@ mod tests {
         assert_eq!(failed["eval_report"]["passed"], false);
         assert_eq!(failed["eval_report"]["assertions"]["deleted_scrub_intact"], false);
         assert!(consolidate_promote(&ctx, failed["id"].as_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn completion_text_reads_every_wire_shape() {
+        let chat = r#"{"choices":[{"message":{"content":"{\"a\":1}"}}]}"#;
+        let chat_sse = "data: {\"choices\":[{\"delta\":{\"content\":\"{\\\"a\\\"\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\":1}\"}}]}\n\ndata: [DONE]\n\n";
+        let resp_sse = "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"{\\\"a\\\":1}\"}\n\n";
+        let resp_done = "data: {\"type\":\"response.output_text.done\",\"text\":\"{\\\"a\\\":1}\"}\n\n";
+        let responses = r#"{"output":[{"type":"message","content":[{"type":"output_text","text":"{\"a\":1}"}]}]}"#;
+        let messages = r#"{"content":[{"type":"thinking","thinking":"x"},{"type":"text","text":"Sure:\n```json\n{\"a\":1}\n```"}]}"#;
+        for body in [chat, chat_sse, resp_sse, resp_done, responses, messages] {
+            let t = completion_text(body).unwrap_or_else(|| panic!("no text: {body}"));
+            assert_eq!(first_json_object(&t), Some(json!({"a":1})), "{body}");
+        }
+        assert_eq!(first_json_object("x {\"s\":\"}{\"} y"), Some(json!({"s":"}{"})));
+    }
+
+    /// Real gateway in front of fake subscription upstreams (Claude OAuth Messages JSON, ChatGPT
+    /// OAuth Responses SSE): observation goes through the gateway with the subscription token,
+    /// picks the cheap sibling model, writes title/files/category, and Strict agents never call out.
+    #[tokio::test]
+    async fn oauth_providers_drive_structured_observation_through_the_gateway() {
+        use crate::guard::GuardMode;
+        use crate::providers::{Kind, Provider};
+        use std::sync::Mutex as StdMutex;
+        let reply = json!({
+            "working_note": {"requirements": null, "decisions": "Ship models in app data, not the bundle", "failed_attempts": null, "next_steps": null},
+            "observations": [
+                {"title": "Use pnpm, not npm", "category": "decision", "content": "The repo standardised on pnpm; npm lockfiles are rejected in CI.", "files": ["package.json", "/etc/passwd", "../x"], "fact_key": "tooling.package_manager", "trust_tier": "agent_inferred"},
+                {"title": "Vite HMR breaks behind the proxy", "category": "gotcha", "content": "Set server.hmr.clientPort when running behind the dev proxy.", "files": ["vite.config.js"]},
+                {"title": "bad", "category": "nonsense", "content": "dropped"}
+            ]
+        })
+        .to_string();
+        let seen: Arc<StdMutex<Vec<(String, String, String)>>> = Default::default();
+        let (s, r) = (seen.clone(), reply.clone());
+        let app = Router::new().route(
+            "/{*rest}",
+            post(move |uri: axum::http::Uri, headers: axum::http::HeaderMap, body: String| {
+                let (s, r) = (s.clone(), r.clone());
+                async move {
+                    let auth = headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+                    s.lock().unwrap().push((uri.path().to_string(), auth, body));
+                    if uri.path().ends_with("/messages") {
+                        ([("content-type", "application/json")], json!({"type":"message","role":"assistant","content":[{"type":"text","text":r}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}).to_string())
+                    } else {
+                        let sse = format!(
+                            "event: response.output_text.delta\ndata: {}\n\nevent: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{{}}}}\n\n",
+                            json!({"type":"response.output_text.delta","delta":r})
+                        );
+                        ([("content-type", "text/event-stream")], sse)
+                    }
+                }
+            }),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up = format!("http://{}", l.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+
+        let gw = crate::gateway::Gateway::new("g".repeat(48), None);
+        gw.tokens.set(Arc::new(|_, _| Box::pin(async { Ok(crate::oauth::Creds { access: "SUB-ACCESS".into(), ..Default::default() }) })));
+        let gl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gw_url = format!("http://{}", gl.local_addr().unwrap());
+        let router = gw.router();
+        tokio::spawn(async move { axum::serve(gl, router).await.unwrap() });
+        let dir = crate::ctx::test_dir("observe-oauth");
+        let ctx = Ctx::new(crate::db::Db::memory(), dir.join("data"), dir.join("root"), gw.clone(), gw_url);
+        ctx.db.kv_set("library.imported_at", "fixture").unwrap();
+        init(&ctx).unwrap();
+        for (id, kind) in [("claude", Kind::ClaudeOauth), ("chatgpt", Kind::ChatgptOauth)] {
+            let p = Provider { id: id.into(), name: id.into(), kind, base_url: up.clone(), trusted: true, guard: GuardMode::Redact, enabled: true, default_model: None };
+            crate::providers::upsert(&ctx, &p).unwrap();
+        }
+        // base_url is fixed for subscriptions in production; point routes at the fake upstream.
+        gw.set_routes(crate::providers::all(&ctx).into_iter().map(|p| crate::gateway::Route { provider: p, api_key: None }).collect());
+        ctx.db.exec(
+            "INSERT INTO models(provider_id,model_id,enabled,discovered_at) VALUES
+             ('claude','claude-opus-5-5',1,0),('claude','claude-haiku-4-5',1,0),('claude','claude-haiku-5-5',1,0),
+             ('chatgpt','gpt-6.1-sol',1,0),('chatgpt','gpt-6-luna',1,0)",
+            [],
+        )
+        .unwrap();
+        ctx.db.exec("INSERT INTO repos(id,name,path,added_at) VALUES('ra','alpha','/tmp/alpha',0),('rb','beta','/tmp/beta',0)", []).unwrap();
+        ctx.db.exec(
+            "INSERT INTO agents(id,name,repo_id,model_ref,strict,hal_session_id,created_at,last_active_at) VALUES
+             ('a1','otter','ra','claude/claude-opus-5-5',0,'sess_a1',10,10),
+             ('b1','fox','rb','chatgpt/gpt-6.1-sol',0,'sess_b1',10,10),
+             ('s1','stricta','ra','claude/claude-opus-5-5',1,'sess_s1',10,10)",
+            [],
+        )
+        .unwrap();
+        for (name, sid) in [("otter", "sess_a1"), ("fox", "sess_b1"), ("stricta", "sess_s1")] {
+            let db_path = ctx.agent_dir(name).join("hal/hal/hal.db");
+            std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch("CREATE TABLE sessions(id TEXT PRIMARY KEY); CREATE TABLE events(session_id TEXT,seq INTEGER,ts TEXT,type TEXT,payload TEXT,PRIMARY KEY(session_id,seq));").unwrap();
+            conn.execute("INSERT INTO sessions VALUES(?1)", [sid]).unwrap();
+            let ev = json!({"seq":1,"session_id":sid,"ts":"t","type":"message.created","role":"user","content":"We use pnpm here. Also the dev proxy breaks HMR."});
+            conn.execute("INSERT INTO events VALUES(?1,1,'t','message.created',?2)", params![sid, ev.to_string()]).unwrap();
+        }
+
+        let a = observe_session(&ctx, "a1").await.unwrap();
+        assert_eq!(a["saved"].as_array().map(Vec::len), Some(2), "{a}");
+        let b = observe_session(&ctx, "b1").await.unwrap();
+        assert_eq!(b["saved"].as_array().map(Vec::len), Some(2), "{b}");
+        assert_eq!(observe_session(&ctx, "s1").await.unwrap()["skipped"], true);
+
+        let calls = seen.lock().unwrap().clone();
+        assert_eq!(calls.len(), 2, "strict agent must never reach a provider: {calls:?}");
+        let (claude_path, claude_auth, claude_body) = calls.iter().find(|c| c.0.ends_with("/messages")).expect("claude call").clone();
+        assert!(claude_path.ends_with("/messages") && claude_auth == "Bearer SUB-ACCESS", "{claude_auth}");
+        let cb: Value = serde_json::from_str(&claude_body).unwrap();
+        assert_eq!(cb["model"], "claude-haiku-5-5", "cheapest newest haiku sibling");
+        let (_, gpt_auth, gpt_body) = calls.iter().find(|c| c.0.ends_with("/responses")).expect("chatgpt call").clone();
+        assert_eq!(gpt_auth, "Bearer SUB-ACCESS");
+        let gb: Value = serde_json::from_str(&gpt_body).unwrap();
+        assert_eq!(gb["model"], "gpt-6-luna");
+        assert_eq!(gb["stream"], true);
+        assert!(gb["instructions"].as_str().unwrap().contains("engineering memory"));
+
+        let rows = list_memories(&ctx, Some("repo:ra"), Some("active"), None, "", 10).unwrap();
+        let rows = rows.as_array().unwrap();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        let pnpm = rows.iter().find(|r| r["category"] == "decision").unwrap();
+        assert_eq!(pnpm["title"], "Use pnpm, not npm");
+        assert_eq!(pnpm["files"], "[\"package.json\"]", "absolute and parent paths are dropped");
+        assert_eq!(pnpm["fact_key"], "tooling.package_manager");
+        assert_eq!(pnpm["trust_tier"], "agent_inferred");
+        assert!(rows.iter().any(|r| r["category"] == "gotcha" && r["title"] == "Vite HMR breaks behind the proxy"));
+        assert!(rows.iter().all(|r| r["scope"] == "repo:ra"));
+        let note = working_note_get(&ctx, "repo:ra").unwrap();
+        assert!(note["decisions"].as_str().unwrap().contains("Ship models in app data"), "{note}");
+        // Sibling repo got its own rows, never ra's.
+        let rb = list_memories(&ctx, Some("repo:rb"), Some("active"), None, "", 10).unwrap();
+        assert_eq!(rb.as_array().unwrap().len(), 2);
     }
 
     #[tokio::test]

@@ -203,7 +203,7 @@ pub fn query_as_of(
         let raw = ctx.db.query(
             "SELECT m.id, m.scope, m.category, m.content, m.source, m.created_at, m.active,
                     m.trust_tier, m.status, m.fact_key, m.supersedes_id, m.source_event_id,
-                    m.provenance, m.updated_at, m.valid_from, m.valid_to
+                    m.provenance, m.updated_at, m.valid_from, m.valid_to, m.title, m.files
              FROM memories m
              WHERE m.status IN ('active', 'superseded')
                AND ((?2 AND m.scope = 'global') OR m.scope = ?1)
@@ -231,7 +231,7 @@ pub fn query_as_of(
         ctx.db.query(
             "SELECT m.id, m.scope, m.category, m.content, m.source, m.created_at, m.active,
                     m.trust_tier, m.status, m.fact_key, m.supersedes_id, m.source_event_id,
-                    m.provenance, m.updated_at, m.valid_from, m.valid_to
+                    m.provenance, m.updated_at, m.valid_from, m.valid_to, m.title, m.files
              FROM memories_fts f
              JOIN memories m ON m.rowid = f.rowid
              WHERE memories_fts MATCH ?1
