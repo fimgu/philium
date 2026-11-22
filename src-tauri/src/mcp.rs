@@ -204,8 +204,8 @@ pub fn tool_list() -> Vec<Value> {
     let i = json!({ "type": "integer" });
     let b = json!({ "type": "boolean" });
     vec![
-        t("board_list", "List tasks in your registered workspace. Filter by status, owner name or q (text).",
-          json!({ "status": s, "owner": s, "q": s }), &[]),
+        t("board_list", "List tasks in your registered workspace, or in a granted external repo (`repo`, requires `context` scope). Filter by status, owner name or q (text).",
+          json!({ "status": s, "owner": s, "q": s, "repo": s }), &[]),
         t("board_get", "Read one workspace task's description, owner, status and playbook step.", json!({ "id": s }), &["id"]),
         t("board_create", "Add a task to the master board.",
           json!({ "title": s, "detail": s, "priority": { "type": "string", "enum": ["low", "normal", "high", "urgent"] },
@@ -216,12 +216,12 @@ pub fn tool_list() -> Vec<Value> {
           json!({ "id": s, "status": s, "note": s, "step": s, "pr_url": s, "detail": s }), &["id"]),
         t("board_submit", "Submit a claimed task for review with a summary and the PR URL. Playbook checks run.",
           json!({ "id": s, "summary": s, "pr_url": s }), &["id", "summary"]),
-        t("mail_send", "Message a named agent in your workspace with the same model and trust level, or \"you\" for the human. No broadcasts.",
+        t("mail_send", "Message a named agent in your workspace (same model and trust level), a Standard agent in another repo you hold a `communicate` grant for, or \"you\" for the human. No broadcasts.",
           json!({ "to": s, "body": s }), &["to", "body"]),
         t("mail_read", "Read your inbox (marks messages read).", json!({ "unread_only": b }), &[]),
         t("agent_spawn", "Start a helper agent. It gets its own worktree of the same repo and its own session.",
           json!({ "name": s, "brief": s, "model": s, "role": s, "task_id": s }), &["brief"]),
-        t("agent_status", "Status of workspace agents, or one by name.", json!({ "name": s }), &[]),
+        t("agent_status", "Status of workspace agents, or agents in a granted external repo (`repo`, requires `communicate` scope), or one by name.", json!({ "name": s, "repo": s }), &[]),
         t("agent_stop", "Stop a helper agent you spawned.", json!({ "name": s }), &["name"]),
         t("shell_run", "Run a command in your persistent interactive shell (bash), visible live to the human. State carries over (cd, exports, venvs). Waits at most 30 seconds, or timeout_secs if shorter, then returns terminal, running, finished, output and exit_code. A running response is NOT failure: do not retry the command. Poll shell_read with the terminal id until finished, and check exit_code. Pass shell to use another shell. Use background=true for builds, test suites, dev servers and watchers to return a terminal id immediately.",
           json!({ "command": s, "cwd": s, "timeout_secs": i, "background": b, "title": s, "shell": s }), &["command"]),
@@ -235,20 +235,31 @@ pub fn tool_list() -> Vec<Value> {
           json!({ "job": s }), &["job"]),
         t("skill_list", "Your skills (reusable procedures like review-pr, make-plan, babysit): name and when to use each.", json!({}), &[]),
         t("skill_get", "Read a listed skill (built-in review-pr, or imported skills in Standard mode).", json!({ "name": s }), &["name"]),
-        t("memory_search", "Search active, non-superseded memories saved under this agent's registered repository ID.",
-          json!({ "q": s, "limit": i }), &["q"]),
-        t("memory_slate", "Fetch a pre-resolved, provenance-tagged, token-budgeted context slate (current decisions, working handoff note, and repo facts) for this workspace.",
-          json!({ "q": s, "budget_tokens": i }), &[]),
+        t("memory_search", "Search active, non-superseded memories saved under this agent's registered repository ID, or a granted external repo (`repo`, requires `context` scope, Standard only).",
+          json!({ "q": s, "limit": i, "repo": s }), &["q"]),
+        t("memory_slate", "Fetch a pre-resolved, provenance-tagged, token-budgeted context slate (current decisions, working handoff note, and repo facts) for this workspace, or a granted external repo (`repo`, requires `context` scope, Standard only).",
+          json!({ "q": s, "budget_tokens": i, "repo": s }), &[]),
         t("memory_save", "Save a repository-scoped memory. Optional fact_key enables code-level supersession; optional valid_from/valid_to set temporal validity. Category: fact, preference, correction, entity, procedure.",
           json!({ "content": s, "category": s, "project": b, "fact_key": s, "supersedes_id": s, "trust_tier": s, "provenance": s, "valid_from": s, "valid_to": s }), &["content", "category"]),
         t("memory_as_of", "Point-in-time historical query over this repository's fact ledger (includes superseded facts valid at `at`).",
           json!({ "at": s, "q": s, "limit": i }), &["at"]),
         t("memory_procedures", "Fetch verified active procedures for this repository sized to your model's measured skill dose.",
           json!({ "q": s }), &[]),
-        t("working_note_get", "Read the structured working-state handoff note (requirements, current decisions, failed attempts, next steps) for this repository.",
-          json!({}), &[]),
+        t("working_note_get", "Read the structured working-state handoff note (requirements, current decisions, failed attempts, next steps) for this repository, or a granted external repo (`repo`, requires `context` scope, Standard only).",
+          json!({ "repo": s }), &[]),
         t("working_note_set", "Partially update the structured working-state handoff note for this repository; omitted fields preserve their existing values.",
           json!({ "requirements": s, "decisions": s, "failed_attempts": s, "next_steps": s }), &[]),
+        t("access_request", "Request human approval to access an external repository, folder, or file (read-only by default). `target` may be a repo name/id, a path, or a description for the person to pick. `scopes`: array of `read`, `code` (repo), `context` (repo, Standard only), `communicate` (repo, Standard only), or `write` (non-repo folder only, explicit opt-in). Waits inline for approval and returns `{status, grant}`.",
+          json!({ "target": s, "kind": { "type": "string", "enum": ["repo", "folder", "file"] }, "scopes": { "type": "array", "items": s }, "reason": s }), &["target", "reason"]),
+        t("access_list", "List your active external access grants (id, target, kind, scopes, lifetime).", json!({}), &[]),
+        t("fs_list", "List files and directories inside an approved external folder or repo (`grant_id` or granted repo name).",
+          json!({ "grant_id": s, "path": s, "glob": s, "depth": i, "limit": i }), &["grant_id"]),
+        t("fs_search", "Search text and filenames inside an approved external folder or repo (`grant_id` or granted repo name).",
+          json!({ "grant_id": s, "query": s, "glob": s, "case_sensitive": b, "max_results": i }), &["grant_id", "query"]),
+        t("fs_read", "Read any file inside an approved external folder, file, or repo (`grant_id` or granted repo name). Supports bounded text/code/markdown/JSON/CSV, images (native image block), PDFs (extracted text), Office/RTF docs, SVG, and binary metadata.",
+          json!({ "grant_id": s, "path": s, "start_line": i, "end_line": i, "max_bytes": i }), &["grant_id"]),
+        t("fs_write", "Write a file inside an approved external non-repo folder when the human explicitly granted `write` scope.",
+          json!({ "grant_id": s, "path": s, "content": s, "append": b }), &["grant_id", "path", "content"]),
         t("review_plan", "Release review, orchestrator only: write the plan once, riskiest check first. Each item is {title, detail (what to verify and how)}. The checks appear on the board and in Review.",
           json!({ "items": { "type": "array", "items": { "type": "object" } } }), &["items"]),
         t("review_result", "Release review: record the outcome of one item you checked. result is pass, fail or blocked. evidence is the exact commands you ran and what they showed, on which commit; for blocked, what you need. For a fail, severity and origin are required. severity is 0 to 5: 0 and 1 block the release (0: data loss, security, the release does not install or upgrade; 1: a main behaviour is broken), 2 to 5 should be looked at, in decreasing importance. origin: run the same check on the target too; introduced (fails on the head, passes on the target), pre_existing (fails the same way on the target) or unverified (the target could not be checked, or fails differently).",
@@ -319,6 +330,13 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
     if matches!(name,"board_get"|"board_claim"|"board_update"|"board_submit") { task_here(arg(&a,"id")?)?; }
     match name {
         "board_list" => {
+            if let Some(ext) = a["repo"].as_str().or_else(|| a["grant_id"].as_str()).filter(|s| !s.trim().is_empty()) {
+                let g = crate::access::resolve_grant(ctx, agent, ext, "context", false)?;
+                let rid = g.target_repo_id.as_deref().ok_or("External grant is not a registered repository")?;
+                ctx.log_event("access_context_read", Some(agent), &json!({ "grant_id": g.id, "tool": "board_list", "target": g.label }));
+                let rows = ctx.db.query("SELECT id,title,detail,status,priority,owner FROM tasks WHERE repo_id=?1 AND (?2 IS NULL OR status=?2) AND (?3 IS NULL OR owner=?3) AND instr(lower(title||' '||detail),lower(?4))>0 ORDER BY created_at DESC LIMIT 100", rusqlite::params![rid,a["status"].as_str(),a["owner"].as_str(),a["q"].as_str().unwrap_or("")])?;
+                return Ok(json!({ "external_repo": g.label, "read_only": true, "tasks": rows }));
+            }
             Ok(json!(ctx.db.query("SELECT id,title,detail,status,priority,owner FROM tasks WHERE repo_id=?1 AND (?2 IS NULL OR status=?2) AND (?3 IS NULL OR owner=?3) AND instr(lower(title||' '||detail),lower(?4))>0 ORDER BY created_at DESC LIMIT 100", rusqlite::params![repo()?,a["status"].as_str(),a["owner"].as_str(),a["q"].as_str().unwrap_or("")])?))
         }
         "board_get" => Ok(ctx.db.query("SELECT id,title,detail,status,priority,owner,playbook,step FROM tasks WHERE repo_id=?1 AND id=?2",[repo()?,arg(&a,"id")?])?.into_iter().next().ok_or("Task unavailable")?),
@@ -364,8 +382,31 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
         }
         "mail_send" => {
             let to = arg(&a, "to")?;
-            if to != "you" && (to == "all" || ctx.db.query("SELECT id FROM agents WHERE name=?1 AND repo_id=?2 AND model_ref=?3 AND strict=?4",rusqlite::params![to,repo()?,row["model_ref"].as_str(),row["strict"].as_i64()])?.is_empty()) {
-                return Err("Choose a direct recipient in the same workspace and model scope".into());
+            if to != "you" {
+                if to == "all" {
+                    return Err("Choose a direct recipient in the same workspace and model scope".into());
+                }
+                let same_scope = !ctx.db.query(
+                    "SELECT id FROM agents WHERE name=?1 AND repo_id=?2 AND model_ref=?3 AND strict=?4",
+                    rusqlite::params![to, repo()?, row["model_ref"].as_str(), row["strict"].as_i64()],
+                )?.is_empty();
+                if !same_scope {
+                    let cross_ok = if row["strict"].as_i64() != Some(1) {
+                        ctx.db
+                            .query("SELECT repo_id, strict FROM agents WHERE name=?1", [to])?
+                            .into_iter()
+                            .next()
+                            .filter(|r| r["strict"].as_i64() != Some(1))
+                            .and_then(|r| r["repo_id"].as_str().map(str::to_string))
+                            .is_some_and(|target_repo| crate::access::can_communicate(ctx, agent, &target_repo))
+                    } else {
+                        false
+                    };
+                    if !cross_ok {
+                        return Err("Choose a direct recipient in the same workspace and model scope, or request a `communicate` grant for the target repo".into());
+                    }
+                    ctx.log_event("access_communicate", Some(agent), &json!({ "to": to }));
+                }
             }
             crate::board::send(ctx, &me, to, arg(&a, "body")?)
         }
@@ -397,7 +438,13 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
             Ok(json!({ "name": r["name"], "id": r["id"], "state": r["state"] }))
         }
         "agent_status" => {
-            let all = json!(ctx.db.query("SELECT a.name,a.state,a.role,a.model_ref,t.title AS task_title,w.branch FROM agents a LEFT JOIN tasks t ON t.id=a.task_id AND t.repo_id=a.repo_id LEFT JOIN worktrees w ON w.agent_id=a.id AND w.repo_id=a.repo_id AND w.state='active' WHERE a.repo_id=?1 ORDER BY a.name",[repo()?])?);
+            let target_repo = if let Some(ext) = a["repo"].as_str().or_else(|| a["grant_id"].as_str()).filter(|s| !s.trim().is_empty()) {
+                let g = crate::access::resolve_grant(ctx, agent, ext, "communicate", false)?;
+                g.target_repo_id.ok_or("External grant is not a registered repository")?
+            } else {
+                repo()?.to_string()
+            };
+            let all = json!(ctx.db.query("SELECT a.name,a.state,a.role,a.model_ref,t.title AS task_title,w.branch FROM agents a LEFT JOIN tasks t ON t.id=a.task_id AND t.repo_id=a.repo_id LEFT JOIN worktrees w ON w.agent_id=a.id AND w.repo_id=a.repo_id AND w.state='active' WHERE a.repo_id=?1 ORDER BY a.name",[&target_repo])?);
             let pick = |r: &Value| {
                 json!({
                     "name": r["name"],
@@ -474,9 +521,87 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
                 if a.get("pr").is_some() || a["include_prs"] == true { return Err("Remote PR context requires separate permission".into()); }
                 a["include_prs"] = json!(false);
             }
+            if let Some(ext) = a["repo"].as_str().or_else(|| a["grant_id"].as_str()).filter(|s| !s.trim().is_empty()) {
+                let g = crate::access::resolve_grant(ctx, agent, ext, "code", true)?;
+                let rid = g.target_repo_id.as_deref().ok_or("External grant is not a registered repository")?;
+                ctx.log_event("access_code_read", Some(agent), &json!({ "grant_id": g.id, "tool": name, "target": g.label }));
+                return crate::codeindex::mcp_call_for_repo(ctx, rid, &g.label, name, a).await;
+            }
             crate::codeindex::mcp_call(ctx, agent, name, a).await
         }
         // --- end codeindex tools ---
+        // --- generalized external access tools ---
+        "access_request" => {
+            let target = arg(&a, "target")?;
+            let reason = arg(&a, "reason")?;
+            let kind = a["kind"].as_str().filter(|s| !s.trim().is_empty());
+            let scopes: Vec<String> = a["scopes"]
+                .as_array()
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            crate::access::request_access(ctx, agent, target, kind, scopes, reason, 600).await
+        }
+        "access_list" => Ok(json!(crate::access::list_active_grants(ctx, agent)?)),
+        "fs_list" => {
+            let gid = arg(&a, "grant_id")?;
+            let g = crate::access::resolve_grant(ctx, agent, gid, "read", false)?;
+            ctx.log_event("access_fs_list", Some(agent), &json!({ "grant_id": g.id, "target": g.label, "path": a["path"] }));
+            let root = g.target_path.clone();
+            let single = g.target_kind == "file";
+            let rel = a["path"].as_str().map(str::to_string);
+            let glob = a["glob"].as_str().map(str::to_string);
+            let depth = a["depth"].as_u64().unwrap_or(2) as usize;
+            let limit = a["limit"].as_u64().unwrap_or(200) as usize;
+            tokio::task::spawn_blocking(move || crate::access_fs::fs_list(&root, single, rel.as_deref(), glob.as_deref(), depth, limit))
+                .await
+                .map_err(|e| e.to_string())?
+        }
+        "fs_search" => {
+            let gid = arg(&a, "grant_id")?;
+            let query = arg(&a, "query")?.to_string();
+            let g = crate::access::resolve_grant(ctx, agent, gid, "read", false)?;
+            ctx.log_event("access_fs_search", Some(agent), &json!({ "grant_id": g.id, "target": g.label }));
+            let root = g.target_path.clone();
+            let single = g.target_kind == "file";
+            let glob = a["glob"].as_str().map(str::to_string);
+            let case_sensitive = a["case_sensitive"].as_bool().unwrap_or(false);
+            let max_results = a["max_results"].as_u64().unwrap_or(50) as usize;
+            tokio::task::spawn_blocking(move || crate::access_fs::fs_search(&root, single, &query, glob.as_deref(), case_sensitive, max_results))
+                .await
+                .map_err(|e| e.to_string())?
+        }
+        "fs_read" => {
+            let gid = arg(&a, "grant_id")?;
+            let g = crate::access::resolve_grant(ctx, agent, gid, "read", true)?;
+            ctx.log_event("access_fs_read", Some(agent), &json!({ "grant_id": g.id, "target": g.label, "path": a["path"] }));
+            let root = g.target_path.clone();
+            let single = g.target_kind == "file";
+            let label = g.label.clone();
+            let rel = a["path"].as_str().map(str::to_string);
+            let start_line = a["start_line"].as_u64().map(|n| n as usize);
+            let end_line = a["end_line"].as_u64().map(|n| n as usize);
+            let max_bytes = a["max_bytes"].as_u64().map(|n| n as usize);
+            tokio::task::spawn_blocking(move || crate::access_fs::fs_read(&root, single, &label, rel.as_deref(), start_line, end_line, max_bytes))
+                .await
+                .map_err(|e| e.to_string())?
+        }
+        "fs_write" => {
+            let gid = arg(&a, "grant_id")?;
+            let path = arg(&a, "path")?.to_string();
+            let content = a["content"].as_str().ok_or("missing `content`")?.to_string();
+            let append = a["append"].as_bool().unwrap_or(false);
+            let g = crate::access::resolve_grant(ctx, agent, gid, "write", true)?;
+            if g.target_kind == "repo" {
+                return Err("Direct writes to external repositories are disabled; use `communicate` to ask an agent in that repo".into());
+            }
+            ctx.log_event("access_fs_write", Some(agent), &json!({ "grant_id": g.id, "target": g.label, "path": path }));
+            let root = g.target_path.clone();
+            let single = g.target_kind == "file";
+            tokio::task::spawn_blocking(move || crate::access_fs::fs_write(&root, single, &path, &content, append))
+                .await
+                .map_err(|e| e.to_string())?
+        }
+        // --- end generalized external access tools ---
         "playbook_get" => {
             let repo = crate::agents::runtime(agent).map(|r| r.cwd.clone());
             crate::board::playbook(ctx, arg(&a, "job")?, repo.as_deref())
@@ -529,13 +654,38 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
             if row["strict"].as_i64() == Some(1) {
                 return Err("memory and past sessions are not available to Strict agents".into());
             }
-            let repo = row["repo_id"].as_str().filter(|id| !id.is_empty()).ok_or("A registered repository is required for memory and history")?;
-            if ctx.db.query("SELECT id FROM repos WHERE id=?1", [repo])?.is_empty() {
-                return Err("Repository identity is unavailable".into());
-            }
+            let ext_target = matches!(name, "memory_search" | "memory_slate" | "working_note_get")
+                .then(|| a["repo"].as_str().or_else(|| a["grant_id"].as_str()).filter(|s| !s.trim().is_empty()))
+                .flatten();
+            let (target_repo, external_label): (String, Option<String>) = if let Some(ext) = ext_target {
+                let g = crate::access::resolve_grant(ctx, agent, ext, "context", true)?;
+                let rid = g.target_repo_id.ok_or("External grant is not a registered repository")?;
+                ctx.log_event("access_context_read", Some(agent), &json!({ "grant_id": g.id, "tool": name, "target": g.label }));
+                (rid, Some(g.label))
+            } else {
+                let r = row["repo_id"].as_str().filter(|id| !id.is_empty()).ok_or("A registered repository is required for memory and history")?;
+                if ctx.db.query("SELECT id FROM repos WHERE id=?1", [r])?.is_empty() {
+                    return Err("Repository identity is unavailable".into());
+                }
+                (r.to_string(), None)
+            };
+            let repo = target_repo.as_str();
+            let tag_ext = |mut v: Value| -> Value {
+                if let Some(ref lbl) = external_label {
+                    if let Some(obj) = v.as_object_mut() {
+                        obj.insert("external_repo".into(), json!(lbl));
+                        obj.insert("read_only".into(), json!(true));
+                    } else {
+                        return json!({ "external_repo": lbl, "read_only": true, "items": v });
+                    }
+                }
+                v
+            };
             match name {
                 "memory_search" => {
-                    crate::library::agent_memories_async(ctx, arg(&a, "q")?, repo, a["limit"].as_i64().unwrap_or(10)).await
+                    crate::library::agent_memories_async(ctx, arg(&a, "q")?, repo, a["limit"].as_i64().unwrap_or(10))
+                        .await
+                        .map(tag_ext)
                 }
                 "memory_slate" => {
                     let budget = a["budget_tokens"]
@@ -554,6 +704,7 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
                         row["model_ref"].as_str(),
                     )
                     .await
+                    .map(tag_ext)
                 }
                 "memory_as_of" => crate::memory_ledger::query_as_of(
                     ctx,
@@ -569,7 +720,7 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
                     a["q"].as_str().unwrap_or(""),
                     row["model_ref"].as_str(),
                 ),
-                "working_note_get" => crate::library::working_note_get(ctx, &format!("repo:{repo}")),
+                "working_note_get" => crate::library::working_note_get(ctx, &format!("repo:{repo}")).map(tag_ext),
                 "working_note_set" => crate::library::working_note_patch(
                     ctx,
                     &format!("repo:{repo}"),
@@ -1077,6 +1228,159 @@ mod tests {
                 && rc_branch.contains("+ src/a.rs:6 fn extra_boost"),
             "{rc_branch}"
         );
+    }
+
+    #[tokio::test]
+    async fn generalized_access_grants_end_to_end() {
+        let ctx = Ctx::test();
+        ctx.db.kv_set("library.imported_at", "fixture").unwrap();
+        crate::access::init(&ctx).unwrap();
+        crate::library::init(&ctx).unwrap();
+        crate::board::init(&ctx).unwrap();
+        crate::codeindex::init(&ctx).unwrap();
+
+        // Two real git repos + one non-repo external folder containing docs, an image, and a secret.
+        let init_git = |dir: &std::path::Path, file: &str, body: &str| {
+            std::fs::create_dir_all(dir.join("src")).unwrap();
+            std::fs::write(dir.join(file), body).unwrap();
+            for args in [
+                vec!["init", "-q", "-b", "main"],
+                vec!["config", "user.email", "t@t"],
+                vec!["config", "user.name", "t"],
+                vec!["add", "."],
+                vec!["commit", "-q", "-m", "init"],
+            ] {
+                assert!(std::process::Command::new("git").args(&args).current_dir(dir).status().unwrap().success());
+            }
+        };
+        let repo_a = ctx.data_dir.join("repo-frontend");
+        let repo_b = ctx.data_dir.join("repo-backend");
+        let docs_dir = ctx.data_dir.join("product-specs");
+        init_git(&repo_a, "src/app.ts", "export function renderApp() { return 1; }\n");
+        init_git(&repo_b, "src/auth.rs", "pub fn verify_jwt_token(tok: &str) -> bool { !tok.is_empty() }\n");
+        std::fs::create_dir_all(&docs_dir).unwrap();
+        std::fs::write(docs_dir.join("roadmap.md"), "# Q3 Roadmap\nLine two: JWT auth migration\n").unwrap();
+        std::fs::write(docs_dir.join(".env"), "TOP_SECRET=should_never_leak\n").unwrap();
+        // Minimal valid 1x1 PNG
+        let png_bytes: &[u8] = &[
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9c, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        ];
+        std::fs::write(docs_dir.join("mockup.png"), png_bytes).unwrap();
+
+        ctx.db.exec("INSERT INTO repos(id,name,path,default_branch,added_at) VALUES('r-fe','frontend',?1,'main',0),('r-be','backend',?2,'main',0)", rusqlite::params![repo_a.to_str().unwrap(), repo_b.to_str().unwrap()]).unwrap();
+        ctx.db.exec("INSERT INTO agents(id,name,repo_id,model_ref,strict,created_at,last_active_at) VALUES('fe1','otter','r-fe','p/m',0,0,0),('be1','heron','r-be','p/m',0,0,0),('st1','lynx','r-fe','u/m',1,0,0)", []).unwrap();
+        crate::library::working_note_patch(&ctx, "repo:r-be", Some("JWT RS256"), Some("Use JWKS rotation"), None, None, None, "user").unwrap();
+        ctx.db.exec("INSERT INTO tasks(id,title,repo_id,status,created_at,updated_at) VALUES('tb1','Rotate JWKS keys','r-be','open',0,0)", []).unwrap();
+
+        let call = |agent: &'static str, name: &'static str, args: Value| {
+            let ctx = ctx.clone();
+            async move { dispatch(&ctx, agent, json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":name,"arguments":args}})).await.unwrap() }
+        };
+
+        // Without grant: cross-repo code_find, working_note_get, board_list, agent_status, mail_send all fail.
+        assert_eq!(call("fe1", "code_find", json!({"repo":"backend","query":"verify_jwt_token"})).await["result"]["isError"], true);
+        assert_eq!(call("fe1", "working_note_get", json!({"repo":"backend"})).await["result"]["isError"], true);
+        assert_eq!(call("fe1", "mail_send", json!({"to":"heron","body":"please update jwt"})).await["result"]["isError"], true);
+
+        // Blocking access_request for backend repo approved concurrently by user.
+        let ctx_dec = ctx.clone();
+        let ctx_req = ctx.clone();
+        let req_task = tokio::spawn(async move {
+            dispatch(
+                &ctx_req,
+                "fe1",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "access_request",
+                        "arguments": {
+                            "target": "backend",
+                            "scopes": ["read", "code", "context", "communicate"],
+                            "reason": "Inspect JWT contract and coordinate with backend agent"
+                        }
+                    }
+                }),
+            )
+            .await
+            .unwrap()
+        });
+        let req_id = loop {
+            let pending = crate::access::call(&ctx_dec, "pending", json!({"agent_id":"fe1"})).await.unwrap();
+            if let Some(id) = pending.as_array().and_then(|a| a.first()).and_then(|r| r["id"].as_str()) {
+                assert_eq!(crate::attention::needing_you(&ctx_dec), 1);
+                break id.to_string();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+        let dec = crate::access::call(&ctx, "decide", json!({"request_id": req_id, "decision": "approve", "lifetime": "session"})).await.unwrap();
+        let repo_grant_id = dec["grant"]["id"].as_str().unwrap().to_string();
+        let req_resp = req_task.await.unwrap();
+        assert_eq!(req_resp["result"]["isError"], false, "{req_resp}");
+        assert!(req_resp["result"]["content"][0]["text"].as_str().unwrap().contains("approved"));
+
+        // Now cross-repo code_find, working_note_get, board_list, agent_status, and mail_send all work!
+        let cf = call("fe1", "code_find", json!({"repo":"backend","query":"verify_jwt_token"})).await;
+        assert_eq!(cf["result"]["isError"], false, "{cf}");
+        let cf_txt = cf["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(cf_txt.contains("[external repo: backend]") && cf_txt.contains("verify_jwt_token"), "{cf_txt}");
+
+        let wn = call("fe1", "working_note_get", json!({"repo":"backend"})).await;
+        assert_eq!(wn["result"]["isError"], false, "{wn}");
+        assert!(wn["result"]["content"][0]["text"].as_str().unwrap().contains("Use JWKS rotation"));
+
+        let bl = call("fe1", "board_list", json!({"repo":"backend"})).await;
+        assert_eq!(bl["result"]["isError"], false, "{bl}");
+        assert!(bl["result"]["content"][0]["text"].as_str().unwrap().contains("Rotate JWKS keys"));
+
+        let st = call("fe1", "agent_status", json!({"repo":"backend"})).await;
+        assert_eq!(st["result"]["isError"], false, "{st}");
+        assert!(st["result"]["content"][0]["text"].as_str().unwrap().contains("heron"));
+
+        let ms = call("fe1", "mail_send", json!({"to":"heron","body":"Please add audience claim to verify_jwt_token"})).await;
+        assert_eq!(ms["result"]["isError"], false, "{ms}");
+        let inbox = call("be1", "mail_read", json!({"unread_only":true})).await;
+        assert!(inbox["result"]["content"][0]["text"].as_str().unwrap().contains("audience claim"), "{inbox}");
+
+        // Grant non-repo folder with read + explicit write; test multimodal image + text + secret block + write.
+        let fg = crate::access::call(&ctx, "grant_create", json!({
+            "agent_id": "fe1",
+            "target_kind": "folder",
+            "target_path": docs_dir.to_str().unwrap(),
+            "label": "product-specs",
+            "scopes": ["read", "write"],
+            "lifetime": "session"
+        })).await.unwrap();
+        let fg_id = fg["id"].as_str().unwrap().to_string();
+
+        let img = call("fe1", "fs_read", json!({"grant_id": fg_id, "path": "mockup.png"})).await;
+        assert_eq!(img["result"]["isError"], false, "{img}");
+        let img_items = img["result"]["content"].as_array().unwrap();
+        assert_eq!(img_items[1]["type"], "image");
+        assert_eq!(img_items[1]["mimeType"], "image/png");
+
+        // Secret file blocked even inside granted folder!
+        assert_eq!(call("fe1", "fs_read", json!({"grant_id": fg_id, "path": ".env"})).await["result"]["isError"], true);
+
+        // Explicit write on granted non-repo folder works; direct write on repo grant is always denied.
+        let wr = call("fe1", "fs_write", json!({"grant_id": fg_id, "path": "notes.md", "content": "Updated spec\n"})).await;
+        assert_eq!(wr["result"]["isError"], false, "{wr}");
+        assert_eq!(std::fs::read_to_string(docs_dir.join("notes.md")).unwrap(), "Updated spec\n");
+        assert_eq!(call("fe1", "fs_write", json!({"grant_id": repo_grant_id, "path": "src/x.rs", "content": "no"})).await["result"]["isError"], true);
+
+        // Strict agent can read granted folder (with strict_allowed) but NEVER request context or communicate.
+        assert_eq!(call("st1", "access_request", json!({"target":"backend","scopes":["context"],"reason":"nope"})).await["result"]["isError"], true);
+        assert_eq!(call("st1", "access_request", json!({"target":"backend","scopes":["communicate"],"reason":"nope"})).await["result"]["isError"], true);
+
+        // Revoking the repo grant immediately blocks further reads and cross-repo mail!
+        crate::access::call(&ctx, "revoke", json!({"id": repo_grant_id})).await.unwrap();
+        assert_eq!(call("fe1", "code_find", json!({"repo":"backend","query":"verify_jwt_token"})).await["result"]["isError"], true);
+        assert_eq!(call("fe1", "mail_send", json!({"to":"heron","body":"after revoke"})).await["result"]["isError"], true);
     }
 }
 

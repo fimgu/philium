@@ -177,6 +177,7 @@ async fn rpc_inner(app: &App, method: String, args: Option<Value>) -> Result<Val
             }
             _ => Err(format!("unknown activity.{m}")),
         },
+        "access" => access::call(&ctx, m, args).await,
         "providers" => providers::call(&ctx, m, args).await,
         "terminals" => terminals::call(&ctx, m, args).await,
         "workspace" => workspace::call(&ctx, m, args).await,
@@ -376,8 +377,9 @@ fn main() {
             });
 
             // Module init. Failures are logged, never fatal: the UI shows them.
-            let inits: [(&str, fn(&Arc<Ctx>) -> Result<(), String>); 18] = [
+            let inits: [(&str, fn(&Arc<Ctx>) -> Result<(), String>); 19] = [
                 ("workday", workday::init),
+                ("access", access::init),
                 ("library", library::init),
                 ("surfaces", surfaces::init),
                 ("providers", providers::init),

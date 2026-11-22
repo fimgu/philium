@@ -233,6 +233,7 @@ fn shared_instructions(strict: bool) -> String {
          - Web pages: use your browser, not curl. `browser_open`, then `browser_snapshot` for the page and numbered refs, then `browser_click` / `browser_type` / `browser_press`. Snapshot again after each navigation. The person approves browser calls; respect a denial.\n\
          - App surfaces: `surface_catalog`, `surface_launch`, `surface_exec`, `surface_screenshot`, `surface_stop` run isolated GUI/CLI apps (KiCad, DBeaver, Chromium) off the host desktop.\n\
          - Memory: `memory_slate`, `memory_search`, `memory_save`, `working_note_get`, `working_note_set` manage repository facts and handoff notes (Standard mode only).\n\
+         - External access: call `access_request` to ask the person for read-only access to another repo, folder, or file (docs, images, PDFs, code index, repo context, or cross-repo `communicate` with agents there). Use `access_list`, `fs_list`, `fs_search`, `fs_read` (and `fs_write` only if explicitly granted on a non-repo folder), or pass `repo` to `code_*`, `memory_*`, `working_note_get`, `board_list`, `agent_status`.\n\
          - Tasks and people: `board_*` for tasks (claim before working, keep the lease alive), `mail_send` / `mail_read` for messages. `mail_send` to `\"you\"` reaches the person. Jobs like commit, open_pr, review_pr and release: `playbook_get` first and follow it. Finished work lands as a GitHub pull request.\n\
          - Philium renders `mermaid`, `diff`, `svg`, `math` and `csv` blocks and GFM tables in your replies.\n\
          \n\
@@ -582,6 +583,9 @@ async fn provision(ctx: &Arc<Ctx>, id: &str, fresh: bool, brief: Option<String>)
     extra.push_str(&agent_identity_tail(&name, &role, parent_name.as_deref(), worktree.as_deref()));
     let seed_query = brief.as_deref().unwrap_or("");
     extra.push_str(&agent_session_context_async(ctx, strict, row["repo_id"].as_str(), Some(&model_ref), seed_query).await);
+    if let Some(grants_block) = crate::access::active_grants_prompt(ctx, id) {
+        extra.push_str(&grants_block);
+    }
     config["prompt"] = json!({ "extra": extra });
     if let Some(url) = ctx.mcp_url.get() {
         config["mcp"] = json!({ "servers": { "philium": {
@@ -834,6 +838,7 @@ fn on_hal_exit(ctx: &Arc<Ctx>, id: &str, hal: &Arc<Hal>, reason: &str) {
         crate::sandbox::revoke(&n);
     }
     crate::mcp::revoke(id);
+    crate::access::cleanup_agent(ctx, id);
     crate::library::clear_agent_reminder_state(id);
     crate::library::schedule_session_observe(ctx, id);
     crate::terminals::kill_agent(ctx, id);
@@ -1142,6 +1147,7 @@ pub fn stop(ctx: &Arc<Ctx>, id: &str, state: &str) {
         }
     }
     crate::mcp::revoke(id);
+    crate::access::cleanup_agent(ctx, id);
     crate::library::clear_agent_reminder_state(id);
     crate::library::schedule_session_observe(ctx, id);
     crate::terminals::kill_agent(ctx, id);

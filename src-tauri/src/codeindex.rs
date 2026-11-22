@@ -2873,23 +2873,51 @@ pub fn mcp_tools() -> Vec<Value> {
         json!({ "name": name, "description": desc, "inputSchema": { "type": "object", "properties": props, "required": req } })
     };
     vec![
-        t("code_map", "Directories, files and their most-used symbols with line spans (`start-end`), most-used first. Your prompt already has the top of this map: call this to zoom into a directory `path`, or pass a file `path` for all its symbols.",
-          json!({ "path": s, "depth": i }), &[]),
-        t("code_outline", "Every symbol in one file with line spans (`start-end`), signatures and call counts. Use it to find what to read instead of reading the whole file.",
-          json!({ "path": s }), &["path"]),
-        t("code_symbol", "The source of one function, method, struct, class or type, with its direct callers and callees. Accepts `Parent.name` or `name` and an optional `path`.",
-          json!({ "symbol": s, "path": s }), &["symbol"]),
-        t("code_find", "Find code by symbol name (`retryWithBackoff`, fuzzy) or by words (`loading spinner skeleton`, `auth|token`). Words are also searched in the code, and the lines are grouped by the function, class or file that holds them, those holding the most words first. Returns `path:start-end kind name`.",
-          json!({ "query": s, "kind": s }), &["query"]),
-        t("code_refs", "Where a symbol is defined, what it calls, and who calls it (`exact` by file, import or qualified path, `possible` by name only). Accepts `Parent.name`.",
-          json!({ "symbol": s }), &["symbol"]),
+        t("code_map", "Directories, files and their most-used symbols with line spans (`start-end`), most-used first. Your prompt already has the top of this map: call this to zoom into a directory `path`, or pass a file `path` for all its symbols. Optional `repo` (grant id or repo name) queries a granted external repo.",
+          json!({ "path": s, "depth": i, "repo": s }), &[]),
+        t("code_outline", "Every symbol in one file with line spans (`start-end`), signatures and call counts. Use it to find what to read instead of reading the whole file. Optional `repo` queries a granted external repo.",
+          json!({ "path": s, "repo": s }), &["path"]),
+        t("code_symbol", "The source of one function, method, struct, class or type, with its direct callers and callees. Accepts `Parent.name` or `name` and an optional `path`. Optional `repo` queries a granted external repo.",
+          json!({ "symbol": s, "path": s, "repo": s }), &["symbol"]),
+        t("code_find", "Find code by symbol name (`retryWithBackoff`, fuzzy) or by words (`loading spinner skeleton`, `auth|token`). Words are also searched in the code, and the lines are grouped by the function, class or file that holds them, those holding the most words first. Returns `path:start-end kind name`. Optional `repo` queries a granted external repo.",
+          json!({ "query": s, "kind": s, "repo": s }), &["query"]),
+        t("code_refs", "Where a symbol is defined, what it calls, and who calls it (`exact` by file, import or qualified path, `possible` by name only). Accepts `Parent.name`. Optional `repo` queries a granted external repo.",
+          json!({ "symbol": s, "repo": s }), &["symbol"]),
         t("code_impact", "The symbols your committed and uncommitted changes touch since the merge-base, the callers that depend on them two levels up, and overlaps with other agents' worktrees. Run before you finish.",
           json!({}), &[]),
         // Agents get no GitHub PR access through this tool (mcp.rs refuses `pr`), so it is
         // not offered.
-        t("repo_context", "Worktrees (Philium's and others) with dirty files and ahead/behind counts, overlaps between them, and local and remote branches. Pass `branch` (`feat/x` or `origin/feat/x`) for the symbols it changed against the default branch.",
-          json!({ "branch": s }), &[]),
+        t("repo_context", "Worktrees (Philium's and others) with dirty files and ahead/behind counts, overlaps between them, and local and remote branches. Pass `branch` (`feat/x` or `origin/feat/x`) for the symbols it changed against the default branch. Optional `repo` queries a granted external repo.",
+          json!({ "branch": s, "repo": s }), &[]),
     ]
+}
+
+pub async fn mcp_call_for_repo(ctx: &Arc<Ctx>, repo_id: &str, label: &str, name: &str, a: Value) -> Result<Value, String> {
+    if name == "code_impact" {
+        return Err("code_impact applies only to your own worktree".into());
+    }
+    let c = ctx.clone();
+    let repo_id = repo_id.to_string();
+    let label = label.to_string();
+    let name = name.to_string();
+    tokio::task::spawn_blocking(move || {
+        let t = target_for_repo(&c, &repo_id, None)?;
+        let l = load_sync(&c, t, name != "repo_context")?;
+        let cap = a["max_tokens"].as_u64().map(|n| n as usize).unwrap_or(4000).clamp(100, 60000);
+        let root = l.t.repo_path.as_path();
+        let text = match name.as_str() {
+            "code_map" => render_map(&l.view, a["path"].as_str(), a["depth"].as_u64().unwrap_or(2) as usize, cap),
+            "code_outline" => render_outline(&l.view, a["path"].as_str().ok_or("missing `path`")?, cap),
+            "code_symbol" => render_symbol(&l.view, root, a["symbol"].as_str().ok_or("missing `symbol`")?, a["path"].as_str(), cap),
+            "code_find" => render_find(&l.view, Some(root), a["query"].as_str().ok_or("missing `query`")?, a["kind"].as_str(), cap),
+            "code_refs" => render_refs(&l.view, a["symbol"].as_str().ok_or("missing `symbol`")?, cap),
+            "repo_context" => render_repo_context(&c, &l, &a, cap),
+            _ => return Err(format!("unknown tool {name}")),
+        };
+        Ok(Value::String(format!("[external repo: {label}]\n{}{}", l.header, text)))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 pub async fn mcp_call(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Result<Value, String> {

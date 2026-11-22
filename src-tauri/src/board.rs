@@ -616,11 +616,30 @@ pub fn send(ctx: &Arc<Ctx>, from: &str, to: &str, body: &str) -> Result<Value, S
     let mut text = body.to_owned();
     let mut findings = crate::guard::Findings::default();
     crate::guard::scan_text(&mut text, true, &mut findings);
+    let cross_repo_allowed = if from != "you" && !matches!(to, "all" | "you") {
+        let sender = ctx.db.query("SELECT id,repo_id,strict FROM agents WHERE name=?1", [from]).ok().and_then(|mut v| v.pop());
+        let recip = ctx.db.query("SELECT id,repo_id,strict FROM agents WHERE name=?1", [to]).ok().and_then(|mut v| v.pop());
+        match (sender, recip) {
+            (Some(s), Some(r)) if s["strict"].as_i64() != Some(1) && r["strict"].as_i64() != Some(1) => {
+                match (s["id"].as_str(), s["repo_id"].as_str(), r["repo_id"].as_str()) {
+                    (Some(sid), Some(sr), Some(rr)) if sr != rr => crate::access::can_communicate(ctx, sid, rr),
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    } else {
+        false
+    };
     let msg=ctx.db.with(|c|{
         let tx = c.unchecked_transaction()?;
         tx.execute("INSERT INTO messages(from_agent,to_target,body,guard_findings,created_at) VALUES(?1,?2,?3,?4,?5)",rusqlite::params![from,to,text,json!(findings).to_string(),now()])?;
         let id = tx.last_insert_rowid();
-        tx.execute("INSERT INTO agent_mail_delivery SELECT ?1,a.id,a.repo_id,a.model_ref FROM agents a JOIN repos r ON r.id=a.repo_id WHERE a.name=?2 AND ?2 NOT IN ('all','you') AND (?3='you' OR EXISTS(SELECT 1 FROM agents s WHERE s.name=?3 AND s.repo_id=a.repo_id AND s.model_ref=a.model_ref AND s.strict=a.strict))",rusqlite::params![id,to,from])?;
+        if cross_repo_allowed {
+            tx.execute("INSERT INTO agent_mail_delivery SELECT ?1,a.id,a.repo_id,a.model_ref FROM agents a JOIN repos r ON r.id=a.repo_id WHERE a.name=?2 AND a.strict=0 AND ?2 NOT IN ('all','you')",rusqlite::params![id,to])?;
+        } else {
+            tx.execute("INSERT INTO agent_mail_delivery SELECT ?1,a.id,a.repo_id,a.model_ref FROM agents a JOIN repos r ON r.id=a.repo_id WHERE a.name=?2 AND ?2 NOT IN ('all','you') AND (?3='you' OR EXISTS(SELECT 1 FROM agents s WHERE s.name=?3 AND s.repo_id=a.repo_id AND s.model_ref=a.model_ref AND s.strict=a.strict))",rusqlite::params![id,to,from])?;
+        }
         tx.commit()?; Ok(id)
     })?;
     let v = ctx
@@ -637,10 +656,11 @@ pub fn send(ctx: &Arc<Ctx>, from: &str, to: &str, body: &str) -> Result<Value, S
     }
     Ok(v)
 }
-/// Unread mail an idle agent is told about on its own: from the person, from its lead, or
-/// from a helper it started. Mail between unrelated agents stays in the inbox. Marks it read.
+/// Unread mail an idle agent is told about on its own: from the person, from its lead, from
+/// a helper it started, or an authorized cross-repo message (`communicate` grant). Mail between
+/// unrelated same-repo peers stays in the inbox. Marks it read.
 pub fn take_deliverable(ctx: &Arc<Ctx>, id: &str, name: &str) -> Result<Vec<Value>, String> {
-    let rows = ctx.db.query("SELECT m.id,m.from_agent,m.body FROM agent_mail_delivery d JOIN agents a ON a.id=d.agent_id AND a.repo_id=d.repo_id AND a.model_ref=d.model_ref JOIN messages m ON m.id=d.message_id LEFT JOIN mail_reads r ON r.message_id=m.id AND r.agent=a.name LEFT JOIN agents s ON s.name=m.from_agent WHERE a.id=?1 AND r.read_at IS NULL AND (m.from_agent='you' OR s.id=a.parent_id OR s.parent_id=a.id) ORDER BY m.id LIMIT 20", [id])?;
+    let rows = ctx.db.query("SELECT m.id,m.from_agent,m.body FROM agent_mail_delivery d JOIN agents a ON a.id=d.agent_id AND a.repo_id=d.repo_id AND a.model_ref=d.model_ref JOIN messages m ON m.id=d.message_id LEFT JOIN mail_reads r ON r.message_id=m.id AND r.agent=a.name LEFT JOIN agents s ON s.name=m.from_agent WHERE a.id=?1 AND r.read_at IS NULL AND (m.from_agent='you' OR s.id=a.parent_id OR s.parent_id=a.id OR (s.repo_id IS NOT NULL AND a.repo_id IS NOT NULL AND s.repo_id!=a.repo_id AND s.strict=0 AND a.strict=0)) ORDER BY m.id LIMIT 20", [id])?;
     finish_inbox(ctx, name, rows.clone(), true)?;
     Ok(rows)
 }
