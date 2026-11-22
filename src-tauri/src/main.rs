@@ -47,8 +47,8 @@ mod memory_ledger;
 mod memory_skills;
 mod mcp;
 mod mcp_servers;
-mod skills;
 mod oauth;
+mod skills;
 mod pipeline;
 mod providers;
 mod reaper;
@@ -199,8 +199,8 @@ async fn rpc_inner(app: &App, method: String, args: Option<Value>) -> Result<Val
         "stats" => stats::call(&ctx, m, args).await,
         "storage" => storage::call(&ctx, m, args).await,
         "reaper" => reaper::call(&ctx, m, args).await,
-        "skills" => skills::call(&ctx, m, args).await,
         "library" => library::call(&ctx, m, args).await,
+        "skills" => skills::call(&ctx, m, args).await,
         "surfaces" => surfaces::call(&ctx, m, args).await,
         "selfdev" => selfdev::call(&ctx, m, args).await,
         "mcp" if m.starts_with("servers_") => mcp_servers::call(&ctx, m, args).await,
@@ -331,6 +331,9 @@ fn main() {
             if let Err(e) = tauri::async_runtime::block_on(pilot::check()) { eprintln!("Pilot check failed: {e}"); std::process::exit(1); }
             return;
         }
+    } else if !offscreen {
+        // Dock launches get a bare PATH; Improve Philium needs cargo/npm from the login shell.
+        if let Some(home) = std::env::var_os("HOME") { pilot::adopt_login_path(std::path::Path::new(&home)); }
     }
     let builder=tauri::Builder::default();
     #[cfg(target_os="macos")] let builder=if offscreen{builder.activate_ignoring_other_apps(false)}else{builder};

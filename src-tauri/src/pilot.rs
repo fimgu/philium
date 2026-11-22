@@ -118,22 +118,7 @@ pub fn prepare() -> Result<(), String> {
     for k in foreign {
         env::remove_var(k);
     }
-    // A window opened from the Dock gets the system's bare PATH, so agents and checks would not
-    // find the toolchains a terminal has. Ask the person's login shell for theirs, once, while
-    // HOME still names their own home. Entries of another agent harness are left out.
-    let mut entries: Vec<PathBuf> = login_path(&home).map(|p| env::split_paths(&p).collect()).unwrap_or_default();
-    for p in env::var_os("PATH").map(|p| env::split_paths(&p).collect::<Vec<_>>()).unwrap_or_default() {
-        if !entries.contains(&p) {
-            entries.push(p);
-        }
-    }
-    let other = home.join(".jcode");
-    entries.retain(|p| p.is_absolute() && !p.starts_with(&other));
-    if let Ok(joined) = env::join_paths(entries) {
-        if !joined.is_empty() {
-            env::set_var("PATH", joined);
-        }
-    }
+    adopt_login_path(&home);
     env::set_var("HOME", &private_home);
     for (key, dir) in [
         ("XDG_CONFIG_HOME", "config"),
@@ -146,6 +131,24 @@ pub fn prepare() -> Result<(), String> {
     }
     BASE.set(base)
         .map_err(|_| "Pilot already initialized".into())
+}
+
+/// A window opened from the Dock gets the system's bare PATH, so agents, checks and
+/// "Improve Philium" (cargo, npm) would not find the toolchains a terminal has. Ask the
+/// person's login shell for theirs, once, before threads start.
+pub fn adopt_login_path(home: &Path) {
+    let mut entries: Vec<PathBuf> = login_path(home).map(|p| env::split_paths(&p).collect()).unwrap_or_default();
+    for p in env::var_os("PATH").map(|p| env::split_paths(&p).collect::<Vec<_>>()).unwrap_or_default() {
+        if !entries.contains(&p) {
+            entries.push(p);
+        }
+    }
+    entries.retain(|p| p.is_absolute());
+    if let Ok(joined) = env::join_paths(entries) {
+        if !joined.is_empty() {
+            env::set_var("PATH", joined);
+        }
+    }
 }
 
 /// Packaged, non-graphical regression. Only accepts an explicitly marked disposable HOME.
