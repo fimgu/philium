@@ -569,15 +569,44 @@ pub fn init(ctx: &Arc<Ctx>) -> Result<(), String> {
     // Idempotent: remaps previously imported `project:<abs_path>` / `jcode:<hash>` rows onto
     // their registered `repo:<id>` scopes (no-op when nothing matches).
     sync_imported_repo_scopes(ctx);
-    if !crate::pilot::active() && ctx.db.kv_get("library.imported_at").is_none() {
-        let c = ctx.clone();
-        std::thread::spawn(move || {
-            let r = import(&c, &home());
-            sync_imported_repo_scopes(&c);
-            c.log_event("library:import", None, &r.unwrap_or_else(|e| json!({ "error": e })));
-        });
+    // Memory never reads ~/.jcode or ~/.claude on its own. Earlier builds imported them silently
+    // at first launch; drop that data once. `library.import` remains an explicit, manual action.
+    if ctx.db.kv_get(PURGE_AUTO_IMPORT_KEY).is_none() {
+        let r = purge_auto_imported(ctx)?;
+        ctx.db.kv_set(PURGE_AUTO_IMPORT_KEY, &now().to_string())?;
+        if r["memories"].as_u64().unwrap_or(0) + r["skills"].as_u64().unwrap_or(0) > 0 {
+            ctx.log_event("library:purge_auto_import", None, &r);
+        }
     }
     Ok(())
+}
+
+const PURGE_AUTO_IMPORT_KEY: &str = "library.auto_import_purged_at";
+
+/// Delete everything the old silent first-launch import wrote: Jcode memories (any scope) and
+/// skills copied from ~/.jcode / ~/.claude, plus their vectors and retrieval feedback.
+fn purge_auto_imported(ctx: &Ctx) -> Result<Value, String> {
+    // The old importer's fingerprint. Pre-provenance v0 rows are left alone.
+    const MATCH: &str = "provenance='imported:jcode' OR scope LIKE 'jcode:%'";
+    let (memories, skills) = ctx.db.with(|c| {
+        let tx = c.unchecked_transaction()?;
+        let ids = format!("SELECT id FROM memories WHERE {MATCH}");
+        tx.execute(&format!("DELETE FROM memory_vectors WHERE memory_id IN ({ids})"), [])?;
+        tx.execute(&format!("DELETE FROM retrieval_feedback WHERE memory_id IN ({ids})"), [])?;
+        let m = tx.execute(&format!("DELETE FROM memories WHERE {MATCH}"), [])?;
+        let s = tx.execute("DELETE FROM skills WHERE source IN ('jcode','claude','claude-plugin')", [])?;
+        tx.execute("DELETE FROM kv WHERE k='library.imported_at'", [])?;
+        tx.commit()?;
+        Ok((m, s))
+    })?;
+    if memories > 0 {
+        let _ = ctx.db.exec("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')", []);
+        invalidate_vector_cache(ctx);
+    }
+    if memories + skills > 0 {
+        ctx.notify("library");
+    }
+    Ok(json!({ "memories": memories, "skills": skills }))
 }
 
 fn home() -> PathBuf {
@@ -661,24 +690,9 @@ pub fn sync_imported_repo_scopes(ctx: &Ctx) -> usize {
     migrated
 }
 
-/// Candidate project paths so hashed Jcode project files map back to real repos.
-fn known_projects(ctx: &Ctx, home: &Path) -> Vec<PathBuf> {
-    let mut v: Vec<PathBuf> = ctx
-        .db
-        .query("SELECT path FROM repos", [])
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|r| r["path"].as_str().map(PathBuf::from))
-        .collect();
-    for base in ["Developer", "Documents", "Desktop", ""] {
-        if let Ok(rd) = std::fs::read_dir(home.join(base)) {
-            v.extend(rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()));
-        }
-    }
-    v.push(home.to_path_buf());
-    v
-}
-
+/// Manual, user-triggered import from Jcode / Claude. Never runs on its own.
+/// Project memories land only in registered repos; files for unknown projects are skipped.
+/// Imported memories are `agent_inferred`: another tool wrote them, not the operator here.
 pub fn import(ctx: &Arc<Ctx>, home: &Path) -> Result<Value, String> {
     let mut skills = 0;
     let mut memories = 0;
@@ -711,10 +725,9 @@ pub fn import(ctx: &Arc<Ctx>, home: &Path) -> Result<Value, String> {
     }
 
     let mem = home.join(".jcode/memory");
-    let repo_by_path = registered_repo_map(ctx);
-    let projects: HashMap<String, String> = known_projects(ctx, home)
+    let projects: HashMap<String, String> = registered_repo_map(ctx)
         .into_iter()
-        .map(|p| (jcode_project_hash(&p), p.to_string_lossy().into_owned()))
+        .map(|(path, repo_id)| (jcode_project_hash(Path::new(&path)), repo_id))
         .collect();
     let mut files = vec![(mem.join("global.json"), "global".to_string())];
     if let Ok(rd) = std::fs::read_dir(mem.join("projects")) {
@@ -724,21 +737,9 @@ pub fn import(ctx: &Arc<Ctx>, home: &Path) -> Result<Value, String> {
                 continue;
             }
             let hash = p.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
-            let scope = match projects.get(&hash) {
-                Some(proj_path) => {
-                    let matched_repo = repo_by_path.get(proj_path).cloned().or_else(|| {
-                        std::fs::canonicalize(proj_path)
-                            .ok()
-                            .and_then(|c| repo_by_path.get(c.to_string_lossy().as_ref()).cloned())
-                    });
-                    match matched_repo {
-                        Some(repo_id) => format!("repo:{repo_id}"),
-                        None => format!("project:{proj_path}"),
-                    }
-                }
-                None => format!("jcode:{hash}"),
-            };
-            files.push((p, scope));
+            if let Some(repo_id) = projects.get(&hash) {
+                files.push((p, format!("repo:{repo_id}")));
+            }
         }
     }
     for (path, scope) in files {
@@ -754,7 +755,7 @@ pub fn import(ctx: &Arc<Ctx>, home: &Path) -> Result<Value, String> {
                 let status = if active == 1 { "active" } else { "deleted" };
                 tx.execute(
                     "INSERT INTO memories(id,scope,category,content,source,created_at,active,trust_tier,status,provenance)
-                     VALUES(?1,?2,?3,?4,'jcode',?5,?6,'user_direct',?7,'imported:jcode')
+                     VALUES(?1,?2,?3,?4,'import:jcode',?5,?6,'agent_inferred',?7,'imported:jcode')
                      ON CONFLICT(id) DO UPDATE SET content=excluded.content, category=excluded.category,
                      active=excluded.active, scope=excluded.scope, status=excluded.status",
                     params![id, scope, category, content, m["created_at"].as_str().unwrap_or(""), active, status],
@@ -3904,36 +3905,72 @@ mod tests {
     }
 
     #[test]
+    fn init_purges_silently_imported_rows_once_and_keeps_real_memories() {
+        let ctx = Ctx::test();
+        init(&ctx).unwrap();
+        // Simulate a database written by the old silent first-launch import.
+        ctx.db.exec("DELETE FROM kv WHERE k=?1", [PURGE_AUTO_IMPORT_KEY]).unwrap();
+        ctx.db.exec("INSERT INTO kv(k,v) VALUES('library.imported_at','1')", []).unwrap();
+        for (id, scope, prov) in [("j1", "jcode:abc", ""), ("j2", "project:/x", "imported:jcode"), ("j3", "repo:r", "imported:jcode"), ("u1", "repo:r", "operator")] {
+            ctx.db.exec(
+                "INSERT INTO memories(id,scope,category,content,source,created_at,provenance) VALUES(?1,?2,'fact','kept marker','jcode','',?3)",
+                params![id, scope, prov],
+            ).unwrap();
+            ctx.db.exec("INSERT INTO memory_vectors(memory_id,model_version,dim,vec,updated_at) VALUES(?1,'m',1,x'00000000','')", [id]).unwrap();
+        }
+        ctx.db.exec("INSERT INTO skills(name,description,body,source,updated_at) VALUES('a','','','claude-plugin',0),('b','','','jcode',0),('c','','','philium',0)", []).unwrap();
+        init(&ctx).unwrap();
+        let ids: Vec<String> = ctx.db.query("SELECT id FROM memories ORDER BY id", []).unwrap().iter().map(|r| r["id"].as_str().unwrap().to_string()).collect();
+        assert_eq!(ids, vec!["u1"]);
+        assert_eq!(ctx.db.query("SELECT count(*) AS n FROM memory_vectors", []).unwrap()[0]["n"], 1);
+        assert_eq!(ctx.db.query("SELECT name FROM skills", []).unwrap(), vec![json!({"name": "c"})]);
+        assert!(ctx.db.kv_get("library.imported_at").is_none());
+        // FTS stays consistent with the table after the bulk delete.
+        assert_eq!(memory_search(&ctx, "kept marker", None, 10).unwrap().as_array().unwrap().len(), 0);
+        assert_eq!(agent_memories(&ctx, "kept marker", "r", 10).unwrap()[0]["id"], "u1");
+        // Runs once: later rows from an explicit manual import survive restarts.
+        ctx.db.exec("INSERT INTO memories(id,scope,category,content,source,created_at) VALUES('j9','repo:r','fact','x','import:jcode','')", []).unwrap();
+        ctx.db.exec("UPDATE memories SET provenance='imported:jcode' WHERE id='j9'", []).unwrap();
+        init(&ctx).unwrap();
+        assert_eq!(ctx.db.query("SELECT count(*) AS n FROM memories WHERE id='j9'", []).unwrap()[0]["n"], 1);
+    }
+
+    #[test]
     fn imports_skills_and_memories_and_serves_them() {
         let ctx = Ctx::test();
         init(&ctx).unwrap();
         let home = fake_home();
+        let proj = home.join("Developer/philium").to_string_lossy().into_owned();
+        // Init never touches ~/.jcode or ~/.claude on its own.
+        assert_eq!(ctx.db.query("SELECT count(*) AS n FROM memories", []).unwrap()[0]["n"], 0);
+        // Manual import skips project files for repos that are not registered.
+        let r = import(&ctx, &home).unwrap();
+        assert_eq!(r, json!({"skills": 1, "memories": 2}));
+        ctx.db.exec("INSERT INTO repos(id,name,path,added_at) VALUES('repo_ph','philium',?1,0)", [&proj]).unwrap();
         let r = import(&ctx, &home).unwrap();
         assert_eq!(r, json!({"skills": 1, "memories": 3}));
         // Idempotent: a second import does not duplicate.
         import(&ctx, &home).unwrap();
         assert_eq!(ctx.db.query("SELECT count(*) AS n FROM memories", []).unwrap()[0]["n"], 3);
+        // Imported rows are another tool's claims, never operator-direct.
+        assert_eq!(
+            ctx.db.query("SELECT count(*) AS n FROM memories WHERE trust_tier!='agent_inferred'", []).unwrap()[0]["n"],
+            0
+        );
 
         let s = skill_get(&ctx, "review-pr").unwrap();
         assert!(s["body"].as_str().unwrap().contains("# Steps"));
         assert_eq!(s["files"]["gate.sh"], "echo ok");
         assert!(skill_get(&ctx, "nope").is_err());
 
-        let proj = home.join("Developer/philium").to_string_lossy().into_owned();
-        let hits = memory_search(&ctx, "quit second", Some(&proj), 10).unwrap();
-        assert_eq!(hits[0]["id"], "p1", "{hits}");
-        assert_eq!(hits[0]["scope"], format!("project:{proj}"));
+        // Project memories land directly on the registered repo scope.
+        let agent_hits = agent_memories(&ctx, "quit second", "repo_ph", 5).unwrap();
+        assert_eq!(agent_hits[0]["id"], "p1", "{agent_hits}");
+        assert_eq!(agent_hits[0]["scope"], "repo:repo_ph");
         // Inactive memories never surface.
         assert!(memory_search(&ctx, "retired", None, 10).unwrap().as_array().unwrap().is_empty());
         // Search input cannot inject FTS syntax.
         memory_search(&ctx, "\"unbalanced * NEAR( OR", None, 5).unwrap();
-
-        // Registering the repo maps imported `project:<path>` memories to `repo:<id>` for Standard agents!
-        ctx.db.exec("INSERT INTO repos(id,name,path,added_at) VALUES('repo_ph','philium',?1,0)", [&proj]).unwrap();
-        assert_eq!(sync_imported_repo_scopes(&ctx), 1);
-        let agent_hits = agent_memories(&ctx, "quit second", "repo_ph", 5).unwrap();
-        assert_eq!(agent_hits[0]["id"], "p1", "{agent_hits}");
-        assert_eq!(agent_hits[0]["scope"], "repo:repo_ph");
 
         memory_save(&ctx, "Prefers Philium over Jcode", "preference", None, "tester").unwrap();
         let standing = standing_memories(&ctx);
