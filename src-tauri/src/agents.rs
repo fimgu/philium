@@ -314,7 +314,7 @@ async fn agent_session_context_async(
             out.push_str(&note);
         }
         let budget = crate::library::model_memory_budget(ctx, model_ref);
-        if let Ok(slate) = crate::library::build_context_slate_async(
+        if let Ok(slate) = crate::library::build_context_slate_for_model_async(
             ctx,
             Some(rid),
             query,
@@ -322,12 +322,18 @@ async fn agent_session_context_async(
             false,
             false,
             vec!["on_session_start".into()],
+            model_ref,
         )
         .await
         {
             let max_slate_bytes = (budget * 4).clamp(1024, 12_000);
             if let Some(block) = crate::library::format_slate_memories_prompt(&slate, max_slate_bytes) {
                 out.push_str(&block);
+            }
+        }
+        if let Ok(dose) = crate::memory_skills::select_skill_dose(ctx, rid, query, model_ref) {
+            if let Some(proc_block) = crate::memory_skills::format_skill_dose_prompt(&dose, 2048) {
+                out.push_str(&proc_block);
             }
         }
     }

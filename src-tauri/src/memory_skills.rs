@@ -124,7 +124,7 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> String {
 enum RecordOutcome {
     Created(Value),
     Updated(Value),
-    Unchanged(Value),
+    Unchanged(#[allow(dead_code)] Value),
 }
 
 fn record_verified_procedure_inner(

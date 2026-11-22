@@ -65,7 +65,9 @@ CREATE TABLE IF NOT EXISTS memories (
   supersedes_id TEXT,
   source_event_id TEXT,
   provenance TEXT,
-  updated_at TEXT);
+  updated_at TEXT,
+  valid_from TEXT,
+  valid_to TEXT);
 CREATE INDEX IF NOT EXISTS memories_scope ON memories(scope);
 CREATE INDEX IF NOT EXISTS memories_status ON memories(status, active);
 CREATE INDEX IF NOT EXISTS memories_fact_key ON memories(scope, fact_key);
@@ -380,7 +382,7 @@ fn query_embed_cache() -> &'static Mutex<HashMap<(String, String), Vec<f32>>> {
     C.get_or_init(Default::default)
 }
 
-fn invalidate_vector_cache(ctx: &Ctx) {
+pub(crate) fn invalidate_vector_cache(ctx: &Ctx) {
     let mut g = scope_vector_cache().lock().unwrap_or_else(|e| e.into_inner());
     g.retain(|(dir, _, _, _), _| dir != &ctx.data_dir);
 }
@@ -544,6 +546,9 @@ fn load_scope_vectors_cached(
 pub fn init(ctx: &Arc<Ctx>) -> Result<(), String> {
     ctx.db.with(|c| c.execute_batch(SCHEMA))?;
     migrate_columns(ctx)?;
+    crate::memory_ledger::init(ctx)?;
+    crate::memory_skills::init(ctx)?;
+    crate::memory_consolidation::init(ctx)?;
     sync_imported_repo_scopes(ctx);
     if !crate::pilot::active() && ctx.db.kv_get("library.imported_at").is_none() {
         let c = ctx.clone();
@@ -952,6 +957,9 @@ pub fn save_structured(ctx: &Ctx, opts: SaveOpts<'_>) -> Result<Value, String> {
         )?;
         tx.commit()
     })?;
+    if status == "active" && !to_supersede.is_empty() {
+        let _ = crate::memory_ledger::close_superseded_validity(ctx, &to_supersede, "");
+    }
     invalidate_vector_cache(ctx);
     ctx.notify("library");
     Ok(json!({
@@ -985,26 +993,30 @@ pub async fn memory_search_async(ctx: &Arc<Ctx>, q: &str, project: Option<&str>,
     let scope = project.map(|p| format!("project:{p}")).unwrap_or_default();
     let q_embed = embed_query_cached(ctx, q).await;
     let (c, q_owned) = (ctx.clone(), q.to_string());
+    let pool_limit = limit.clamp(1, 50).max(20);
     let items = tokio::task::spawn_blocking(move || {
         let q_ref = q_embed.as_ref().map(|(mv, v)| (mv.as_str(), v.as_slice()));
-        search_scope_core(&c, &q_owned, &scope, true, limit, q_ref).map(|(rows, _, _)| rows)
+        search_scope_core(&c, &q_owned, &scope, true, pool_limit, q_ref).map(|(rows, _, _)| rows)
     })
     .await
     .map_err(|e| e.to_string())??;
-    Ok(Value::Array(items))
+    let (reranked, _) = crate::memory_ledger::rerank_candidates_async(ctx, q, items, limit.clamp(1, 50) as usize).await;
+    Ok(Value::Array(reranked))
 }
 
 pub async fn agent_memories_async(ctx: &Arc<Ctx>, q: &str, repo_id: &str, limit: i64) -> Result<Value, String> {
     let scope = format!("repo:{repo_id}");
     let q_embed = embed_query_cached(ctx, q).await;
     let (c, q_owned) = (ctx.clone(), q.to_string());
+    let pool_limit = limit.clamp(1, 50).max(20);
     let items = tokio::task::spawn_blocking(move || {
         let q_ref = q_embed.as_ref().map(|(mv, v)| (mv.as_str(), v.as_slice()));
-        search_scope_core(&c, &q_owned, &scope, false, limit, q_ref).map(|(rows, _, _)| rows)
+        search_scope_core(&c, &q_owned, &scope, false, pool_limit, q_ref).map(|(rows, _, _)| rows)
     })
     .await
     .map_err(|e| e.to_string())??;
-    Ok(Value::Array(items))
+    let (reranked, _) = crate::memory_ledger::rerank_candidates_async(ctx, q, items, limit.clamp(1, 50) as usize).await;
+    Ok(Value::Array(reranked))
 }
 
 fn search_scope_core(
@@ -1022,28 +1034,32 @@ fn search_scope_core(
         .map(|t| format!("\"{t}\""))
         .collect();
     let limit = limit.clamp(1, 50);
+    let valid_now = crate::memory_ledger::is_valid_now_sql_clause();
     let active_embed_model = query_embed
         .map(|(mv, _)| mv.to_string())
         .or_else(|| resolve_embedding_config(ctx).map(|c| c.model_version));
 
     if terms.is_empty() {
-        let rows = ctx.db.query(
-            "SELECT id,scope,category,content,trust_tier,status,fact_key,supersedes_id,source,source_event_id,provenance,created_at,updated_at
-             FROM memories
-             WHERE active=1 AND status='active' AND ((?3 AND scope='global') OR scope=?1)
-             ORDER BY (scope=?1) DESC, COALESCE(updated_at, created_at) DESC LIMIT ?2",
-            params![scope, limit, include_global],
-        )?;
+        let sql = format!(
+            "SELECT m.id,m.scope,m.category,m.content,m.trust_tier,m.status,m.fact_key,m.supersedes_id,m.source,m.source_event_id,m.provenance,m.created_at,m.updated_at,m.valid_from,m.valid_to
+             FROM memories m
+             WHERE m.active=1 AND m.status='active' AND ({valid_now}) AND ((?3 AND m.scope='global') OR m.scope=?1)
+             ORDER BY (m.scope=?1) DESC, COALESCE(m.updated_at, m.created_at) DESC LIMIT ?2"
+        );
+        let rows = ctx.db.query(&sql, params![scope, limit, include_global])?;
         return Ok((rows, "browse", active_embed_model));
     }
 
     // 1. Lexical candidates (SQLite FTS5 BM25), strictly ownership-filtered BEFORE ranking.
     // Pure BM25 ordering — zero provenance/trust weighting in retrieval (Utility Under Attack / blueprint §3).
-    let bm25_rows = ctx.db.query(
-        "SELECT m.id,m.scope,m.category,m.content,m.trust_tier,m.status,m.fact_key,m.supersedes_id,m.source,m.source_event_id,m.provenance,m.created_at,m.updated_at
+    let bm25_sql = format!(
+        "SELECT m.id,m.scope,m.category,m.content,m.trust_tier,m.status,m.fact_key,m.supersedes_id,m.source,m.source_event_id,m.provenance,m.created_at,m.updated_at,m.valid_from,m.valid_to
          FROM memories_fts f JOIN memories m ON m.rowid=f.rowid
-         WHERE memories_fts MATCH ?1 AND m.active=1 AND m.status='active' AND ((?3 AND m.scope='global') OR m.scope=?2)
-         ORDER BY bm25(memories_fts) LIMIT ?4",
+         WHERE memories_fts MATCH ?1 AND m.active=1 AND m.status='active' AND ({valid_now}) AND ((?3 AND m.scope='global') OR m.scope=?2)
+         ORDER BY bm25(memories_fts) LIMIT ?4"
+    );
+    let bm25_rows = ctx.db.query(
+        &bm25_sql,
         params![terms.join(" OR "), scope, include_global, RRF_POOL_LIMIT],
     )?;
 
@@ -1722,7 +1738,10 @@ pub fn consolidate_preview(ctx: &Ctx, scope: &str) -> Result<Value, String> {
         .unwrap_or(1);
     let deleted_scrub_intact = unscrubbed_deleted == 0 && dangling_deleted_vecs == 0;
 
-    let passed = user_direct_preserved && deleted_scrub_intact && no_drop_cycle && recall_preserved;
+    let tier0_passed = user_direct_preserved && deleted_scrub_intact && no_drop_cycle && recall_preserved;
+    let replay_eval = crate::memory_consolidation::run_replay_eval_gate(ctx, scope, &proposals)?;
+    let replay_passed = replay_eval["passed"].as_bool().unwrap_or(false);
+    let passed = tier0_passed && replay_passed;
 
     let eval_report = json!({
         "passed": passed,
@@ -1731,9 +1750,11 @@ pub fn consolidate_preview(ctx: &Ctx, scope: &str) -> Result<Value, String> {
             "deleted_scrub_intact": deleted_scrub_intact,
             "no_drop_cycle": no_drop_cycle,
             "recall_preserved": recall_preserved,
+            "replay_eval_passed": replay_passed,
         },
         "recall_failures": recall_failures,
-        "v3_replay_eval": "not_run",
+        "replay_eval": replay_eval,
+        "v3_replay_eval": if replay_passed { "passed" } else { "failed" },
         "mode": mode,
         "checked_records": rows.len(),
         "duplicates_found": proposals.len(),
@@ -1768,8 +1789,11 @@ pub fn consolidate_promote(ctx: &Ctx, run_id: &str) -> Result<Value, String> {
     if eval["passed"].as_bool() != Some(true) {
         return Err("Refusing to promote consolidation run that did not pass the eval gate".into());
     }
+    let scope_str = row["scope"].as_str().unwrap_or("global").to_string();
+    let version_id = crate::memory_consolidation::snapshot_scope_version(ctx, &scope_str, Some(run_id))?;
     let proposals: Vec<Value> = serde_json::from_str(row["proposals"].as_str().unwrap_or("[]")).unwrap_or_default();
     let mut applied = 0usize;
+    let mut superseded_ids = Vec::new();
     ctx.db.with(|c| {
         let tx = c.unchecked_transaction()?;
         for p in &proposals {
@@ -1781,6 +1805,7 @@ pub fn consolidate_promote(ctx: &Ctx, run_id: &str) -> Result<Value, String> {
                 )?;
                 if n > 0 {
                     let _ = tx.execute("DELETE FROM memory_vectors WHERE memory_id=?1", [sid]);
+                    superseded_ids.push(sid.to_string());
                 }
                 applied += n;
             }
@@ -1791,9 +1816,10 @@ pub fn consolidate_promote(ctx: &Ctx, run_id: &str) -> Result<Value, String> {
         )?;
         tx.commit()
     })?;
+    let _ = crate::memory_ledger::close_superseded_validity(ctx, &superseded_ids, "");
     invalidate_vector_cache(ctx);
     ctx.notify("library");
-    Ok(json!({ "id": run_id, "state": "promoted", "applied": applied }))
+    Ok(json!({ "id": run_id, "version_id": version_id, "state": "promoted", "applied": applied }))
 }
 
 // ---------- Structured Working Notes (Partial-Patch Semantics) ----------
@@ -2026,6 +2052,7 @@ pub fn build_context_slate(
     )
 }
 
+#[cfg(test)]
 pub async fn build_context_slate_async(
     ctx: &Arc<Ctx>,
     repo_id: Option<&str>,
@@ -2035,9 +2062,28 @@ pub async fn build_context_slate_async(
     include_global: bool,
     due_triggers: Vec<String>,
 ) -> Result<Value, String> {
+    build_context_slate_for_model_async(ctx, repo_id, query, budget_tokens, strict, include_global, due_triggers, None).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn build_context_slate_for_model_async(
+    ctx: &Arc<Ctx>,
+    repo_id: Option<&str>,
+    query: &str,
+    budget_tokens: usize,
+    strict: bool,
+    include_global: bool,
+    due_triggers: Vec<String>,
+    model_ref: Option<&str>,
+) -> Result<Value, String> {
     let q_embed = if !strict { embed_query_cached(ctx, query).await } else { None };
-    let (c, rid, q_owned) = (ctx.clone(), repo_id.map(str::to_string), query.to_string());
-    tokio::task::spawn_blocking(move || {
+    let (c, rid, q_owned, mref) = (
+        ctx.clone(),
+        repo_id.map(str::to_string),
+        query.to_string(),
+        model_ref.map(str::to_string),
+    );
+    let mut slate = tokio::task::spawn_blocking(move || {
         let trig_refs: Vec<&str> = if due_triggers.is_empty() {
             vec!["on_session_start"]
         } else {
@@ -2058,7 +2104,80 @@ pub async fn build_context_slate_async(
         )
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())??;
+
+    if strict {
+        return Ok(slate);
+    }
+
+    // Cross-encoder rerank over selected/retrieved items when configured & query is non-empty.
+    if !query.trim().is_empty() {
+        if let Some(items) = slate["items"].as_array().cloned() {
+            if items.len() > 1 {
+                let top_n = items.len();
+                let (reranked, active_reranker) =
+                    crate::memory_ledger::rerank_candidates_async(ctx, query, items, top_n).await;
+                if let Some(rr) = active_reranker {
+                    slate["items"] = Value::Array(reranked);
+                    slate["reranker"] = json!(rr);
+                }
+            }
+        }
+    }
+
+    // Apply trained AgentMemRec learned feature ranker if active (pure retrieval features, zero provenance inflation).
+    if !query.trim().is_empty() {
+        let ranker = crate::memory_consolidation::active_ranker(ctx);
+        if ranker["active"].as_bool() == Some(true) {
+            if let Some(items) = slate["items"].as_array().cloned() {
+                let q_low = query.to_lowercase();
+                let scope_target = repo_id.map(|r| format!("repo:{r}")).unwrap_or_else(|| "global".into());
+                let mut scored: Vec<(f64, usize, Value)> = items
+                    .into_iter()
+                    .enumerate()
+                    .map(|(idx, item)| {
+                        let rank_rrf = 1.0 / (RRF_K + (idx as f64) + 1.0);
+                        let ret = item["retrieval"].as_str().unwrap_or("");
+                        let f = crate::memory_consolidation::RankFeatures {
+                            bm25_rrf: if matches!(ret, "bm25" | "hybrid_rrf") { rank_rrf } else { 0.0 },
+                            dense_rrf: if matches!(ret, "dense" | "hybrid_rrf") { rank_rrf } else { 0.0 },
+                            rerank_score: item["rerank_score"].as_f64().unwrap_or(0.0),
+                            exact_key_match: item["fact_key"]
+                                .as_str()
+                                .filter(|k| !k.is_empty() && q_low.contains(&k.to_lowercase()))
+                                .map(|_| 1.0)
+                                .unwrap_or(0.0),
+                            scope_local: if item["scope"].as_str() == Some(scope_target.as_str()) { 1.0 } else { 0.0 },
+                            token_efficiency: 1.0 / (item["tokens"].as_f64().unwrap_or(32.0).max(8.0) / 32.0),
+                        };
+                        let s = crate::memory_consolidation::score_with_ranker(&ranker["weights"], &f);
+                        (s, idx, item)
+                    })
+                    .collect();
+                scored.sort_by(|a, b| {
+                    b.0.partial_cmp(&a.0)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.1.cmp(&b.1))
+                });
+                slate["items"] = Value::Array(scored.into_iter().map(|(_, _, v)| v).collect());
+                slate["ranker_version"] = ranker["version"].clone();
+            }
+        }
+    }
+
+    // Attach per-model verified skill dose (IBM #2 / Zep Skills) for Standard repo-scoped slates.
+    if let Some(rid) = repo_id.filter(|s| !s.is_empty()) {
+        if let Ok(dose) = crate::memory_skills::select_skill_dose(ctx, rid, query, mref.as_deref()) {
+            slate["procedures"] = dose["procedures"].clone();
+            slate["skill_dose"] = json!({
+                "max_procedures": dose["max_procedures"],
+                "budget_tokens": dose["budget_tokens"],
+                "used_tokens": dose["used_tokens"],
+            });
+        }
+    }
+
+    Ok(slate)
 }
 
 fn build_context_slate_core(
@@ -2247,7 +2366,7 @@ pub fn list_memories(
     let limit = limit.clamp(1, 200);
     let q_trim = q.trim().to_lowercase();
     let rows = ctx.db.query(
-        "SELECT id, scope, category, content, source, created_at, active, trust_tier, status, fact_key, supersedes_id, source_event_id, provenance, updated_at
+        "SELECT id, scope, category, content, source, created_at, active, trust_tier, status, fact_key, supersedes_id, source_event_id, provenance, updated_at, valid_from, valid_to
          FROM memories
          WHERE status != 'deleted'
            AND (?1 IS NULL OR scope=?1)
@@ -3200,6 +3319,7 @@ pub async fn observe_session(ctx: &Arc<Ctx>, agent_id: &str) -> Result<Value, St
         }
 
         let _ = c_save.db.kv_set(&format!("memory.observed_seq.{aid_save}"), &max_seq.to_string());
+        let _ = crate::memory_skills::mine_verified_runs(&c_save, &repo_save);
         Ok((saved, to_embed, source_event_id))
     })
     .await
@@ -3283,9 +3403,11 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
             let supersedes_id = args["supersedes_id"].as_str().map(str::to_string);
             let source_event_id = args["source_event_id"].as_str().map(str::to_string);
             let provenance = args["provenance"].as_str().unwrap_or("operator:ui").to_string();
+            let valid_from = args["valid_from"].as_str().filter(|s| !s.trim().is_empty()).map(str::to_string);
+            let valid_to = args["valid_to"].as_str().filter(|s| !s.trim().is_empty()).map(str::to_string);
             let (c, content_for_embed) = (ctx.clone(), content.clone());
             let res = tokio::task::spawn_blocking(move || {
-                save_structured(&c, SaveOpts {
+                let saved = save_structured(&c, SaveOpts {
                     content: &content,
                     category: &category,
                     scope: &scope,
@@ -3295,7 +3417,13 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
                     supersedes_id: supersedes_id.as_deref(),
                     source_event_id: source_event_id.as_deref(),
                     provenance: Some(&provenance),
-                })
+                })?;
+                if valid_from.is_some() || valid_to.is_some() {
+                    if let Some(mid) = saved["id"].as_str() {
+                        crate::memory_ledger::set_validity(&c, mid, valid_from.as_deref(), valid_to.as_deref())?;
+                    }
+                }
+                Ok::<Value, String>(saved)
             })
             .await
             .map_err(|e| e.to_string())??;
@@ -3395,7 +3523,7 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
                 .as_array()
                 .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
                 .unwrap_or_default();
-            build_context_slate_async(
+            build_context_slate_for_model_async(
                 ctx,
                 args["repo_id"].as_str(),
                 args["q"].as_str().unwrap_or(""),
@@ -3403,8 +3531,191 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
                 args["strict"].as_bool().unwrap_or(false),
                 args["include_global"].as_bool().unwrap_or(false),
                 triggers,
+                args["model_ref"].as_str(),
             )
             .await
+        }
+        "config_get" => Ok(crate::memory_ledger::config_get(ctx)),
+        "config_set" => {
+            let res = crate::memory_ledger::config_set(ctx, &args)?;
+            invalidate_vector_cache(ctx);
+            Ok(res)
+        }
+        "as_of" => {
+            let at = crate::ctx::arg_str(&args, "at")?;
+            let scope = args["scope"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .or_else(|| args["repo_id"].as_str().filter(|s| !s.is_empty()).map(|r| format!("repo:{r}")))
+                .unwrap_or_else(|| "global".into());
+            let include_global = args["include_global"].as_bool().unwrap_or(scope == "global");
+            crate::memory_ledger::query_as_of(
+                ctx,
+                &scope,
+                include_global,
+                &at,
+                args["q"].as_str().unwrap_or(""),
+                args["limit"].as_i64().unwrap_or(100),
+            )
+        }
+        "rollback_source" => {
+            let scope = args["scope"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .or_else(|| args["repo_id"].as_str().filter(|s| !s.is_empty()).map(|r| format!("repo:{r}")));
+            let dry_run = args["dry_run"].as_bool().unwrap_or(true);
+            let res = crate::memory_ledger::rollback_source(
+                ctx,
+                scope.as_deref(),
+                args["source"].as_str(),
+                args["session_id"].as_str(),
+                dry_run,
+            )?;
+            if !dry_run {
+                invalidate_vector_cache(ctx);
+            }
+            Ok(res)
+        }
+        "rebuild_views" => {
+            let scope = args["scope"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .or_else(|| args["repo_id"].as_str().filter(|s| !s.is_empty()).map(|r| format!("repo:{r}")));
+            let res = crate::memory_ledger::rebuild_views(ctx, scope.as_deref())?;
+            invalidate_vector_cache(ctx);
+            Ok(res)
+        }
+        "procedures" => {
+            let scope = args["scope"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .or_else(|| args["repo_id"].as_str().filter(|s| !s.is_empty()).map(|r| format!("repo:{r}")));
+            crate::memory_skills::list_procedures(
+                ctx,
+                scope.as_deref(),
+                args["status"].as_str().filter(|s| !s.is_empty()),
+                args["limit"].as_i64().unwrap_or(100),
+            )
+        }
+        "procedure_mine" => {
+            let c = ctx.clone();
+            let repo_id = args["repo_id"].as_str().filter(|s| !s.is_empty()).map(str::to_string);
+            tokio::task::spawn_blocking(move || -> Result<Value, String> {
+                if let Some(rid) = repo_id {
+                    return crate::memory_skills::mine_verified_runs(&c, &rid);
+                }
+                let repos = c.db.query("SELECT id FROM repos", [])?;
+                let mut mined = 0u64;
+                let mut updated = 0u64;
+                let mut all_procs = Vec::new();
+                for r in repos {
+                    if let Some(rid) = r["id"].as_str() {
+                        if let Ok(res) = crate::memory_skills::mine_verified_runs(&c, rid) {
+                            mined += res["mined"].as_u64().unwrap_or(0);
+                            updated += res["updated"].as_u64().unwrap_or(0);
+                            if let Some(arr) = res["procedures"].as_array() {
+                                all_procs.extend(arr.iter().cloned());
+                            }
+                        }
+                    }
+                }
+                Ok(json!({ "mined": mined, "updated": updated, "procedures": all_procs }))
+            })
+            .await
+            .map_err(|e| e.to_string())?
+        }
+        "procedure_promote" => crate::memory_skills::promote_procedure(ctx, &crate::ctx::arg_str(&args, "id")?),
+        "procedure_rollback" => crate::memory_skills::rollback_procedure(ctx, &crate::ctx::arg_str(&args, "id")?),
+        "procedure_record" => {
+            let scope = args["scope"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .or_else(|| args["repo_id"].as_str().filter(|s| !s.is_empty()).map(|r| format!("repo:{r}")))
+                .unwrap_or_else(|| "global".into());
+            crate::memory_skills::record_verified_procedure(
+                ctx,
+                &scope,
+                &crate::ctx::arg_str(&args, "title")?,
+                &crate::ctx::arg_str(&args, "steps")?,
+                args["verify_cmd"].as_str().unwrap_or(""),
+                args["trigger_hint"].as_str().unwrap_or(""),
+                args["run_id"].as_str().unwrap_or("manual"),
+                args["source_event_id"].as_str(),
+            )
+        }
+        "skill_dose_get" => Ok(crate::memory_skills::skill_dose_get(ctx, args["model_ref"].as_str())),
+        "skill_dose_set" => crate::memory_skills::skill_dose_set(
+            ctx,
+            &crate::ctx::arg_str(&args, "model_ref")?,
+            args["max_procedures"].as_i64().ok_or("missing `max_procedures`")?,
+            args["budget_tokens"].as_i64(),
+            args["measured_score"].as_f64(),
+        ),
+        "consolidate_versions" => {
+            let scope = args["scope"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .or_else(|| args["repo_id"].as_str().filter(|s| !s.is_empty()).map(|r| format!("repo:{r}")));
+            crate::memory_consolidation::list_versions(ctx, scope.as_deref(), args["limit"].as_i64().unwrap_or(20))
+        }
+        "consolidate_rollback" => {
+            let scope = args["scope"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .or_else(|| args["repo_id"].as_str().filter(|s| !s.is_empty()).map(|r| format!("repo:{r}")))
+                .unwrap_or_else(|| "global".into());
+            let res = crate::memory_consolidation::rollback_to_version(ctx, &scope, args["version_id"].as_str())?;
+            invalidate_vector_cache(ctx);
+            Ok(res)
+        }
+        "poison_audit" => {
+            let scope = args["scope"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .or_else(|| args["repo_id"].as_str().filter(|s| !s.is_empty()).map(|r| format!("repo:{r}")));
+            crate::memory_consolidation::audit_poisoning(ctx, scope.as_deref())
+        }
+        "ranker_status" => Ok(crate::memory_consolidation::active_ranker(ctx)),
+        "ranker_train" => {
+            let scope = args["scope"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .or_else(|| args["repo_id"].as_str().filter(|s| !s.is_empty()).map(|r| format!("repo:{r}")));
+            crate::memory_consolidation::train_ranker(ctx, scope.as_deref())
+        }
+        "ranker_feedback" => {
+            let scope = args["scope"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .or_else(|| args["repo_id"].as_str().filter(|s| !s.is_empty()).map(|r| format!("repo:{r}")))
+                .unwrap_or_else(|| "global".into());
+            let f = crate::memory_consolidation::RankFeatures {
+                bm25_rrf: args["features"]["bm25_rrf"].as_f64().unwrap_or(0.0),
+                dense_rrf: args["features"]["dense_rrf"].as_f64().unwrap_or(0.0),
+                rerank_score: args["features"]["rerank_score"].as_f64().unwrap_or(0.0),
+                exact_key_match: args["features"]["exact_key_match"].as_f64().unwrap_or(0.0),
+                scope_local: args["features"]["scope_local"].as_f64().unwrap_or(1.0),
+                token_efficiency: args["features"]["token_efficiency"].as_f64().unwrap_or(1.0),
+            };
+            crate::memory_consolidation::record_retrieval_feedback(
+                ctx,
+                &scope,
+                args["query"].as_str().unwrap_or(""),
+                &crate::ctx::arg_str(&args, "memory_id")?,
+                &f,
+                args["helpful"].as_bool().unwrap_or(true),
+            )?;
+            Ok(json!({ "recorded": true }))
         }
         "intentions" => {
             let scope = args["scope"]
@@ -3949,11 +4260,13 @@ mod tests {
         assert_eq!(preview["eval_report"]["assertions"]["user_direct_preserved"], true);
         assert_eq!(preview["eval_report"]["assertions"]["deleted_scrub_intact"], true);
         assert_eq!(preview["eval_report"]["assertions"]["recall_preserved"], true);
-        assert_eq!(preview["eval_report"]["v3_replay_eval"], "not_run");
+        assert_eq!(preview["eval_report"]["assertions"]["replay_eval_passed"], true);
+        assert_eq!(preview["eval_report"]["v3_replay_eval"], "passed");
         assert_eq!(preview["proposals"].as_array().unwrap().len(), 1);
 
         let promoted = consolidate_promote(&ctx, preview["id"].as_str().unwrap()).unwrap();
         assert_eq!(promoted["applied"], 1);
+        assert!(promoted["version_id"].as_str().is_some_and(|v| v.starts_with("mver_")));
         let after = list_memories(&ctx, Some("repo:r2"), Some("active"), None, "", 10).unwrap();
         assert_eq!(after.as_array().unwrap().len(), 1);
 

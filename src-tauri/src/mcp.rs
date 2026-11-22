@@ -239,8 +239,12 @@ pub fn tool_list() -> Vec<Value> {
           json!({ "q": s, "limit": i }), &["q"]),
         t("memory_slate", "Fetch a pre-resolved, provenance-tagged, token-budgeted context slate (current decisions, working handoff note, and repo facts) for this workspace.",
           json!({ "q": s, "budget_tokens": i }), &[]),
-        t("memory_save", "Save a repository-scoped memory. Optional fact_key enables code-level supersession; agent writes cannot silently override operator decisions (they become proposed). Category: fact, preference, correction, entity, procedure.",
-          json!({ "content": s, "category": s, "project": b, "fact_key": s, "supersedes_id": s, "trust_tier": s, "provenance": s }), &["content", "category"]),
+        t("memory_save", "Save a repository-scoped memory. Optional fact_key enables code-level supersession; optional valid_from/valid_to set temporal validity. Category: fact, preference, correction, entity, procedure.",
+          json!({ "content": s, "category": s, "project": b, "fact_key": s, "supersedes_id": s, "trust_tier": s, "provenance": s, "valid_from": s, "valid_to": s }), &["content", "category"]),
+        t("memory_as_of", "Point-in-time historical query over this repository's fact ledger (includes superseded facts valid at `at`).",
+          json!({ "at": s, "q": s, "limit": i }), &["at"]),
+        t("memory_procedures", "Fetch verified active procedures for this repository sized to your model's measured skill dose.",
+          json!({ "q": s }), &[]),
         t("working_note_get", "Read the structured working-state handoff note (requirements, current decisions, failed attempts, next steps) for this repository.",
           json!({}), &[]),
         t("working_note_set", "Partially update the structured working-state handoff note for this repository; omitted fields preserve their existing values.",
@@ -520,7 +524,7 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
             let repo = row["repo_id"].as_str().filter(|id| !id.is_empty()).ok_or("Release checks belong to a registered checkout")?;
             crate::release_sql::propose(ctx, repo, &me, &a["contracts"])
         }
-        "memory_search" | "memory_slate" | "memory_save" | "working_note_get" | "working_note_set" | "session_search" => {
+        "memory_search" | "memory_slate" | "memory_save" | "memory_as_of" | "memory_procedures" | "working_note_get" | "working_note_set" | "session_search" => {
             // Personal memory and past sessions never go to agents on untrusted (Strict) providers.
             if row["strict"].as_i64() == Some(1) {
                 return Err("memory and past sessions are not available to Strict agents".into());
@@ -539,7 +543,7 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
                         .filter(|b| *b > 0)
                         .map(|b| b as usize)
                         .unwrap_or_else(|| crate::library::model_memory_budget(ctx, row["model_ref"].as_str()));
-                    crate::library::build_context_slate_async(
+                    crate::library::build_context_slate_for_model_async(
                         ctx,
                         Some(repo),
                         a["q"].as_str().unwrap_or(""),
@@ -547,9 +551,24 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
                         false,
                         false,
                         vec![],
+                        row["model_ref"].as_str(),
                     )
                     .await
                 }
+                "memory_as_of" => crate::memory_ledger::query_as_of(
+                    ctx,
+                    &format!("repo:{repo}"),
+                    false,
+                    arg(&a, "at")?,
+                    a["q"].as_str().unwrap_or(""),
+                    a["limit"].as_i64().unwrap_or(20),
+                ),
+                "memory_procedures" => crate::memory_skills::select_skill_dose(
+                    ctx,
+                    repo,
+                    a["q"].as_str().unwrap_or(""),
+                    row["model_ref"].as_str(),
+                ),
                 "working_note_get" => crate::library::working_note_get(ctx, &format!("repo:{repo}")),
                 "working_note_set" => crate::library::working_note_patch(
                     ctx,
@@ -579,9 +598,11 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
                     let supersedes_id = a["supersedes_id"].as_str().map(str::to_string);
                     let trust_tier = a["trust_tier"].as_str().map(str::to_string);
                     let provenance = a["provenance"].as_str().map(str::to_string);
+                    let valid_from = a["valid_from"].as_str().filter(|s| !s.trim().is_empty()).map(str::to_string);
+                    let valid_to = a["valid_to"].as_str().filter(|s| !s.trim().is_empty()).map(str::to_string);
                     let (c, repo_s, me_s, content_embed) = (ctx.clone(), repo.to_string(), me.clone(), content.clone());
                     let res = tokio::task::spawn_blocking(move || {
-                        crate::library::save_agent_memory_rich(
+                        let saved = crate::library::save_agent_memory_rich(
                             &c,
                             &content,
                             &category,
@@ -591,7 +612,13 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
                             supersedes_id.as_deref(),
                             trust_tier.as_deref(),
                             provenance.as_deref(),
-                        )
+                        )?;
+                        if valid_from.is_some() || valid_to.is_some() {
+                            if let Some(mid) = saved["id"].as_str() {
+                                crate::memory_ledger::set_validity(&c, mid, valid_from.as_deref(), valid_to.as_deref())?;
+                            }
+                        }
+                        Ok::<Value, String>(saved)
                     })
                     .await
                     .map_err(|e| e.to_string())??;
@@ -833,6 +860,27 @@ mod tests {
         let path_again = call("t1", "code_outline", json!({"path": "db/migrations/001.sql"})).await;
         let again_blocks: Vec<&str> = path_again["result"]["content"].as_array().unwrap().iter().filter_map(|c| c["text"].as_str()).collect();
         assert!(!again_blocks.iter().any(|b| b.contains("Do not edit applied migrations")), "{again_blocks:?}");
+
+        // v2 MCP tools: memory_as_of (point-in-time) and memory_procedures (skill dose) work for Standard agents and block Strict agents.
+        let mon = call("t1", "memory_save", json!({
+            "content": "No API calls allowed anywhere.",
+            "category": "preference",
+            "fact_key": "net.mode",
+            "valid_from": "2026-11-16 09:00:00",
+            "valid_to": "2026-11-19 09:00:00"
+        })).await;
+        assert_ne!(mon["result"]["isError"], true, "{mon}");
+        let as_of_mon = text(&call("t1", "memory_as_of", json!({"at": "2026-11-17 12:00:00", "q": "API"})).await);
+        assert!(as_of_mon.contains("No API calls allowed anywhere."), "{as_of_mon}");
+        assert_eq!(call("s2", "memory_as_of", json!({"at": "2026-11-17 12:00:00"})).await["result"]["isError"], true);
+
+        let proc_rec = crate::memory_skills::record_verified_procedure(
+            &ctx, "repo:ra", "Offline startup check", "Disable network; run smoke test", "cargo test offline", "release", "run-1", Some("evt:1")
+        ).unwrap();
+        crate::memory_skills::promote_procedure(&ctx, proc_rec["id"].as_str().unwrap()).unwrap();
+        let procs_std = text(&call("t1", "memory_procedures", json!({"q": "offline"})).await);
+        assert!(procs_std.contains("Offline startup check"), "{procs_std}");
+        assert_eq!(call("s2", "memory_procedures", json!({"q": "offline"})).await["result"]["isError"], true);
     }
 
     #[test]
