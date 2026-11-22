@@ -36,9 +36,8 @@ export function LocalChecks(props) {
   onCleanup(()=>{alive=false; clearTimeout(timer);});
   async function act(fn) { if(busy())return; setBusy(true); setError(''); try {await fn();} catch(e){if(alive)setError(String(e));} finally{if(alive)setBusy(false);} }
   return <section aria-label="Local check runs"><h2>Local checks</h2>
-    <p>Run a trusted Make target on a clean, pinned checkout. macOS only. No network or dependency downloads. Output stays on this device.</p>
-    <p>Before each check, Philium looks for local Colima sockets. It does not connect to or reuse those environments.</p>
-    <Show when={memory()?.observed}><p>Last observed for this checkout at {new Date(memory().observed).toLocaleString()} {now()>=memory().expires || now()<memory().observed?'(stale)':''}: {Array.isArray(memory().profiles)?(memory().profiles.join(', ')||'no direct sockets found'):'inventory unavailable'}. This is not a health or revision check.</p></Show>
+    <p title="macOS only. Runs offline without touching existing local container runtimes; output stays on this device.">Run a Makefile target on a clean, pinned checkout offline.</p>
+    <Show when={memory()?.observed}><p>Last runtime scan at {new Date(memory().observed).toLocaleString()} {now()>=memory().expires || now()<memory().observed?'(stale)':''}: {Array.isArray(memory().profiles)?(memory().profiles.join(', ')||'no sockets found'):'unavailable'}.</p></Show>
     <fieldset disabled={busy() || Boolean(plan())}><label>Make target <input value={target()} maxlength="80" onInput={e=>setTarget(e.currentTarget.value)}/></label>
       <label>Timeout (seconds) <input type="number" min="1" max="600" value={seconds()} onInput={e=>setSeconds(e.currentTarget.valueAsNumber)}/></label>
       <label>Task <select value={task()} onChange={e=>setTask(e.currentTarget.value)}><option value="">No linked task</option><For each={tasks()}>{t=><option value={t.id}>{t.title}</option>}</For></select></label>

@@ -16,12 +16,18 @@ const SUB_LABEL = {
   antigravity_oauth: "Google Antigravity subscription (signed in through Philium)",
 };
 const SUB_NOTICE = {
-  claude_oauth:
-    "Using a Claude subscription outside Anthropic's own apps may be billed separately or flagged by Anthropic. An Anthropic API key (add it as a provider) is the risk-free alternative.",
-  chatgpt_oauth:
-    "Using a ChatGPT subscription outside OpenAI's own apps may be rate-limited or flagged by OpenAI. An OpenAI API key (add it as a provider) is the risk-free alternative.",
-  antigravity_oauth:
-    "Gives agents Gemini, and Claude through Google, on your Antigravity plan. Using Antigravity's sign-in outside Google's own apps breaks Google's terms, and Google has suspended accounts for it. A Gemini API key, added as a provider, carries no such risk.",
+  claude_oauth: {
+    short: "Third-party OAuth may be flagged by Anthropic; an API key is lower risk.",
+    detail: "Using a Claude subscription outside Anthropic's own apps may be billed separately or flagged by Anthropic. An Anthropic API key (add it as a provider) is the risk-free alternative.",
+  },
+  chatgpt_oauth: {
+    short: "Third-party OAuth may be rate-limited by OpenAI; an API key is lower risk.",
+    detail: "Using a ChatGPT subscription outside OpenAI's own apps may be rate-limited or flagged by OpenAI. An OpenAI API key (add it as a provider) is the risk-free alternative.",
+  },
+  antigravity_oauth: {
+    short: "Third-party OAuth violates Google's terms; a Gemini API key is lower risk.",
+    detail: "Gives agents Gemini, and Claude through Google, on your Antigravity plan. Using Antigravity's sign-in outside Google's own apps breaks Google's terms, and Google has suspended accounts for it. A Gemini API key, added as a provider, carries no such risk.",
+  },
 };
 const SUBSCRIPTIONS = [["claude_oauth", "Claude"], ["chatgpt_oauth", "ChatGPT"], ["antigravity_oauth", "Google Antigravity"]];
 const kindLabel = (k) => SUB_LABEL[k] ?? KINDS.find((x) => x.value === k)?.label ?? k;
@@ -91,7 +97,7 @@ function ProviderForm(props) {
       </div>
       <Show when={!sub()}>
         <Field label="Base URL"><Input mono value={url()} onValue={setUrl} placeholder={KINDS.find((k) => k.value === kind())?.url} /></Field>
-        <Field label="API key" hint={editing && p.has_key ? "Saved in Philium's private vault. Leave empty to keep it." : "Saved in Philium's private vault, which agents cannot read."}>
+        <Field label="API key" hint={editing && p.has_key ? "Stored in local vault. Leave empty to keep." : "Stored in local vault (unreadable by agents)."}>
           <Input mono type="password" value={key()} onValue={setKey} placeholder={editing && p.has_key ? "••••••••" : "sk-…"} />
         </Field>
         <Field label="Trust">
@@ -105,7 +111,7 @@ function ProviderForm(props) {
               }}
               label="Untrusted provider"
             />
-            <span class="xs faint">Untrusted providers only run agents in Strict mode: OS sandbox, egress allowlist, no subscriptions, everything observed.</span>
+            <span class="xs faint" title="Untrusted providers always run in Strict mode with OS sandbox, host allowlist, and full request logging.">Runs agents in Strict mode only.</span>
           </div>
         </Field>
       </Show>
@@ -113,8 +119,8 @@ function ProviderForm(props) {
         label="Secret guard"
         hint={
           untrusted()
-            ? "Scans every outgoing request for keys, tokens and passwords. Untrusted providers require Redact or Block."
-            : "Scans every outgoing request for keys, tokens and passwords."
+            ? "Scans outgoing requests for secrets. Required for untrusted providers."
+            : "Scans outgoing requests for keys, tokens, and passwords."
         }
       >
         <div class="segmented" role="group" aria-label="Secret guard">
@@ -130,9 +136,6 @@ function ProviderForm(props) {
             Off
           </button>
         </div>
-        <Show when={untrusted()}>
-          <span class="xs faint" style={{ "margin-top": "4px" }}>Untrusted providers require Redact or Block.</span>
-        </Show>
       </Field>
       <Field label="Status">
         <Toggle on={enabled()} onChange={setEnabled} label="Provider enabled" />
@@ -420,12 +423,12 @@ export default function Providers() {
   };
 
   return (
-    <Page title="Providers" sub="Keys stay in Philium's private vault. Agents only ever get a local gateway token."
+    <Page title="Providers" sub="Keys stay in the local vault; agents receive gateway tokens only."
       actions={<Button variant="primary" onClick={() => setForm({})}><Icon name="plus" /> Add provider</Button>}>
       <Show when={list() && list().length === 0}>
         <Empty icon={<Icon name="key" size={32} />} title="No providers yet"
-          action={<Button variant="primary" onClick={() => setForm({})}>Add an API provider</Button>}>
-          Add an API key for any provider, or sign in with a Claude, ChatGPT or Google Antigravity subscription below. Models are discovered live.
+          action={<Button variant="primary" onClick={() => setForm({})}>Add provider</Button>}>
+          Add an API key or sign in with a subscription below.
         </Empty>
       </Show>
       <div class="col" style={{ gap: "12px" }}>
@@ -434,7 +437,7 @@ export default function Providers() {
             <Card>
               <div class="card-head"><h2>{label} subscription</h2></div>
               <Show when={SUB_NOTICE[k]}>
-                <div class="small dim" style={{ "margin-bottom": "8px" }}>{SUB_NOTICE[k]}</div>
+                <div class="small dim" style={{ "margin-bottom": "8px" }} title={SUB_NOTICE[k].detail}>{SUB_NOTICE[k].short}</div>
               </Show>
               <SignIn kind={k} onDone={syncStore} />
             </Card>
@@ -472,7 +475,7 @@ export default function Providers() {
               <Show when={isSub(p.kind) && !p.signed_in}>
                 <div style={{ "margin-top": "10px" }}>
                   <Show when={SUB_NOTICE[p.kind]}>
-                    <div class="small dim" style={{ "margin-bottom": "8px" }}>{SUB_NOTICE[p.kind]}</div>
+                    <div class="small dim" style={{ "margin-bottom": "8px" }} title={SUB_NOTICE[p.kind].detail}>{SUB_NOTICE[p.kind].short}</div>
                   </Show>
                   <SignIn kind={p.kind} again onDone={syncStore} />
                 </div>

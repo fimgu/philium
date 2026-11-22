@@ -39,10 +39,12 @@ export function SpawnModal(props) {
     if (tk?.repo_id && !repo()) setRepo(tk.repo_id);
   }));
 
+  const roleLabel = (r) => (r === "orchestrator" ? "Coordinator" : r === "reviewer" ? "Reviewer" : "Agent");
+
   const submit = async (e) => {
     e?.preventDefault?.();
     if (busy()) return;
-    if (role() === "orchestrator" && !repo()) { setErr("Choose a repo. A coordinator without a checkout cannot create tasks or start helpers."); return; }
+    if (role() === "orchestrator" && !repo()) { setErr("Choose a repo so the coordinator can create tasks and helpers."); return; }
     setBusy(true); setErr("");
     try {
       const a = await rpc("agents.spawn", {
@@ -55,7 +57,7 @@ export function SpawnModal(props) {
         brief: brief(),
         strict: strict() || forcedStrict(),
       });
-      toast(`${a.name} (${role()}) is starting`, "secure");
+      toast(`${a.name} (${roleLabel(role())}) is starting`, "secure");
       props.onClose(a);
     } catch (e) { setErr(String(e)); } finally { setBusy(false); }
   };
@@ -63,7 +65,7 @@ export function SpawnModal(props) {
   return (
     <Modal title="New agent" onClose={() => props.onClose(null)} footer={<>
       <Button onClick={() => props.onClose(null)}>Cancel</Button>
-      <Button variant="primary" busy={busy()} onClick={submit}>Start Agent</Button>
+      <Button variant="primary" busy={busy()} onClick={submit}>Start</Button>
     </>}>
       <form
         onSubmit={submit}
@@ -76,17 +78,17 @@ export function SpawnModal(props) {
         style={{ display: "grid", gap: "16px" }}
       >
         <div class="grid-2">
-          <Field label="Name" hint={`Leave empty for ${names()?.[0] ?? "a free name"}`}>
+          <Field label="Name" hint={`Optional (defaults to ${names()?.[0] ?? "auto"})`}>
             <Input value={name()} placeholder={names()?.[0] ?? "lion"} onValue={(v) => setName(v.toLowerCase().replace(/[^a-z0-9-]/g, ""))} />
           </Field>
-          <Field label="Role" hint="Standard agent or multi-agent orchestrator">
+          <Field label="Role" hint="Single agent, coordinator, or reviewer">
             <Select value={role()} onValue={setRole} options={[
-              { value: "worker", label: "Agent (Standard)" },
-              { value: "orchestrator", label: "Orchestrator (Spawns sub-agents)" },
+              { value: "worker", label: "Agent (Single worker)" },
+              { value: "orchestrator", label: "Coordinator (Splits work across helpers)" },
               { value: "reviewer", label: "Reviewer (Audits diffs & PRs)" },
             ]} />
           </Field>
-          <Field label="Model" hint="From your providers, discovered live">
+          <Field label="Model" hint="Discovered from enabled providers">
             <ModelPicker
               value={chosen()}
               onValue={setModel}
@@ -103,7 +105,7 @@ export function SpawnModal(props) {
               </div>
             </Show>
           </Field>
-          <Field label="Repo" hint="The agent gets its own worktree and branch">
+          <Field label="Repo" hint="Gets an isolated worktree and branch">
             <Select value={repo()} onValue={id => { setTask(""); setRepo(id); }} options={[{ value: "", label: "No repo (scratch only)" }, ...(repos() ?? []).map((r) => ({ value: r.id, label: labels().get(r.id) }))]} />
             <Show when={repos.state === "ready" && (repos() ?? []).length === 0}>
               <div class="row" style={{ "margin-top": "4px" }}>
@@ -113,18 +115,18 @@ export function SpawnModal(props) {
               </div>
             </Show>
           </Field>
-          <Field label="Task" hint="Optional: link a board task">
+          <Field label="Task" hint="Optional board task">
             <Select value={task()} onValue={setTask} options={[{ value: "", label: "None" }, ...(tasks() ?? []).filter(t => (t.repo_id ?? "") === repo()).map((t) => ({ value: t.id, label: t.title }))]} />
           </Field>
         </div>
-        <Field label="Mission Brief" hint="The first instruction. Orchestrators will automatically plan, spawn workers on disjoint files, and synthesize results. (⌘Enter to start)">
-          <TextArea rows={5} value={brief()} onValue={setBrief} placeholder="Describe the mission, target PR, or task..." />
+        <Field label="Brief" hint="First instruction. Coordinators plan, delegate to helpers, and synthesize results. (⌘Enter)">
+          <TextArea rows={5} value={brief()} onValue={setBrief} placeholder="Describe the task, PR, or goal…" />
         </Field>
         <div class="row">
           <Toggle tone="strict" on={strict() || forcedStrict()} disabled={forcedStrict() || isSub()} onChange={setStrict} label="Strict mode" />
-          <span class="small dim">
-            <Show when={forcedStrict()} fallback={<Show when={isSub()} fallback="Sandboxed: own worktree only, network only to allowed hosts.">Subscriptions are trusted and run in Standard mode.</Show>}>
-              Required: this provider is untrusted. Sandboxed, every request recorded.
+          <span class="small dim" title="Strict mode confines the agent to its worktree and allows outbound network access only to approved hosts.">
+            <Show when={forcedStrict()} fallback={<Show when={isSub()} fallback="Sandboxed worktree with host allowlist.">Subscriptions run in Standard mode.</Show>}>
+              Required for untrusted providers.
             </Show>
           </span>
         </div>

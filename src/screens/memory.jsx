@@ -320,7 +320,7 @@ export default function Memory() {
           <div class="col" style={{ gap: "8px" }}>
             <Show
               when={(items() ?? []).length}
-              fallback={<Empty icon={<Icon name="brain" size={24} />} title={`No ${statusTab() === "proposed" ? "pending" : statusTab()} memories`} />}
+              fallback={<Empty icon={<Icon name="brain" size={24} />} title={`No ${statusTab() === "proposed" ? "pending" : statusTab()} memories`} body="Use Remember to save rules, corrections, or facts." />}
             >
               <For each={items()}>
                 {(m) => {

@@ -117,7 +117,7 @@ function GlobalHome() {
         <Stat label="Requests (24h)" value={n(totals().requests)} sub={totals().error_rate ? `${(totals().error_rate * 100).toFixed(1)}% errors` : "no errors"} />
         <Stat label="Tokens (24h)" value={n((totals().tokens_in ?? 0) + (totals().tokens_out ?? 0))} sub={totals().avg_tps ? `${totals().avg_tps.toFixed(0)} tok/s avg` : ""} />
         <Stat label="Cost (24h)" value={totals().cost != null ? `$${totals().cost.toFixed(2)}` : "n/a"} sub={totals().unpriced_requests ? `${totals().unpriced_requests} unpriced` : ""} />
-        <Stat label="Secrets removed" value={n(guardCount(totals().guard_actions))} sub="by the gateway, 24h" />
+        <Stat label="Secrets removed" value={n(guardCount(totals().guard_actions))} sub="24h · gateway" />
       </div>
 
       <Show when={attention()}>
@@ -183,7 +183,7 @@ function GlobalHome() {
       <div class="home-grid">
         <Section title="Running agents" action={<Button size="sm" variant="ghost" onClick={() => go("agents")}>All agents</Button>}>
           <Show when={live().length} fallback={
-            <Empty title="Nothing running" action={<Button onClick={() => setSpawn(true)}>Start an agent</Button>}>Agents work in their own worktree and report back on the board.</Empty>}>
+            <Empty title="No running agents" action={<Button onClick={() => setSpawn(true)}>New agent</Button>}>Each agent works in an isolated worktree.</Empty>}>
             <div class="list card" style={{ padding: 0 }}>
               <For each={live().slice(0, 12)}>
                 {(a) => (

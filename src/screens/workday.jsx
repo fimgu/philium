@@ -10,10 +10,10 @@ export default function Workday() {
   useVisibleEvent("event", () => refetch(), { debounceMs: 1000 });
   const act = async (fn) => { setBusy(true); setMessage(""); try { await fn(); await refetch(); } catch (e) { setMessage(String(e)); } finally { setBusy(false); } };
   const record = (e) => { e.preventDefault(); act(async () => { await rpc("workday.fallback", { tool: tool(), note: note() }, { local: true }); setNote(""); setMessage("Fallback recorded."); }); };
-  return <Page title="Workday" sub="What you did here, and when you had to leave" actions={<><Button onClick={() => refetch()} disabled={busy()}>Refresh</Button><Button disabled={busy()} onClick={() => act(async () => { const r = await rpc("workday.export", {}, { local: true }); setMessage(`Summary written to ${r.path}`); })}>Export summary</Button></>}>
+  return <Page title="Workday" sub="Local activity log and manual fallbacks" actions={<><Button onClick={() => refetch()} disabled={busy()}>Refresh</Button><Button disabled={busy()} onClick={() => act(async () => { const r = await rpc("workday.export", {}, { local: true }); setMessage(`Summary written to ${r.path}`); })}>Export summary</Button></>}>
     <div class="sheet">
-      <p class="small dim" style={{ "margin-bottom": "12px" }}>
-        Philium records the name and outcome of each action you take on a screen — not what you typed, no paths, no output, and nothing leaves this Mac. It cannot see when you switch to another tool, so record any fallback below.
+      <p class="small dim" style={{ "margin-bottom": "12px" }} title="Records action names and outcomes locally — no prompts, paths, or output leave this device.">
+        Tracks completed actions locally; log any manual switch to another tool below.
       </p>
       <Show when={data()?.error}><p role="alert">{data().error}</p></Show>
     <Show when={data() && !data().error}>{() => <div aria-label="Workday ledger" class="sheet">

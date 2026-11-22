@@ -7,7 +7,7 @@ import { Dynamic } from "solid-js/web";
 import { ToastHost, ConfirmHost, Guard, toast, cleanError } from "./ui/kit.jsx";
 import { ImproveHost } from "./ui/improve.jsx";
 import { Icon } from "./ui/icons.jsx";
-import { failures, clearFailures } from "./lib/rpc.js";
+import { rpc, useEvent, failures, clearFailures } from "./lib/rpc.js";
 import { repoLabels } from "./lib/repo-labels.js";
 import { workspaceAgents } from "./lib/agent-workspace.js";
 import { route, go, commands, improve } from "./lib/nav.js";
@@ -30,18 +30,18 @@ const SCREENS = [
   { id: "browser", label: "Browser", icon: "globe", group: "workbench", load: () => import("./screens/browser.jsx") },
   { id: "surfaces", label: "Apps", icon: "layers", group: "workbench", load: () => import("./screens/surfaces.jsx") },
   { id: "memory", label: "Memory", icon: "brain", group: "workbench", load: () => import("./screens/memory.jsx") },
-  { id: "chat", label: "Chat", icon: "chat", group: "more", load: () => import("./screens/chat.jsx") },
-  { id: "environments", label: "Environments", icon: "shield", group: "more", load: () => import("./screens/environments.jsx") },
-  { id: "repos", label: "Repos", icon: "repo", group: "more", load: () => import("./screens/repos.jsx") },
-  { id: "activity", label: "Activity", icon: "activity", group: "more", load: () => import("./screens/activity.jsx") },
-  { id: "stats", label: "Stats", icon: "stats", group: "more", load: () => import("./screens/stats.jsx") },
-  { id: "workday", label: "Workday", icon: "grid", group: "more", load: () => import("./screens/workday.jsx") },
-  { id: "providers", label: "Providers", icon: "key", group: "more", load: () => import("./screens/providers.jsx") },
-  { id: "settings", label: "Settings", icon: "settings", group: "more", load: () => import("./screens/settings.jsx") },
+  { id: "chat", label: "Chat", icon: "chat", group: "system", load: () => import("./screens/chat.jsx") },
+  { id: "environments", label: "Environments", icon: "shield", group: "system", load: () => import("./screens/environments.jsx") },
+  { id: "repos", label: "Repos", icon: "repo", group: "system", load: () => import("./screens/repos.jsx") },
+  { id: "activity", label: "Activity", icon: "activity", group: "system", load: () => import("./screens/activity.jsx") },
+  { id: "stats", label: "Stats", icon: "stats", group: "system", load: () => import("./screens/stats.jsx") },
+  { id: "workday", label: "Workday", icon: "grid", group: "system", optional: "show_workday", load: () => import("./screens/workday.jsx") },
+  { id: "providers", label: "Providers", icon: "key", group: "system", load: () => import("./screens/providers.jsx") },
+  { id: "settings", label: "Settings", icon: "settings", group: "system", load: () => import("./screens/settings.jsx") },
 ];
 const COMPONENTS = Object.fromEntries(SCREENS.map((s) => [s.id, lazy(s.load)]));
 const PRIMARY_GROUPS = [["work", "Work"], ["workbench", "Workbench"]];
-const MORE_IDS = new Set(SCREENS.filter((s) => s.group === "more").map((s) => s.id));
+const SYSTEM_IDS = new Set(SCREENS.filter((s) => s.group === "system").map((s) => s.id));
 
 function Palette(props) {
   const store = useStore();
@@ -112,14 +112,26 @@ function App() {
   const status = store.status;
   const labels = createMemo(() => repoLabels(store.repos() ?? []));
   const [palette, setPalette] = createSignal(false);
-  const [moreOpen, setMoreOpenRaw] = createSignal(localStorage.getItem("philium.sidebarMore") === "1" || MORE_IDS.has(route()));
-  const setMoreOpen = (next) => {
-    setMoreOpenRaw(next);
-    localStorage.setItem("philium.sidebarMore", next ? "1" : "0");
+  const [showWorkday, setShowWorkday] = createSignal(false);
+  const [systemOpen, setSystemOpenRaw] = createSignal(
+    (localStorage.getItem("philium.sidebarSystem") ?? localStorage.getItem("philium.sidebarMore")) === "1" || SYSTEM_IDS.has(route()),
+  );
+  const setSystemOpen = (next) => {
+    setSystemOpenRaw(next);
+    localStorage.setItem("philium.sidebarSystem", next ? "1" : "0");
   };
   createEffect(() => {
-    if (MORE_IDS.has(route()) && !moreOpen()) setMoreOpenRaw(true);
+    if (SYSTEM_IDS.has(route()) && !systemOpen()) setSystemOpenRaw(true);
   });
+  const loadShellSettings = () => {
+    rpc("app.settings_get", {}, { local: true })
+      .then((s) => setShowWorkday(s?.show_workday === "true"))
+      .catch(() => {});
+  };
+  useEvent("settings", loadShellSettings);
+  const systemScreens = createMemo(() =>
+    SCREENS.filter((s) => s.group === "system" && (!s.optional || (s.optional === "show_workday" && showWorkday()))),
+  );
   const [attempts, setAttempts] = createSignal({});
   const [visited, setVisited] = createSignal([route()]);
   createEffect(() => {
@@ -150,6 +162,7 @@ function App() {
     setAttempts((prev) => ({ ...prev, [cur]: (prev[cur] ?? 0) + 1 }));
   };
   onMount(() => {
+    loadShellSettings();
     const onKey = (e) => {
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
         e.preventDefault();
@@ -218,12 +231,12 @@ function App() {
             </>
           )}
         </For>
-        <button type="button" class="nav-group-toggle" aria-expanded={moreOpen()} onClick={() => setMoreOpen(!moreOpen())}>
-          <Icon name={moreOpen() ? "chevronDown" : "chevronRight"} size={12} />
-          <span class="grow">More</span>
+        <button type="button" class="nav-group-toggle" aria-expanded={systemOpen()} onClick={() => setSystemOpen(!systemOpen())}>
+          <Icon name={systemOpen() ? "chevronDown" : "chevronRight"} size={12} />
+          <span class="grow">System</span>
         </button>
-        <Show when={moreOpen()}>
-          <For each={SCREENS.filter((s) => s.group === "more")}>
+        <Show when={systemOpen()}>
+          <For each={systemScreens()}>
             {(s) => (
               <button class={`nav-item ${route() === s.id ? "on" : ""}`} onClick={() => go(s.id)}>
                 <Icon name={s.icon} /> {s.label}

@@ -34,14 +34,14 @@ export default function CheckoutHome(props) {
   const repoClashes = () => (result()?.data?.agents || []).flatMap(a => (a.warnings || []).filter(w => w.kind === 'clash').map(w => ({ agent: a, text: w.text })));
   const needsYouCount = () => waitingAgents().length + failedAgents().length + repoClashes().length;
   const link = (label, route, params) => <Button size="sm" variant="ghost" onClick={() => go(route,params)}>{label}</Button>;
-  return <Page title="Workspace" sub="Selected checkout" actions={<div class="row">
+  return <Page title="Workspace" sub="Active repository" actions={<div class="row">
     <Button variant="primary" onClick={() => setSpawnPreset({ role: 'worker', repo_id: props.id })}><Icon name="plus" size={12} /> New agent</Button>
     <Button onClick={() => refetch()} disabled={result.loading}>Refresh</Button>
   </div>}>
-    <Show when={result()?.error}><p role="alert">Could not load this checkout: {result().error}</p></Show>
-    <Show when={result()?.data} fallback={!result()?.error && <p role="status">Loading checkout…</p>}>{d => <div aria-label="Checkout overview" class="checkout-home">
+    <Show when={result()?.error}><p role="alert">Could not load workspace: {result().error}</p></Show>
+    <Show when={result()?.data} fallback={!result()?.error && <p role="status">Loading workspace…</p>}>{d => <div aria-label="Checkout overview" class="checkout-home">
       <code class="ws-path">{d().path}</code>
-      <div class="row">{link('Open terminals','terminals')}{link('Review changes','code',{repo_id:props.id})}{link('Review evidence','review')}</div>
+      <div class="row">{link('Terminals','terminals')}{link('Code','code',{repo_id:props.id})}{link('Review','review')}</div>
       <Show when={needsYouCount() > 0}>
         <section class="home-sec" aria-label="Needs you">
           <div class="row"><h2 class="grow">Needs you ({needsYouCount()})</h2></div>

@@ -1,6 +1,5 @@
-// Agents: every named agent, its live conversation, approvals, terminals and
-// changes. Supports Human -> Orchestrator -> Worker/Reviewer hierarchies,
-// shared-prefix KV cache telemetry, AST clash/health warnings, and Fleet Command Grid.
+// Agents: live conversations, approvals, terminals, diffs, and fleet overview.
+// Supports Coordinator -> Agent / Reviewer hierarchies, KV cache telemetry, and clash warnings.
 import { workspaceAgents, selectedAgentId, spawnRepoDefault } from "../lib/agent-workspace.js";
 import { repoLabels } from "../lib/repo-labels.js";
 import { kindResources } from "../lib/kind-resources.js";
@@ -36,6 +35,7 @@ const STATE = {
 };
 const stateDot = (s) => STATE[s]?.[0] ?? "";
 const stateLabel = (s) => STATE[s]?.[1] ?? s;
+const roleLabel = (r) => (r === "orchestrator" ? "Coordinator" : r === "reviewer" ? "Reviewer" : "Agent");
 
 /**
  * Fast-path O(K) event merge when incoming events are strictly newer than previous.at(-1).seq.
@@ -99,7 +99,7 @@ function Terminals(props) {
   useVisibleEvent("terminals:changed", () => refetch(), { debounceMs: 120 });
   return (
     <div class="page-body">
-      <Show when={(list() ?? []).length} fallback={<Empty title="No commands yet">Every command this agent runs opens a visible terminal here.</Empty>}>
+      <Show when={(list() ?? []).length} fallback={<Empty title="No commands yet">Commands run by this agent appear here.</Empty>}>
         <div class="list">
           <For each={list()}>
             {(t) => (
@@ -124,7 +124,7 @@ function Impact(props) {
     <Show when={imp() && ((imp().changed ?? []).length || (imp().dependents ?? []).length)}>
       <div class="impact">
         <h3>Impact</h3>
-        <div class="xs faint">Symbols this agent changed, and code that uses them. "name match" means same name only, not confirmed.</div>
+        <div class="xs faint" title='"name match" means same symbol name only, not confirmed via resolution.'>Changed symbols and callers.</div>
         <div class="small dim" style={{ "margin-top": "8px" }}>Changed symbols ({imp().changed.length})</div>
         <For each={byFile(imp().changed)}>{([path, xs]) => (<><div class="ifile">{path}</div><For each={xs}>{(x) => <div class="irow">{x.kind} {x.name} :{x.line}</div>}</For></>)}</For>
         <Show when={(imp().dependents ?? []).length}>
@@ -142,7 +142,7 @@ function Changes(props) {
   return (
     <div class="page-body">
       <div class="row" style={{ "margin-bottom": "8px", "flex-wrap": "wrap" }}>
-        <span class="small dim grow">Changes in this agent's worktree, compared with where it started.</span>
+        <span class="small dim grow">Worktree diff against base.</span>
         <Show when={a()?.repo_id}>
           <Button size="sm" variant="primary" onClick={() => go("code", { repo_id: a().repo_id, ...(a().worktree_id ? { worktree_id: a().worktree_id } : {}) })}>
             <Icon name="graph" size={12} /> Inspect & comment in Code
@@ -218,7 +218,7 @@ function Details(props) {
     <div class="page-body agent-details">
       <KvTelemetryBar kv={kv()} />
       <div class="grid-2" style={{ "margin-top": "12px" }}>
-        <div><div class="xs faint">Role & Cluster</div><div class="row gap-4"><RoleBadge role={a().role} /><span class="small">{a().cluster_name ? `Cluster ${a().cluster_name}` : "Root"}</span></div></div>
+        <div><div class="xs faint">Role</div><div class="row gap-4"><RoleBadge role={a().role} /><span class="small">{a().parent_name ? `Helper of ${a().parent_name}` : roleLabel(a().role)}</span></div></div>
         <div><div class="xs faint">Model</div><div class="mono small">{a().model_ref}</div></div>
         <div><div class="xs faint">Reasoning Effort</div><div class="mono small">{a().effort ?? "default"}</div></div>
         <div><div class="xs faint">Security</div>
@@ -284,7 +284,7 @@ function Details(props) {
         </table>
       </Show>
       <Show when={(a().children ?? []).length}>
-        <h3 class="section-title">Sub-Agents ({a().children.length})</h3>
+        <h3 class="section-title">Helpers ({a().children.length})</h3>
         <div class="row" style={{ "flex-wrap": "wrap", gap: "6px" }}>
           <For each={a().children}>
             {(c) => (
@@ -595,7 +595,7 @@ function AgentView(props) {
         <Show when={a()?.strict}><Badge tone="strict"><Icon name="shield" size={11} /> Strict</Badge></Show>
         <Show when={a()?.parent_id}>
           <span class="xs faint" style={{ cursor: "pointer" }} onClick={() => go("agents", { id: a().parent_id })}>
-            ↳ lead: <b>{a()?.parent_name || "parent"}</b>
+            ↳ coordinator: <b>{a()?.parent_name || "parent"}</b>
           </span>
         </Show>
         <Show when={a()?.branch}>
@@ -629,7 +629,7 @@ function AgentView(props) {
       </Show>
       <Show when={(a()?.children ?? []).length}>
         <div class="cluster-subbar">
-          <span class="xs faint">Sub-agents ({a().children.length}):</span>
+          <span class="xs faint">Helpers ({a().children.length}):</span>
           <For each={a().children}>
             {(c) => (
               <button type="button" class="cluster-subpill" onClick={() => go("agents", { id: c.id })}>
@@ -776,15 +776,15 @@ export function AgentGridCard(props) {
         <KvBadge kv={a()?.kv} />
         <Show when={a()?.strict}><Badge tone="strict">Strict</Badge></Show>
         <Show when={a()?.state === "waiting"}><Badge tone="strict">Needs you</Badge></Show>
-        <Show when={a()?.parent_name}><span class="xs faint" title={`Sub-agent of ${a().parent_name}`}>↳ {a().parent_name}</span></Show>
-        <Show when={(a()?.children_count ?? 0) > 0}><span class="xs faint" title="Spawned sub-agents">◈ {a().children_count}</span></Show>
+        <Show when={a()?.parent_name}><span class="xs faint" title={`Helper of ${a().parent_name}`}>↳ {a().parent_name}</span></Show>
+        <Show when={(a()?.children_count ?? 0) > 0}><span class="xs faint" title="Helpers">◈ {a().children_count}</span></Show>
         <span class="xs faint ellipsis grow" title={a()?.task_title || a()?.branch || a()?.model_ref}>
           {a()?.repo_name ? `${a().repo_name}${a().branch ? `@${a().branch}` : ""}` : (a()?.task_title || a()?.branch || a()?.model_ref)}
         </span>
         <span class="mono xs faint">{(a()?.model_ref ?? "").split("/").pop()}</span>
         <div class="row gap-4" onClick={(e) => e.stopPropagation()}>
           <Show when={a()?.role === "orchestrator"}>
-            <Button size="sm" variant="ghost" onClick={() => props.onSpawnChild?.(a())} title="Spawn worker under this orchestrator">
+            <Button size="sm" variant="ghost" onClick={() => props.onSpawnChild?.(a())} title="Add helper under this coordinator">
               <Icon name="plus" size={11} />
             </Button>
           </Show>
@@ -849,7 +849,7 @@ function FleetHeatmapTile(props) {
     <div
       class={`fleet-tile state-${a()?.state} ${warnings().length ? "has-warning" : ""}`}
       onClick={() => props.onOpen?.(a().id)}
-      title={`${a()?.name} (${a()?.role}) · ${stateLabel(a()?.state)}${a()?.repo_name ? ` · ${a().repo_name}` : ""}${a()?.branch ? `@${a().branch}` : ""}`}
+      title={`${a()?.name} (${roleLabel(a()?.role)}) · ${stateLabel(a()?.state)}${a()?.repo_name ? ` · ${a().repo_name}` : ""}${a()?.branch ? `@${a().branch}` : ""}`}
     >
       <div class="fleet-tile-top">
         <Dot state={stateDot(a()?.state)} />
@@ -878,7 +878,7 @@ function FleetHeatmapTile(props) {
   );
 }
 
-/** Quick Mission Dispatch Bar: 1-line launch for an Orchestrator cluster or Worker. */
+/** Quick Mission Dispatch Bar: 1-line launch for a Coordinator or Agent. */
 function MissionDispatchBar(props) {
   const store = useStore();
   const repos = store.repos;
@@ -901,7 +901,7 @@ function MissionDispatchBar(props) {
         brief: text,
       });
       setBrief("");
-      toast(`Dispatched ${role()} ${a.name}`, "secure");
+      toast(`Dispatched ${roleLabel(role())} ${a.name}`, "secure");
       props.onSpawned?.(a);
     } catch (err) {
       toast(String(err), "danger");
@@ -912,11 +912,10 @@ function MissionDispatchBar(props) {
 
   return (
     <form class="mission-dispatch-bar" onSubmit={dispatch}>
-      <span class="mission-dispatch-tag">HUMAN → ORCHESTRATOR</span>
-      <select class="select mission-select" value={role()} onChange={(e) => setRole(e.currentTarget.value)} aria-label="Agent hierarchy role">
-        <option value="orchestrator">Orchestrator (Cluster Lead)</option>
-        <option value="worker">Worker (Single Task)</option>
-        <option value="reviewer">Reviewer (PR / Diff Audit)</option>
+      <select class="select mission-select" value={role()} onChange={(e) => setRole(e.currentTarget.value)} aria-label="Agent role">
+        <option value="orchestrator">Coordinator (Splits work)</option>
+        <option value="worker">Agent (Single worker)</option>
+        <option value="reviewer">Reviewer (Audits diffs &amp; PRs)</option>
       </select>
       <select class="select mission-select" value={repo()} onChange={(e) => setRepo(e.currentTarget.value)} aria-label="Target repository">
         <option value="">Any / Scratch Repo</option>
@@ -928,7 +927,7 @@ function MissionDispatchBar(props) {
         value={brief()}
         disabled={busy()}
         onInput={(e) => setBrief(e.currentTarget.value)}
-        placeholder="Give a high-level directive (e.g. 'Decompose auth refactor across workers, verify tests, and render a Mermaid architecture diagram')…"
+        placeholder="Describe a task or goal…"
       />
       <Button size="sm" variant="primary" type="submit" busy={busy()} disabled={!brief().trim()}>
         <Icon name="send" size={12} /> Dispatch
@@ -1025,7 +1024,9 @@ export default function Agents() {
   }
   const [filter, setFilter] = createSignal("all");
   const [search, setSearch] = createSignal("");
-  const [viewMode, setViewModeRaw] = createSignal(localStorage.getItem("agents.viewMode") || "split");
+  const savedMode = localStorage.getItem("agents.viewMode");
+  const initialMode = savedMode === "grid" || savedMode === "fleet" ? savedMode : "split";
+  const [viewMode, setViewModeRaw] = createSignal(initialMode);
   const setViewMode = (m) => { setViewModeRaw(m); localStorage.setItem("agents.viewMode", m); };
   createEffect(() => {
     if (params().focusOwner && params().id) {
@@ -1037,11 +1038,10 @@ export default function Agents() {
   });
 
   const unregisterCommands = registerCommands([
-    { id: "agent.new", label: "New agent / orchestrator", run: () => setSpawn({}) },
-    { id: "agent.clusters", label: "Agents: Cluster hierarchy view (Orchestrator -> Workers)", run: () => setViewMode("clusters") },
-    { id: "agent.grid", label: "Agents: Grid view (all agents side-by-side)", run: () => setViewMode("grid") },
-    { id: "agent.fleet", label: "Agents: Fleet heatmap view (100+ agents)", run: () => setViewMode("fleet") },
-    { id: "agent.split", label: "Agents: Focus view (single agent + shell/browser)", run: () => setViewMode("split") },
+    { id: "agent.new", label: "New agent or coordinator", run: () => setSpawn({}) },
+    { id: "agent.split", label: "Agents: Focus view", run: () => setViewMode("split") },
+    { id: "agent.grid", label: "Agents: Grid view", run: () => setViewMode("grid") },
+    { id: "agent.fleet", label: "Agents: Fleet view", run: () => setViewMode("fleet") },
   ]);
   if (typeof onCleanup === "function" && unregisterCommands) onCleanup(unregisterCommands);
 
@@ -1051,9 +1051,9 @@ export default function Agents() {
       if (filter() === "live" && !a.live) return false;
       if (filter() === "waiting" && a.state !== "waiting") return false;
       if (filter() === "warnings" && !(a.warnings ?? []).length) return false;
-      if (filter() === "orchestrators" && a.role !== "orchestrator") return false;
       if (q) {
-        const hay = `${a.name} ${a.role} ${a.repo_name || ""} ${a.branch || ""} ${a.task_title || ""} ${a.cluster_name || ""}`.toLowerCase();
+        const roleText = a.role === "orchestrator" ? "coordinator" : a.role === "reviewer" ? "reviewer" : "agent";
+        const hay = `${a.name} ${roleText} ${a.role || ""} ${a.repo_name || ""} ${a.branch || ""} ${a.task_title || ""}`.toLowerCase();
         if (!hay.includes(q)) return false;
       }
       return true;
@@ -1074,27 +1074,6 @@ export default function Agents() {
     const walk = (p, d) => (byParent.get(p) ?? []).forEach((a) => { out.push({ a, d }); walk(a.id, d + 1); });
     walk(null, 0);
     return out;
-  });
-
-  // Group into Clusters (each root Orchestrator or standalone agent forms a cluster)
-  const clusters = createMemo(() => {
-    const groups = new Map();
-    for (const { a, d } of tree()) {
-      const cid = a.cluster_id || a.id;
-      if (!groups.has(cid)) {
-        groups.set(cid, {
-          id: cid,
-          name: a.cluster_name || a.name,
-          repo: a.repo_name,
-          lead: a,
-          members: [],
-        });
-      }
-      const g = groups.get(cid);
-      if (a.id === cid) g.lead = a;
-      g.members.push({ a, d });
-    }
-    return [...groups.values()];
   });
 
   const selected = createMemo(() => selectedAgentId(tree().map(({ a }) => a), params().id));
@@ -1197,10 +1176,9 @@ export default function Agents() {
               : []),
           ]} />
           <Segmented value={viewMode()} onChange={setViewMode} options={[
-            { value: "split", label: <span class="row gap-4" title="Single agent with live terminal & browser"><Icon name="agents" size={12} /> Focus</span> },
-            { value: "grid", label: <span class="row gap-4" title="Watch and control all agents side-by-side"><Icon name="grid" size={12} /> Grid</span> },
-            { value: "clusters", label: <span class="row gap-4" title="Grouped by cluster"><Icon name="board" size={12} /> Clusters</span> },
-            { value: "fleet", label: <span class="row gap-4" title="Compact fleet heatmap"><Icon name="activity" size={12} /> Fleet</span> },
+            { value: "split", label: "Focus" },
+            { value: "grid", label: "Grid" },
+            { value: "fleet", label: "Fleet" },
           ]} />
         </Show>
         <Button variant="primary" onClick={() => setSpawn({})}><Icon name="plus" size={12} /> New agent</Button>
@@ -1234,8 +1212,8 @@ export default function Agents() {
       <div class="agents-workspace-content" style={{ display: "flex", flex: "1", "min-height": "0", overflow: "hidden" }}>
       <Show when={scoped().length} fallback={
         <Empty icon={<Icon name="agents" size={28} />} title="No agents in this workspace"
-          action={<Button variant="primary" onClick={() => setSpawn({})}>Start your first agent</Button>}>
-          Create an agent for the selected workspace, or switch workspaces to see its agents.
+          action={<Button variant="primary" onClick={() => setSpawn({})}>New agent</Button>}>
+          Start an agent or coordinator for this workspace.
         </Empty>}>
         <Show when={viewMode() !== "split"} fallback={
           <div class="split" style={{ flex: "1", "min-width": "0" }}>
@@ -1264,50 +1242,6 @@ export default function Agents() {
         }>
           <div class="agents-grid-wrap">
             <Show when={tree().length} fallback={<Empty title="No matching agents">Switch the filter above to see all agents.</Empty>}>
-              <Show when={viewMode() === "clusters"}>
-                <div class="clusters-stack">
-                  <For each={clusters()}>
-                    {(cl) => (
-                      <section class="cluster-section">
-                        <header class="cluster-header">
-                          <span class="cluster-badge">CLUSTER</span>
-                          <AgentChip name={cl.name} />
-                          <RoleBadge role={cl.lead?.role} />
-                          <Show when={cl.repo}><span class="mono xs dim">{cl.repo}</span></Show>
-                          <span class="xs faint">{cl.members.filter((m) => m.a.live).length}/{cl.members.length} live</span>
-                          <KvBadge kv={cl.lead?.kv} />
-                          <div class="grow" />
-                          <Show when={cl.members.some((m) => m.a.state === "waiting")}>
-                            <Button size="sm" variant="primary" onClick={() => approveAllWaiting(cl.id)}>
-                              Approve Cluster
-                            </Button>
-                          </Show>
-                          <Button size="sm" variant="ghost" onClick={() => setSpawn({ parent_id: cl.id, role: "worker", repo_id: cl.lead?.repo_id })}>
-                            <Icon name="plus" size={11} /> Add Worker
-                          </Button>
-                          <Show when={cl.members.some((m) => m.a.live)}>
-                            <Button size="sm" variant="ghost" onClick={() => rpc("agents.stop_cluster", { cluster_id: cl.id }).then(refetch)}>
-                              Stop Cluster
-                            </Button>
-                          </Show>
-                        </header>
-                        <div class={`agents-grid count-${Math.min(cl.members.length, 4)}`}>
-                          <For each={cl.members}>
-                            {({ a }) => (
-                              <AgentGridCard
-                                agent={a}
-                                onOpen={openAgentFocus}
-                                onSpawnChild={(parent) => setSpawn({ parent_id: parent.id, role: "worker", repo_id: parent.repo_id })}
-                              />
-                            )}
-                          </For>
-                        </div>
-                      </section>
-                    )}
-                  </For>
-                </div>
-              </Show>
-
               <Show when={viewMode() === "grid"}>
                 <div class={`agents-grid count-${Math.min(tree().length, 4)}`}>
                   <For each={tree()}>

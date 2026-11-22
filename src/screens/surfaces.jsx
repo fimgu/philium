@@ -160,7 +160,7 @@ export default function Surfaces() {
                 </form>
               </Show>
 
-              <Show when={(catalog() ?? []).length} fallback={<Empty title="No apps" />}>
+              <Show when={(catalog() ?? []).length} fallback={<Empty title="No apps" body="Add a container image or start a local runtime." />}>
                 <div class="surf-catalog">
                   <For each={catalog()}>
                     {(r) => {

@@ -107,14 +107,14 @@ export function GateChecks(props) {
           </div>
         </div>
         <Show when={res()?.configured === false}>
-          <p>Add the checks this repo runs in <code>.philium/pipeline.yaml</code> in the repo, or try them first from <code>{res().local_gate}</code>.</p>
+          <p>Add repo checks in <code>.philium/pipeline.yaml</code> (or test locally in <code>{res().local_gate}</code>).</p>
         </Show>
         <For each={(status()?.lends || []).filter(l => !l.path)}>
           {l => (
             <form class="row" aria-label={`Lend ${l.name}`} onSubmit={e => { e.preventDefault(); lend(l.name); }}>
-              <span>Checks here read <b>{l.name}</b> from a folder on this Mac. Lend one, read-only:</span>
-              <input aria-label={`Folder for ${l.name}`} placeholder="~/go/pkg/mod/cache/download" value={lendPath()[l.name] || ''} onInput={e => setLendPath(p => ({ ...p, [l.name]: e.currentTarget.value }))} />
-              <button type="submit" disabled={!(lendPath()[l.name] || '').trim()}>Lend read-only</button>
+              <span>Mount <b>{l.name}</b> from a local folder (read-only):</span>
+              <input aria-label={`Folder for ${l.name}`} placeholder="/path/to/local/cache" value={lendPath()[l.name] || ''} onInput={e => setLendPath(p => ({ ...p, [l.name]: e.currentTarget.value }))} />
+              <button type="submit" disabled={!(lendPath()[l.name] || '').trim()}>Mount read-only</button>
             </form>
           )}
         </For>
