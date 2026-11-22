@@ -66,23 +66,22 @@ export default function CheckoutHome(props) {
         </section>
       </Show>
       <section class="home-sec" aria-label="Coordinator"><div class="row"><h2 class="grow">Coordinator</h2><Show when={!coordinators().length}><Button variant="primary" onClick={() => setSpawnPreset({ role: 'orchestrator', repo_id: props.id })}>Start coordinator</Button></Show><Button size="sm" onClick={() => setSpawnPreset({ role: 'worker', repo_id: props.id })}>New agent</Button></div>
-        <For each={coordinators()} fallback={<p class="small faint">No coordinator for this checkout yet. Start one, tell it what you want, and it creates tasks and hands them to helpers here.</p>}>
-          {a => <div class="checkout-row"><span><strong>{a.name}</strong> coordinates this checkout</span><small>{a.state}</small><Button size="sm" onClick={() => go('agents',{id:a.id})}>Open coordinator</Button></div>}
+        <For each={coordinators()} fallback={<p class="small faint">No coordinator running.</p>}>
+          {a => <div class="checkout-row"><span><strong>{a.name}</strong></span><small>{a.state}</small><Button size="sm" onClick={() => go('agents',{id:a.id})}>Open</Button></div>}
         </For>
       </section>
-      <Records title="Unfinished tasks" rows={d().tasks} empty="No unfinished tasks for this checkout." action={link('Open board','board')}>
-        {t => <div class="checkout-row" style={{ cursor: 'pointer' }} onClick={() => go('board', { id: t.id })}><span>{t.title}</span><small>{t.status}{t.owner ? ` · ${t.owner}` : t.assigned ? ` · handed to ${t.assigned}` : ''}</small></div>}
+      <Records title="Tasks" rows={d().tasks} empty="No open tasks." action={link('Board','board')}>
+        {t => <div class="checkout-row" style={{ cursor: 'pointer' }} onClick={() => go('board', { id: t.id })}><span>{t.title}</span><small>{t.status}{t.owner ? ` · ${t.owner}` : t.assigned ? ` · ${t.assigned}` : ''}</small></div>}
       </Records>
-      <Records title="Agents" rows={d().agents} empty="No agents assigned." action={link('Open agents','agents')}>
+      <Records title="Agents" rows={d().agents} empty="No agents." action={link('Agents','agents')}>
         {a => <div class="checkout-row">{link(a.name,'agents',{id:a.id})}<small>{a.state}</small></div>}
       </Records>
-      <Records title="Worktrees" rows={d().worktrees} empty="No managed worktrees." action={link('Inspect worktrees','repos',{repo_id:props.id})}>
+      <Records title="Worktrees" rows={d().worktrees} empty="No worktrees." action={link('Repos','repos',{repo_id:props.id})}>
         {w => <div class="checkout-row"><span title={w.path}>{w.branch}</span><small>{w.state}</small></div>}
       </Records>
-      <Records title="Agent resources" rows={d().resources} empty="No unreleased resources recorded for current agents.">
-        {r => <div class="checkout-row"><span><strong>{r.owner}</strong> · {r.kind}<br/><code>{r.handle}</code></span><small>{r.state}</small></div>}
+      <Records title="Resources" rows={d().resources} empty="None active.">
+        {r => <div class="checkout-row"><span><strong>{r.owner}</strong> · {r.kind} <code>{r.handle}</code></span><small>{r.state}</small></div>}
       </Records>
-      <p class="small faint">Recorded by Philium, not a live Docker or Kubernetes scan. Released resources and resources without a matching agent are not shown.{d().pilot && ' Host cleanup and kind cluster changes are disabled in this pilot.'}</p>
     </div>}</Show>
     <Show when={spawnPreset()}><SpawnModal preset={spawnPreset()} onClose={(a) => { setSpawnPreset(null); if (a) go('agents', { id: a.id }); }} /></Show>
   </Page>;

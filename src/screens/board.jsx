@@ -70,7 +70,7 @@ export default function Board() {
   async function patch(patch) { await rpc("board.update", { task_id: selected().id, patch }); await refresh(); }
   async function sendBack(t) { await attempt(async () => { if (t.status === "in_review") await rpc("board.update", { task_id: t.id, patch: { status: "claimed", note: "Changes requested: resolve failed checks and resubmit." } }); await rpc("board.mail_send", { to: t.owner || "all", body: `Task ${t.id}: please resolve failed checks and resubmit.` }); await refresh(); }); }
   const failures = (t) => (t.check_results || []).filter(c => c.passed === false);
-  return <Page title="Board" sub="Shared work, exclusive leases, and guard-scanned conversations" actions={<><Button onClick={() => setTab("board")}>Board</Button><Button onClick={() => { setTab("mail"); attempt(readMail); }}>Mail</Button><span class="board-secure">● Mail guard on</span></>}>
+  return <Page title="Board" actions={<><Button size="sm" variant={tab() === "board" ? "primary" : "ghost"} onClick={() => setTab("board")}>Board</Button><Button size="sm" variant={tab() === "mail" ? "primary" : "ghost"} onClick={() => { setTab("mail"); attempt(readMail); }}>Mail</Button></>}>
     <Show when={error()}><div class="board-error" role="alert">{error()} <button onClick={() => setError("")}>Dismiss</button></div></Show>
     <Show when={tab() === "board"} fallback={<section class="board-mail">
       <div class="board-mail-controls"><label>Conversation participant<input value={a()} onInput={e => setA(e.currentTarget.value)} /></label><label>With<input list="board-recipients" value={b()} onInput={e => setB(e.currentTarget.value)} /></label><Button disabled={busy()} onClick={() => attempt(readMail)}>Load conversation</Button></div>

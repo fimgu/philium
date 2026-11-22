@@ -53,6 +53,7 @@ function GlobalHome() {
   const [events, ev] = createResource(() => rpc("app.events", { limit: 30 }).catch(() => []));
   const [disk] = createResource(() => rpc("app.disk").catch(() => null));
   const [clashes, cl] = createResource(() => rpc("codeindex.clashes", {}).then((r) => r?.clashes ?? []).catch(() => []));
+  const [libStatus, libSt] = createResource(() => rpc("library.status", {}, { local: true }).catch(() => null));
   const [spawn, setSpawn] = createSignal(false);
   const [hideOnboarding, setHideOnboarding] = createSignal(false);
 
@@ -62,6 +63,7 @@ function GlobalHome() {
   useVisibleEvent("codeindex:clashes", () => cl.refetch(), { debounceMs: 300 });
   useVisibleEvent("reaper:proposals", () => pr.refetch(), { debounceMs: 200 });
   useVisibleEvent("reaper:changed", () => pr.refetch(), { debounceMs: 200 });
+  useVisibleEvent("library", () => libSt.refetch(), { debounceMs: 300 });
 
   const live = createMemo(() => (agents() ?? []).filter((a) => a.live));
   const waiting = createMemo(() => (agents() ?? []).filter((a) => a.state === "waiting"));
@@ -74,7 +76,8 @@ function GlobalHome() {
   const guardHits = createMemo(() => (events() ?? []).filter((e) => /guard|blocked|denied/.test(e.kind)));
   const totals = () => stats()?.totals ?? {};
   const diskTotal = () => Object.values(disk() ?? {}).reduce((s, v) => s + (v.bytes ?? 0), 0);
-  const attention = () => waiting().length + (proposals() ?? []).length + (leaked() ?? []).length + failed().length + (clashes() ?? []).length;
+  const proposedMemories = () => Number(libStatus()?.proposed ?? 0);
+  const attention = () => waiting().length + (proposals() ?? []).length + (leaked() ?? []).length + failed().length + (clashes() ?? []).length + (proposedMemories() > 0 ? 1 : 0);
 
   const hasProviders = () => (providers() ?? []).length > 0;
   const hasRepos = () => (repos() ?? []).length > 0;
@@ -90,22 +93,19 @@ function GlobalHome() {
     <Page title="Home" actions={<Button variant="primary" onClick={() => setSpawn(true)}><Icon name="plus" size={12} /> New agent</Button>}>
       <Show when={showOnboarding()}>
         <Card class="home-hero">
-          <div class="row" style={{ "margin-bottom": "4px" }}>
-            <h2 class="grow" style={{ margin: 0 }}>Welcome to Philium</h2>
+          <div class="row" style={{ "margin-bottom": "10px" }}>
+            <h2 class="grow" style={{ margin: 0 }}>Get started</h2>
             <Button size="sm" variant="ghost" onClick={() => setHideOnboarding(true)}>Dismiss</Button>
           </div>
-          <p class="dim" style={{ margin: "0 0 10px" }}>
-            Subscriptions (ChatGPT, Claude) are used directly. API keys stay in Philium's private vault, out of agents' reach, and every request passes through the local gateway, which removes secrets before they leave your machine.
-          </p>
           <div class="row" style={{ "flex-wrap": "wrap", gap: "8px" }}>
-            <Show when={!hasProviders()} fallback={<Badge tone="secure">1. Provider added ✓</Badge>}>
-              <Button size="sm" variant="primary" onClick={() => go("providers")}><Icon name="key" size={12} /> 1. Add a provider</Button>
+            <Show when={!hasProviders()} fallback={<Badge tone="secure">1. Provider ✓</Badge>}>
+              <Button size="sm" variant="primary" onClick={() => go("providers")}><Icon name="key" size={12} /> 1. Add provider</Button>
             </Show>
-            <Show when={!hasRepos()} fallback={<Badge tone="secure">2. Repository added ✓</Badge>}>
-              <Button size="sm" variant={hasProviders() ? "primary" : ""} onClick={() => go("repos")}><Icon name="repo" size={12} /> 2. Add a repository</Button>
+            <Show when={!hasRepos()} fallback={<Badge tone="secure">2. Repo ✓</Badge>}>
+              <Button size="sm" variant={hasProviders() ? "primary" : ""} onClick={() => go("repos")}><Icon name="repo" size={12} /> 2. Add repo</Button>
             </Show>
-            <Show when={!hasAgents()} fallback={<Badge tone="secure">3. First agent launched ✓</Badge>}>
-              <Button size="sm" variant={hasProviders() && hasRepos() ? "primary" : ""} onClick={() => setSpawn(true)}><Icon name="plus" size={12} /> 3. Launch your first agent</Button>
+            <Show when={!hasAgents()} fallback={<Badge tone="secure">3. Agent ✓</Badge>}>
+              <Button size="sm" variant={hasProviders() && hasRepos() ? "primary" : ""} onClick={() => setSpawn(true)}><Icon name="plus" size={12} /> 3. Start agent</Button>
             </Show>
           </div>
         </Card>
@@ -160,6 +160,13 @@ function GlobalHome() {
                 </div>
               )}
             </For>
+            <Show when={proposedMemories() > 0}>
+              <div class="list-item" onClick={() => go("memory")}>
+                <Dot state="warn" /><Icon name="brain" size={12} />
+                <span class="grow small">{proposedMemories()} proposed memory update{proposedMemories() === 1 ? "" : "s"} waiting for review</span>
+                <Button size="sm">Review in Memory</Button>
+              </div>
+            </Show>
             <For each={leaked()}>
               {(r) => (
                 <div class="list-item" onClick={() => go("settings")}>

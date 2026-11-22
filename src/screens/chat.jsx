@@ -145,7 +145,7 @@ export default function Chat() {
   };
 
   return (
-    <Page title="Chat" flush sub="Conversation only. No tools, no files. Start an agent for real work."
+    <Page title="Chat" flush
       actions={<>
         <ModelPicker
           compact

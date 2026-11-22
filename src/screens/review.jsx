@@ -48,9 +48,9 @@ export default function Review() {
   const slug = () => githubIdentity(workspace()?.remote_url);
   // Key by stable values, not the repo row object: background refresh is not a switch.
   const key = () => slug() && JSON.stringify([activeRepoId(), slug()]);
-  return <Page title="Review" sub="Is this release good to go?"><div class="sheet">
+  return <Page title="Review"><div class="sheet">
     <Show when={key()} keyed fallback={
-      <Empty title="Select a GitHub workspace" body="Use the workspace picker in the sidebar to verify release readiness, run checks, or view a saved PR review for a repository." />
+      <Empty title="Select a workspace" body="Pick a GitHub repository in the sidebar." />
     }>
       {k => <ReleaseIntake repo={JSON.parse(k)[0]}/>}
     </Show>
