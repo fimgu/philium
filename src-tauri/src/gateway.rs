@@ -25,6 +25,7 @@ use serde_json::{json, Value};
 use tokio::sync::broadcast;
 
 pub(crate) mod gemini;
+pub(crate) mod stale;
 pub(crate) mod translate;
 
 use crate::guard::{self, GuardMode};
@@ -103,6 +104,8 @@ pub struct Gateway {
     /// turns, and schema keywords the backend refused by name.
     signatures: Mutex<HashMap<String, String>>,
     rejected: Mutex<std::collections::HashSet<String>>,
+    /// Antigravity default model learned from this app's last catalog fetch.
+    pub antigravity_default: Mutex<Option<String>>,
 }
 
 type TokenFn = dyn Fn(String, Kind) -> futures_util::future::BoxFuture<'static, Result<crate::oauth::Creds, String>> + Send + Sync;
@@ -177,6 +180,7 @@ impl Gateway {
             tokens: TokenSource::new(),
             signatures: Mutex::new(HashMap::new()),
             rejected: Mutex::new(Default::default()),
+            antigravity_default: Mutex::new(None),
         })
     }
 
@@ -755,7 +759,9 @@ async fn proxy(
     } else {
         None
     };
-    let build_req = |body_bytes: &Bytes| {
+    // Claude beta flags the backend refused by name on this request; dropped on the one retry.
+    let mut dropped_betas: Vec<String> = vec![];
+    let build_req = |body_bytes: &Bytes, dropped_betas: &[String]| {
         let mut req = gw.client.request(method.clone(), &url).body(body_bytes.clone());
         for h in FORWARD_HEADERS {
             if sub && matches!(h, "anthropic-beta" | "user-agent") {
@@ -770,7 +776,7 @@ async fn proxy(
             if p.kind == Kind::ClaudeOauth {
                 let beta = headers.get("anthropic-beta").and_then(|v| v.to_str().ok());
                 req = req
-                    .header("anthropic-beta", crate::oauth::claude_beta(beta))
+                    .header("anthropic-beta", stale::without(&crate::oauth::claude_beta(beta), dropped_betas))
                     .header("user-agent", crate::oauth::claude_cli_user_agent());
                 if headers.get("anthropic-version").is_none() {
                     req = req.header("anthropic-version", crate::pins::ANTHROPIC_VERSION);
@@ -799,7 +805,7 @@ async fn proxy(
     let mut upstream_resp = None;
     let mut version_retried = false;
     for attempt in 0..4 {
-        let resp = match build_req(&outgoing).send().await {
+        let resp = match build_req(&outgoing, &dropped_betas).send().await {
             Ok(r) => r,
             Err(e) => {
                 let msg = format!("upstream unreachable: {e}");
@@ -826,6 +832,14 @@ async fn proxy(
                         }
                         continue;
                     }
+                }
+            }
+            if p.kind == Kind::ClaudeOauth && dropped_betas.is_empty() {
+                let sent = crate::oauth::claude_beta(headers.get("anthropic-beta").and_then(|v| v.to_str().ok()));
+                if let Some(flag) = stale::rejected_beta(status.as_u16(), &String::from_utf8_lossy(&bytes), &sent) {
+                    eprintln!("[gateway] {}; retrying without it", stale::warning("Claude", "beta flag", &flag));
+                    dropped_betas.push(flag);
+                    continue;
                 }
             }
             if let Some(learned) = translate::parse_effort_rejection(status.as_u16(), &String::from_utf8_lossy(&bytes)) {
@@ -865,8 +879,32 @@ async fn proxy(
         upstream_resp = Some(resp);
         break;
     }
-    if let Some((status, content_type, retry_after, bytes)) = buffered_err {
-        gw.update(id, |r| r.summary.status = Some(status.as_u16()));
+    if let Some((status, mut content_type, retry_after, mut bytes)) = buffered_err {
+        let text = String::from_utf8_lossy(&bytes).to_string();
+        let stale_msg = if p.kind == Kind::ClaudeOauth {
+            let sent = crate::oauth::claude_beta(headers.get("anthropic-beta").and_then(|v| v.to_str().ok()));
+            stale::rejected_beta(status.as_u16(), &text, &sent).map(|f| stale::warning("Claude", "beta flag", &f))
+        } else if p.kind.is_subscription() && stale::outdated(status.as_u16(), &text) {
+            Some(if p.kind == Kind::ClaudeOauth {
+                stale::warning("Claude", "client version", &crate::oauth::claude_cli_user_agent())
+            } else {
+                stale::warning("ChatGPT", "client", crate::oauth::CHATGPT_ORIGINATOR)
+            })
+        } else {
+            None
+        };
+        if let Some(w) = &stale_msg {
+            eprintln!("[gateway] {w}");
+            let detail = cap(&text, 300);
+            bytes = Bytes::from(json!({"error": {"type": "philium_client_outdated", "message": format!("{w}. Provider said: {detail}")}}).to_string());
+            content_type = Some(HeaderValue::from_static("application/json"));
+        }
+        gw.update(id, |r| {
+            r.summary.status = Some(status.as_u16());
+            if let Some(w) = &stale_msg {
+                r.summary.error = Some(w.clone());
+            }
+        });
         let mut fin = Finalizer {
             gw: gw.clone(),
             id,
@@ -990,7 +1028,9 @@ async fn antigravity(
     let Some(project) = creds.account_id.clone().filter(|p| !p.is_empty()) else {
         return fail(StatusCode::UNAUTHORIZED, "philium_signin", "No Antigravity project for this Google account. Sign in again on the Providers screen".into());
     };
-    let model = gemini::resolve_model(body["model"].as_str().unwrap_or(""));
+    let mut body = body;
+    let model = gemini::resolve_model_with(body["model"].as_str().unwrap_or(""), gw.antigravity_default.lk().as_deref());
+    body["model"] = Value::String(model.clone());
     let url = format!("{}/v1internal:generateContent", p.base_url.trim_end_matches('/'));
     let mut shaping = gemini::Shaping { rejected: gw.rejected.lk().clone(), ..Default::default() };
     let (mut schema_fixed, mut forced) = (false, 0);
@@ -1053,7 +1093,16 @@ async fn antigravity(
             let mut fin = Finalizer { gw: gw.clone(), id, started, first: None, head: Vec::new(), tail: VecDeque::new(), total: 0, error: None, _permit: permit.take() };
             fin.feed(text.as_bytes());
             let msg = serde_json::from_str::<Value>(&text).ok().and_then(|v| v.pointer("/error/message").and_then(Value::as_str).map(str::to_string)).unwrap_or_else(|| cap(&text, 500));
-            let hint = if matches!(status.as_u16(), 401 | 403) { " (sign in again on the Providers screen)" } else { "" };
+            let stale_msg = stale::outdated(status.as_u16(), &text).then(|| stale::warning("Antigravity", "client version", gemini::VERSION));
+            if let Some(w) = &stale_msg {
+                eprintln!("[gateway] {w}");
+                gw.update(id, |r| r.summary.error = Some(w.clone()));
+            }
+            let hint = match &stale_msg {
+                Some(w) => format!(" ({w})"),
+                None if matches!(status.as_u16(), 401 | 403) => " (sign in again on the Providers screen)".into(),
+                None => String::new(),
+            };
             let mut out = Response::new(Body::from(json!({"error": {"type": "antigravity", "code": status.as_u16(), "message": format!("Antigravity: {msg}{hint}")}}).to_string()));
             *out.status_mut() = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
             out.headers_mut().insert("content-type", HeaderValue::from_static("application/json"));

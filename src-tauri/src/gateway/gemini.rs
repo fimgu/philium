@@ -20,14 +20,19 @@ pub const CLIENT_METADATA: &str = r#"{"ideType":"ANTIGRAVITY","platform":"PLATFO
 /// Compiled-in default, used only until a `fetchAvailableModels` catalog names one.
 pub const FALLBACK_MODEL: &str = crate::pins::GEMINI_FALLBACK_MODEL;
 
-fn default_cell() -> &'static std::sync::RwLock<Option<String>> {
-    static D: std::sync::OnceLock<std::sync::RwLock<Option<String>>> = std::sync::OnceLock::new();
-    D.get_or_init(|| std::sync::RwLock::new(None))
+
+/// The backend's default model named by a `fetchAvailableModels` catalog.
+/// Callers keep it per gateway, never process-global.
+pub fn catalog_default(body: &Value) -> Option<String> {
+    body["defaultAgentModelId"].as_str().map(resolve_model).filter(|d| !d.is_empty() && d != "default")
 }
 
-/// The backend's current default model, learned from the live catalog.
-pub fn default_model() -> String {
-    default_cell().read().ok().and_then(|d| d.clone()).unwrap_or_else(|| FALLBACK_MODEL.into())
+/// `resolve_model`, with "default" mapped to a learned catalog default.
+pub fn resolve_model_with(model: &str, learned: Option<&str>) -> String {
+    match (model.trim().trim_start_matches("antigravity:"), learned) {
+        ("" | "default", Some(d)) => d.into(),
+        _ => resolve_model(model),
+    }
 }
 const TOOL_GUARD: &str = "\n\n## Function calling\n- When you call a tool, emit a native function call, not code. Never write Python (or any language) that calls the tool, and never wrap a call in print(...) or a code block.\n- Use the function name exactly as defined. Do not prepend `default_api.` or any other namespace to the function name.";
 
@@ -40,7 +45,7 @@ pub fn user_agent() -> String {
 pub fn resolve_model(model: &str) -> String {
     let m = model.trim().trim_start_matches("antigravity:");
     match m {
-        "" | "default" => default_model(),
+        "" | "default" => FALLBACK_MODEL.into(),
         "gemini-3.1-pro-high" => "gemini-pro-agent".into(),
         _ => m.into(),
     }
@@ -542,11 +547,6 @@ pub fn retry_after(body: &str) -> Option<u64> {
 /// quota come first; the backend's default leads.
 pub fn models(body: &Value) -> Vec<(String, Option<String>, bool)> {
     let map = body["models"].as_object().cloned().unwrap_or_default();
-    if let Some(d) = body["defaultAgentModelId"].as_str().map(resolve_model).filter(|d| !d.is_empty() && d != "default") {
-        if let Ok(mut c) = default_cell().write() {
-            *c = Some(d);
-        }
-    }
     let mut ids: Vec<String> = vec![];
     for id in std::iter::once(body["defaultAgentModelId"].clone())
         .chain(body["commandModelIds"].as_array().cloned().unwrap_or_default())
@@ -624,8 +624,11 @@ mod tests {
 
     #[test]
     fn models_that_fail_by_name_are_sent_as_ones_that_work() {
-        assert_eq!(resolve_model("default"), default_model());
-        assert_eq!(resolve_model(""), default_model());
+        assert_eq!(resolve_model("default"), FALLBACK_MODEL);
+        assert_eq!(resolve_model(""), FALLBACK_MODEL);
+        assert_eq!(resolve_model_with("default", Some("gemini-pro-agent")), "gemini-pro-agent");
+        assert_eq!(resolve_model_with("claude-sonnet-4-6", Some("x")), "claude-sonnet-4-6");
+        assert_eq!(catalog_default(&json!({"defaultAgentModelId": "gemini-3.1-pro-high"})).as_deref(), Some("gemini-pro-agent"));
         assert_eq!(resolve_model("antigravity:gemini-3.1-pro-high"), "gemini-pro-agent");
         assert_eq!(resolve_model("claude-sonnet-4-6"), "claude-sonnet-4-6");
         assert_eq!((family("Gemini-3-flash"), family("claude-opus-4-6-thinking"), family("gpt-oss-120b-medium")), (Family::Gemini, Family::Claude, Family::Bridge));

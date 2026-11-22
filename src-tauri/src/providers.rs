@@ -681,11 +681,11 @@ fn http_client() -> &'static reqwest::Client {
     })
 }
 
-async fn discover(_ctx: &Arc<Ctx>, p: &Provider) -> Result<Vec<Discovered>, String> {
+async fn discover(ctx: &Arc<Ctx>, p: &Provider) -> Result<Vec<Discovered>, String> {
     let client = http_client();
     let base = p.base_url.trim_end_matches('/');
     if p.kind == Kind::AntigravityOauth {
-        return discover_antigravity(client, p, base).await;
+        return discover_antigravity(ctx, client, p, base).await;
     }
     let mut url = format!("{base}/models");
     let mut req;
@@ -716,6 +716,16 @@ async fn discover(_ctx: &Arc<Ctx>, p: &Provider) -> Result<Vec<Discovered>, Stri
     let status = resp.status();
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
+        use crate::gateway::stale;
+        let stale_msg = match p.kind {
+            Kind::ClaudeOauth => stale::rejected_beta(status.as_u16(), &text, &crate::oauth::claude_beta(None)).map(|f| stale::warning("Claude", "beta flag", &f)),
+            Kind::ChatgptOauth if stale::outdated(status.as_u16(), &text) => Some(stale::warning("ChatGPT", "client version", crate::pins::CHATGPT_CLIENT_VERSION)),
+            _ => None,
+        };
+        if let Some(w) = stale_msg {
+            eprintln!("[providers] {w}");
+            return Err(format!("{w}. HTTP {status} from {url}: {}", text.chars().take(300).collect::<String>()));
+        }
         let hint = if p.kind.is_subscription() && matches!(status.as_u16(), 401 | 403) { " (sign in again)" } else { "" };
         return Err(format!("HTTP {status} from {url}{hint}: {}", text.chars().take(300).collect::<String>()));
     }
@@ -731,7 +741,7 @@ async fn discover(_ctx: &Arc<Ctx>, p: &Provider) -> Result<Vec<Discovered>, Stri
 }
 
 /// Antigravity lists the account's models, with quota, from `fetchAvailableModels`.
-async fn discover_antigravity(client: &reqwest::Client, p: &Provider, base: &str) -> Result<Vec<Discovered>, String> {
+async fn discover_antigravity(ctx: &Arc<Ctx>, client: &reqwest::Client, p: &Provider, base: &str) -> Result<Vec<Discovered>, String> {
     use crate::gateway::gemini;
     let c = crate::oauth::access(&p.id, p.kind).await?;
     let url = format!("{base}/v1internal:fetchAvailableModels");
@@ -749,10 +759,18 @@ async fn discover_antigravity(client: &reqwest::Client, p: &Provider, base: &str
     let status = resp.status();
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
+        if crate::gateway::stale::outdated(status.as_u16(), &text) {
+            let w = crate::gateway::stale::warning("Antigravity", "client version", gemini::VERSION);
+            eprintln!("[providers] {w}");
+            return Err(format!("{w}. HTTP {status} from {url}: {}", text.chars().take(300).collect::<String>()));
+        }
         let hint = if matches!(status.as_u16(), 401 | 403) { " (sign in again)" } else { "" };
         return Err(format!("HTTP {status} from {url}{hint}: {}", text.chars().take(300).collect::<String>()));
     }
     let v: Value = resp.json().await.map_err(|e| format!("bad model list: {e}"))?;
+    if let Some(d) = gemini::catalog_default(&v) {
+        *crate::ctx::LockExt::lk(&ctx.gateway.antigravity_default) = Some(d);
+    }
     let list: Vec<Discovered> = gemini::models(&v)
         .into_iter()
         .map(|(id, display, _)| {
