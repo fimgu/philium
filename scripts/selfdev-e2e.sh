@@ -4,7 +4,6 @@
 # scripted stand-in model that changes a tooltip and commits.
 #   cd src-tauri && cargo test --no-run   # prints the test executable
 #   PHILIUM_SCRATCH_DIR=/tmp/x scripts/selfdev-e2e.sh /abs/path/to/philium-<hash>
-# Set PHILIUM_SELFDEV_SKIP_REAL_TESTS=1 to skip the nested cargo test/vite run.
 set -eu
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 BINARY="${1:?pass the already-compiled absolute Rust test executable}"

@@ -695,7 +695,6 @@ mod tests {
         assert!(crate::hal::server_path().is_file(), "HAL sidecar required");
         let src = PathBuf::from(std::env::var_os("PHILIUM_SELFDEV_TEST_SOURCE").expect("disposable source clone"));
         let scratch = PathBuf::from(std::env::var_os("PHILIUM_SELFDEV_TEST_SCRATCH").expect("scratch dir"));
-        let skip_tests = std::env::var_os("PHILIUM_SELFDEV_SKIP_REAL_TESTS").is_some();
         let commit = "perl -pi -e 's/title=\"Improve Philium\"/title=\"Improve Philium (ask an agent)\"/' src/main.jsx && git add src/main.jsx && git -c user.name=Agent -c user.email=agent@example.invalid commit -qm 'Clearer Improve tooltip' && echo COMMITTED";
         let app = axum::Router::new().route("/v1/{*rest}", axum::routing::any(move |body: String| async move {
             let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
@@ -770,19 +769,14 @@ mod tests {
         // 4. Accept is refused until tests pass on this exact commit.
         assert!(call(&ctx, "accept", json!({"id": id})).await.unwrap_err().contains("Run the tests first"));
         let t = call(&ctx, "test", json!({"id": id})).await.unwrap()["terminal"].as_str().unwrap().to_string();
-        if skip_tests {
-            crate::terminals::kill(&ctx, &t).unwrap();
-            ctx.db.exec("UPDATE terminals SET state='exited', exit_code=0 WHERE id=?1", [&t]).unwrap();
-        } else {
-            let deadline = Instant::now() + Duration::from_secs(1500);
-            let exit = loop {
-                if let Some(x) = term_exit(&ctx, &t) { break x; }
-                assert!(Instant::now() < deadline, "tests timed out");
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            };
-            let out = crate::terminals::snapshot(&ctx, &t, 64 * 1024).unwrap_or_default();
-            assert_eq!(exit, 0, "selfdev tests failed:\n{out}");
-        }
+        let deadline = Instant::now() + Duration::from_secs(1500);
+        let exit = loop {
+            if let Some(x) = term_exit(&ctx, &t) { break x; }
+            assert!(Instant::now() < deadline, "tests timed out");
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        };
+        let out = crate::terminals::snapshot(&ctx, &t, 64 * 1024).unwrap_or_default();
+        assert_eq!(exit, 0, "selfdev tests failed:\n{out}");
         let st = call(&ctx, "get", json!({"id": id})).await.unwrap();
         assert_eq!((st["tests"].clone(), st["tested_commit"].clone()), (json!("passed"), st["head"].clone()), "{st}");
 
@@ -804,7 +798,7 @@ mod tests {
         assert_ne!(rep["needs_confirmation"], true, "{rep}");
         assert_eq!(row(&ctx, &id).unwrap()["state"], "rejected");
         assert!(!wt.exists(), "worktree removed on discard");
-        println!("improver e2e: request, agent commit in {}, diff, tests {}, accept, rollback, discard OK", wt.display(), if skip_tests { "skipped" } else { "passed" });
+        println!("improver e2e: request, agent commit in {}, diff, tests {}, accept, rollback, discard OK", wt.display(), "passed");
     }
 
     #[test]
