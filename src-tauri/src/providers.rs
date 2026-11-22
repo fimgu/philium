@@ -693,10 +693,10 @@ async fn discover(_ctx: &Arc<Ctx>, p: &Provider) -> Result<Vec<Discovered>, Stri
         let c = crate::oauth::access(&p.id, p.kind).await?;
         if p.kind == Kind::ClaudeOauth {
             url.push_str("?limit=1000");
-            req = client.get(&url).bearer_auth(&c.access).header("anthropic-version", "2023-06-01")
+            req = client.get(&url).bearer_auth(&c.access).header("anthropic-version", crate::pins::ANTHROPIC_VERSION)
                 .header("anthropic-beta", crate::oauth::claude_beta(None)).header("user-agent", crate::oauth::claude_cli_user_agent());
         } else {
-            url.push_str("?client_version=1.0.0");
+            url.push_str(&format!("?client_version={}", crate::pins::CHATGPT_CLIENT_VERSION));
             req = client.get(&url).bearer_auth(&c.access).header("originator", crate::oauth::CHATGPT_ORIGINATOR);
             if let Some(a) = &c.account_id {
                 req = req.header("chatgpt-account-id", a);
@@ -707,7 +707,7 @@ async fn discover(_ctx: &Arc<Ctx>, p: &Provider) -> Result<Vec<Discovered>, Stri
         req = client.get(&url);
         if !key.is_empty() {
             req = match p.kind {
-                Kind::Anthropic => req.header("x-api-key", &key).header("anthropic-version", "2023-06-01"),
+                Kind::Anthropic => req.header("x-api-key", &key).header("anthropic-version", crate::pins::ANTHROPIC_VERSION),
                 _ => req.bearer_auth(&key),
             };
         }

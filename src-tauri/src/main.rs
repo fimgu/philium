@@ -57,6 +57,7 @@ mod secrets;
 mod drafts;
 mod capture;
 mod selfdev;
+mod pins;
 mod pilot;
 mod stats;
 mod storage;

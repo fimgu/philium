@@ -773,7 +773,7 @@ async fn proxy(
                     .header("anthropic-beta", crate::oauth::claude_beta(beta))
                     .header("user-agent", crate::oauth::claude_cli_user_agent());
                 if headers.get("anthropic-version").is_none() {
-                    req = req.header("anthropic-version", "2023-06-01");
+                    req = req.header("anthropic-version", crate::pins::ANTHROPIC_VERSION);
                 }
             } else {
                 req = req.header("originator", crate::oauth::CHATGPT_ORIGINATOR);
@@ -788,7 +788,7 @@ async fn proxy(
             };
         }
         if anthropic && headers.get("anthropic-version").is_none() && p.kind == Kind::Anthropic {
-            req = req.header("anthropic-version", "2023-06-01");
+            req = req.header("anthropic-version", crate::pins::ANTHROPIC_VERSION);
         }
         if translating {
             req = req.header("content-type", "application/json");

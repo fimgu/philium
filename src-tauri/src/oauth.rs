@@ -27,7 +27,7 @@ pub const CLAUDE_PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profil
 pub const CLAUDE_SCOPES: &str = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
 pub const CLAUDE_REFRESH_SCOPES: &str = "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
 /// Compiled-in floor, used only until the npm registry has been read once.
-const CLAUDE_CLI_FLOOR: &str = "2.1.330";
+use crate::pins::CLAUDE_CLI_FLOOR;
 const CLAUDE_VERSION_KEY: &str = "claude_cli_version";
 const CLAUDE_VERSION_AT_KEY: &str = "claude_cli_version_at";
 const CLAUDE_NPM_LATEST: &str = "https://registry.npmjs.org/@anthropic-ai/claude-code/latest";
@@ -119,7 +119,7 @@ pub fn learn_claude_min_version(v: &str) -> bool {
     }
     changed
 }
-pub const CLAUDE_BETA: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,effort-2025-11-24";
+pub use crate::pins::CLAUDE_BETA;
 const CLAUDE_IDENTITY: &str = "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
 
 pub const OPENAI_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -130,7 +130,7 @@ pub const CHATGPT_ORIGINATOR: &str = "codex_cli_rs";
 pub const GOOGLE_AUTHORIZE_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 pub const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const GOOGLE_USERINFO_URL: &str = "https://www.googleapis.com/oauth2/v1/userinfo?alt=json";
-const GOOGLE_USER_AGENT: &str = "google-api-nodejs-client/9.15.1";
+use crate::pins::GOOGLE_USER_AGENT;
 /// Antigravity's public desktop-app client (Google lets desktop apps embed the
 /// secret). It only accepts this fixed loopback address.
 pub const ANTIGRAVITY_CLIENT_ID: &str = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
@@ -536,7 +536,7 @@ pub fn shape_chatgpt_body(v: &mut Value) {
 async fn claude_profile(access: &str, url: &str) -> (Option<String>, Option<String>) {
     let Ok(c) = client() else { return (None, None) };
     let Ok(r) = c.get(url).bearer_auth(access).header("user-agent", claude_cli_user_agent())
-        .header("anthropic-beta", "oauth-2025-04-20,claude-code-20250219").send().await else { return (None, None) };
+        .header("anthropic-beta", crate::pins::CLAUDE_PROFILE_BETA).send().await else { return (None, None) };
     let Ok(v) = r.json::<Value>().await else { return (None, None) };
     let email = v["account"]["email"].as_str().map(str::to_string);
     let plan = if v["account"]["has_claude_max"] == true { Some("Max".to_string()) } else if v["account"]["has_claude_pro"] == true { Some("Pro".to_string()) } else { None };

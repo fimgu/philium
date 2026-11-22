@@ -101,7 +101,7 @@ pub async fn dispatch(ctx: &Arc<Ctx>, agent: &str, req: Value) -> Option<Value> 
     let method = req["method"].as_str().unwrap_or("");
     let result = match method {
         "initialize" => Ok(json!({
-            "protocolVersion": req["params"]["protocolVersion"].as_str().unwrap_or("2025-06-18"),
+            "protocolVersion": req["params"]["protocolVersion"].as_str().unwrap_or(crate::pins::MCP_PROTOCOL_VERSION),
             "capabilities": { "tools": { "listChanged": false } },
             "serverInfo": { "name": "philium", "version": env!("CARGO_PKG_VERSION") },
         })),

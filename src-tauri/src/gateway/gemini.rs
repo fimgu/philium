@@ -13,12 +13,12 @@ use std::collections::{HashMap, HashSet};
 /// answers 429 RESOURCE_EXHAUSTED to the same token.
 pub const ENDPOINT: &str = "https://daily-cloudcode-pa.googleapis.com";
 /// The consumer CLI fingerprint unlocks the full model catalog.
-pub const VERSION: &str = "cli/1.5.6";
-pub const API_CLIENT: &str = "google-cloud-sdk vscode_cloudshelleditor/0.1";
+pub const VERSION: &str = crate::pins::GEMINI_CLI_VERSION;
+pub const API_CLIENT: &str = crate::pins::GEMINI_API_CLIENT;
 /// OS-specific platform values are rejected.
 pub const CLIENT_METADATA: &str = r#"{"ideType":"ANTIGRAVITY","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}"#;
 /// Compiled-in default, used only until a `fetchAvailableModels` catalog names one.
-pub const FALLBACK_MODEL: &str = "gemini-3-flash";
+pub const FALLBACK_MODEL: &str = crate::pins::GEMINI_FALLBACK_MODEL;
 
 fn default_cell() -> &'static std::sync::RwLock<Option<String>> {
     static D: std::sync::OnceLock<std::sync::RwLock<Option<String>>> = std::sync::OnceLock::new();

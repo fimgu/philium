@@ -202,9 +202,9 @@ async fn launch(ctx: &Ctx, a: &Value) -> Result<Value, String> {
     let api = Engine::open(profile)?;
     let engine = api.identity().await?;
     let im = api
-        .ok(Method::GET, "/images/alpine:3.20/json", None)
+        .ok(Method::GET, &format!("/images/{}/json", crate::pins::ALPINE_IMAGE), None)
         .await
-        .map_err(|_| "Local alpine:3.20 required. No image was pulled.")?;
+        .map_err(|_| format!("Local {} required. No image was pulled.", crate::pins::ALPINE_IMAGE))?;
     let image = key(&im, "Id")?;
     if !image.strip_prefix("sha256:").is_some_and(valid_id)
         || im["Config"]["Volumes"]
