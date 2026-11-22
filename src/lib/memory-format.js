@@ -40,9 +40,15 @@ export function fileChips(files, max = 3) {
   return { shown: list.slice(0, max), more: Math.max(0, list.length - max) };
 }
 
+// SQLite CURRENT_TIMESTAMP is UTC without a zone ("YYYY-MM-DD HH:MM:SS").
+function utcIso(s) {
+  const m = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?)$/.exec(String(s).trim());
+  return m ? `${m[1]}T${m[2]}Z` : s;
+}
+
 export function relTime(ts, now = Date.now()) {
   if (!ts) return "";
-  const t = typeof ts === "number" ? (ts < 1e12 ? ts * 1000 : ts) : Date.parse(ts);
+  const t = typeof ts === "number" ? (ts < 1e12 ? ts * 1000 : ts) : Date.parse(utcIso(ts));
   if (!Number.isFinite(t)) return "";
   const s = Math.max(0, Math.round((now - t) / 1000));
   if (s < 60) return "just now";

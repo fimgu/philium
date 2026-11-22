@@ -16,6 +16,7 @@ test("fileChips parses JSON and caps", () => {
 test("relTime", () => {
   const now = Date.parse("2026-01-01T12:00:00Z");
   assert.equal(relTime("2026-01-01T09:00:00Z", now), "3h ago");
+  assert.equal(relTime("2026-01-01 09:00:00", now), "3h ago");
   assert.equal(relTime("2026-01-01T11:59:30Z", now), "just now");
   assert.equal(relTime(null, now), "");
 });
