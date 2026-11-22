@@ -1,11 +1,10 @@
 //! Subscription sign-in owned by Philium (Claude, ChatGPT and Google Antigravity), modeled on
-//! jcode and HAL. Tokens live only in the OS keychain entry `oauth:<id>`;
+//! HAL. Tokens live only in the OS keychain entry `oauth:<id>`;
 //! the gateway asks for a fresh access token per request and swaps it in, so
 //! HAL, its config and its environment never see them.
 //!
 //! rpc (via `providers.*`): `oauth_start {kind}`, `oauth_paste {id, input}`,
-//! `oauth_cancel {kind}`, `oauth_signout {id}`, `oauth_import_check`,
-//! `oauth_import {id}` (Claude Code login, only after explicit consent).
+//! `oauth_cancel {kind}`, `oauth_signout {id}`.
 //! Events: `oauth:done {id, ok, error}`.
 
 use std::collections::HashMap;
@@ -705,49 +704,6 @@ async fn start_chatgpt(ctx: &Arc<Ctx>) -> Result<Value, String> {
     Ok(json!({ "id": id, "kind": "chatgpt_oauth", "user_code": code, "verify_url": OPENAI_VERIFY_URL }))
 }
 
-// ---------- optional import of a Claude Code login ----------
-
-pub fn parse_claude_code_creds(raw: &str) -> Result<Creds, String> {
-    let v: Value = serde_json::from_str(raw).map_err(|_| "unreadable Claude Code credentials")?;
-    let o = v.get("claudeAiOauth").unwrap_or(&v);
-    let access = o["accessToken"].as_str().ok_or("no access token in the Claude Code login")?.to_string();
-    let refresh = o["refreshToken"].as_str().ok_or("no refresh token in the Claude Code login")?.to_string();
-    let scopes: Vec<String> = o["scopes"].as_array().map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect()).unwrap_or_default();
-    if !scopes.iter().any(|s| s == "user:inference") {
-        return Err("the Claude Code login lacks the user:inference scope. Use Sign in with Claude instead".into());
-    }
-    Ok(Creds { access, refresh, expires_at: o["expiresAt"].as_i64().unwrap_or(0), scopes, plan: o["subscriptionType"].as_str().map(str::to_string), ..Default::default() })
-}
-
-fn read_claude_code_login() -> Option<String> {
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from)?;
-    if let Ok(s) = std::fs::read_to_string(home.join(".claude/.credentials.json")) {
-        return Some(s);
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let o = std::process::Command::new("security").args(["find-generic-password", "-s", "Claude Code-credentials", "-w"]).output().ok()?;
-        if o.status.success() {
-            return Some(String::from_utf8_lossy(&o.stdout).trim().to_string());
-        }
-    }
-    None
-}
-
-/// Presence check that never reads the secret (no keychain prompt).
-fn claude_code_login_exists() -> bool {
-    let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else { return false };
-    if home.join(".claude/.credentials.json").exists() {
-        return true;
-    }
-    #[cfg(target_os = "macos")]
-    {
-        return std::process::Command::new("security").args(["find-generic-password", "-s", "Claude Code-credentials"]).output().is_ok_and(|o| o.status.success());
-    }
-    #[allow(unreachable_code)]
-    false
-}
-
 // ---------- rpc ----------
 
 pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, String> {
@@ -774,13 +730,6 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
             ctx.notify("providers");
             ctx.emit("providers:changed", json!({ "id": id }));
             Ok(Value::Null)
-        }
-        "oauth_import_check" => Ok(json!({ "available": claude_code_login_exists() })),
-        "oauth_import" => {
-            let id = target_id(ctx, Kind::ClaudeOauth);
-            let creds = parse_claude_code_creds(&read_claude_code_login().ok_or("no Claude Code login found on this Mac")?)?;
-            finish(ctx, &id, Kind::ClaudeOauth, creds).await?;
-            Ok(json!({ "id": id }))
         }
         _ => Err(format!("unknown providers.{method}")),
     }
@@ -904,15 +853,12 @@ mod tests {
     }
 
     #[test]
-    fn chatgpt_claims_and_claude_import() {
+    fn chatgpt_claims() {
         let payload = B64URL.encode(json!({ "exp": 4102444800i64, "email": "me@x.y",
             "https://api.openai.com/auth": { "chatgpt_account_id": "acc-1", "chatgpt_plan_type": "plus" } }).to_string());
         let jwt = format!("h.{payload}.s");
         let c = chatgpt_creds(TokenResp { access_token: Some(jwt.clone()), refresh_token: Some("r".into()), expires_in: Some(3600), id_token: Some(jwt), scope: None }, None).unwrap();
         assert_eq!((c.account_id.as_deref(), c.plan.as_deref(), c.email.as_deref()), (Some("acc-1"), Some("plus"), Some("me@x.y")));
-        let raw = r#"{"claudeAiOauth":{"accessToken":"a","refreshToken":"r","expiresAt":5,"scopes":["user:inference"],"subscriptionType":"max"}}"#;
-        assert_eq!(parse_claude_code_creds(raw).unwrap().plan.as_deref(), Some("max"));
-        assert!(parse_claude_code_creds(r#"{"claudeAiOauth":{"accessToken":"a","refreshToken":"r","scopes":["user:profile"]}}"#).is_err());
     }
 
     #[test]

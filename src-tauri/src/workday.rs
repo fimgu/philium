@@ -53,8 +53,8 @@ const ACTIONS: &[(&str, &str)] = &[
     ("app.chat_create", "Started a chat"),
 ];
 const TOOLS: [&str; 5] = [
-    "Jcode",
-    "Herdr",
+    "Another coding agent",
+    "Terminal multiplexer",
     "Manual database edit",
     "Assistant intervention",
     "Other",
@@ -209,9 +209,9 @@ mod tests {
         assert!(v["actions"].as_array().unwrap().iter().all(|a| a["method"] != "agents.list" && a["method"] != "terminals.write"));
         assert!(v["actions"].as_array().unwrap().iter().any(|a| a["method"] == "board.create" && a["repo"].is_null()));
         assert!(call(&ctx, "fallback", json!({"tool":"Emacs"})).await.is_err());
-        call(&ctx, "fallback", json!({"tool":"Herdr","note":"needed a split pane"})).await.unwrap();
+        call(&ctx, "fallback", json!({"tool":"Terminal multiplexer","note":"needed a split pane"})).await.unwrap();
         let v = call(&ctx, "summary", Value::Null).await.unwrap();
-        assert_eq!(v["fallbacks"][0]["tool"], "Herdr");
+        assert_eq!(v["fallbacks"][0]["tool"], "Terminal multiplexer");
         let out = call(&ctx, "export", Value::Null).await.unwrap();
         let text = std::fs::read_to_string(out["path"].as_str().unwrap()).unwrap();
         assert!(text.contains("needed a split pane") && text.contains("Sent a message to an agent"));

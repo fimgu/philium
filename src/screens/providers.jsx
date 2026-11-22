@@ -283,8 +283,6 @@ function SignIn(props) {
   const [st, setSt] = createSignal(null);
   const [paste, setPaste] = createSignal("");
   const [err, setErr] = createSignal("");
-  const [importable, setImportable] = createSignal(false);
-  if (claude) rpc("providers.oauth_import_check").then((r) => setImportable(!!r.available)).catch(() => {});
   useEvent("oauth:done", (e) => {
     const d = e?.payload ?? e;
     if (!st() || (d.id && st().id !== d.id)) return;
@@ -300,10 +298,6 @@ function SignIn(props) {
     catch (e) { setErr(String(e)); }
   };
   const cancel = async () => { await rpc("providers.oauth_cancel", { kind: props.kind }).catch(() => {}); setSt(null); };
-  const doImport = async () => {
-    if (!(await confirm("Import your Claude Code login?", "Philium will read the Claude Code credentials stored on this Mac (macOS may ask for Keychain access) and keep its own copy. Nothing is changed in Claude Code.", { ok: "Import" }))) return;
-    try { await rpc("providers.oauth_import"); toast("Imported", "good"); props.onDone?.(); } catch (e) { setErr(String(e)); }
-  };
   const btnLabel = () => {
     const who = claude ? "Claude" : google ? "Google" : "ChatGPT";
     return props.again ? `Sign in again with ${who}` : `Sign in with ${who}`;
@@ -330,7 +324,6 @@ function SignIn(props) {
         </div>}>
         <div class="row">
           <Button variant="primary" onClick={start}>{btnLabel()}</Button>
-          <Show when={claude && importable()}><Button onClick={doImport}>Import existing Claude Code login</Button></Show>
         </div>
       </Show>
       <Show when={err()}><Shield tone="danger">{err()}</Shield></Show>

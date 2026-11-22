@@ -33,14 +33,11 @@ use rusqlite::params;
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
-    hash::{Hash, Hasher},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
     time::{Duration, SystemTime},
 };
 
-const MAX_SKILL_FILE: u64 = 64 * 1024;
-const MAX_SKILL_FILES: usize = 12;
 const MAX_UNTRUSTED_PER_SLATE: usize = 2;
 const MAX_WORKING_NOTE_PROMPT_BYTES: usize = 2048;
 const MAX_REMINDERS_PROMPT_BYTES: usize = 2048;
@@ -165,8 +162,7 @@ CREATE INDEX IF NOT EXISTS memories_status ON memories(status, active);
 CREATE INDEX IF NOT EXISTS memories_fact_key ON memories(scope, fact_key);
 ";
 
-/// Standing rules every agent gets, adapted from the user's Jcode overlay to
-/// Philium's tools. Editable via setting `agent_rules`.
+/// Standing rules every agent gets, tuned to Philium's tools. Editable via setting `agent_rules`.
 pub const DEFAULT_RULES: &str = "\
 ## Filip's standing rules
 - Keep replies short. Lead with the result. Separate what you verified from what you did not.
@@ -593,11 +589,10 @@ pub fn init(ctx: &Arc<Ctx>) -> Result<(), String> {
     crate::memory_ledger::init(ctx)?;
     crate::memory_skills::init(ctx)?;
     crate::memory_consolidation::init(ctx)?;
-    // Idempotent: remaps previously imported `project:<abs_path>` / `jcode:<hash>` rows onto
+    // Idempotent: remaps previously imported `project:<abs_path>` rows onto
     // their registered `repo:<id>` scopes (no-op when nothing matches).
     sync_imported_repo_scopes(ctx);
-    // Memory never reads ~/.jcode or ~/.claude on its own. Earlier builds imported them silently
-    // at first launch; drop that data once. `library.import` remains an explicit, manual action.
+    // Memory never reads another tool's files. Earlier builds imported them; drop that data once.
     if ctx.db.kv_get(PURGE_AUTO_IMPORT_KEY).is_none() {
         let r = purge_auto_imported(ctx)?;
         ctx.db.kv_set(PURGE_AUTO_IMPORT_KEY, &now().to_string())?;
@@ -610,8 +605,8 @@ pub fn init(ctx: &Arc<Ctx>) -> Result<(), String> {
 
 const PURGE_AUTO_IMPORT_KEY: &str = "library.auto_import_purged_at";
 
-/// Delete everything the old silent first-launch import wrote: Jcode memories (any scope) and
-/// skills copied from ~/.jcode / ~/.claude, plus their vectors and retrieval feedback.
+/// Delete everything the old silent first-launch import wrote: memories and skills
+/// copied from other tools, plus their vectors and retrieval feedback.
 fn purge_auto_imported(ctx: &Ctx) -> Result<Value, String> {
     // The old importer's fingerprint. Pre-provenance v0 rows are left alone.
     const MATCH: &str = "provenance='imported:jcode' OR scope LIKE 'jcode:%'";
@@ -636,10 +631,6 @@ fn purge_auto_imported(ctx: &Ctx) -> Result<Value, String> {
     Ok(json!({ "memories": memories, "skills": skills }))
 }
 
-fn home() -> PathBuf {
-    std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default()
-}
-
 /// Rules injected into every agent's instructions.
 pub fn rules(ctx: &Ctx) -> String {
     ctx.db.kv_get("setting.agent_rules").unwrap_or_else(|| DEFAULT_RULES.to_string())
@@ -658,28 +649,7 @@ pub fn set_rules(ctx: &Ctx, body: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Same hash Jcode uses for per-project memory files (std DefaultHasher over the path).
-fn jcode_project_hash(p: &Path) -> String {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    p.hash(&mut h);
-    format!("{:016x}", h.finish())
-}
-
-/// Map registered repos by path (both stored and canonicalized) -> repo_id.
-fn registered_repo_map(ctx: &Ctx) -> HashMap<String, String> {
-    let mut map = HashMap::new();
-    let rows = ctx.db.query("SELECT id, path FROM repos", []).unwrap_or_default();
-    for r in rows {
-        let (Some(id), Some(path)) = (r["id"].as_str(), r["path"].as_str()) else { continue };
-        map.insert(path.to_string(), id.to_string());
-        if let Ok(canon) = std::fs::canonicalize(path) {
-            map.insert(canon.to_string_lossy().into_owned(), id.to_string());
-        }
-    }
-    map
-}
-
-/// Rebind any imported `project:<abs_path>` or `jcode:<hash>` memories to their registered `repo:<id>`
+/// Rebind any `project:<abs_path>` memories to their registered `repo:<id>`
 /// scope so Standard agents can retrieve them via `memory_search` and `memory_slate`.
 pub fn sync_imported_repo_scopes(ctx: &Ctx) -> usize {
     let rows = ctx.db.query("SELECT id, path FROM repos", []).unwrap_or_default();
@@ -690,15 +660,11 @@ pub fn sync_imported_repo_scopes(ctx: &Ctx) -> usize {
     for r in rows {
         let (Some(repo_id), Some(repo_path)) = (r["id"].as_str(), r["path"].as_str()) else { continue };
         let target_scope = format!("repo:{repo_id}");
-        let mut old_scopes = vec![
-            format!("project:{repo_path}"),
-            format!("jcode:{}", jcode_project_hash(Path::new(repo_path))),
-        ];
+        let mut old_scopes = vec![format!("project:{repo_path}")];
         if let Ok(canon) = std::fs::canonicalize(repo_path) {
             let cs = canon.to_string_lossy().into_owned();
             if cs != repo_path {
                 old_scopes.push(format!("project:{cs}"));
-                old_scopes.push(format!("jcode:{}", jcode_project_hash(&canon)));
             }
         }
         for old_scope in old_scopes {
@@ -715,126 +681,6 @@ pub fn sync_imported_repo_scopes(ctx: &Ctx) -> usize {
         ctx.notify("library");
     }
     migrated
-}
-
-/// Manual, user-triggered import from Jcode / Claude. Never runs on its own.
-/// Project memories land only in registered repos; files for unknown projects are skipped.
-/// Imported memories are `agent_inferred`: another tool wrote them, not the operator here.
-pub fn import(ctx: &Arc<Ctx>, home: &Path) -> Result<Value, String> {
-    let mut skills = 0;
-    let mut memories = 0;
-    // Later sources win on name clashes: plugins < ~/.claude/skills < ~/.jcode/skills.
-    let mut dirs: Vec<(PathBuf, &str)> = vec![];
-    if let Ok(s) = std::fs::read_to_string(home.join(".claude/plugins/installed_plugins.json")) {
-        if let Ok(v) = serde_json::from_str::<Value>(&s) {
-            for list in v["plugins"].as_object().into_iter().flat_map(|o| o.values()) {
-                if let Some(p) = list[0]["installPath"].as_str() {
-                    dirs.push((PathBuf::from(p).join("skills"), "claude-plugin"));
-                }
-            }
-        }
-    }
-    dirs.push((home.join(".claude/skills"), "claude"));
-    dirs.push((home.join(".jcode/skills"), "jcode"));
-    for (dir, source) in dirs {
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
-        for e in rd.flatten() {
-            if let Some(s) = read_skill(&e.path(), source) {
-                ctx.db.exec(
-                    "INSERT INTO skills(name,description,body,files,source,updated_at) VALUES(?1,?2,?3,?4,?5,?6)
-                     ON CONFLICT(name) DO UPDATE SET description=excluded.description, body=excluded.body,
-                     files=excluded.files, source=excluded.source, updated_at=excluded.updated_at",
-                    params![s.0, s.1, s.2, s.3.to_string(), source, now()],
-                )?;
-                skills += 1;
-            }
-        }
-    }
-
-    let mem = home.join(".jcode/memory");
-    let projects: HashMap<String, String> = registered_repo_map(ctx)
-        .into_iter()
-        .map(|(path, repo_id)| (jcode_project_hash(Path::new(&path)), repo_id))
-        .collect();
-    let mut files = vec![(mem.join("global.json"), "global".to_string())];
-    if let Ok(rd) = std::fs::read_dir(mem.join("projects")) {
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.extension().and_then(|x| x.to_str()) != Some("json") {
-                continue;
-            }
-            let hash = p.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
-            if let Some(repo_id) = projects.get(&hash) {
-                files.push((p, format!("repo:{repo_id}")));
-            }
-        }
-    }
-    for (path, scope) in files {
-        let Ok(text) = std::fs::read_to_string(&path) else { continue };
-        let Ok(v) = serde_json::from_str::<Value>(&text) else { continue };
-        let Some(map) = v["memories"].as_object() else { continue };
-        ctx.db.with(|c| {
-            let tx = c.unchecked_transaction()?;
-            for m in map.values() {
-                let (Some(id), Some(content)) = (m["id"].as_str(), m["content"].as_str()) else { continue };
-                let category = m["category"].as_str().unwrap_or("fact");
-                let active = m["active"].as_bool().unwrap_or(true) as i64;
-                let status = if active == 1 { "active" } else { "deleted" };
-                tx.execute(
-                    "INSERT INTO memories(id,scope,category,content,source,created_at,active,trust_tier,status,provenance)
-                     VALUES(?1,?2,?3,?4,'import:jcode',?5,?6,'agent_inferred',?7,'imported:jcode')
-                     ON CONFLICT(id) DO UPDATE SET content=excluded.content, category=excluded.category,
-                     active=excluded.active, scope=excluded.scope, status=excluded.status",
-                    params![id, scope, category, content, m["created_at"].as_str().unwrap_or(""), active, status],
-                )?;
-                memories += 1;
-            }
-            tx.commit()
-        })?;
-    }
-    invalidate_vector_cache(ctx);
-    ctx.db.kv_set("library.imported_at", &now().to_string())?;
-    Ok(json!({ "skills": skills, "memories": memories }))
-}
-
-/// (name, description, body, small text supporting files) from a skill folder.
-fn read_skill(dir: &Path, _source: &str) -> Option<(String, String, String, Value)> {
-    if std::fs::symlink_metadata(dir).ok()?.file_type().is_symlink() {
-        return None;
-    }
-    let body = std::fs::read_to_string(dir.join("SKILL.md")).ok()?;
-    let (mut name, mut desc) = (None, String::new());
-    let mut lines = body.lines();
-    if lines.next() == Some("---") {
-        for l in lines {
-            if l.trim() == "---" {
-                break;
-            }
-            if let Some(v) = l.strip_prefix("name:") {
-                name = Some(v.trim().trim_matches('"').to_string());
-            }
-            if let Some(v) = l.strip_prefix("description:") {
-                desc = v.trim().trim_matches('"').to_string();
-            }
-        }
-    }
-    let name = name.or_else(|| dir.file_name()?.to_str().map(str::to_string))?;
-    if name.is_empty() || name.len() > 64 || !name.chars().all(|c| c.is_ascii_alphanumeric() || "-_ ".contains(c)) {
-        return None;
-    }
-    let mut files = serde_json::Map::new();
-    for e in std::fs::read_dir(dir).ok()?.flatten().take(64) {
-        let p = e.path();
-        let fname = e.file_name().to_string_lossy().into_owned();
-        let Ok(meta) = std::fs::symlink_metadata(&p) else { continue };
-        if fname == "SKILL.md" || !meta.is_file() || meta.len() > MAX_SKILL_FILE || files.len() >= MAX_SKILL_FILES {
-            continue;
-        }
-        if let Ok(t) = std::fs::read_to_string(&p) {
-            files.insert(fname, json!(t));
-        }
-    }
-    Some((name.trim().to_string(), desc, body, Value::Object(files)))
 }
 
 pub fn skill_list(ctx: &Ctx) -> Result<Value, String> {
@@ -2591,23 +2437,10 @@ pub fn session_search(
     repo_only: bool,
     limit: usize,
 ) -> Result<Value, String> {
-    session_search_at(ctx, &home(), query, project, repo_only, limit)
-}
-
-fn strip_system_reminders(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    while let Some(start) = rest.find("<system-reminder>") {
-        out.push_str(&rest[..start]);
-        if let Some(end) = rest[start..].find("</system-reminder>") {
-            rest = &rest[start + end + "</system-reminder>".len()..];
-        } else {
-            rest = "";
-            break;
-        }
+    if repo_only && project.filter(|p| !p.is_empty()).is_none() {
+        return Err("A repository is required for scoped history".into());
     }
-    out.push_str(rest);
-    out.trim().to_string()
+    search_sessions(ctx, query, project, repo_only, None, limit)
 }
 
 fn matches_repo(working_dir: &str, project: Option<&str>) -> bool {
@@ -2617,24 +2450,10 @@ fn matches_repo(working_dir: &str, project: Option<&str>) -> bool {
     Path::new(proj).is_absolute() && Path::new(working_dir) == Path::new(proj)
 }
 
-pub fn session_search_at(
-    ctx: &Ctx,
-    home_dir: &Path,
-    query: &str,
-    project: Option<&str>,
-    repo_only: bool,
-    limit: usize,
-) -> Result<Value, String> {
-    if repo_only && project.filter(|p| !p.is_empty()).is_none() {
-        return Err("A repository is required for scoped history".into());
-    }
-    search_sessions(ctx, Some(home_dir), query, project, repo_only, None, limit)
-}
-
 /// Standard-agent raw evidence + session lookup, strictly bound to `repo_id`.
 /// Never opens imported histories or sibling-repo sessions; never callable by Strict agents.
 pub fn agent_sessions(ctx: &Ctx, query: &str, repo_id: &str, limit: usize) -> Result<Value, String> {
-    search_sessions(ctx, None, query, None, true, Some(repo_id), limit)
+    search_sessions(ctx, query, None, true, Some(repo_id), limit)
 }
 
 #[derive(Clone)]
@@ -2644,27 +2463,8 @@ struct CachedHalEvents {
     entries: Vec<(String, String, String, String)>,
 }
 
-#[derive(Clone)]
-struct CachedJcodeSession {
-    stamp: (SystemTime, u64),
-    skip: bool,
-    working_dir: String,
-    short_name: String,
-    title: String,
-    session_id: String,
-    updated_at: Value,
-    meta_low: String,
-    /// (role, excerpt <= 280 chars, lowercased cleaned text)
-    texts: Vec<(String, String, String)>,
-}
-
 fn hal_session_cache() -> &'static Mutex<HashMap<PathBuf, CachedHalEvents>> {
     static C: OnceLock<Mutex<HashMap<PathBuf, CachedHalEvents>>> = OnceLock::new();
-    C.get_or_init(Default::default)
-}
-
-fn jcode_session_cache() -> &'static Mutex<HashMap<PathBuf, CachedJcodeSession>> {
-    static C: OnceLock<Mutex<HashMap<PathBuf, CachedJcodeSession>>> = OnceLock::new();
     C.get_or_init(Default::default)
 }
 
@@ -2830,84 +2630,8 @@ fn extract_hal_db_entries(ctx: &Ctx, agent_id: &str, sid: &str, after_seq: i64, 
     out
 }
 
-fn load_jcode_session_cached(path: &Path, stamp: (SystemTime, u64)) -> Option<CachedJcodeSession> {
-    {
-        let cache = jcode_session_cache().lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(hit) = cache.get(path) {
-            if hit.stamp == stamp {
-                return Some(hit.clone());
-            }
-        }
-    }
-    let raw = std::fs::read_to_string(path).ok()?;
-    #[cfg(test)]
-    SESSION_FILE_PARSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let parsed = match serde_json::from_str::<Value>(&raw) {
-        Ok(v) if v["debug"].as_bool() != Some(true) && v["canary"].as_bool() != Some(true) => {
-            let wd = v["working_dir"].as_str().unwrap_or("").to_string();
-            let short = v["short_name"].as_str().unwrap_or("").to_string();
-            let title = v["title"].as_str().unwrap_or("").to_string();
-            let sid = v["id"].as_str().unwrap_or("").to_string();
-            let meta_low = format!("{short} {title} {wd} {sid}").to_lowercase();
-            let mut texts = vec![];
-            if let Some(msgs) = v["messages"].as_array() {
-                for m in msgs.iter().take(120) {
-                    let role = m["role"].as_str().unwrap_or("");
-                    if role != "user" && role != "assistant" {
-                        continue;
-                    }
-                    let Some(blocks) = m["content"].as_array() else { continue };
-                    for b in blocks {
-                        if b["type"].as_str() != Some("text") {
-                            continue;
-                        }
-                        let clean = strip_system_reminders(b["text"].as_str().unwrap_or(""));
-                        if clean.is_empty() {
-                            continue;
-                        }
-                        texts.push((
-                            role.to_string(),
-                            clean.chars().take(280).collect::<String>(),
-                            clean.to_lowercase(),
-                        ));
-                    }
-                }
-            }
-            CachedJcodeSession {
-                stamp,
-                skip: false,
-                working_dir: wd,
-                short_name: short,
-                title,
-                session_id: sid,
-                updated_at: v["updated_at"].clone(),
-                meta_low,
-                texts,
-            }
-        }
-        _ => CachedJcodeSession {
-            stamp,
-            skip: true,
-            working_dir: String::new(),
-            short_name: String::new(),
-            title: String::new(),
-            session_id: String::new(),
-            updated_at: Value::Null,
-            meta_low: String::new(),
-            texts: vec![],
-        },
-    };
-    let mut cache = jcode_session_cache().lock().unwrap_or_else(|e| e.into_inner());
-    if cache.len() >= SESSION_CACHE_CAP {
-        cache.clear();
-    }
-    cache.insert(path.to_path_buf(), parsed.clone());
-    Some(parsed)
-}
-
 fn search_sessions(
     ctx: &Ctx,
-    home_dir: Option<&Path>,
     query: &str,
     project: Option<&str>,
     repo_only: bool,
@@ -3031,68 +2755,6 @@ fn search_sessions(
                     "excerpts": excerpts,
                 }),
             ));
-        }
-    }
-
-    // 2. Jcode sessions (~/.jcode/sessions/*.json), cached by (path, mtime, len) — operator UI only (home_dir=None for agents).
-    if let Some(rd) = home_dir.and_then(|home| std::fs::read_dir(home.join(".jcode/sessions")).ok()) {
-        let mut files: Vec<(SystemTime, u64, PathBuf)> = rd
-            .flatten()
-            .filter_map(|e| {
-                let p = e.path();
-                let name = p.file_name()?.to_str()?;
-                if !name.ends_with(".json") || name.contains("canary") {
-                    return None;
-                }
-                let md = e.metadata().ok()?;
-                let m = md.modified().ok()?;
-                Some((m, md.len(), p))
-            })
-            .collect();
-        files.sort_by(|a, b| b.0.cmp(&a.0));
-        for (mtime, len, p) in files.into_iter().take(120) {
-            let Some(sess) = load_jcode_session_cached(&p, (mtime, len)) else { continue };
-            if sess.skip {
-                continue;
-            }
-            let same_repo = matches_repo(&sess.working_dir, project);
-            if repo_only && project.is_some() && !same_repo {
-                continue;
-            }
-            let mut score: i64 = if same_repo { 25 } else { 0 };
-            for t in &terms {
-                if sess.meta_low.contains(t) {
-                    score += 15;
-                }
-            }
-            let mut excerpts = vec![];
-            for (role, excerpt, low) in &sess.texts {
-                let hits = terms.iter().filter(|t| low.contains(t.as_str())).count();
-                if terms.is_empty() || hits > 0 {
-                    score += (hits as i64) * 12;
-                    if excerpts.len() < 3 {
-                        excerpts.push(json!({
-                            "role": role,
-                            "text": excerpt,
-                        }));
-                    }
-                }
-            }
-            if (terms.is_empty() && !excerpts.is_empty()) || score > if same_repo { 25 } else { 0 } {
-                candidates.push((
-                    score,
-                    json!({
-                        "source": "jcode",
-                        "session_id": sess.session_id,
-                        "name": sess.short_name,
-                        "title": sess.title,
-                        "working_dir": sess.working_dir,
-                        "updated_at": sess.updated_at,
-                        "same_repo": same_repo,
-                        "excerpts": excerpts,
-                    }),
-                ));
-            }
         }
     }
 
@@ -3661,18 +3323,6 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
                 "imported_at": ctx.db.kv_get("library.imported_at"),
             }))
         }
-        "import" => {
-            let c = ctx.clone();
-            let res = tokio::task::spawn_blocking(move || {
-                let r = import(&c, &home())?;
-                sync_imported_repo_scopes(&c);
-                Ok::<Value, String>(r)
-            })
-            .await
-            .map_err(|e| e.to_string())??;
-            let _ = sync_vectors_async(ctx).await;
-            Ok(res)
-        }
         "reindex" => sync_vectors_async(ctx).await,
         "observe_session" => observe_session(ctx, &crate::ctx::arg_str(&args, "agent_id")?).await,
         "skills" => skill_list(ctx),
@@ -4105,36 +3755,6 @@ mod tests {
     use super::*;
     use axum::{routing::post, Json, Router};
 
-    fn fake_home() -> PathBuf {
-        let h = std::env::temp_dir().join(format!("philium-lib-{}", crate::db::new_id()));
-        std::fs::create_dir_all(h.join(".jcode/skills/review-pr")).unwrap();
-        std::fs::create_dir_all(h.join(".jcode/memory/projects")).unwrap();
-        std::fs::create_dir_all(h.join("Developer/philium")).unwrap();
-        std::fs::write(h.join(".jcode/skills/review-pr/SKILL.md"), "---\nname: review-pr\ndescription: Review PRs\n---\n# Steps\n1. test").unwrap();
-        std::fs::write(h.join(".jcode/skills/review-pr/gate.sh"), "echo ok").unwrap();
-        let g = json!({"memories": {
-            "m1": {"id":"m1","category":"preference","content":"Never add Co-authored-by trailers","active":true,"created_at":"2026-01-01"},
-            "m2": {"id":"m2","category":"fact","content":"old retired thing","active":false,"created_at":"2026-01-02"}}});
-        std::fs::write(h.join(".jcode/memory/global.json"), g.to_string()).unwrap();
-        let hash = jcode_project_hash(&h.join("Developer/philium"));
-        let p = json!({"memories": {"p1": {"id":"p1","category":{"custom":"x"},"content":"Philium quit must finish under one second","created_at":"2026-01-03"}}});
-        std::fs::write(h.join(format!(".jcode/memory/projects/{hash}.json")), p.to_string()).unwrap();
-        std::fs::create_dir_all(h.join(".jcode/sessions")).unwrap();
-        let sess1 = json!({
-            "id": "session_dolphin_1",
-            "short_name": "dolphin",
-            "title": "Codegraph PageRank optimization",
-            "working_dir": h.join("Developer/philium").to_string_lossy(),
-            "updated_at": "2026-04-19T12:00:00Z",
-            "messages": [
-                {"role": "user", "content": [{"type": "text", "text": "<system-reminder>noisy</system-reminder>Make code_outline token optimal"}]},
-                {"role": "assistant", "content": [{"type": "text", "text": "Added tree-sitter AST symbol ranges and bidirectional code_refs."}]}
-            ]
-        });
-        std::fs::write(h.join(".jcode/sessions/session_dolphin_1.json"), sess1.to_string()).unwrap();
-        h
-    }
-
     /// Spawn a real loopback OpenAI-compatible `/v1/embeddings` server returning deterministic semantic
     /// concept vectors so tests exercise the real HTTP client, L2 normalization, model_version pinning,
     /// and true paraphrase recall with ZERO overlapping lexical tokens or character 3-grams.
@@ -4182,20 +3802,6 @@ mod tests {
         (url, handle)
     }
 
-    /// Dry run against the real home, into an in-memory DB. Read-only on sources.
-    #[test]
-    #[ignore]
-    fn real_home_dry_run() {
-        let ctx = Ctx::test();
-        init(&ctx).unwrap();
-        let r = import(&ctx, &home()).unwrap();
-        let scopes = ctx.db.query("SELECT substr(scope,1,8) AS s, count(*) AS n FROM memories GROUP BY 1", []).unwrap();
-        let names: Vec<_> = skill_list(&ctx).unwrap().as_array().unwrap().iter().map(|s| s["name"].as_str().unwrap().to_string()).collect();
-        println!("import {r}\nscopes {}\nskills {}", json!(scopes), names.join(" "));
-        println!("search 'coauthor' -> {}", memory_search(&ctx, "co-authored trailers", None, 2).unwrap());
-        println!("standing bytes {}", standing_memories(&ctx).len() + rules(&ctx).len());
-    }
-
     #[test]
     fn keyword_memory_search_excludes_other_projects_before_ranking() {
         let ctx = Ctx::test();
@@ -4240,61 +3846,6 @@ mod tests {
         ctx.db.exec("UPDATE memories SET provenance='imported:jcode' WHERE id='j9'", []).unwrap();
         init(&ctx).unwrap();
         assert_eq!(ctx.db.query("SELECT count(*) AS n FROM memories WHERE id='j9'", []).unwrap()[0]["n"], 1);
-    }
-
-    #[test]
-    fn imports_skills_and_memories_and_serves_them() {
-        let ctx = Ctx::test();
-        init(&ctx).unwrap();
-        let home = fake_home();
-        let proj = home.join("Developer/philium").to_string_lossy().into_owned();
-        // Init never touches ~/.jcode or ~/.claude on its own.
-        assert_eq!(ctx.db.query("SELECT count(*) AS n FROM memories", []).unwrap()[0]["n"], 0);
-        // Manual import skips project files for repos that are not registered.
-        let r = import(&ctx, &home).unwrap();
-        assert_eq!(r, json!({"skills": 1, "memories": 2}));
-        ctx.db.exec("INSERT INTO repos(id,name,path,added_at) VALUES('repo_ph','philium',?1,0)", [&proj]).unwrap();
-        let r = import(&ctx, &home).unwrap();
-        assert_eq!(r, json!({"skills": 1, "memories": 3}));
-        // Idempotent: a second import does not duplicate.
-        import(&ctx, &home).unwrap();
-        assert_eq!(ctx.db.query("SELECT count(*) AS n FROM memories", []).unwrap()[0]["n"], 3);
-        // Imported rows are another tool's claims, never operator-direct.
-        assert_eq!(
-            ctx.db.query("SELECT count(*) AS n FROM memories WHERE trust_tier!='agent_inferred'", []).unwrap()[0]["n"],
-            0
-        );
-
-        let s = skill_get(&ctx, "review-pr").unwrap();
-        assert!(s["body"].as_str().unwrap().contains("# Steps"));
-        assert_eq!(s["files"]["gate.sh"], "echo ok");
-        assert!(skill_get(&ctx, "nope").is_err());
-
-        // Project memories land directly on the registered repo scope.
-        let agent_hits = agent_memories(&ctx, "quit second", "repo_ph", 5).unwrap();
-        assert_eq!(agent_hits[0]["id"], "p1", "{agent_hits}");
-        assert_eq!(agent_hits[0]["scope"], "repo:repo_ph");
-        // Inactive memories never surface.
-        assert!(memory_search(&ctx, "retired", None, 10).unwrap().as_array().unwrap().is_empty());
-        // Search input cannot inject FTS syntax.
-        memory_search(&ctx, "\"unbalanced * NEAR( OR", None, 5).unwrap();
-
-        memory_save(&ctx, "Prefers Philium over Jcode", "preference", None, "tester").unwrap();
-        let standing = standing_memories(&ctx);
-        assert!(standing.contains("Co-authored-by") && standing.contains("Prefers Philium"), "{standing}");
-        assert!(!standing.contains("retired"));
-        assert!(memory_save(&ctx, "x", "bogus", None, "t").is_err());
-
-        let shits = session_search_at(&ctx, &home, "code_outline bidirectional", Some(&proj), true, 5).unwrap();
-        let arr = shits.as_array().unwrap();
-        assert_eq!(arr.len(), 1, "{shits}");
-        assert_eq!(arr[0]["source"], "jcode");
-        assert_eq!(arr[0]["name"], "dolphin");
-        assert_eq!(arr[0]["same_repo"], true);
-        let ex_text = arr[0]["excerpts"][0]["text"].as_str().unwrap();
-        assert!(ex_text.contains("Make code_outline token optimal") && !ex_text.contains("noisy"), "{ex_text}");
-
-        let _ = std::fs::remove_dir_all(home);
     }
 
     // ---- Tier 0-1 Memory Evals (from Obsidian research blueprint) ----
@@ -5017,44 +4568,5 @@ mod tests {
         reset_agent_path_reminders("a1");
         assert_eq!(path_reminders_once(&ctx, "a1", Some("ra"), "db/migrations/001.sql").len(), 1, "re-fires after compaction reset");
         assert_eq!(compaction_reminders(&ctx, Some("ra")).len(), 1);
-    }
-
-    #[test]
-    fn session_search_caches_unchanged_files_by_mtime() {
-        let ctx = Ctx::test();
-        init(&ctx).unwrap();
-        let home = fake_home();
-        let proj = home.join("Developer/philium").to_string_lossy().into_owned();
-        let before = SESSION_FILE_PARSES.load(std::sync::atomic::Ordering::Relaxed);
-        let first = session_search_at(&ctx, &home, "code_outline", Some(&proj), true, 5).unwrap();
-        let after_first = SESSION_FILE_PARSES.load(std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(first.as_array().unwrap().len(), 1);
-        assert!(after_first > before, "first search should parse session file");
-
-        // Second search with unchanged file must hit cache and not re-parse.
-        let second = session_search_at(&ctx, &home, "bidirectional", Some(&proj), true, 5).unwrap();
-        let after_second = SESSION_FILE_PARSES.load(std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(second.as_array().unwrap().len(), 1);
-        assert_eq!(after_second, after_first, "unchanged file must not be re-parsed");
-
-        // Updating file content/size invalidates cache and returns updated text.
-        let sess_path = home.join(".jcode/sessions/session_dolphin_1.json");
-        let updated = json!({
-            "id": "session_dolphin_1",
-            "short_name": "dolphin",
-            "title": "Updated session title",
-            "working_dir": proj,
-            "updated_at": "2026-04-20T12:00:00Z",
-            "messages": [
-                {"role": "user", "content": [{"type": "text", "text": "Fresh unique_cache_marker_9912"}]}
-            ]
-        });
-        std::fs::write(&sess_path, updated.to_string()).unwrap();
-        let third = session_search_at(&ctx, &home, "unique_cache_marker_9912", Some(&proj), true, 5).unwrap();
-        let after_third = SESSION_FILE_PARSES.load(std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(third.as_array().unwrap().len(), 1);
-        assert!(after_third > after_second, "modified file must be re-parsed");
-
-        let _ = std::fs::remove_dir_all(home);
     }
 }

@@ -6,7 +6,7 @@ import { useVisibleEvent } from "../lib/visibility.js";
 
 export default function Workday() {
   const [data, { refetch }] = createResource(() => rpc("workday.summary", {}, { local: true }).catch((e) => ({ error: String(e) })));
-  const [tool, setTool] = createSignal("Jcode"), [note, setNote] = createSignal(""), [busy, setBusy] = createSignal(false), [message, setMessage] = createSignal("");
+  const [tool, setTool] = createSignal("Another coding agent"), [note, setNote] = createSignal(""), [busy, setBusy] = createSignal(false), [message, setMessage] = createSignal("");
   useVisibleEvent("event", () => refetch(), { debounceMs: 1000 });
   const act = async (fn) => { setBusy(true); setMessage(""); try { await fn(); await refetch(); } catch (e) { setMessage(String(e)); } finally { setBusy(false); } };
   const record = (e) => { e.preventDefault(); act(async () => { await rpc("workday.fallback", { tool: tool(), note: note() }, { local: true }); setNote(""); setMessage("Fallback recorded."); }); };
