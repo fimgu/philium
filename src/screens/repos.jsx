@@ -3,16 +3,45 @@ import { repoLabels } from "../lib/repo-labels.js";
 import { params as routeParams, go } from "../lib/nav.js";
 import { Page, Empty, Button, Input, Field, Badge, Modal, Select, Segmented, VirtualList, Menu, confirm, toast } from "../ui/kit.jsx";
 import { Icon } from "../ui/icons.jsx";
+import { AccessGrantModal } from "../ui/access-requests.jsx";
 import { rpc, fmt } from "../lib/rpc.js";
 import { useStore, activeRepoId, setActiveRepoId } from "../lib/store.js";
 import { useVisibleEvent, useScreenVisible } from "../lib/visibility.js";
+import {
+  isGrantActive,
+  parseScopes,
+  scopeMeta,
+  targetDisplay,
+  targetKindLabel,
+} from "../lib/access-helpers.js";
 import "../styles/workspace.css";
+import "../styles/access.css";
 
 function Grants(props) {
   const [list, setList] = createSignal([]);
   const [err, setErr] = createSignal("");
+  const [accessGrants, setAccessGrants] = createSignal([]);
+  const [accessErr, setAccessErr] = createSignal("");
+  const [modalOpen, setModalOpen] = createSignal(false);
+
   const load = (id) => rpc("sandbox.grants_get", { repo_id: id }).then((r) => setList(r.grants)).catch((e) => setErr(String(e)));
-  createEffect(on(() => props.repoId, load));
+  const loadAccess = (id) => {
+    if (!id) { setAccessGrants([]); return; }
+    setAccessErr("");
+    rpc("access.grants", { repo_id: id }, { local: true })
+      .then((rows) => setAccessGrants((rows ?? []).filter(isGrantActive)))
+      .catch((e) => setAccessErr(String(e)));
+  };
+
+  createEffect(on(() => props.repoId, (id) => {
+    load(id);
+    loadAccess(id);
+  }));
+
+  useVisibleEvent("access:changed", (payload) => {
+    if (!payload?.repo_id || payload.repo_id === props.repoId) loadAccess(props.repoId);
+  }, { debounceMs: 150 });
+
   const save = async (next) => {
     setErr("");
     try { const r = await rpc("sandbox.grants_set", { repo_id: props.repoId, grants: next }); setList(r.grants); } catch (e) { setErr(String(e)); }
@@ -23,7 +52,64 @@ function Grants(props) {
       if (r.path && !list().some((g) => g.path === r.path)) save([...list(), { path: r.path, write: false }]);
     } catch (e) { setErr(String(e)); }
   };
+  const revokeAccess = async (id) => {
+    setAccessErr("");
+    try {
+      await rpc("access.revoke", { id }, { action: true });
+      toast("Access revoked");
+      loadAccess(props.repoId);
+    } catch (e) {
+      setAccessErr(String(e));
+      toast(String(e), "danger");
+    }
+  };
+
   return <section class="ws-grants">
+    <div class="access-repo-subsection">
+      <div class="ws-row">
+        <div>
+          <h3>Linked repos &amp; folders</h3>
+          <p class="ws-muted">Persistent cross-repo links and shared folders available to agents working in this repository.</p>
+        </div>
+        <Button onClick={() => setModalOpen(true)}><Icon name="plus" size={12} /> Link repo / folder</Button>
+      </div>
+      <Show when={accessErr()}><p class="ws-alert">{accessErr()}</p></Show>
+      <For each={accessGrants()} fallback={<p class="ws-muted">No linked repos or shared folders yet.</p>}>{(g) => {
+        const display = targetDisplay(g);
+        const gScopes = parseScopes(g.scopes);
+        return (
+          <div class="access-repo-grant-row">
+            <div class="access-repo-grant-main">
+              <div class="access-repo-grant-title">
+                <Badge>{targetKindLabel(g.target_kind)}</Badge>
+                <strong class="small ellipsis" title={g.target_path || display}>{display}</strong>
+                <Show when={g.strict_allowed}><Badge tone="strict">Strict</Badge></Show>
+                <div class="access-grant-badges">
+                  <For each={gScopes}>{(s) => {
+                    const meta = scopeMeta(s);
+                    return <span class={`access-scope-pill ${meta?.caution ? "caution" : ""}`} title={meta?.description}>{s}</span>;
+                  }}</For>
+                </div>
+              </div>
+              <Show when={g.target_path && g.target_path !== display}>
+                <code class="ws-path xs faint" title={g.target_path}>{g.target_path}</code>
+              </Show>
+            </div>
+            <Button variant="ghost" title="Revoke access" aria-label={`Revoke ${display}`} onClick={() => revokeAccess(g.id)}>
+              <Icon name="trash" size={12} />
+            </Button>
+          </div>
+        );
+      }}</For>
+      <AccessGrantModal
+        open={modalOpen()}
+        onClose={() => setModalOpen(false)}
+        sourceRepoId={props.repoId}
+        lifetime="persistent"
+        onCreated={() => loadAccess(props.repoId)}
+      />
+    </div>
+
     <div class="ws-row"><div><h3>Shared with strict agents</h3><p class="ws-muted">Strict agents can read and run every app and tool on this Mac, but never your keys, logins, mail, messages or personal folders. Add folders this repository needs from those places, such as a parts library in Documents.</p></div><Button onClick={addFolder}><Icon name="plus" size={12} /> Add folder</Button></div>
     <Show when={err()}><p class="ws-alert">{err()}</p></Show>
     <For each={list()} fallback={<p class="ws-muted">Nothing extra shared. The agent's own worktree is always writable.</p>}>{(g, i) =>

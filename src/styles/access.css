@@ -1,0 +1,330 @@
+/* Generalized Access Grant UI styles.
+   Uses Philium's theme tokens so components stay crisp in both dark and light themes. */
+
+.access-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-raised);
+  flex: none;
+}
+
+.access-card {
+  display: grid;
+  gap: 8px;
+  padding: 10px 12px;
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius);
+}
+
+.access-card.is-strict {
+  border-left-color: var(--strict);
+  border-color: color-mix(in srgb, var(--strict) 38%, var(--line-strong));
+}
+
+.access-card-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.access-card-title {
+  font-size: var(--fs-s);
+  font-weight: 600;
+  color: var(--text);
+}
+
+.access-strict-note {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 9px;
+  border-radius: var(--radius-s);
+  background: var(--strict-dim);
+  color: var(--strict);
+  font-size: var(--fs-xs);
+  line-height: 1.4;
+}
+
+.access-reason {
+  margin: 0;
+  font-size: var(--fs-s);
+  color: var(--text);
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.access-target-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+  font-size: var(--fs-xs);
+}
+
+.access-target-label {
+  color: var(--text-dim);
+  flex: none;
+}
+
+.access-target-path {
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  padding: 2px 7px;
+  border-radius: 4px;
+  background: var(--bg-sunken);
+  border: 1px solid var(--line);
+  color: var(--text);
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.access-target-path.unresolved {
+  border-color: color-mix(in srgb, var(--strict) 50%, var(--line));
+  color: var(--strict);
+}
+
+.access-picker {
+  display: grid;
+  gap: 7px;
+  padding: 8px 10px;
+  border-radius: var(--radius-s);
+  background: var(--bg-sunken);
+  border: 1px solid var(--line);
+}
+
+.access-picker-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.access-picker-row .select,
+.access-picker-row .input {
+  height: 28px;
+  font-size: var(--fs-xs);
+  flex: 1 1 180px;
+  min-width: 0;
+}
+
+.access-scopes {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.access-scope-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 25px;
+  padding: 0 8px;
+  border-radius: var(--radius-s);
+  border: 1px solid var(--line-strong);
+  background: var(--bg-sunken);
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+  cursor: pointer;
+  user-select: none;
+  transition: border-color 120ms var(--ease), background 120ms var(--ease), color 120ms var(--ease);
+}
+
+.access-scope-chip:hover {
+  border-color: var(--text-faint);
+  color: var(--text);
+}
+
+.access-scope-chip input {
+  margin: 0;
+  width: 12px;
+  height: 12px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.access-scope-chip.on {
+  border-color: var(--accent);
+  background: var(--accent-dim);
+  color: var(--text);
+}
+
+.access-scope-chip.caution.on {
+  border-color: var(--strict);
+  background: var(--strict-dim);
+  color: var(--strict);
+}
+
+.access-scope-chip.caution input {
+  accent-color: var(--strict);
+}
+
+.access-scope-caution-tag {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 0 4px;
+  border-radius: 3px;
+  background: var(--strict-dim);
+  color: var(--strict);
+}
+
+.access-scope-req-tag {
+  font-size: 10px;
+  color: var(--text-faint);
+}
+
+.access-card-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding-top: 2px;
+}
+
+.access-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+}
+
+/* ---------- Modal ---------- */
+.access-modal-form {
+  display: grid;
+  gap: 14px;
+}
+
+.access-modal-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.access-modal-row .input,
+.access-modal-row .select {
+  flex: 1;
+  min-width: 0;
+}
+
+/* ---------- Grant lists (AgentContext + Repos) ---------- */
+.access-grant-list {
+  display: grid;
+  gap: 6px;
+}
+
+.access-grant-card {
+  display: grid;
+  gap: 6px;
+  padding: 8px 10px;
+  border-radius: var(--radius);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  transition: border-color 120ms var(--ease);
+}
+
+.access-grant-card:hover {
+  border-color: var(--line-strong);
+}
+
+.access-grant-top {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.access-grant-name {
+  font-size: var(--fs-s);
+  font-weight: 500;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.access-grant-path {
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  color: var(--text-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.access-grant-badges {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.access-scope-pill {
+  display: inline-flex;
+  align-items: center;
+  height: 18px;
+  padding: 0 6px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 500;
+  background: var(--bg-raised);
+  border: 1px solid var(--line);
+  color: var(--text-dim);
+}
+
+.access-scope-pill.caution {
+  background: var(--strict-dim);
+  border-color: color-mix(in srgb, var(--strict) 45%, transparent);
+  color: var(--strict);
+}
+
+.access-repo-subsection {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-bottom: 14px;
+  margin-bottom: 6px;
+  border-bottom: 1px solid var(--line);
+}
+
+.access-repo-grant-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-s);
+  background: var(--bg-sunken);
+  min-width: 0;
+}
+
+.access-repo-grant-main {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  flex: 1;
+}
+
+.access-repo-grant-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  flex-wrap: wrap;
+}

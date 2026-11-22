@@ -2,9 +2,19 @@
 import { For, Show, createSignal, createResource, createEffect, on } from "solid-js";
 import { Button, Badge, Meter, toast } from "./kit.jsx";
 import { Icon } from "./icons.jsx";
+import { AccessGrantModal } from "./access-requests.jsx";
 import { rpc } from "../lib/rpc.js";
 import { useVisibleEvent } from "../lib/visibility.js";
+import {
+  isGrantActive,
+  lifetimeLabel,
+  parseScopes,
+  scopeMeta,
+  targetDisplay,
+  targetKindLabel,
+} from "../lib/access-helpers.js";
 import "../styles/surfaces-memory.css";
+import "../styles/access.css";
 
 const TIER = {
   user_direct: { label: "Direct", tone: "secure" },
@@ -22,8 +32,31 @@ export function AgentContext(props) {
   const [fail, setFail] = createSignal("");
   const [nextSteps, setNextSteps] = createSignal("");
   const [noteSaving, setNoteSaving] = createSignal(false);
+  const [grantOpen, setGrantOpen] = createSignal(false);
 
   const scope = () => (props.repoId ? `repo:${props.repoId}` : "global");
+
+  const [grants, { refetch: refetchGrants }] = createResource(
+    () => [props.agentId || "", props.repoId || ""],
+    ([agentId, repoId]) => {
+      if (!agentId && !repoId) return [];
+      const args = agentId ? { agent_id: agentId } : { repo_id: repoId };
+      return rpc("access.grants", args, { local: true }).catch(() => []);
+    },
+  );
+  const activeGrants = () => (grants() ?? []).filter(isGrantActive);
+  useVisibleEvent("access:changed", () => refetchGrants(), { debounceMs: 150 });
+  useVisibleEvent("access:requested", () => refetchGrants(), { debounceMs: 150 });
+
+  const revokeGrant = async (id) => {
+    try {
+      await rpc("access.revoke", { id }, { action: true });
+      toast("Access revoked");
+      refetchGrants();
+    } catch (err) {
+      toast(String(err), "danger");
+    }
+  };
 
   const [slate, { refetch: refetchSlate }] = createResource(
     () => [props.repoId || "", !!props.strict, props.modelRef || ""],
@@ -272,6 +305,85 @@ export function AgentContext(props) {
           </Show>
         </div>
       </Show>
+
+      <details class="ctx-section quiet-details" open={props.strict || activeGrants().length > 0}>
+        <summary class="ctx-section-head" style={{ cursor: "pointer" }}>
+          <span class="grow">Shared Access ({activeGrants().length})</span>
+          <Button
+            size="sm"
+            variant="ghost"
+            onClick={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              setGrantOpen(true);
+            }}
+          >
+            <Icon name="plus" size={11} /> Grant
+          </Button>
+          <span class="faint">▾</span>
+        </summary>
+        <div class="access-grant-list" style={{ "margin-top": "6px" }}>
+          <Show
+            when={activeGrants().length > 0}
+            fallback={<div class="xs faint">No external folders or repos shared.</div>}
+          >
+            <For each={activeGrants()}>
+              {(g) => {
+                const display = targetDisplay(g);
+                const gScopes = parseScopes(g.scopes);
+                return (
+                  <div class="access-grant-card">
+                    <div class="access-grant-top">
+                      <span class="access-grant-name grow" title={g.target_path || display}>{display}</span>
+                      <Badge>{targetKindLabel(g.target_kind)}</Badge>
+                      <button
+                        type="button"
+                        class="icon-btn"
+                        title="Revoke access"
+                        aria-label={`Revoke ${display}`}
+                        onClick={() => revokeGrant(g.id)}
+                      >
+                        <Icon name="trash" size={11} />
+                      </button>
+                    </div>
+                    <Show when={g.target_path && g.target_path !== display}>
+                      <div class="access-grant-path" title={g.target_path}>{g.target_path}</div>
+                    </Show>
+                    <div class="access-grant-badges">
+                      <For each={gScopes}>
+                        {(s) => {
+                          const meta = scopeMeta(s);
+                          return (
+                            <span
+                              class={`access-scope-pill ${meta?.caution ? "caution" : ""}`}
+                              title={meta?.description}
+                            >
+                              {s}
+                            </span>
+                          );
+                        }}
+                      </For>
+                      <span class="mem-chip">{lifetimeLabel(g.lifetime, g.uses_remaining)}</span>
+                      <Show when={g.strict_allowed}>
+                        <Badge tone="strict">Strict</Badge>
+                      </Show>
+                    </div>
+                  </div>
+                );
+              }}
+            </For>
+          </Show>
+        </div>
+      </details>
+
+      <AccessGrantModal
+        open={grantOpen()}
+        onClose={() => setGrantOpen(false)}
+        sourceRepoId={props.repoId}
+        agentId={props.agentId}
+        strict={!!props.strict}
+        onCreated={() => refetchGrants()}
+      />
     </div>
   );
 }

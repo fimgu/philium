@@ -9,6 +9,8 @@ import { Icon } from "../ui/icons.jsx";
 import { Conversation, Composer, KvTelemetryBar, speedEffort, effortSpeed, agentAttachmentLoader, PlainError } from "../ui/conversation.jsx";
 import { agentHue, AgentChip, RoleBadge, KvBadge, WarningPills } from "../ui/agent-chip.jsx";
 import { SpawnModal } from "../ui/spawn-modal.jsx";
+import { AccessApprovalBar } from "../ui/access-requests.jsx";
+import { pendingAccessByAgent, agentNeedsUser } from "../lib/access-helpers.js";
 import { rpc, fmt, sendError } from "../lib/rpc.js";
 import { route, go, params, registerCommands } from "../lib/nav.js";
 import { useStore, activeRepoId, agentEventsCache } from "../lib/store.js";
@@ -83,6 +85,7 @@ function AgentRow(props) {
       <div class="grow" style={{ "min-width": 0 }}>
         <div class="row" style={{ gap: "6px" }}>
           <AgentChip name={a().name} />
+          <Show when={(props.pendingAccess ?? 0) > 0}><Badge tone="strict">Access request</Badge></Show>
           <Show when={a().state === "waiting"}><Badge tone="strict">Needs you</Badge></Show>
           <Show when={(a().warnings ?? []).some((w) => w.kind === "clash")}><Badge tone="danger">Clash</Badge></Show>
         </div>
@@ -652,6 +655,7 @@ function AgentView(props) {
             <Show when={historyLoading()}><div class="history-loading small dim" role="status">Loading saved conversation…</div></Show>
             <Show when={historyError()}><div class="history-error shield danger" role="alert">Unable to load saved conversation: {historyError()} <Button size="sm" onClick={() => load(props.id, retryAfter)}>Retry history</Button></div></Show>
             <Show when={historyMore()}><div class="history-more small dim" role="status">More saved history is available. Showing loaded pages only. <Button size="sm" disabled={historyLoading()} onClick={() => load(props.id, historyCursor())}>Load more history</Button></div></Show>
+            <AccessApprovalBar agentId={props.id} agentName={a()?.name} repoId={a()?.repo_id} strict={!!a()?.strict} />
             <Conversation events={events()} busy={busy()} readOnly={!live()} loadAttachment={agentAttachmentLoader(props.id)} emptyText={historyLoading() ? "Loading saved conversation…" : historyError() ? "History could not be loaded. Retry above." : live() ? "Send the first message to start." : "No saved messages. This agent is stopped. Resume it to continue."}
               onApprove={(id, scope) => decide(id, "approve", scope)} onDeny={(id) => decide(id, "deny")} />
             <Composer draftKey={`agent:${props.id}`} dropTarget={() => agentMain} onSend={send} busy={busy()} disabled={!live()}
@@ -765,7 +769,7 @@ export function AgentGridCard(props) {
 
   return (
     <div
-      class={`agent-card role-card-${a()?.role || "worker"} ${a()?.state === "waiting" ? "needs-you" : hasClash() ? "has-clash" : busy() ? "active" : ""}`}
+      class={`agent-card role-card-${a()?.role || "worker"} ${a()?.state === "waiting" || (props.pendingAccess ?? 0) > 0 ? "needs-you" : hasClash() ? "has-clash" : busy() ? "active" : ""}`}
       data-agent-card={a()?.name}
     >
       <div class="agent-card-head" onClick={() => props.onOpen?.(a().id)}>
@@ -775,6 +779,7 @@ export function AgentGridCard(props) {
         <span class="xs dim">{stateLabel(a()?.state)}</span>
         <KvBadge kv={a()?.kv} />
         <Show when={a()?.strict}><Badge tone="strict">Strict</Badge></Show>
+        <Show when={(props.pendingAccess ?? 0) > 0}><Badge tone="strict">Access request</Badge></Show>
         <Show when={a()?.state === "waiting"}><Badge tone="strict">Needs you</Badge></Show>
         <Show when={a()?.parent_name}><span class="xs faint" title={`Helper of ${a().parent_name}`}>↳ {a().parent_name}</span></Show>
         <Show when={(a()?.children_count ?? 0) > 0}><span class="xs faint" title="Helpers">◈ {a().children_count}</span></Show>
@@ -942,6 +947,26 @@ export default function Agents() {
   const refetch = store.refetchAgents;
   const screenVisible = typeof useScreenVisible === "function" ? useScreenVisible() : () => true;
   const [spawn, setSpawn] = createSignal(null);
+  const [pendingAccess, pendingAccessCtrl] = typeof createResource === "function"
+    ? createResource(() => rpc("access.pending", {}, { local: true }).catch(() => []))
+    : [() => [], { refetch() {} }];
+  if (typeof useVisibleEvent === "function") {
+    useVisibleEvent("access:requested", () => pendingAccessCtrl.refetch(), { debounceMs: 120 });
+    useVisibleEvent("access:changed", () => pendingAccessCtrl.refetch(), { debounceMs: 120 });
+  }
+  const pendingByAgent = createMemo(() => {
+    if (typeof pendingAccessByAgent === "function") return pendingAccessByAgent(pendingAccess());
+    const counts = new Map();
+    for (const r of pendingAccess() ?? []) {
+      if (r?.agent_id && (!r.status || r.status === "pending")) {
+        counts.set(r.agent_id, (counts.get(r.agent_id) ?? 0) + 1);
+      }
+    }
+    return counts;
+  });
+  const needsYou = (a) => (typeof agentNeedsUser === "function"
+    ? agentNeedsUser(a, pendingByAgent())
+    : a.state === "waiting" || (pendingByAgent().get(a.id) ?? 0) > 0);
   const scoped = createMemo(() => workspaceAgents(list() ?? [], activeRepoId(), store.repos() ?? []));
   // Stopped or failed agents in the active workspace scope: what they found stays in Review and Board after they go.
   const finished = createMemo(() => scoped().filter((a) => a.state === "stopped" || a.state === "failed"));
@@ -1049,7 +1074,7 @@ export default function Agents() {
     const q = search().trim().toLowerCase();
     return scoped().filter((a) => {
       if (filter() === "live" && !a.live) return false;
-      if (filter() === "waiting" && a.state !== "waiting") return false;
+      if (filter() === "waiting" && !needsYou(a)) return false;
       if (filter() === "warnings" && !(a.warnings ?? []).length) return false;
       if (q) {
         const roleText = a.role === "orchestrator" ? "coordinator" : a.role === "reviewer" ? "reviewer" : "agent";
@@ -1095,7 +1120,7 @@ export default function Agents() {
     return {
       total: l.length,
       live: l.filter((a) => a.live).length,
-      waiting: l.filter((a) => a.state === "waiting").length,
+      waiting: l.filter((a) => needsYou(a)).length,
       strict: l.filter((a) => a.strict).length,
       orchestrators: l.filter((a) => a.role === "orchestrator").length,
       kvPct,
@@ -1228,7 +1253,7 @@ export default function Agents() {
                   <Button size="sm" variant="ghost" onClick={() => setPicked([])}>Clear</Button>
                 </div>
               </Show>
-              <For each={tree()}>{({ a, d }) => <AgentRow agent={a} depth={d} selected={a.id === selected()} picked={picked().includes(a.id)} onPick={() => pickRow({ metaKey: true }, a.id)} onClick={(e) => pickRow(e, a.id)} />}</For>
+              <For each={tree()}>{({ a, d }) => <AgentRow agent={a} depth={d} selected={a.id === selected()} picked={picked().includes(a.id)} pendingAccess={pendingByAgent().get(a.id) ?? 0} onPick={() => pickRow({ metaKey: true }, a.id)} onClick={(e) => pickRow(e, a.id)} />}</For>
             </div>
             <Show when={selected()}>{(id) => (
               <Show when={filtered().some((a) => a.id === id())} fallback={
@@ -1248,6 +1273,7 @@ export default function Agents() {
                     {({ a }) => (
                       <AgentGridCard
                         agent={a}
+                        pendingAccess={pendingByAgent().get(a.id) ?? 0}
                         onOpen={openAgentFocus}
                         onSpawnChild={(parent) => setSpawn({ parent_id: parent.id, role: "worker", repo_id: parent.repo_id })}
                       />
