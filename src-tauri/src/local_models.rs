@@ -513,5 +513,55 @@ mod tests {
         assert_eq!(rows.first().map(|r| r["id"].clone()), Some(want["id"].clone()), "{hits}");
         assert!(rows.iter().all(|r| r["scope"] == "repo:ra"), "scope gate: {hits}");
     }
+
+    /// A/B: same corpus and paraphrased queries (little/no word overlap) with local models off
+    /// (keyword only, the previous out-of-box behaviour) vs on. Prints recall@1 for both.
+    #[tokio::test]
+    #[ignore]
+    async fn ab_paraphrase_recall_local_models_vs_keyword_only() {
+        let facts = [
+            ("Use pnpm; npm lockfiles are rejected in CI.", "which package manager should I install dependencies with?"),
+            ("Bundle the model weights inside the app so it works with no network.", "can it run on a plane without internet?"),
+            ("Rotate the OAuth refresh token every 30 days.", "how often do credentials need renewing?"),
+            ("Never edit applied database migrations; add a new one.", "may I change an old schema change file?"),
+            ("Run cargo tests with TMPDIR=/tmp/ph-tests or access tests hang.", "why does the rust suite stall on my machine?"),
+            ("The dev proxy breaks Vite hot reload unless clientPort is set.", "live refresh stops working behind the forwarder"),
+            ("Release builds must link clang_rt.osx for ONNX Runtime.", "linker complains about a missing symbol when shipping"),
+            ("Strict agents get zero personal or repo memory.", "what context do untrusted sandboxed workers receive?"),
+        ];
+        let mut out = Vec::new();
+        for on in [false, true] {
+            let dir = crate::ctx::test_dir(if on { "ab-on" } else { "ab-off" });
+            let ctx = Arc::new(Ctx::new(crate::db::Db::memory(), dir.join("data"), dir.join("root"), crate::gateway::Gateway::new("t".repeat(48), None), "http://127.0.0.1:1".into()));
+            ctx.db.kv_set("library.imported_at", "fixture").unwrap();
+            crate::library::init(&ctx).unwrap();
+            if on {
+                let real = std::env::var("HOME").unwrap() + "/Library/Application Support/dev.gunnarsson.philium/models";
+                std::fs::create_dir_all(ctx.data_dir.clone()).unwrap();
+                let _ = std::os::unix::fs::symlink(&real, ctx.data_dir.join("models"));
+                assert!(installed(&ctx.data_dir, &EMBED) && installed(&ctx.data_dir, &RERANK), "run the app once to download models");
+            } else {
+                set_enabled(&ctx, false).unwrap();
+            }
+            let mut ids = Vec::new();
+            for (f, _) in facts {
+                let r = crate::library::save_structured(&ctx, crate::library::SaveOpts { content: f, category: "fact", scope: "repo:ra", source: "user", trust_tier: "user_direct", fact_key: None, supersedes_id: None, source_event_id: None, provenance: None }).unwrap();
+                ids.push(r["id"].clone());
+                crate::library::save_structured(&ctx, crate::library::SaveOpts { content: &format!("SIBLING {f}"), category: "fact", scope: "repo:rb", source: "user", trust_tier: "user_direct", fact_key: None, supersedes_id: None, source_event_id: None, provenance: None }).unwrap();
+            }
+            let _ = crate::library::sync_vectors_async(&ctx).await;
+            let (mut hit, mut leak) = (0, 0);
+            for (i, (_, q)) in facts.iter().enumerate() {
+                let rows = crate::library::agent_memories_async(&ctx, q, "ra", 5).await.unwrap();
+                let rows = rows.as_array().cloned().unwrap_or_default();
+                if rows.first().map(|r| r["id"].clone()) == Some(ids[i].clone()) { hit += 1; }
+                leak += rows.iter().filter(|r| r["scope"] != "repo:ra").count();
+            }
+            out.push((on, hit, leak));
+        }
+        eprintln!("AB_RESULT keyword_only recall@1={}/{} leaks={} | local_models recall@1={}/{} leaks={}", out[0].1, facts.len(), out[0].2, out[1].1, facts.len(), out[1].2);
+        assert_eq!(out[0].2 + out[1].2, 0, "scope leak");
+        assert!(out[1].1 > out[0].1, "local models must beat keyword-only: {out:?}");
+    }
 }
 
