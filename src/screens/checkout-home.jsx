@@ -27,12 +27,17 @@ export default function CheckoutHome(props) {
   for (const topic of ['agents:changed','board:changed','workspace:changed','reaper:changed']) {
     useVisibleEvent(topic, () => refetch(), { debounceMs: 300 });
   }
+  const [prReviews, {refetch: refetchPrReviews}] = createResource(() =>
+    rpc('pr_review.list', {repo_id: props.id}, {local: true}).catch(() => []));
+  useVisibleEvent('pr_review:changed', () => refetchPrReviews(), { debounceMs: 300 });
   const [spawnPreset, setSpawnPreset] = createSignal(null);
   const coordinators = () => (result()?.data?.agents || []).filter(a => a.role === 'orchestrator' || a.role === 'coordinator');
   const waitingAgents = () => (result()?.data?.agents || []).filter(a => a.state === 'waiting');
   const failedAgents = () => (result()?.data?.agents || []).filter(a => a.state === 'failed');
   const repoClashes = () => (result()?.data?.agents || []).flatMap(a => (a.warnings || []).filter(w => w.kind === 'clash').map(w => ({ agent: a, text: w.text })));
-  const needsYouCount = () => waitingAgents().length + failedAgents().length + repoClashes().length;
+  const needsYouPrReviews = () => (prReviews() || []).filter(r => r.verdict === 'needs_you');
+  const blockedTitles = (r) => (r.items || []).filter(it => it.status === 'blocked').map(it => it.title).join(', ');
+  const needsYouCount = () => waitingAgents().length + failedAgents().length + repoClashes().length + needsYouPrReviews().length;
   const link = (label, route, params) => <Button size="sm" variant="ghost" onClick={() => go(route,params)}>{label}</Button>;
   return <Page title="Workspace" sub="Active repository" actions={<div class="row">
     <Button variant="primary" onClick={() => setSpawnPreset({ role: 'worker', repo_id: props.id })}><Icon name="plus" size={12} /> New agent</Button>
@@ -61,6 +66,12 @@ export default function CheckoutHome(props) {
             {c => <div class="checkout-row" style={{ cursor: 'pointer' }} onClick={() => go('code', { repo_id: props.id })}>
               <span class="row"><Dot state="warn" /><AgentChip name={c.agent.name} /> <small>{c.text}</small></span>
               <Button size="sm">See code</Button>
+            </div>}
+          </For>
+          <For each={needsYouPrReviews()}>
+            {r => <div class="checkout-row" style={{ cursor: 'pointer' }} onClick={() => go('review')}>
+              <span class="row"><Dot state="warn" /><small>PR #{r.pr}{r.title ? ` · ${r.title}` : ''} needs you{blockedTitles(r) ? `: ${blockedTitles(r)}` : ''}</small></span>
+              <Button size="sm">Review</Button>
             </div>}
           </For>
         </section>

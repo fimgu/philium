@@ -7,6 +7,7 @@ import { Button, Empty, Page, toast } from '../ui/kit.jsx';
 import { githubIdentity, maxPacketBytes, reviewPreview } from '../lib/review-packet.js';
 import { LocalChecks } from './local-checks.jsx';
 import { ReleaseIntake } from './release-intake.jsx';
+import { PrReviewer } from './pr-review.jsx';
 
 function Reader(props) {
   const [data, setData] = createSignal(null), [error, setError] = createSignal('');
@@ -131,6 +132,7 @@ export default function Review() {
         >
           {id => (
             <>
+              <PrReviewer repo={id} />
               <Show when={key()} keyed fallback={
                 <Show when={!branchAgents().length}>
                   <Empty title="No PR remote or agent branch" body="Add a GitHub remote for PR links, or start an agent to review its branch." />
