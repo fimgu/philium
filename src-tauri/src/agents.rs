@@ -25,6 +25,7 @@
 //!   set_model {id, model}
 //!   set_effort {id, effort} / get_effort {id}  -> reasoning effort (default|low|medium|high|...), persisted
 //!   checkpoints {id} / checkpoint_preview|checkpoint_restore {id, turn, paths?} -> HAL turn undo (A1)
+//!   plan_mode {id} / plan_get {id} / plan_approve {id, revision} -> read-only planning until approved (A2)
 //!   diff {id}                                 -> git diff of the agent's workspace
 //!   names {}                                  -> suggested free names
 //! events: `agents:changed` {id}, `agents:events` {id, events:[...]} (batched ~10 Hz)
@@ -1340,9 +1341,46 @@ pub async fn send_with_images(ctx: &Arc<Ctx>, id: &str, text: &str, images: Valu
     }
     // Only HAL events change turn state. A rejected request is not a new turn,
     // and setting state after acceptance can race a fast completion event.
+    // A2: while a plan awaits approval every send is a read-only plan turn, whatever its source.
+    let mut body = message_body(text, images);
+    if plan_locked(ctx, id) {
+        body["plan"] = json!(true);
+        bump_plan_revision(ctx, id);
+    }
     r.hal
-        .call(reqwest::Method::POST, &format!("/sessions/{}/messages", r.session), Some(message_body(text, images)))
+        .call(reqwest::Method::POST, &format!("/sessions/{}/messages", r.session), Some(body))
         .await
+}
+
+fn plan_key(id: &str) -> String {
+    format!("agent.{id}.plan")
+}
+
+/// Plan state: `{locked, revision}`. Locked means sends are planning-only until approved.
+pub(crate) fn plan_state(ctx: &Ctx, id: &str) -> Value {
+    ctx.db.kv_get(&plan_key(id)).and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(json!({ "locked": false, "revision": 0 }))
+}
+
+fn plan_locked(ctx: &Ctx, id: &str) -> bool {
+    plan_state(ctx, id)["locked"].as_bool().unwrap_or(false)
+}
+
+fn bump_plan_revision(ctx: &Ctx, id: &str) {
+    let mut st = plan_state(ctx, id);
+    st["revision"] = json!(st["revision"].as_i64().unwrap_or(0) + 1);
+    let _ = ctx.db.kv_set(&plan_key(id), &st.to_string());
+}
+
+/// Enter plan mode, or approve the plan at `revision` and leave it. A stale revision stays locked.
+pub(crate) fn set_plan(ctx: &Ctx, id: &str, lock: bool, revision: Option<i64>) -> Result<Value, String> {
+    let mut st = plan_state(ctx, id);
+    if !lock && st["locked"].as_bool() == Some(true) && revision != st["revision"].as_i64() {
+        return Err("The plan changed since you reviewed it. Read the latest plan, then approve again.".into());
+    }
+    st["locked"] = json!(lock);
+    ctx.db.kv_set(&plan_key(id), &st.to_string())?;
+    ctx.emit("agents:changed", json!({ "id": id, "plan": st }));
+    Ok(st)
 }
 
 /// What the person typed while the agent worked, oldest first, as one message: the text joined
@@ -1815,6 +1853,17 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
             let r = rt(&id()?)?;
             r.hal.call(reqwest::Method::POST, &format!("/sessions/{}/compact", r.session), Some(json!({}))).await
         }
+        "plan_get" => Ok(plan_state(ctx, &id()?)),
+        "plan_mode" => {
+            let id = id()?;
+            let r = rt(&id)?;
+            let sess = r.hal.call(reqwest::Method::GET, &format!("/sessions/{}", r.session), None).await?;
+            if sess["plan_mode_supported"].as_bool() != Some(true) {
+                return Err("Plan mode is not available in this HAL version.".into());
+            }
+            set_plan(ctx, &id, true, None)
+        }
+        "plan_approve" => set_plan(ctx, &id()?, false, args["revision"].as_i64()),
         "cancel" => {
             let r = rt(&id()?)?;
             r.hal.call(reqwest::Method::POST, &format!("/sessions/{}/cancel", r.session), None).await
@@ -2317,6 +2366,19 @@ async fn remove_one(ctx: &Arc<Ctx>, id: &str, force: bool) -> Result<Value, Stri
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn plan_lock_holds_until_the_current_revision_is_approved() {
+        let ctx = Ctx::test();
+        assert!(!plan_locked(&ctx, "a"));
+        set_plan(&ctx, "a", true, None).unwrap();
+        bump_plan_revision(&ctx, "a");
+        assert!(plan_locked(&ctx, "a"));
+        assert!(set_plan(&ctx, "a", false, Some(0)).is_err());
+        assert!(plan_locked(&ctx, "a"));
+        set_plan(&ctx, "a", false, Some(1)).unwrap();
+        assert!(!plan_locked(&ctx, "a"));
+    }
+
     #[test]
     fn checkpoint_requests_map_to_hal_routes() {
         let (m, p, _) = checkpoint_request("s1", "checkpoints", &json!({})).unwrap();
