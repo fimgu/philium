@@ -14,6 +14,7 @@ import {
   targetDisplay,
   targetKindLabel,
 } from "../lib/access-helpers.js";
+import PublishModal from "../ui/publish-modal.jsx";
 import "../styles/workspace.css";
 import "../styles/access.css";
 
@@ -153,6 +154,7 @@ function Worktree(props) {
     </div>
     <div class="wt-actions">
       <Button size="sm" onClick={() => props.onDiff(w())}>View diff</Button>
+      <Show when={!w().kind || w().kind !== "external"}><Button size="sm" onClick={() => props.onPublish?.(w())}>Publish</Button></Show>
       <Menu items={[
         { label: "Open in Finder", onClick: () => props.onOpen(w().path, "finder") },
         { label: "Open in Terminal", onClick: () => props.onOpen(w().path, "terminal") },
@@ -214,6 +216,7 @@ export default function Repos() {
   const labels = createMemo(() => repoLabels(repos()));
   const [trees, setTrees] = createSignal([]), [branches, setBranches] = createSignal([]);
   const [error, setError] = createSignal(""), [busy, setBusy] = createSignal(false);
+  const [publishing, setPublishing] = createSignal(null);
   const loading = () => store.repos.loading && !store.repos()?.length;
   const [dialog, setDialog] = createSignal(null), [path, setPath] = createSignal(""), [name, setName] = createSignal("");
   const [diff, setDiff] = createSignal(null), [treeName, setTreeName] = createSignal("");
@@ -335,7 +338,8 @@ export default function Repos() {
                 <div class="rp-create"><Input aria-label="Worktree name" placeholder="Agent or worktree name" value={treeName()} onValue={setTreeName} onKeyDown={(e) => e.key === "Enter" && treeName().trim() && act(async () => { await rpc("workspace.worktree_create", { repo_id: r().id, name: treeName().trim() }); setTreeName(""); })} />
                 <Button busy={busy()} disabled={!treeName().trim()} onClick={() => act(async () => { await rpc("workspace.worktree_create", { repo_id: r().id, name: treeName().trim() }); setTreeName(""); })}>Create</Button></div></div>
               <Show when={trees().length} fallback={<p class="ws-muted rp-pad">No managed worktrees yet. Create one here or assign an agent to this repository. Your main checkout stays untouched.</p>}>
-                <div class="ws-tree-list" style={{ height: `${Math.min(trees().length, 5) * 104 + 4}px` }}><VirtualList items={trees()} rowHeight={104}>{w => <Worktree w={w} busy={busy()} onDiff={viewDiff} onOpen={open} onRemove={remove} />}</VirtualList></div>
+                <div class="ws-tree-list" style={{ height: `${Math.min(trees().length, 5) * 104 + 4}px` }}><VirtualList items={trees()} rowHeight={104}>{w => <Worktree w={w} busy={busy()} onDiff={viewDiff} onOpen={open} onRemove={remove} onPublish={(x) => setPublishing({ w: x, base: r().integration_branch || r().default_branch || "" })} />}</VirtualList></div>
+                <Show when={publishing()}><PublishModal worktree={publishing().w} base={publishing().base} onClose={() => setPublishing(null)} /></Show>
               </Show>
             </section>
             <Branches branches={branches()} trees={trees()} />

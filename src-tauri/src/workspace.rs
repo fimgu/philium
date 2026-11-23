@@ -907,6 +907,25 @@ fn dispatch(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, String> 
             changed(ctx);
             Ok(r)
         }
+        "publish_state" | "commit" | "push" | "pr_create" => {
+            let w = worktree(ctx, &arg_str(&args, "worktree_id")?)?;
+            let path = Path::new(text(&w, "path")?);
+            if method == "publish_state" {
+                return crate::publish::state(path);
+            }
+            let lock = repo_lock(text(&w, "repo_id")?);
+            let _queue = lock.lock().map_err(|e| e.to_string())?;
+            let r = match method {
+                "commit" => {
+                    let paths: Vec<String> = args["paths"].as_array().map(|a| a.iter().filter_map(|p| p.as_str().map(str::to_string)).collect()).unwrap_or_default();
+                    crate::publish::commit(path, &paths, &arg_str(&args, "message")?, args["expect_head"].as_str())
+                }
+                "push" => crate::publish::push(path),
+                _ => crate::publish::pr(path, &arg_str(&args, "base")?, &arg_str(&args, "title")?, args["body"].as_str().unwrap_or("")),
+            }?;
+            changed(ctx);
+            Ok(r)
+        }
         "log" => {
             let row = if let Some(id) = args["worktree_id"].as_str() {
                 worktree(ctx, id)?

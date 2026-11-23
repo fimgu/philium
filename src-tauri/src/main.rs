@@ -60,6 +60,7 @@ mod drafts;
 mod capture;
 mod selfdev;
 mod pins;
+mod publish;
 mod pilot;
 mod stats;
 mod storage;
