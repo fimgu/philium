@@ -909,7 +909,14 @@ fn s<'a>(v: &'a Value, k: &str) -> Result<&'a str, String> {
 pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, String> {
     match method {
         "list" => list(ctx, &args),
-        "get" => get(ctx, s(&args, "task_id").or_else(|_| s(&args, "id"))?),
+        // A missing task is an optional record (deleted while a drawer was open), not a load failure.
+        "get" => {
+            let id = s(&args, "task_id").or_else(|_| s(&args, "id"))?;
+            match ctx.db.query("SELECT * FROM tasks WHERE id=?1", [id])?.into_iter().next() {
+                Some(t) => decorate(ctx, t, true),
+                None => Ok(Value::Null),
+            }
+        }
         "create" => create(
             ctx,
             "you",
@@ -1030,6 +1037,16 @@ mod tests {
             .as_str()
             .unwrap()
             .into()
+    }
+    #[test]
+    fn get_of_deleted_task_is_null_not_error() {
+        let c = ctx();
+        let id = task(&c, &[], None);
+        assert!(get(&c, &id).is_ok());
+        c.db.exec("DELETE FROM tasks WHERE id=?1", [&id]).unwrap();
+        assert!(get(&c, &id).is_err());
+        let r = tauri::async_runtime::block_on(call(&c, "get", json!({"task_id": id})));
+        assert_eq!(r.unwrap(), Value::Null);
     }
     #[test]
     fn handover_survives_stop_and_restart() {

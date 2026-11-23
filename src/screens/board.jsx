@@ -36,7 +36,7 @@ export default function Board() {
   const [mail, setMail] = createSignal([]), [messages, setMessages] = createSignal([]), [a, setA] = createSignal("you"), [b, setB] = createSignal("all"), [body, setBody] = createSignal("");
   const columns = createMemo(() => cancelled() ? [...statuses, ["cancelled", "Cancelled"]] : statuses);
   async function attempt(fn) { setError(""); setBusy(true); try { return await fn(); } catch (e) { setError(String(e)); } finally { setBusy(false); } }
-  async function refresh() { setTasks(await rpc("board.list", {})); if (selected()) { const id=selected().id; const updated=await rpc("board.get", { task_id:id }); if(selected()?.id===id)setSelected(updated); } }
+  async function refresh() { setTasks(await rpc("board.list", {})); if (selected()) { const id=selected().id; const updated=await rpc("board.get", { task_id:id }); if(selected()?.id===id)setSelected(updated ?? null); } }
   async function readMail() { setMail(await rpc("board.mail_inbox", { agent: a(), mark_read: true })); await readThread(); }
   async function readTaskMail(t) { const rows = await rpc("board.mail_threads", { a: "you", b: t.owner || "all", limit: 1000 }); setTaskMail(rows.filter(m => m.body.includes(t.id))); }
   async function readThread() { setMessages(await rpc("board.mail_threads", { a: a(), b: b(), limit: 1000 })); }
