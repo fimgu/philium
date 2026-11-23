@@ -6,6 +6,8 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import { rpc } from "../lib/rpc.js";
+import { terminalIO } from "../lib/terminal-io.js";
+import { useScreenVisible } from "../lib/visibility.js";
 
 const decode = (s) => {
   const bin = atob(s);
@@ -29,7 +31,8 @@ const THEME = {
 };
 
 export function TermView(props) {
-  let el, term, fit, observer, unlisten, dead = false, ready = false, offset = 0;
+  const visible = useScreenVisible();
+  let el, term, io, fit, observer, unlisten, dead = false, ready = false, offset = 0;
   let resizeRaf = 0, lastCols = 0, lastRows = 0;
   const queued = [];
   const [error, setError] = createSignal("");
@@ -42,10 +45,11 @@ export function TermView(props) {
     const data = decode(p.data);
     const end = p.offset ?? offset + data.length;
     const skip = Math.max(0, offset - (end - data.length));
-    if (end > offset && term) {
+    if (end > offset) {
       const follow = isNearBottom();
-      term.write(data.subarray(skip), () => {
-        if (!dead && follow) term.scrollToBottom();
+      io.write(data.subarray(skip), {
+        replay: !visible(),
+        done: () => { if (follow) term.scrollToBottom(); },
       });
     }
     offset = Math.max(offset, end);
@@ -77,22 +81,28 @@ export function TermView(props) {
     };
     observer = new ResizeObserver(resize);
     observer.observe(el);
-    term.onData((d) => rpc("terminals.write", { id: props.id, data: encode(d) }).catch((e) => setError(String(e))));
+    io = terminalIO(
+      term,
+      () => visible() && props.running !== false,
+      (d) => rpc("terminals.write", { id: props.id, data: encode(d) }).catch((e) => setError(String(e))),
+    );
     try {
       unlisten = await listen("terminals:data", (e) => {
-        if (e.payload.id !== props.id) return;
+        if (dead || e.payload.id !== props.id) return;
         ready ? append(e.payload) : queued.push(e.payload);
       });
       if (dead) return unlisten();
       const b = await rpc("terminals.buffer", { id: props.id });
       if (dead) return;
       const data = decode(b.data);
-      term.write(data, () => {
-        if (!dead) term.scrollToBottom();
+      io.write(data, {
+        replay: true,
+        done: () => term.scrollToBottom(),
       });
       props.onData?.(data);
       offset = b.offset ?? data.length;
     } catch (e) {
+      if (dead) return;
       setError(String(e));
     }
     ready = true;
@@ -106,6 +116,7 @@ export function TermView(props) {
     if (resizeRaf) cancelAnimationFrame(resizeRaf);
     observer?.disconnect();
     unlisten?.();
+    io?.dispose();
     term?.dispose();
   });
   return (

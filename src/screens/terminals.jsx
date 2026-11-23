@@ -16,6 +16,7 @@ import { rpc, useEvent } from "../lib/rpc.js";
 import { params } from "../lib/nav.js";
 import { activeRepoId, useStore } from "../lib/store.js";
 import { useScreenVisible, useVisibleEvent } from "../lib/visibility.js";
+import { terminalIO } from "../lib/terminal-io.js";
 import "../styles/terminals.css";
 
 const decode = (s) => {
@@ -36,6 +37,7 @@ function Pane(props) {
   const visible = useScreenVisible();
   let el,
     term,
+    io,
     fit,
     observer,
     resizeRaf = 0,
@@ -47,11 +49,11 @@ function Pane(props) {
   const queued = [];
   const hiddenQueue = [];
   const [error, setError] = createSignal("");
-  const append = (p) => {
+  const append = (p, replay = !visible()) => {
     const data = decode(p.data);
     const end = p.offset ?? offset + data.length;
     const skip = Math.max(0, offset - (end - data.length));
-    if (end > offset) term?.write(data.subarray(skip));
+    if (end > offset) io.write(data.subarray(skip), { replay });
     offset = Math.max(offset, end);
   };
   const doResize = () => {
@@ -97,7 +99,7 @@ function Pane(props) {
   createEffect(() => {
     if (visible() && ready && !dead) {
       if (hiddenQueue.length) {
-        for (const p of hiddenQueue) append(p);
+        for (const p of hiddenQueue) append(p, true);
         hiddenQueue.length = 0;
       }
       resize();
@@ -116,22 +118,23 @@ function Pane(props) {
     term.open(el);
     observer = new ResizeObserver(resize);
     observer.observe(el);
-    term.onData((data) =>
-      rpc("terminals.write", { id: props.item.id, data: encode(data) }).catch(
-        setError,
-      ),
+    io = terminalIO(
+      term,
+      () => visible() && props.item.state === "running",
+      (data) => rpc("terminals.write", { id: props.item.id, data: encode(data) }).catch(setError),
     );
     try {
       const b = await rpc("terminals.buffer", { id: props.item.id });
       if (dead) return;
       const initialBytes = decode(b?.data);
-      if (initialBytes.length) term.write(initialBytes);
+      if (initialBytes.length) io.write(initialBytes, { replay: true });
       offset = b?.offset ?? initialBytes.length;
       ready = true;
       for (const p of queued) append(p);
       queued.length = 0;
       doResize();
     } catch (e) {
+      if (dead) return;
       setError(String(e));
       ready = true;
       for (const p of queued) append(p);
@@ -142,6 +145,7 @@ function Pane(props) {
     dead = true;
     if (resizeRaf) cancelAnimationFrame(resizeRaf);
     observer?.disconnect();
+    io?.dispose();
     term?.dispose();
   });
   return (
