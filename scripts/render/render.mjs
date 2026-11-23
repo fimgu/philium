@@ -1,11 +1,11 @@
 // Headless render harness: serves ../../dist with a stubbed Tauri bridge and
 // screenshots every screen and modal in EMPTY and POPULATED fixture states.
 // usage: node render.mjs [outDir] [--only=agents,board] [--sets=empty,populated]
+// visible preview: node render.mjs --serve --port=PORT
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import puppeteer from "puppeteer-core";
 import { EMPTY, POPULATED, FAILING, SLOW, HUGE } from "./fixtures.js";
 import { checkAgentMessaging, checkChatMessaging } from "./robustness.mjs";
 import { checkStoppedHistory } from "./stopped-history.mjs";
@@ -15,7 +15,6 @@ import { checkReviewPreview } from "./review-preview.mjs";
 const SETS = { empty: EMPTY, populated: POPULATED, failing: FAILING, slow: SLOW, huge: HUGE };
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const dist = process.env.PHILIUM_RENDER_DIST ?? path.resolve(here, "../../dist");
 const args = process.argv.slice(2);
 const out = path.resolve(args.find((a) => !a.startsWith("--")) ?? path.join(here, "out"));
 const opt = (k, d) => (args.find((a) => a.startsWith(`--${k}=`)) ?? `--${k}=${d}`).split("=")[1];
@@ -24,18 +23,48 @@ const sets = opt("sets", "empty,populated,failing,slow,huge").split(",");
 const CHROME = process.env.CHROME ?? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 const SIZES = [[1440, 900], [1280, 800]];
 const SCREENS = ["home", "agents", "board", "review", "environments", "chat", "terminals", "browser", "repos", "code", "activity", "stats", "providers", "settings"];
+const serveOnly = args.includes("--serve");
+const dist = serveOnly
+  ? path.resolve(here, "../../dist-fixture")
+  : path.resolve(process.env.PHILIUM_RENDER_DIST ?? path.join(here, "../../dist"));
 
 const mime = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".woff2": "font/woff2", ".png": "image/png", ".svg": "image/svg+xml" };
 const server = http.createServer((req, res) => {
-  let p = path.join(dist, decodeURIComponent(req.url.split("?")[0]));
+  const url = new URL(req.url, "http://localhost");
+  if (serveOnly && ["/", "/index.html", "/fixture.js"].includes(url.pathname)) {
+    const state = url.searchParams.get("set") || "populated";
+    const route = url.searchParams.get("screen") || "stats";
+    if (!Object.hasOwn(SETS, state) || !SCREENS.includes(route)) {
+      res.writeHead(400).end("Unknown fixture or screen");
+      return;
+    }
+    if (url.pathname === "/fixture.js") {
+      res.setHeader("content-type", mime[".js"]);
+      res.end(`(${stub.toString()})(${JSON.stringify(SETS[state])}, ${JSON.stringify(state)}, true);\nlocalStorage.setItem("route", ${JSON.stringify(route)});`);
+      return;
+    }
+    const query = new URLSearchParams({ set: state, screen: route });
+    res.setHeader("content-type", mime[".html"]);
+    res.end(fs.readFileSync(path.join(dist, "index.html"), "utf8").replace("<head>", `<head><script src="/fixture.js?${query.toString().replaceAll("&", "&amp;")}"></script>`));
+    return;
+  }
+  let p;
+  try {
+    p = path.resolve(dist, `.${decodeURIComponent(url.pathname)}`);
+  } catch {
+    res.writeHead(400).end("Invalid path");
+    return;
+  }
+  if (p !== dist && !p.startsWith(`${dist}${path.sep}`)) {
+    res.writeHead(404).end();
+    return;
+  }
   if (!fs.existsSync(p) || fs.statSync(p).isDirectory()) p = path.join(dist, "index.html");
   res.setHeader("content-type", mime[path.extname(p)] ?? "application/octet-stream");
   fs.createReadStream(p).pipe(res);
 });
-await new Promise((resolve,reject) => server.once('error',reject).listen(0, '127.0.0.1', resolve));
-const port = server.address().port;
 
-const stub = (fx, setName) => {
+const stub = (fx, setName, serveOnly = false) => {
   const fixtures = fx;
   window.__permissionCalls = [];
   const listeners = new Map();
@@ -61,8 +90,7 @@ const stub = (fx, setName) => {
   };
   let permissionSeq = 2000;
   let cb = 1;
-  window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener() {} };
-  window.__TAURI_INTERNALS__ = {
+  const bridge = {
     metadata: { currentWindow: { label: "main" }, currentWebview: { label: "main", windowLabel: "main" } },
     transformCallback(f) { const id = cb++; window[`_${id}`] = f; return id; },
     unregisterCallback() {},
@@ -202,8 +230,25 @@ const stub = (fx, setName) => {
       return null;
     },
   };
+  if (serveOnly) {
+    window.__philiumFixtureBridge = bridge;
+  } else {
+    window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener() {} };
+    window.__TAURI_INTERNALS__ = bridge;
+  }
 };
 
+if (!fs.existsSync(path.join(dist, "index.html"))) throw new Error(`Run npm run build${serveOnly ? " -- --mode fixture" : ""} first`);
+await new Promise((resolve, reject) => server.once("error", reject).listen(serveOnly ? Number(opt("port", 0)) : 0, "127.0.0.1", resolve));
+const port = server.address().port;
+if (serveOnly) {
+  console.log(`Fixture preview (no browser launched): http://127.0.0.1:${port}/?screen=stats&set=populated`);
+} else {
+  await renderScreens();
+}
+
+async function renderScreens() {
+const { default: puppeteer } = await import("puppeteer-core");
 const problems = [];
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const browser = await puppeteer.launch({ executablePath: CHROME, headless: "new", args: ["--no-sandbox"] });
@@ -363,3 +408,4 @@ for (const setName of sets) {
 await browser.close();
 if (problems.length) { console.log("\nPROBLEMS (" + problems.length + ")"); for (const p of [...new Set(problems)]) console.log(" - " + p); process.exitCode = 1; } else console.log("\nno problems");
 server.close();
+}
