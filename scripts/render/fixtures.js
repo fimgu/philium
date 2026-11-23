@@ -11,6 +11,7 @@ export const EMPTY = {
   "app.events": [],
   "providers.default": "",
   "providers.models": [],
+  "activity.quotas": {},
   "stats.summary": { totals: { requests: 0 }, by_agent: [], by_provider: [], by_model: [] },
   "stats.timeseries": { points: [] },
   "stats.efficiency": {},
@@ -168,12 +169,18 @@ export const POPULATED = {
   "reaper.proposals": [{ id: "p1", kind: "worktree", handle: "/Users/demo/Philium/worktrees/old", reason: "Agent removed", state: "proposed" }],
   "reaper.ledger": [{ id: "l1", kind: "worktree", handle: "/Users/demo/Philium/worktrees/lion", state: "live", created_at: now - 3600000 }],
   "activity.list": rows,
+  "activity.quotas": {
+    chatgpt: {
+      observed_at: Math.floor(now / 1000),
+      windows: [{ label: "7d", used_percent: 28, resets_at: Math.floor(now / 1000) + 259200 }],
+    },
+  },
   "stats.summary": {
     totals: { requests: 342, tokens_in: 1.2e6, tokens_out: 3.4e5, cost: 12.8, error_rate: 0.012, avg_tps: 58, avg_ttft_ms: 410, guard_actions: 7, unpriced_requests: 12 },
     by_agent: ["lion", "otter", "heron"].map(statRow), by_provider: ["claude", "chatgpt", "local"].map(statRow), by_model: ["claude-opus-5-5", "gpt-6.1", "qwen3-coder"].map(statRow),
   },
   "stats.timeseries": points,
-  "stats.efficiency": { cached_share: 0.42, cache_available: true, output_input_ratio: 0.28, cost_per_: 0.04 },
+  "stats.efficiency": [],
   "codeindex.status": { files: 5, symbols: 42, indexed_at: now - 60000, state: "ready" },
   "codeindex.tree": tree,
   "codeindex.graph": codeGraph,

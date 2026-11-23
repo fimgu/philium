@@ -244,6 +244,19 @@ for (const setName of sets) {
         return out;
       });
       for (const b of bad) problems.push(`${setName} ${w}x${h} ${s}: ${b}`);
+      if (s === "stats" && setName === "populated") {
+        try {
+          await page.waitForFunction(() => {
+            const table = document.querySelector('table[aria-label="Provider usage"]');
+            const row = (name) => [...(table?.tBodies[0]?.rows ?? [])]
+              .find((r) => r.cells[0]?.textContent.includes(name));
+            return row("ChatGPT")?.cells[1]?.textContent.includes("7d: 28% used · resets in")
+              && Number(row("ChatGPT")?.cells[2]?.textContent) > 0
+              && row("Claude")?.cells[1]?.textContent.includes("No quota reported")
+              && row("OpenRouter")?.textContent.includes("No requests in this range");
+          }, { timeout: 3000 });
+        } catch (e) { problems.push(`${w} Stats provider quota and traffic: ${e.message}`); }
+      }
       if(s==='environments' && setName==='populated') {
         try {
           await clickText(page,'button','Inspect local machine'); await page.waitForSelector('label select option[value="alpha"]');
