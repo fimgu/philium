@@ -195,6 +195,12 @@ export function useStore() {
     const [providers, { refetch: refetchProviders }] = createStoreResource(() =>
       rpc("providers.list").catch(() => []),
     );
+    const [pendingAccess, { refetch: refetchPendingAccess }] = createStoreResource(() =>
+      rpc("access.pending", {}, { local: true }),
+    );
+    const [agentApprovals, { refetch: refetchAgentApprovals }] = createStoreResource(() =>
+      rpc("agents.pending_permissions", {}, { local: true }),
+    );
 
     // Lazy slices: fetched on demand when first read so Home cold launch avoids unused RPCs.
     const [models, { refetch: refetchModels, refetchIfStarted: refetchModelsIfStarted }] =
@@ -221,6 +227,16 @@ export function useStore() {
       clearTimeout(agTimer);
       agTimer = setTimeout(refetchAgents, 120);
     });
+    let approvalsTimer;
+    const scheduleApprovals = () => {
+      clearTimeout(approvalsTimer);
+      approvalsTimer = setTimeout(refetchAgentApprovals, 120);
+    };
+    useEvent("agents:events", ({ events }) => {
+      if (events?.some((event) => /^(permission\.|turn\.(cancelled|failed|finished))/.test(event.type))) scheduleApprovals();
+    });
+    useEvent("access:requested", refetchPendingAccess);
+    useEvent("access:changed", refetchPendingAccess);
 
     useEvent("providers:changed", () => {
       refetchModelsIfStarted();
@@ -247,7 +263,10 @@ export function useStore() {
 
     if (typeof window !== "undefined") {
       const statusTimer = setInterval(() => {
-        if (typeof document === "undefined" || !document.hidden) refetchStatus();
+        if (typeof document === "undefined" || !document.hidden) {
+          refetchStatus();
+          refetchAgentApprovals();
+        }
       }, 30000);
       statusTimer?.unref?.();
       onCleanup(() => clearInterval(statusTimer));
@@ -256,6 +275,9 @@ export function useStore() {
     return {
       agents,
       refetchAgents,
+      pendingAccess,
+      agentApprovals,
+      refetchAgentApprovals,
       repos,
       refetchRepos,
       models,

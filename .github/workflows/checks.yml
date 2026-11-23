@@ -1,0 +1,64 @@
+name: Checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@main
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@main
+        with:
+          node-version: lts/*
+          check-latest: true
+      - run: npm ci
+      - run: npm ci --prefix scripts/render
+      - run: npm run build
+      - run: npm run build -- --mode fixture
+      - name: Run frontend tests
+        run: |
+          export CHROME="$(command -v google-chrome)"
+          test -n "$CHROME"
+          node --test src/lib/*.test.js scripts/render/*.test.mjs scripts/memory-eval/*.test.mjs
+          node scripts/render/render.mjs "$RUNNER_TEMP/philium-render" --only=agents,code,stats,providers,repos --sets=populated
+
+  macos:
+    # HAL is a separate repository. Private source and checkout credentials are
+    # available only on trusted main-branch runs.
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && vars.PHILIUM_HAL_REPOSITORY != ''
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@main
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@main
+        with:
+          repository: ${{ vars.PHILIUM_HAL_REPOSITORY }}
+          token: ${{ secrets.PHILIUM_HAL_READ_TOKEN || github.token }}
+          path: ci-hal
+          persist-credentials: false
+      - uses: actions/setup-node@main
+        with:
+          node-version: lts/*
+          check-latest: true
+      - run: rustup update stable
+      - run: npm ci
+      - run: npm run build
+      - name: Build HAL sidecar
+        run: npm run sidecar
+        env:
+          HAL_DIR: ${{ github.workspace }}/ci-hal
+          RUSTUP_TOOLCHAIN: stable
+      - run: cargo +stable test --locked --manifest-path src-tauri/Cargo.toml
+      - run: npm run tauri -- build --bundles app
+        env:
+          RUSTUP_TOOLCHAIN: stable

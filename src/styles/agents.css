@@ -299,7 +299,9 @@ details.msg summary { cursor: pointer; display: flex; align-items: center; gap: 
 }
 .cluster-section > .agents-grid { padding: 10px; min-height: auto; grid-auto-rows: minmax(340px, 420px); }
 .agent-card.role-card-orchestrator { border-top: 2px solid rgba(232, 168, 85, 0.65); }
-.agent-card.has-clash { border-color: rgba(239, 123, 123, 0.65); }
+.agent-approvals { flex: none; max-height: 35vh; overflow: auto; padding: 4px 12px; }
+.agent-approvals .perm { flex-wrap: wrap; margin: 4px 0; }
+.agent-approvals pre { max-height: 120px; overflow: auto; }
 
 .cluster-subbar {
   display: flex; align-items: center; gap: 6px; padding: 6px 16px;

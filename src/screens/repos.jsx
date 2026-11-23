@@ -4,7 +4,9 @@ import { params as routeParams, go } from "../lib/nav.js";
 import { Page, Empty, Button, Input, Field, Badge, Modal, Select, Segmented, VirtualList, Menu, confirm, toast } from "../ui/kit.jsx";
 import { Icon } from "../ui/icons.jsx";
 import { AccessGrantModal } from "../ui/access-requests.jsx";
+import { GitHubAccountPicker, useGitHubConnection } from "../ui/github-account.jsx";
 import { rpc, fmt } from "../lib/rpc.js";
+import { githubIdentity } from "../lib/review-packet.js";
 import { useStore, activeRepoId, setActiveRepoId } from "../lib/store.js";
 import { useVisibleEvent, useScreenVisible } from "../lib/visibility.js";
 import {
@@ -208,6 +210,11 @@ function Branches(props) {
   </section>;
 }
 
+function GitHubSettings(props) {
+  const [connection, reloadConnection] = useGitHubConnection(() => props.repo);
+  return <GitHubAccountPicker repo={props.repo} connection={connection} reloadConnection={reloadConnection} />;
+}
+
 export default function Repos() {
   const store = useStore();
   const visible = useScreenVisible();
@@ -223,6 +230,7 @@ export default function Repos() {
   let detailRequest = 0;
   let loadedFor = null;
   const current = createMemo(() => repos().find(r => r.id === selected()));
+  const githubOrigin = () => githubIdentity(current()?.remote_url);
   const cleanErr = (e) => String(e?.message ?? e).replace(/^Error:\s*/, "");
   async function details(id) {
     const request = ++detailRequest;
@@ -258,12 +266,11 @@ export default function Repos() {
   const viewDiff = (w) => act(async () => { const d = await rpc("workspace.diff", { worktree_id: w.id }); setDiff({ ...d, branch: w.branch, files: w.status?.dirty_files }); });
   const unregister = (r) => act(async () => { if (await confirm("Unregister repository?", "This only unregisters the repository. No user folder is deleted. Managed worktrees must be removed first.")) { await rpc("workspace.repo_remove", { id: r.id }); if (activeRepoId() === r.id) setActiveRepoId(""); setSelected(null); } });
 
-  createEffect(() => {
-    const pid = routeParams()?.repo_id;
+  createEffect(on(routeParams, ({ repo_id: pid }) => {
     if (pid && pid !== selected()) {
       choose(pid);
     }
-  });
+  }));
 
   createEffect(() => {
     const list = repos();
@@ -326,6 +333,12 @@ export default function Repos() {
                 <Show when={!r().remote_url}><span class="rp-chip faint">No remote</span></Show>
               </div>
             </header>
+            <section class="rp-sec" aria-label="GitHub settings">
+              <div class="rp-sec-head"><h3>GitHub account</h3></div>
+              <Show when={githubOrigin() && `${r().id}:${githubOrigin()}`} keyed fallback={<p class="ws-muted">Add a github.com origin to choose an account for this repository.</p>}>
+                {() => <GitHubSettings repo={r().id} />}
+              </Show>
+            </section>
             <section class="rp-sec">
               <div class="rp-sec-head"><h3>Branch settings</h3></div>
               <div class="rp-settings">

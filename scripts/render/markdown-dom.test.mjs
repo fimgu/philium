@@ -2,9 +2,9 @@
 // Runs an isolated ephemeral Vite server. Does not read/write dist or restart apps.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createServer } from 'vite';
 import solid from 'vite-plugin-solid';
 import puppeteer from 'puppeteer-core';
+import { startTestVite } from './test-vite.mjs';
 
 const fixtureId = new URL('./__markdown-fixture.jsx', import.meta.url).pathname;
 const fixture = `import { render } from 'solid-js/web';
@@ -23,7 +23,7 @@ render(() => <><Conversation events={events()} busy={true} /><Composer busy={tru
 `;
 
 test('Conversation Markdown DOM, streaming, unsafe content and clipboard matrix', async () => {
-  const server = await createServer({
+  const server = await startTestVite({
     configFile: false, root: new URL('../..', import.meta.url).pathname,
     plugins: [solid(), { name: 'markdown-test-fixture',
       configureServer(server) { server.middlewares.use('/markdown-test', (_req, res) => {
@@ -32,18 +32,17 @@ test('Conversation Markdown DOM, streaming, unsafe content and clipboard matrix'
       }); },
       resolveId(id) { if (id === '/@markdown-fixture.jsx') return fixtureId; },
       load(id) { if (id === fixtureId) return fixture; }
-    }], server: { port: 0, host: '127.0.0.1' }
+    }],
   });
   let browser;
   try {
-    await server.listen();
-    browser = await puppeteer.launch({ executablePath: process.env.CHROME || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', headless: true });
+    browser = await puppeteer.launch({ executablePath: process.env.CHROME || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', headless: true, args: ['--no-sandbox'] });
     const page = await browser.newPage();
     const errors = [];
     page.on('pageerror', error => { errors.push(error.message); console.error('DOM fixture error:', error.message); });
     const requests = [];
     page.on('request', request => { if (!request.url().startsWith('http://127.0.0.1:')) requests.push(request.url()); });
-    await page.goto(`http://127.0.0.1:${server.httpServer.address().port}/markdown-test`);
+    await page.goto(server.url + 'markdown-test');
     await page.waitForFunction(() => typeof window.setEvents === 'function');
     const set = async (text, done = true) => {
       await page.evaluate(({ text, done }) => window.setEvents([
@@ -58,6 +57,8 @@ test('Conversation Markdown DOM, streaming, unsafe content and clipboard matrix'
     const markdown = '# Title\n\n**bold** and *em* and `inline`\n\n- one\n- two\n- [x] done\n\n~~removed~~\n\n> quote\n\n| A | B |\n| - | - |\n| 1 | 2 |\n\n```js\nconst x = "<b>";\n\n```\n\n[good](https://example.com)';
     await set(markdown);
     assert.deepEqual(await page.evaluate(() => ['h1','strong','em','code','li','blockquote','table'].map(s => !!document.querySelector('.assistant-markdown ' + s))), Array(7).fill(true));
+    await page.waitForSelector('.markdown-code .hljs-keyword');
+    assert.equal(await page.$eval('.markdown-code pre code', el => el.textContent), 'const x = "<b>";\n\n');
     assert.ok(await page.$('.assistant-markdown del'));
     assert.equal(await page.$eval('.assistant-markdown input', el => el.checked && el.disabled), true);
     assert.equal(await page.$$eval('.assistant-markdown li', els => els.at(-1).textContent), 'done');
@@ -137,6 +138,47 @@ test('Conversation Markdown DOM, streaming, unsafe content and clipboard matrix'
     assert.deepEqual(await page.$$eval('.assistant-markdown a', links => links.map(a => a.protocol)), ['https:']);
     assert.equal(await page.$eval('.assistant-markdown a', el => el.rel), 'noopener noreferrer');
     assert.deepEqual(requests, []);
+    assert.deepEqual(errors, []);
+    const pixel = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aM1sAAAAASUVORK5CYII=';
+    const remote = 'https://example.invalid/preview.png';
+    await page.setRequestInterception(true);
+    page.on('request', request => request.url() === remote
+      ? request.respond({ contentType: 'image/png', body: Buffer.from(pixel, 'base64') })
+      : request.continue());
+    await set([
+      '==Take note== and **bold**. See https://example.com/docs.',
+      'Inline $x^2$ and \\(y_1\\). Price: $5 or $10.',
+      '$$\n\\frac{1}{\\sqrt{x}}\n$$',
+      '\\[\\sum_{i=1}^{n}i\\]',
+      '```latex\n\\frac{a}{b}\n```',
+      `![Local pixel](data:image/png;base64,${pixel})`,
+      `[![Remote pixel](${remote})](https://example.com/image)`,
+      '```mermaid\ngraph LR; A[Start] --> B[Done]\n```',
+      '```mermaid\nsequenceDiagram\nA->>B: Hello\n```',
+      '```mermaid\nflowchart LR\n```',
+    ].join('\n\n'));
+    await page.waitForFunction(() => document.querySelectorAll('.assistant-markdown math').length === 5);
+    assert.equal(await page.$eval('.assistant-markdown mark', el => el.textContent), 'Take note');
+    assert.equal(await page.$eval('.assistant-markdown a', el => el.href), 'https://example.com/docs');
+    assert.equal(await page.$eval('.assistant-markdown p', el => getComputedStyle(el).userSelect), 'text');
+    assert.ok(await page.$('.markdown-math math mfrac msqrt'));
+    assert.ok(await page.$('.markdown-equation math msup'));
+    await page.waitForFunction(() => document.querySelector('img[alt="Local pixel"]')?.naturalWidth === 1);
+    assert.ok(!requests.includes(remote), 'external images do not load before consent');
+    await page.focus('.markdown-image-load');
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.querySelector('img[alt="Remote pixel"]')?.naturalWidth === 1);
+    assert.equal(requests.filter(url => url === remote).length, 1);
+    await page.waitForFunction(() => document.querySelectorAll('.markdown-mermaid svg').length === 2);
+    assert.equal(await page.$$eval('.markdown-mermaid marker', els => new Set(els.map(el => el.id)).size), 2);
+    assert.match(await page.$eval('.markdown-mermaid .mermaid-canvas', el => el.textContent), /Start.*Done/);
+    await page.click('.markdown-mermaid button:not([title]):not([aria-label])');
+    assert.match(await page.$eval('.markdown-mermaid pre', el => el.textContent), /graph LR/);
+    assert.match(await page.$$eval('.markdown-mermaid .markdown-rich-badge', els => els.at(-1).textContent), /NO PREVIEW/);
+    await page.evaluate(() => { window.isTauri = true; window.__TAURI_INTERNALS__ = { invoke: async (cmd, args) => { window.openedLink = { cmd, ...args }; } }; });
+    await page.click('.assistant-markdown a');
+    assert.deepEqual(await page.evaluate(() => window.openedLink), { cmd: 'open_markdown_link', url: 'https://example.com/docs' });
+    await page.evaluate(() => { delete window.isTauri; delete window.__TAURI_INTERNALS__; });
     assert.deepEqual(errors, []);
     await set('# Long history\n\n' + 'Paragraph in restored history.\n\n'.repeat(80) + '~~~js\nconst value = 1;\n~~~');
     await page.evaluate(() => { const conv = document.querySelector('.conv'); conv.style.height = '300px'; conv.style.flex = 'none'; conv.scrollTop = conv.scrollHeight; });

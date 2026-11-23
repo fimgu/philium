@@ -2,12 +2,15 @@
 // confirmed steps that run the user's own git and gh on this machine.
 import { createResource, createSignal, For, Show } from "solid-js";
 import { Modal, Button, Input, Field, toast } from "./kit.jsx";
-import { rpc } from "../lib/rpc.js";
+import { rpc, useEvent } from "../lib/rpc.js";
 import { publishSteps } from "../lib/publish-steps.js";
 
 export default function PublishModal(props) {
   const id = () => props.worktree.id;
   const [state, { refetch }] = createResource(id, (wid) => rpc("workspace.publish_state", { worktree_id: wid }, { fresh: true }).catch((e) => ({ error: String(e) })));
+  useEvent("github:connection", ({ origin }) => {
+    if (origin === state.latest?.github_origin) refetch();
+  });
   const [picked, setPicked] = createSignal([]);
   const [message, setMessage] = createSignal("");
   const [base, setBase] = createSignal(props.base || "");
@@ -49,11 +52,15 @@ export default function PublishModal(props) {
         <p class="small dim">{state()?.remote ? `To ${state().remote}/${state()?.branch}${state()?.ahead != null ? `, ${state().ahead} commit(s) ahead` : ", not pushed yet"}.` : "No remote found for this branch."}</p>
         <Button size="sm" disabled={!steps().canPush || !!busy()} onClick={() => step("push", "push", {}, () => toast("Pushed.", "good"))}>Push branch</Button>
         <h3 class="small">3. Pull request</h3>
+        <p class="small dim">
+          {state()?.github_login ? `Open as @${state().github_login} on ${state().github_origin}.`
+            : state()?.github_error || "Choose a GitHub account for this repository in Repositories before opening a pull request."}
+        </p>
         <Field label="Base branch"><Input value={base()} onValue={setBase} /></Field>
         <Field label="Title"><Input value={title()} onValue={setTitle} /></Field>
         <Field label="Description"><textarea class="textarea" rows="4" value={body()} onInput={(e) => setBody(e.currentTarget.value)} /></Field>
-        <Button size="sm" disabled={!steps().canPr || !title().trim() || !base().trim() || !!busy()}
-          onClick={() => step("pr", "pr_create", { base: base(), title: title(), body: body() }, (r) => setPrUrl(r?.url || ""))}>
+        <Button size="sm" disabled={state.loading || !state()?.github_login || !steps().canPr || !title().trim() || !base().trim() || !!busy()}
+          onClick={() => step("pr", "pr_create", { base: base(), title: title(), body: body(), github_login: state().github_login, github_origin: state().github_origin }, (r) => setPrUrl(r?.url || ""))}>
           Open pull request
         </Button>
         <Show when={prUrl()}><p class="small">Pull request: <code>{prUrl()}</code></p></Show>

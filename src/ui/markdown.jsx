@@ -1,21 +1,17 @@
 import { createEffect, createMemo, createSignal, For, Index, lazy, Match, onCleanup, Show, Suspense, Switch } from "solid-js";
-import { marked } from "marked";
+import { Marked } from "marked";
 import { decodeHTML } from "entities";
+import { markdownExtensions } from "./markdown-syntax.js";
+import { MarkdownLink, MarkdownImage, safeLink } from "./markdown-media.jsx";
 import "./markdown.css";
 
+const marked = new Marked({ gfm: true, extensions: markdownExtensions });
 const MermaidBlock = lazy(() => import("./mermaid.jsx").then((m) => ({ default: m.MermaidBlock })));
+const MathPreview = lazy(() => import("./markdown-math.jsx").then((m) => ({ default: m.MathPreview })));
+const HighlightedCode = lazy(() => import("./markdown-code.jsx").then((m) => ({ default: m.HighlightedCode })));
 
-// Do not use innerHTML here; the security regression test checks this file.
-export function safeLink(raw) {
-  if (typeof raw !== "string") return undefined;
-  const trimmed = raw.trim();
-  if (!trimmed) return undefined;
-  try {
-    const parsed = new URL(decodeHTML(trimmed));
-    return ["http:", "https:", "mailto:"].includes(parsed.protocol) ? parsed.href : undefined;
-  } catch {
-    return undefined;
-  }
+function Equation(props) {
+  return <Suspense fallback={props.code}><MathPreview code={props.code} display={props.display} /></Suspense>;
 }
 
 function CopyButton(props) {
@@ -68,37 +64,6 @@ export function codeContents(token, source = "") {
   return lines.join("");
 }
 
-const LATEX_MAP = {
-  "\\alpha": "α", "\\beta": "β", "\\gamma": "γ", "\\delta": "δ", "\\epsilon": "ε", "\\zeta": "ζ",
-  "\\eta": "η", "\\theta": "θ", "\\iota": "ι", "\\kappa": "κ", "\\lambda": "λ", "\\mu": "μ",
-  "\\nu": "ν", "\\xi": "ξ", "\\pi": "π", "\\rho": "ρ", "\\sigma": "σ", "\\tau": "τ",
-  "\\phi": "φ", "\\chi": "χ", "\\psi": "ψ", "\\omega": "ω",
-  "\\Gamma": "Γ", "\\Delta": "Δ", "\\Theta": "Θ", "\\Lambda": "Λ", "\\Xi": "Ξ", "\\Pi": "Π",
-  "\\Sigma": "Σ", "\\Phi": "Φ", "\\Psi": "Ψ", "\\Omega": "Ω",
-  "\\rightarrow": "→", "\\to": "→", "\\leftarrow": "←", "\\leftrightarrow": "↔",
-  "\\Rightarrow": "⇒", "\\Leftarrow": "⇐", "\\Leftrightarrow": "⇔", "\\mapsto": "↦",
-  "\\times": "×", "\\cdot": "·", "\\div": "÷", "\\pm": "±", "\\mp": "∓",
-  "\\leq": "≤", "\\le": "≤", "\\geq": "≥", "\\ge": "≥", "\\neq": "≠", "\\ne": "≠",
-  "\\approx": "≈", "\\equiv": "≡", "\\sim": "∼", "\\propto": "∝",
-  "\\infty": "∞", "\\partial": "∂", "\\nabla": "∇", "\\forall": "∀", "\\exists": "∃",
-  "\\in": "∈", "\\notin": "∉", "\\subset": "⊂", "\\subseteq": "⊆", "\\cup": "∪", "\\cap": "∩",
-  "\\emptyset": "∅", "\\sum": "∑", "\\prod": "∏", "\\int": "∫", "\\sqrt": "√",
-  "\\dots": "…", "\\ldots": "…", "\\cdots": "⋯",
-};
-
-function formatMathString(src) {
-  let s = String(src || "").trim().replace(/^\$\$|\$\$$/g, "").replace(/^\$|\$$/g, "");
-  s = s.replace(/\\frac\{([^{}]+)\}\{([^{}]+)\}/g, "($1) / ($2)");
-  s = s.replace(/\\text\{([^{}]+)\}/g, "$1");
-  s = s.replace(/\\(?:mathbf|mathrm|mathit|mathcal|mathbb)\{([^{}]+)\}/g, "$1");
-  s = s.replace(/\^\{([^{}]+)\}/g, "^($1)");
-  s = s.replace(/_\{([^{}]+)\}/g, "_($1)");
-  for (const [k, v] of Object.entries(LATEX_MAP)) {
-    s = s.split(k).join(v);
-  }
-  return s;
-}
-
 function DiffBlock(props) {
   const [view, setView] = createSignal("diff");
   const parsed = createMemo(() => {
@@ -149,6 +114,13 @@ const ALLOWED_SVG_TAGS = new Set([
   "clippath", "mask", "pattern", "title", "desc",
 ]);
 
+const SVG_ATTRIBUTES = new Set((
+  "id viewBox width height x y x1 x2 y1 y2 dx dy cx cy r rx ry d points transform " +
+  "fill fill-opacity fill-rule stroke stroke-width stroke-opacity stroke-dasharray stroke-linecap stroke-linejoin " +
+  "opacity font-size font-weight text-anchor dominant-baseline offset stop-color stop-opacity " +
+  "gradientUnits gradientTransform markerWidth markerHeight refX refY orient marker-start marker-mid marker-end clip-path mask"
+).split(" "));
+
 function sanitizeSvgNode(node) {
   if (node.nodeType === 3) return document.createTextNode(node.nodeValue || "");
   if (node.nodeType !== 1) return null;
@@ -156,11 +128,11 @@ function sanitizeSvgNode(node) {
   if (!ALLOWED_SVG_TAGS.has(tag)) return null;
   const el = document.createElementNS("http://www.w3.org/2000/svg", tag);
   for (const attr of Array.from(node.attributes || [])) {
-    const name = attr.name.toLowerCase();
-    const val = String(attr.value || "");
-    if (name.startsWith("on") || name === "href" || name === "xlink:href") continue;
-    if (/javascript:|data:text\/html/i.test(val)) continue;
-    el.setAttribute(attr.name, val);
+    const { name, value } = attr;
+    if (!SVG_ATTRIBUTES.has(name)) continue;
+    // Reference only in-document paint servers, never remote URLs or CSS escapes.
+    if (/[()\\]/.test(value) && !/^(?:d|points|transform|gradientTransform)$/.test(name) && !/^url\(#[\w.-]+\)$/.test(value.trim())) continue;
+    el.setAttribute(name, value);
   }
   for (const child of Array.from(node.childNodes || [])) {
     const c = sanitizeSvgNode(child);
@@ -175,6 +147,7 @@ function SvgBlock(props) {
   createEffect(() => {
     const src = String(props.code || "");
     if (!hostRef) return;
+    hostRef.replaceChildren();
     try {
       const doc = new DOMParser().parseFromString(src, "image/svg+xml");
       const root = doc.querySelector("svg");
@@ -208,7 +181,6 @@ function SvgBlock(props) {
 
 function MathBlock(props) {
   const [view, setView] = createSignal("math");
-  const formatted = createMemo(() => formatMathString(props.code));
   return (
     <div class="markdown-rich markdown-math">
       <div class="markdown-rich-bar">
@@ -221,7 +193,7 @@ function MathBlock(props) {
         </div>
       </div>
       <Show when={view() === "math"} fallback={<pre class="markdown-rich-source"><code>{props.code}</code></pre>}>
-        <div class="markdown-math-body">{formatted()}</div>
+        <div class="markdown-math-body"><Equation code={props.code} display /></div>
       </Show>
     </div>
   );
@@ -330,7 +302,7 @@ function CodeBlock(props) {
             </div>
           </div>
           <Show when={!collapsed()}>
-            <pre><code>{code()}</code></pre>
+            <pre><Suspense fallback={<code>{code()}</code>}><HighlightedCode code={code()} lang={lang()} live={props.live} /></Suspense></pre>
           </Show>
         </div>
       }
@@ -357,14 +329,10 @@ function Tokens(props) {
       const t = token();
       if (t.type === "heading") return `h${t.depth}`;
       if (t.type === "list") return t.ordered ? "ol" : "ul";
-      if (t.type === "paragraph") {
-        const s = (t.text || "").trim();
-        return s.startsWith("$$") && s.endsWith("$$") && s.length > 4 ? "p-math" : "p";
-      }
       if (t.type === "text") return t.tokens ? "text-nested" : "text-leaf";
       return t.type;
     });
-    const children = () => <Tokens tokens={token().tokens || []} source={props.source} />;
+    const children = () => <Tokens tokens={token().tokens || []} source={props.source} live={props.live} />;
     return createMemo(() => {
       switch (shape()) {
         case "space": return null;
@@ -374,8 +342,10 @@ function Tokens(props) {
         case "h4": return <h4>{children()}</h4>;
         case "h5": return <h5>{children()}</h5>;
         case "h6": return <h6>{children()}</h6>;
-        case "p-math": return <MathBlock code={(token().text || "").trim().slice(2, -2)} />;
-        case "p": return <p>{children()}</p>;
+        case "displayMath": return <MathBlock code={token().text} />;
+        case "inlineMath": return <Equation code={token().text} />;
+        case "mark": return <mark>{children()}</mark>;
+        case "paragraph": return <p>{children()}</p>;
         case "text-nested": return children();
         case "text-leaf": return decodeHTML(token().text);
         case "escape": return token().text;
@@ -386,16 +356,16 @@ function Tokens(props) {
         case "br": return <br />;
         case "hr": return <hr />;
         case "blockquote": return <blockquote>{children()}</blockquote>;
-        case "link": return <Show when={safeLink(token().href)} fallback={children()}>{(href) => <a href={href()} target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer">{children()}</a>}</Show>;
-        case "image": return <span class="markdown-image">[Image: {decodeHTML(token().text || "image omitted")}]</span>;
+        case "link": return <Show when={safeLink(token().href)} fallback={children()}>{(href) => <MarkdownLink href={href()}>{children()}</MarkdownLink>}</Show>;
+        case "image": return <MarkdownImage href={token().href} alt={token().text} />;
         case "html": return token().raw;
-        case "code": return <CodeBlock token={token()} source={props.source} />;
+        case "code": return <CodeBlock token={token()} source={props.source} live={props.live} />;
         case "checkbox": return <input type="checkbox" disabled checked={token().checked} />;
-        case "ol": return <ol start={token().start}><Index each={token().items}>{(item) => <li><Tokens tokens={item().tokens} source={props.source} /></li>}</Index></ol>;
-        case "ul": return <ul><Index each={token().items}>{(item) => <li><Tokens tokens={item().tokens} source={props.source} /></li>}</Index></ul>;
+        case "ol": return <ol start={token().start}><Index each={token().items}>{(item) => <li><Tokens tokens={item().tokens} source={props.source} live={props.live} /></li>}</Index></ol>;
+        case "ul": return <ul><Index each={token().items}>{(item) => <li><Tokens tokens={item().tokens} source={props.source} live={props.live} /></li>}</Index></ul>;
         case "table": return <div class="markdown-table-wrap"><table>
-          <thead><tr><Index each={token().header}>{(cell) => <th><Tokens tokens={cell().tokens} source={props.source} /></th>}</Index></tr></thead>
-          <tbody><Index each={token().rows}>{(row) => <tr><Index each={row()}>{(cell) => <td><Tokens tokens={cell().tokens} source={props.source} /></td>}</Index></tr>}</Index></tbody>
+          <thead><tr><Index each={token().header}>{(cell) => <th><Tokens tokens={cell().tokens} source={props.source} live={props.live} /></th>}</Index></tr></thead>
+          <tbody><Index each={token().rows}>{(row) => <tr><Index each={row()}>{(cell) => <td><Tokens tokens={cell().tokens} source={props.source} live={props.live} /></td>}</Index></tr>}</Index></tbody>
         </table></div>;
         default: return token().raw || token().text || "";
       }
@@ -407,14 +377,14 @@ export function Markdown(props) {
   const tokens = createMemo((prev = []) => {
     const source = props.text || "";
     const normalized = source.includes("\r") ? source.replace(/\r\n|\r/g, "\n") : source;
-    const parsed = marked.lexer(source, { gfm: true });
+    const parsed = marked.lexer(source, marked.defaults);
     let cursor = 0;
     marked.walkTokens(parsed, (token) => {
       if (token.type !== "code") return;
       const start = normalized.indexOf(token.raw, cursor);
       if (start >= 0) { token.sourceStart = start; cursor = start + token.raw.length; }
     });
-    if (Object.keys(parsed.links || {}).length === Object.keys(prev.links || {}).length) {
+    if (JSON.stringify(parsed.links) === JSON.stringify(prev.links)) {
       const max = Math.min(prev.length, parsed.length);
       for (let i = 0; i < max; i++) {
         const a = prev[i], b = parsed[i];
@@ -427,12 +397,12 @@ export function Markdown(props) {
     }
     return parsed;
   });
-  return <div class="assistant-markdown"><Tokens tokens={tokens()} source={props.text || ""} /></div>;
+  return <div class="assistant-markdown"><Tokens tokens={tokens()} source={props.text || ""} live={props.live} /></div>;
 }
 
 export function AssistantReply(props) {
   return <>
-    <Markdown text={props.text} />
+    <Markdown text={props.text} live={props.live} />
     <Show when={props.live}><span class="caret" /></Show>
     <div class="markdown-actions"><CopyButton label="Copy reply" text={props.text} /></div>
   </>;

@@ -5,6 +5,7 @@ import vm from "node:vm";
 import { createRoot, createSignal, createMemo, createEffect, onCleanup } from "solid-js/dist/solid.js";
 import { workspaceAgents, selectedAgentId, spawnRepoDefault } from "./agent-workspace.js";
 import { repoLabels } from './repo-labels.js';
+import { pendingAccessByAgent, agentNeedsToolApproval, agentNeedsUser } from "./access-helpers.js";
 
 test('same-name checkouts remain identifiable without long paths for unrelated repos', () => {
   const rows = [{id:'a',name:'app',path:'/a/src/app'}, {id:'b',name:'app',path:'/b/src/app'}, {id:'c',name:'solo',path:'/a/solo'}];
@@ -55,12 +56,21 @@ test("actual Agents reactive setup isolates focus, warnings, counts and batch ap
     dispose = cleanup;
     const [activeRepoId, setRepo] = createSignal("phi"); selectRepo = setRepo;
     const context = {
-      useStore: () => ({ agents: () => agents, repos: () => repos, refetchAgents() {} }),
+      useStore: () => ({
+        agents: () => agents, repos: () => repos, refetchAgents() {},
+        pendingAccess: () => [],
+        agentApprovals: () => ({
+          lion: [{ request_id: "p1", action: "mcp", resource: "philium/lion_tool" }],
+          otter: [{ request_id: "p2", action: "mcp", resource: "philium/otter_tool" }],
+        }),
+        async refetchAgentApprovals() {},
+      }),
       createSignal, createMemo, createEffect, onCleanup, setTimeout, clearTimeout, workspaceAgents, selectedAgentId, activeRepoId,
+      pendingAccessByAgent, agentNeedsToolApproval, agentNeedsUser,
       params: () => ({ id: "lion" }), registerCommands() {}, shortcutLabel: () => "",
       localStorage: { getItem: () => null, setItem() {} },
       rpc: async (method, args) => { calls.push({ method, args }); return { resolved: 1 }; },
-      toast() {}, go() {},
+      toast() {}, go() {}, confirm: async () => true,
     };
     api = vm.runInNewContext(`${setup}\n({selected, telemetry, filtered, approveAllWaiting, setSearch})`, context);
   });
@@ -73,8 +83,11 @@ test("actual Agents reactive setup isolates focus, warnings, counts and batch ap
   assert.equal(api.telemetry().allAlerts[0].agent.id, "otter");
   assert.equal(api.telemetry().waiting, 1);
   await api.approveAllWaiting();
-  assert.equal(calls[0].method, "agents.batch_permission");
-  assert.equal(calls[0].args.repo_id, "pcb");
+  assert.equal(calls[0].method, "agents.permission");
+  assert.equal(calls[0].args.id, "otter");
+  assert.equal(calls[0].args.request_id, "p2");
+  assert.equal(calls[0].args.scope, "once");
+  assert.equal(calls.length, 1);
   api.setSearch("lion");
   assert.equal(api.selected(), undefined);
   assert.equal(api.filtered().length, 0);

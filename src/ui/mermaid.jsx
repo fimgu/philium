@@ -1,4 +1,4 @@
-import { createMemo, createSignal, For, Show } from "solid-js";
+import { createMemo, createSignal, createUniqueId, For, Show } from "solid-js";
 
 function cleanLabel(raw) {
   if (!raw) return "";
@@ -100,9 +100,10 @@ export function parseMermaid(code) {
   if (/^(mindmap)\b/i.test(head)) {
     return parseMindmap( code );
   }
-  const flowMatch = head.match(/^(?:flowchart|graph)\s*(TD|TB|BT|LR|RL)?/i);
+  const flowMatch = head.match(/^(?:flowchart|graph)\b(?:\s+(TD|TB|BT|LR|RL)\b)?\s*;?\s*(.*)$/i);
   if (flowMatch) {
-    return parseFlowchart(flowMatch[1]?.toUpperCase() || "TD", body);
+    const flow = parseFlowchart(flowMatch[1]?.toUpperCase() || "TD", [flowMatch[2], ...body]);
+    return flow.nodes.length ? flow : { kind: "raw" };
   }
   // Default: try flowchart if arrows exist
   if (lines.some((l) => /-->|-\.->|==>/.test(l))) {
@@ -634,11 +635,19 @@ function FlowShape(props) {
 export function MermaidBlock(props) {
   const [view, setView] = createSignal("diagram");
   const [zoom, setZoom] = createSignal(1);
-  const parsed = createMemo(() => parseMermaid(props.code));
+  const arrowId = `mermaid-arrow-${createUniqueId()}`;
+  const parsed = createMemo(() => {
+    try {
+      return props.code.length <= 20_000 ? parseMermaid(props.code) : { kind: "raw" };
+    } catch {
+      return { kind: "raw" };
+    }
+  });
+  const hasPreview = () => !["raw", "empty"].includes(parsed().kind);
   const badge = createMemo(() => {
     const p = parsed();
     const k = p.subkind || p.kind || "diagram";
-    return `MERMAID · ${k.toUpperCase()}`;
+    return hasPreview() ? `MERMAID · ${k.toUpperCase()}` : "MERMAID · NO PREVIEW";
   });
 
   return (
@@ -646,24 +655,26 @@ export function MermaidBlock(props) {
       <div class="markdown-rich-bar">
         <span class="markdown-rich-badge">{badge()}</span>
         <div class="markdown-rich-actions">
-          <Show when={view() === "diagram"}>
+          <Show when={hasPreview() && view() === "diagram" && ["flowchart", "sequence"].includes(parsed().kind)}>
             <button type="button" class="markdown-rich-btn" onClick={() => setZoom((z) => Math.max(0.5, +(z - 0.15).toFixed(2)))} title="Zoom out">−</button>
             <button type="button" class="markdown-rich-btn" onClick={() => setZoom(1)} title="Reset zoom">{Math.round(zoom() * 100)}%</button>
             <button type="button" class="markdown-rich-btn" onClick={() => setZoom((z) => Math.min(2.2, +(z + 0.15).toFixed(2)))} title="Zoom in">+</button>
           </Show>
-          <button
-            type="button"
-            class="markdown-rich-btn"
-            onClick={() => setView((v) => (v === "diagram" ? "source" : "diagram"))}
-          >
-            {view() === "diagram" ? "Source" : "Diagram"}
-          </button>
+          <Show when={hasPreview()}>
+            <button
+              type="button"
+              class="markdown-rich-btn"
+              onClick={() => setView((v) => (v === "diagram" ? "source" : "diagram"))}
+            >
+              {view() === "diagram" ? "Source" : "Diagram"}
+            </button>
+          </Show>
           {props.copyButton}
         </div>
       </div>
 
       <Show
-        when={view() === "diagram" && parsed().kind !== "raw" && parsed().kind !== "empty"}
+        when={view() === "diagram" && hasPreview()}
         fallback={<pre class="markdown-rich-source"><code>{props.code}</code></pre>}
       >
         <div class="mermaid-canvas">
@@ -674,7 +685,7 @@ export function MermaidBlock(props) {
               class="mermaid-svg"
             >
               <defs>
-                <marker id="mermaid-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                <marker id={arrowId} viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
                   <path d="M 0 1 L 10 5 L 0 9 z" fill="currentColor" />
                 </marker>
               </defs>
@@ -694,7 +705,7 @@ export function MermaidBlock(props) {
                       fill="none"
                       stroke-dasharray={e.style === "dashed" ? "5,4" : undefined}
                       stroke-width={e.style === "thick" ? "2.4" : "1.5"}
-                      marker-end={e.directed ? "url(#mermaid-arrow)" : undefined}
+                      marker-end={e.directed ? `url(#${arrowId})` : undefined}
                       class="mermaid-edge-path"
                     />
                     <Show when={e.label}>
@@ -722,7 +733,7 @@ export function MermaidBlock(props) {
               class="mermaid-svg"
             >
               <defs>
-                <marker id="seq-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+                <marker id={arrowId} viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
                   <path d="M 0 1 L 10 5 L 0 9 z" fill="currentColor" />
                 </marker>
               </defs>
@@ -747,7 +758,7 @@ export function MermaidBlock(props) {
                         if (a.id === b.id) {
                           return (
                             <g class="mermaid-edge">
-                              <path d={`M ${a.x} ${y() - 6} L ${a.x + 38} ${y() - 6} L ${a.x + 38} ${y() + 10} L ${a.x} ${y() + 10}`} fill="none" marker-end="url(#seq-arrow)" class="mermaid-edge-path" />
+                              <path d={`M ${a.x} ${y() - 6} L ${a.x + 38} ${y() - 6} L ${a.x + 38} ${y() + 10} L ${a.x} ${y() + 10}`} fill="none" marker-end={`url(#${arrowId})`} class="mermaid-edge-path" />
                               <text x={a.x + 44} y={y() + 4} class="mermaid-edge-label">{ev.text}</text>
                             </g>
                           );
@@ -761,7 +772,7 @@ export function MermaidBlock(props) {
                               x2={b.x}
                               y2={y()}
                               stroke-dasharray={ev.dashed ? "5,4" : undefined}
-                              marker-end="url(#seq-arrow)"
+                              marker-end={`url(#${arrowId})`}
                               class="mermaid-edge-path"
                             />
                             <text x={mx} y={y() - 6} text-anchor="middle" class="mermaid-edge-label">{ev.text}</text>

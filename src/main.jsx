@@ -10,14 +10,13 @@ import { Icon } from "./ui/icons.jsx";
 import { rpc, useEvent, failures, clearFailures } from "./lib/rpc.js";
 import { repoLabels } from "./lib/repo-labels.js";
 import { workspaceAgents } from "./lib/agent-workspace.js";
+import { agentNeedsUser, pendingAccessByAgent } from "./lib/access-helpers.js";
 import { route, go, commands, improve } from "./lib/nav.js";
 import { isMac } from "./lib/shortcuts.js";
 import { useStore, activeRepoId, setActiveRepoId } from "./lib/store.js";
 import { ScreenVisibilityProvider } from "./lib/visibility.js";
 import { soundEnabled, setSoundEnabled, playSound } from "./lib/sound.js";
 import "./lib/alerts.js";
-import "./styles/tokens.css";
-import "./styles/components.css";
 import "./styles/sheet.css";
 import "./styles/surfaces-memory.css";
 
@@ -147,9 +146,10 @@ function App() {
   });
   const agentBadge = createMemo(() => {
     const list = workspaceAgents(store.agents() ?? [], activeRepoId(), store.repos() ?? []);
-    const waiting = list.filter((a) => a.state === "waiting").length;
+    const pending = pendingAccessByAgent(store.pendingAccess());
+    const waiting = list.filter((a) => agentNeedsUser(a, pending, store.agentApprovals())).length;
     if (waiting > 0) return { count: String(waiting), warn: true, title: `${waiting} agent${waiting === 1 ? "" : "s"} waiting for approval` };
-    const running = list.filter((a) => a.live).length;
+    const running = list.filter((a) => a.live && a.state === "running").length;
     if (running > 0) return { count: String(running), warn: false, title: `${running} agent${running === 1 ? "" : "s"} running` };
     return null;
   });
@@ -263,6 +263,9 @@ function App() {
         </div>
       </nav>
       <main class="main">
+        <Show when={import.meta.env.MODE === "fixture"}>
+          <div class="fixture-notice" role="status">Sample data · UI preview</div>
+        </Show>
         <Show when={failing().length}>
           <div class="fail-banner" role="alert">
             <span class="ellipsis grow">Some data could not load: {cleanError(failing()[0][1])}{failing().length > 1 ? ` (+${failing().length - 1} more)` : ""}</span>

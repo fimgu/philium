@@ -529,6 +529,17 @@ fn changes(root: &Path, base: &str) -> Result<(Vec<Change>, bool), String> {
             removed: Some(0),
         });
     }
+    let unmerged = metadata(root, &["diff", "--name-only", "--diff-filter=U", "-z", "--"])?;
+    for path in unmerged.split(|b| *b == 0).filter_map(|path| std::str::from_utf8(path).ok()) {
+        if path.is_empty() || checked(root, path).is_err() {
+            continue;
+        }
+        if let Some(change) = result.iter_mut().find(|change| change.path == path) {
+            change.status = "U".into();
+        } else {
+            result.push(Change { path: path.into(), old: None, status: "U".into(), added: None, removed: None });
+        }
+    }
     result.sort_by(|a, b| a.path.cmp(&b.path));
     if result.len() > 10000 {
         result.truncate(10000);
@@ -538,13 +549,17 @@ fn changes(root: &Path, base: &str) -> Result<(Vec<Change>, bool), String> {
 }
 
 pub(super) fn call(ctx: &Ctx, t: &Target, method: &str, args: &Value) -> Result<Value, String> {
-    let base = base_for(ctx, t)?;
-    let rev = revision(t, &base)?;
-    let id = t.wt.as_ref().map(|w| w.id.as_str());
     let root =
         t.wt.as_ref()
             .map(|w| w.path.as_path())
             .unwrap_or(&t.repo_path);
+    let base = if method != "source" && t.wt.is_some() && args["comparison"] == "working" {
+        inspect_revision(root, "HEAD")?
+    } else {
+        base_for(ctx, t)?
+    };
+    let rev = revision(t, &base)?;
+    let id = t.wt.as_ref().map(|w| w.id.as_str());
     if method == "changes" {
         let (files, truncated, note) = if t.wt.is_some() {
             let (files, omitted) = changes(root, &base)?;
@@ -633,6 +648,7 @@ pub(super) fn call(ctx: &Ctx, t: &Target, method: &str, args: &Value) -> Result<
         "--no-color",
         "--find-renames",
     ];
+    cmd.push(if args["more_context"] == true { "--unified=20" } else { "--unified=3" });
     if c.status == "?" {
         cmd.extend(["--no-index", "--", "/dev/null", &c.path]);
     } else {
@@ -643,7 +659,7 @@ pub(super) fn call(ctx: &Ctx, t: &Target, method: &str, args: &Value) -> Result<
     }
     let (bytes, truncated) = run(root, &cmd, PATCH_CAP, true)?;
     let patch = bounded_text(&bytes, PATCH_CAP);
-    let binary = (c.status != "?" && c.added.is_none()) || patch.contains("Binary files ");
+    let binary = (!matches!(c.status.as_str(), "?" | "U") && c.added.is_none()) || patch.contains("Binary files ");
     Ok(
         json!({"path":c.path,"old_path":c.old,"patch":patch,"base_commit":base,"revision":rev,"worktree_id":id,"binary":binary,"truncated":truncated,"note":if truncated {Some("Patch truncated at 512 KiB.")} else if binary {Some("Binary content is not displayed.")} else {None}}),
     )
@@ -767,6 +783,10 @@ mod tests {
         assert!(diff["patch"].as_str().unwrap().contains("-def initial():"));
         assert!(diff["patch"].as_str().unwrap().contains("+def current():"));
         assert_eq!(diff["base_commit"], base["base_commit"]);
+        let working = call(&f.ctx, &f.disk, "file_diff", &json!({"path":"a.py","comparison":"working"})).unwrap();
+        assert_ne!(working["base_commit"], base["base_commit"]);
+        assert!(working["patch"].as_str().unwrap().contains("-def committed():"));
+        assert!(working["patch"].as_str().unwrap().contains("+def current():"));
         assert_eq!(f.get(&f.base, "changes", "")["files"], json!([]));
         assert!(f.get(&f.base, "changes", "")["note"].is_string());
         assert_eq!(f.get(&f.base, "file_diff", "a.py")["patch"], "");

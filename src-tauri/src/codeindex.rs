@@ -1861,7 +1861,7 @@ pub fn clashes_from(w: &[WtChange]) -> Vec<Clash> {
             for (x, y) in [(a, b), (b, a)] {
                 for (p, n) in &x.syms {
                     if y.used.contains(n) && !y.syms.contains(&(p.clone(), n.clone())) && n.len() > 3 && !STOP_METHODS.contains(&n.as_str()) {
-                        dep.push(format!("{} changes {n} ({p}), {} uses it", x.label, y.label));
+                        dep.push(format!("{} changes {n} ({p}), {} references the same name", x.label, y.label));
                     }
                 }
             }
@@ -2125,7 +2125,8 @@ fn announced() -> &'static Mutex<HashSet<String>> {
 /// A clash is news when a pair of worktrees starts clashing or clashes more seriously,
 /// not each time one more file or symbol joins its list.
 fn clash_key(c: &Clash) -> String {
-    format!("{}|{}|{}", c.a, c.b, c.severity)
+    let (a, b) = if c.a_wt <= c.b_wt { (&c.a_wt, &c.b_wt) } else { (&c.b_wt, &c.a_wt) };
+    format!("{a}|{b}|{}", c.severity)
 }
 
 fn latest_clashes() -> &'static Mutex<Vec<Value>> {
@@ -2182,6 +2183,10 @@ fn note_clashes(ctx: &Ctx, cl: &[Clash], repo: Option<&str>) {
     };
     let mut now: HashMap<String, (String, String, &Clash)> = HashMap::new();
     for c in cl {
+        // A dependency inferred from a name match belongs in the Code view.
+        if c.severity == "dependent" {
+            continue;
+        }
         for (wt, other) in [(&c.a_wt, &c.b), (&c.b_wt, &c.a)] {
             if let Some((agent, rid)) = agent_of(wt) {
                 now.insert(format!("{rid}|{agent}|{other}"), (agent, other.clone(), c));
@@ -2198,7 +2203,6 @@ fn note_clashes(ctx: &Ctx, cl: &[Clash], repo: Option<&str>) {
         inbox.told.insert(key, rank);
         let what = match c.severity {
             "same_symbol" => "you both changed",
-            "dependent" => "one of you changes what the other uses",
             _ => "you both changed files",
         };
         let shown: Vec<&str> = c.detail.iter().take(3).map(String::as_str).collect();
@@ -2453,7 +2457,7 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
             let c = ctx.clone();
             let rid = args["repo_id"].as_str().map(str::to_string);
             let cl = tokio::task::spawn_blocking(move || clash_changes(&c, rid.as_deref())).await.map_err(|e| e.to_string())??;
-            publish(ctx, &cl, args["repo_id"].as_str());
+            note_clashes(ctx, &cl, args["repo_id"].as_str());
             Ok(json!({ "text": render_clashes(&cl, cap), "clashes": cl.iter().map(clash_json).collect::<Vec<_>>() }))
         }
         "reindex" => {
@@ -2660,7 +2664,7 @@ pub fn prompt_map(ctx: &Ctx, repo_id: &str, wt_path: Option<&Path>, tokens: usiz
     };
     let view = index_target(ctx, &t.repo_id, &t.repo_path, &t.branch, wt_arg, false).ok().map(|(v, _)| v);
     let mut landscape_block = String::new();
-    if let Some(land) = landscape.then(|| crate::workspace::repo_landscape(ctx, repo_id, false).ok()).flatten() {
+    if let Some(land) = landscape.then(|| crate::workspace::repo_landscape(ctx, repo_id).ok()).flatten() {
         let mut lines = vec![];
         let def_br = land["default_branch"].as_str().unwrap_or("main");
         if let Some(wts) = land["worktrees"].as_array() {
@@ -2740,7 +2744,9 @@ fn render_repo_context(ctx: &Ctx, l: &Loaded, a: &Value, cap: usize) -> String {
     let mut b = Out::new(cap);
     let include_prs = a["include_prs"].as_bool().unwrap_or(true);
     if let Some(pr_num) = a["pr"].as_u64() {
-        if let Some(pr) = crate::workspace::github_pr_view(&l.t.repo_path, pr_num) {
+        // Repo context runs on a blocking worker; the bounded GitHub subprocess is async.
+        let pr = tokio::runtime::Handle::current().block_on(crate::workspace::github_pr_view(ctx, &l.t.repo_id, pr_num));
+        if let Ok(pr) = pr {
             b.line(format!(
                 "PR #{}: {} [{} / {}] ({} -> {}) by @{}",
                 pr["number"].as_u64().unwrap_or(pr_num),
@@ -2798,7 +2804,11 @@ fn render_repo_context(ctx: &Ctx, l: &Loaded, a: &Value, cap: usize) -> String {
         render_branch_ast_diff(&mut b, l, branch_ref.trim());
         return b.finish("code_symbol <name> to inspect any changed symbol");
     }
-    if let Ok(land) = crate::workspace::repo_landscape(ctx, &l.t.repo_id, include_prs) {
+    if let Ok(mut land) = crate::workspace::repo_landscape(ctx, &l.t.repo_id) {
+        if include_prs {
+            let prs = tokio::runtime::Handle::current().block_on(crate::workspace::github_prs(land["remote_url"].as_str().unwrap_or("")));
+            land["prs"] = prs;
+        }
         let def_br = land["default_branch"].as_str().unwrap_or(&l.t.branch);
         b.line(format!(
             "repo: {} ({}) default_branch={def_br}",

@@ -11,14 +11,15 @@ import { agentHue, AgentChip, RoleBadge, KvBadge, WarningPills } from "../ui/age
 import { SpawnModal } from "../ui/spawn-modal.jsx";
 import { AgentProgressLine, AgentProgressPanel } from "../ui/agent-progress.jsx";
 import { AccessApprovalBar } from "../ui/access-requests.jsx";
-import { pendingAccessByAgent, agentNeedsUser } from "../lib/access-helpers.js";
-import { rpc, fmt, sendError } from "../lib/rpc.js";
+import { pendingAccessByAgent, agentNeedsUser, agentNeedsToolApproval } from "../lib/access-helpers.js";
+import { rpc, fmt, sendError, useEvent } from "../lib/rpc.js";
 import { route, go, params, registerCommands } from "../lib/nav.js";
 import HunkReview from "../ui/hunk-review.jsx";
 import { steerKey } from "../lib/steer.js";
 import { matchShortcut, shortcutLabel, cycle } from "../lib/shortcuts.js";
 import { useStore, activeRepoId, agentEventsCache } from "../lib/store.js";
-import { useScreenVisible, useVisibleEvent } from "../lib/visibility.js";
+import { useScreenVisible, useVisibleEvent, useClock } from "../lib/visibility.js";
+import { liveTps, sampleLiveTps } from "../lib/live-tps.js";
 import "../styles/agents.css";
 import "../styles/code.css";
 
@@ -90,17 +91,18 @@ function mergeEvents(previous, incoming) {
 
 function AgentRow(props) {
   const a = () => props.agent;
+  const state = () => props.needsToolApproval ? "waiting" : a().state;
   return (
     <div class={`list-item agent-row ${props.selected ? "on" : ""} ${props.picked ? "picked" : ""}`} style={{ "padding-left": `${12 + props.depth * 14}px` }} onClick={props.onClick}
       role="option" aria-selected={props.picked ? "true" : "false"} data-agent={a().name} title="Tick, or ⌘-click, to pick several; then Delete removes them">
       <input type="checkbox" class="pick" checked={!!props.picked} aria-label={`Pick ${a().name}`} onClick={(e) => { e.stopPropagation(); props.onPick?.(); }} />
-      <Dot state={stateDot(a().state)} title={stateLabel(a().state)} />
+      <Dot state={stateDot(state())} title={stateLabel(state())} />
       <div class="grow" style={{ "min-width": 0 }}>
         <div class="row" style={{ gap: "6px" }}>
           <AgentChip name={a().name} />
           <Show when={(props.pendingAccess ?? 0) > 0}><Badge tone="strict">Access request</Badge></Show>
-          <Show when={a().state === "waiting"}><Badge tone="strict">Needs you</Badge></Show>
-          <Show when={(a().warnings ?? []).some((w) => w.kind === "clash")}><Badge tone="danger">Clash</Badge></Show>
+          <Show when={props.needsToolApproval}><Badge tone="strict">Needs you</Badge></Show>
+          <Show when={(a().warnings ?? []).some((w) => w.kind === "clash")}><Badge tone="strict">Code overlap</Badge></Show>
         </div>
         <div class="xs faint ellipsis">{a().task_title || a().repo_name || a().branch || (a().model_ref ?? "").split("/").pop()}</div>
         <AgentProgressLine agent={a()} />
@@ -351,6 +353,57 @@ function Details(props) {
   );
 }
 
+function PendingAgentPermissions(props) {
+  const store = useStore();
+  const requests = () => store.agentApprovals()?.[props.agent?.id];
+  const [deciding, setDeciding] = createSignal(null);
+  const decide = async (request, decision, scope) => {
+    if (deciding()) return;
+    const agent = props.agent.id;
+    setDeciding(request.request_id);
+    try {
+      await rpc("agents.permission", { id: agent, request_id: request.request_id, decision, scope }, { action: true });
+    } catch (e) {
+      toast(String(e), "danger");
+    } finally {
+      await store.refetchAgentApprovals();
+      setDeciding(null);
+    }
+  };
+  return (
+    <Show when={agentNeedsToolApproval(props.agent, store.agentApprovals())}>
+      <section class="agent-approvals" aria-label="Pending tool approvals">
+        <Show when={Array.isArray(requests())} fallback={
+          <div class="perm" role="status">
+            <span class="grow">This agent is waiting for approval. Its pending requests are temporarily unavailable.</span>
+            <Button size="sm" busy={store.agentApprovals.loading} onClick={store.refetchAgentApprovals}>Retry approvals</Button>
+          </div>
+        }>
+          <For each={requests()}>{(request) => {
+            const isBrowser = request.action === "mcp" && request.resource?.startsWith("philium/browser_");
+            const args = () => request.call_id && props.events?.find((event) =>
+              event.type === "tool.started" && event.call_id === request.call_id
+            )?.arguments;
+            return <div class="perm row">
+              <Icon name="shield" size={14} />
+              <div class="grow">
+                <b>{isBrowser ? "Browser permission" : request.action}</b> <code class="mono">{request.resource}</code>
+                <Show when={args()}><pre class="conv-pre">{JSON.stringify(args(), null, 2)}</pre></Show>
+                <Show when={isBrowser}><div class="dim xs">Page content may be sent to this agent’s provider.</div></Show>
+              </div>
+              <div class="row gap-4">
+                <Button size="sm" disabled={!!deciding()} onClick={() => decide(request, "deny")}>Deny</Button>
+                <Button size="sm" disabled={!!deciding()} onClick={() => decide(request, "approve", "once")}>Allow once</Button>
+                <Button size="sm" disabled={!!deciding()} onClick={() => decide(request, "approve", "session")}>Allow for session</Button>
+              </div>
+            </div>;
+          }}</For>
+        </Show>
+      </section>
+    </Show>
+  );
+}
+
 function AgentView(props) {
   const screenVisible = useScreenVisible();
   const [tab, setTab] = createSignal("chat");
@@ -391,36 +444,28 @@ function AgentView(props) {
   const merge = mergeEvents;
   const load = async (id, after = 0) => {
     const request = ++generation;
-    let effectiveAfter = after;
     if (historyId !== id) {
       historyId = id;
-      const cached = agentEventsCache.get(id);
-      if (cached?.length && after === 0) {
-        setEvents(cached);
-        effectiveAfter = cached.at(-1)?.seq ?? 0;
-        setHistoryCursor(effectiveAfter);
-        setHistoryMore(false);
-      } else {
-        setEvents([]);
-        setHistoryCursor(0);
-        setHistoryMore(false);
-      }
+      setEvents(agentEventsCache.get(id) ?? []);
+      setHistoryCursor(0);
+      setHistoryMore(false);
     }
-    retryAfter = effectiveAfter;
-    if (!agentEventsCache.has(id)) setHistoryLoading(true);
+    retryAfter = after;
+    setHistoryLoading(true);
     setHistoryError("");
     try {
-      const evs = await rpc("agents.events", { id, after: effectiveAfter, limit: 5000 }, { local: true });
+      const result = await rpc("agents.events", { id, after, limit: 5000, page: true }, { local: true });
       if (request !== generation || props.id !== id) return;
+      const evs = Array.isArray(result) ? result : result?.events;
       if (!Array.isArray(evs)) throw new Error("Invalid history response");
       setEvents((current) => {
         const next = merge(current, evs);
         agentEventsCache.set(id, next);
         return next;
       });
-      const next = evs.at(-1)?.seq ?? effectiveAfter;
+      const next = evs.at(-1)?.seq ?? after;
       setHistoryCursor(next);
-      setHistoryMore(evs.length === 5000 && next > effectiveAfter);
+      setHistoryMore((result?.has_more ?? (evs.length === 5000)) && next > after);
     } catch (e) {
       if (request === generation && props.id === id) setHistoryError(String(e));
     } finally {
@@ -441,6 +486,7 @@ function AgentView(props) {
   useVisibleEvent("library", () => refetch(), { debounceMs: 250 });
 
   const a = () => info()?.id === props.id ? info() : props.agent;
+  const state = () => agentNeedsToolApproval(a(), store.agentApprovals()) ? "waiting" : a()?.state;
   const [effort, setEffort] = createSignal("default");
   const [effortPending, setEffortPending] = createSignal(false);
   let effortRequest = 0;
@@ -532,6 +578,21 @@ function AgentView(props) {
     observedId = id; observedLive = value;
   });
   const busy = () => ["running", "waiting"].includes(a()?.state);
+  const clock = useClock(500);
+  const [rate, setRate] = createSignal(null);
+  useEvent("gateway:progress", (p) => {
+    if (!p.agent || p.agent !== a()?.name) return;
+    const id = props.id;
+    setRate((prev) => ({ id, sample: sampleLiveTps(prev?.id === id ? prev.sample : null, p, Date.now()) }));
+  });
+  useEvent("activity", (p) => {
+    if (!p.agent || p.agent !== a()?.name || p.state === "pending") return;
+    setRate((prev) => prev?.id === props.id && prev.sample.id === p.id
+      ? { ...prev, sample: sampleLiveTps(prev.sample, { id: p.id, done: true }, Date.now()) } : prev);
+  });
+  const tps = () => screenVisible() && live() && a()?.state === "running" && rate()?.id === props.id
+    ? liveTps(rate().sample, clock()) : null;
+
   let agentMain;
 
   // What is typed while the agent works waits here, survives a quit, and is sent when the step ends.
@@ -556,8 +617,6 @@ function AgentView(props) {
       toast(sendError(e), "danger"); return false;
     }
   };
-  const decide = (request_id, decision, scope) =>
-    live() ? rpc("agents.permission", { id: props.id, request_id, decision, scope }, { action: true }).catch((e) => toast(String(e), "danger")) : Promise.resolve();
 
   const remove = async () => {
     const r = await rpc("agents.remove", { id: props.id }).catch((e) => ({ error: String(e) }));
@@ -668,10 +727,13 @@ function AgentView(props) {
   return (
     <div class="agent-view">
       <div class="agent-head">
-        <Dot state={stateDot(a()?.state)} />
+        <Dot state={stateDot(state())} />
         <AgentChip name={a()?.name} />
         <RoleBadge role={a()?.role} />
-        <span class="small dim">{stateLabel(a()?.state)}</span>
+        <span class="small dim">{stateLabel(state())}</span>
+        <Show when={tps()}>{(speed) => (
+          <span class="mono xs dim" title="Estimated tokens per second from streamed output. Hidden reasoning is not counted.">~{speed().toFixed(1)} TPS</span>
+        )}</Show>
         <ModelPicker
           compact
           value={a()?.model_ref || ""}
@@ -738,15 +800,16 @@ function AgentView(props) {
       <Show when={calmWarnings(a()?.warnings).length}>
         <div style={{ padding: "6px 16px 0" }}><WarningPills warnings={calmWarnings(a()?.warnings)} max={4} /></div>
       </Show>
+      <PendingAgentPermissions agent={a()} events={events()} />
+      <AccessApprovalBar agentId={props.id} agentName={a()?.name} repoId={a()?.repo_id} strict={!!a()?.strict} />
       <div class="agent-body">
         <div class="agent-main" ref={agentMain}>
           <Show when={tab() === "chat"}>
             <Show when={historyLoading()}><div class="history-loading small dim" role="status">Loading saved conversation…</div></Show>
             <Show when={historyError()}><div class="history-error shield danger" role="alert">Unable to load saved conversation: {historyError()} <Button size="sm" onClick={() => load(props.id, retryAfter)}>Retry history</Button></div></Show>
             <Show when={historyMore()}><div class="history-more small dim" role="status">More saved history is available. Showing loaded pages only. <Button size="sm" disabled={historyLoading()} onClick={() => load(props.id, historyCursor())}>Load more history</Button></div></Show>
-            <AccessApprovalBar agentId={props.id} agentName={a()?.name} repoId={a()?.repo_id} strict={!!a()?.strict} />
             <Conversation agent={a()?.name} events={events()} busy={busy()} readOnly={!live()} loadAttachment={agentAttachmentLoader(props.id)} onForkAt={handleForkAt} emptyText={historyLoading() ? "Loading saved conversation…" : historyError() ? "History could not be loaded. Retry above." : live() ? "Send the first message to start." : "No saved messages. This agent is stopped. Resume it to continue."}
-              onApprove={(id, scope) => decide(id, "approve", scope)} onDeny={(id) => decide(id, "deny")} />
+              externalApprovals />
             <Composer draftKey={`agent:${props.id}`} mentionTarget={a()?.worktree_id ? { worktree_id: a().worktree_id } : null} dropTarget={() => agentMain} onSend={send} busy={busy()} disabled={!live()}
               onQueue={queue} onSteer={steer} queued={queued() ?? []} queueTarget={a()?.name}
               onTakeQueued={(q) => rpc("agents.queue_take", { id: props.id, item: q.id }).then((r) => r?.text).catch((e) => { toast(String(e), "danger"); return null; })}
@@ -833,7 +896,6 @@ export function AgentGridCard(props) {
 
   const live = () => !!a()?.live;
   const busy = () => ["running", "waiting"].includes(a()?.state);
-  const hasClash = () => (a()?.warnings ?? []).some((w) => w.kind === "clash");
 
   const send = async (e) => {
     e?.preventDefault();
@@ -853,23 +915,21 @@ export function AgentGridCard(props) {
     }
   };
 
-  const decide = (request_id, decision, scope) =>
-    live() ? rpc("agents.permission", { id: a().id, request_id, decision, scope }, { action: true }).catch((e) => toast(String(e), "danger")) : Promise.resolve();
 
   return (
     <div
-      class={`agent-card role-card-${a()?.role || "worker"} ${a()?.state === "waiting" || (props.pendingAccess ?? 0) > 0 ? "needs-you" : hasClash() ? "has-clash" : busy() ? "active" : ""}`}
+      class={`agent-card role-card-${a()?.role || "worker"} ${props.needsToolApproval || (props.pendingAccess ?? 0) > 0 ? "needs-you" : busy() ? "active" : ""}`}
       data-agent-card={a()?.name}
     >
       <div class="agent-card-head" onClick={() => props.onOpen?.(a().id)}>
-        <Dot state={stateDot(a()?.state)} title={stateLabel(a()?.state)} />
+        <Dot state={stateDot(props.needsToolApproval ? "waiting" : a()?.state)} />
         <AgentChip name={a()?.name} />
         <RoleBadge role={a()?.role} />
-        <span class="xs dim">{stateLabel(a()?.state)}</span>
+        <span class="xs dim">{stateLabel(props.needsToolApproval ? "waiting" : a()?.state)}</span>
         <KvBadge kv={a()?.kv} />
         <Show when={a()?.strict}><Badge tone="strict">Strict</Badge></Show>
         <Show when={(props.pendingAccess ?? 0) > 0}><Badge tone="strict">Access request</Badge></Show>
-        <Show when={a()?.state === "waiting"}><Badge tone="strict">Needs you</Badge></Show>
+        <Show when={props.needsToolApproval}><Badge tone="strict">Needs you</Badge></Show>
         <Show when={a()?.parent_name}><span class="xs faint" title={`Helper of ${a().parent_name}`}>↳ {a().parent_name}</span></Show>
         <Show when={(a()?.children_count ?? 0) > 0}><span class="xs faint" title="Helpers">◈ {a().children_count}</span></Show>
         <span class="xs faint ellipsis grow" title={a()?.task_title || a()?.branch || a()?.model_ref}>
@@ -908,6 +968,7 @@ export function AgentGridCard(props) {
         </div>
       </Show>
       <Show when={a()?.error}><div class="shield danger xs" style={{ margin: "6px 10px 0" }}>{a().error}</div></Show>
+      <PendingAgentPermissions agent={a()} events={events()} />
       <div class="agent-card-body">
         <Conversation
           agent={a()?.name}
@@ -916,8 +977,7 @@ export function AgentGridCard(props) {
           readOnly={!live()}
           loadAttachment={agentAttachmentLoader(a().id)}
           emptyText={live() ? `Send a message to ${a()?.name} below.` : "Stopped. Press play to resume."}
-          onApprove={(id, scope) => decide(id, "approve", scope)}
-          onDeny={(id) => decide(id, "deny")}
+          externalApprovals
         />
       </div>
       <form class="agent-card-foot" onSubmit={send}>
@@ -940,15 +1000,16 @@ export function AgentGridCard(props) {
 /** Ultra-dense tile for Fleet Heatmap view (100+ agents on screen). */
 function FleetHeatmapTile(props) {
   const a = () => props.agent;
+  const state = () => props.needsToolApproval ? "waiting" : a()?.state;
   const warnings = () => a()?.warnings ?? [];
   return (
     <div
-      class={`fleet-tile state-${a()?.state} ${warnings().length ? "has-warning" : ""}`}
+      class={`fleet-tile state-${state()} ${warnings().length ? "has-warning" : ""}`}
       onClick={() => props.onOpen?.(a().id)}
-      title={`${a()?.name} (${roleLabel(a()?.role)}) · ${stateLabel(a()?.state)}${a()?.repo_name ? ` · ${a().repo_name}` : ""}${a()?.branch ? `@${a().branch}` : ""}`}
+      title={`${a()?.name} (${roleLabel(a()?.role)}) · ${stateLabel(state())}${a()?.repo_name ? ` · ${a().repo_name}` : ""}${a()?.branch ? `@${a().branch}` : ""}`}
     >
       <div class="fleet-tile-top">
-        <Dot state={stateDot(a()?.state)} />
+        <Dot state={stateDot(state())} />
         <AgentChip name={a()?.name} />
         <RoleBadge role={a()?.role} />
         <div class="grow" />
@@ -962,7 +1023,7 @@ function FleetHeatmapTile(props) {
         <WarningPills warnings={warnings()} compact max={2} />
       </Show>
       <div class="fleet-tile-foot" onClick={(e) => e.stopPropagation()}>
-        <span class="xs faint">{stateLabel(a()?.state)}</span>
+        <span class="xs faint">{stateLabel(state())}</span>
         <Show when={a()?.parent_name}><span class="xs faint">↳{a().parent_name}</span></Show>
         <div class="grow" />
         <Show when={a()?.live} fallback={
@@ -1039,26 +1100,9 @@ export default function Agents() {
   const refetch = store.refetchAgents;
   const screenVisible = typeof useScreenVisible === "function" ? useScreenVisible() : () => true;
   const [spawn, setSpawn] = createSignal(null);
-  const [pendingAccess, pendingAccessCtrl] = typeof createResource === "function"
-    ? createResource(() => rpc("access.pending", {}, { local: true }).catch(() => []))
-    : [() => [], { refetch() {} }];
-  if (typeof useVisibleEvent === "function") {
-    useVisibleEvent("access:requested", () => pendingAccessCtrl.refetch(), { debounceMs: 120 });
-    useVisibleEvent("access:changed", () => pendingAccessCtrl.refetch(), { debounceMs: 120 });
-  }
-  const pendingByAgent = createMemo(() => {
-    if (typeof pendingAccessByAgent === "function") return pendingAccessByAgent(pendingAccess());
-    const counts = new Map();
-    for (const r of pendingAccess() ?? []) {
-      if (r?.agent_id && (!r.status || r.status === "pending")) {
-        counts.set(r.agent_id, (counts.get(r.agent_id) ?? 0) + 1);
-      }
-    }
-    return counts;
-  });
-  const needsYou = (a) => (typeof agentNeedsUser === "function"
-    ? agentNeedsUser(a, pendingByAgent())
-    : a.state === "waiting" || (pendingByAgent().get(a.id) ?? 0) > 0);
+  const pendingByAgent = createMemo(() => pendingAccessByAgent(store.pendingAccess()));
+  const needsToolApproval = (a) => agentNeedsToolApproval(a, store.agentApprovals());
+  const needsYou = (a) => agentNeedsUser(a, pendingByAgent(), store.agentApprovals());
   const scoped = createMemo(() => workspaceAgents(list() ?? [], activeRepoId(), store.repos() ?? []));
   // Stopped or failed agents in the active workspace scope: what they found stays in Review and Board after they go.
   const finished = createMemo(() => scoped().filter((a) => a.state === "stopped" || a.state === "failed"));
@@ -1259,7 +1303,7 @@ export default function Agents() {
     const kvPct = totalIn > 0 ? Math.round((totalCached * 100) / totalIn) : 0;
     return {
       total: l.length,
-      live: l.filter((a) => a.live).length,
+      working: l.filter((a) => a.live && a.state === "running" && !needsToolApproval(a)).length,
       waiting: l.filter((a) => needsYou(a)).length,
       strict: l.filter((a) => a.strict).length,
       orchestrators: l.filter((a) => a.role === "orchestrator").length,
@@ -1277,31 +1321,29 @@ export default function Agents() {
     go("agents", { id });
   };
 
-  const approveAllWaiting = async (clusterId = null) => {
-    const waitingAgents = scoped().filter(
-      (a) => a.state === "waiting" && (!clusterId || a.cluster_id === clusterId || a.id === clusterId),
-    );
-    if (typeof confirm === "function") {
-      const names = waitingAgents.map((a) => a.name);
-      const count = waitingAgents.length || telemetry().waiting;
+  const pendingTools = createMemo(() => scoped().filter((a) => a.live).flatMap((a) =>
+    (store.agentApprovals()?.[a.id] ?? []).map((request) => ({ agent: a, request })),
+  ));
+  const [batchBusy, setBatchBusy] = createSignal(false);
+  const approveAllWaiting = async () => {
+    const snapshot = pendingTools();
+    if (!snapshot.length || batchBusy()) return;
+    setBatchBusy(true);
+    try {
       const ok = await confirm(
-        `Approve ${count} waiting agent${count === 1 ? "" : "s"}?`,
-        `Approve pending permission request(s) once for: ${names.join(", ") || "waiting agents"}. Open an agent directly to review or grant session-wide permissions.`,
-        { ok: `Approve once (${count})` },
+        `Approve ${snapshot.length} tool request${snapshot.length === 1 ? "" : "s"} once?`,
+        snapshot.map(({ agent, request }) => `${agent.name} · ${request.action} ${request.resource}`).join("\n"),
+        { ok: "Approve once" },
       );
       if (!ok) return;
-    }
-    try {
-      const res = await rpc("agents.batch_permission", {
-        decision: "approve",
-        scope: "once",
-        cluster_id: clusterId,
-        repo_id: activeRepoId() || null,
-      });
-      toast(`Approved ${res?.resolved ?? 0} waiting permission request(s)`, "secure");
-      refetch();
-    } catch (e) {
-      toast(String(e), "danger");
+      const results = await Promise.allSettled(snapshot.map(({ agent, request }) => rpc("agents.permission", {
+        id: agent.id, request_id: request.request_id, decision: "approve", scope: "once",
+      }, { local: true })));
+      const approved = results.filter((result) => result.status === "fulfilled").length;
+      toast(`Approved ${approved} of ${snapshot.length} requests`, approved === snapshot.length ? "secure" : "warn");
+      await store.refetchAgentApprovals();
+    } finally {
+      setBatchBusy(false);
     }
   };
 
@@ -1310,7 +1352,7 @@ export default function Agents() {
       sub={
         <Show when={scoped().length}>
           <span class="fleet-sub-telemetry">
-            <span>{telemetry().live}/{telemetry().total} running</span>
+            <span>{telemetry().working} working · {telemetry().total} agents</span>
             <Show when={telemetry().waiting > 0}>
               <span>· {telemetry().waiting} need you</span>
             </Show>
@@ -1344,7 +1386,7 @@ export default function Agents() {
           />
           <Segmented value={filter()} onChange={setFilter} options={[
             { value: "all", label: "All" },
-            { value: "live", label: "Running" },
+            { value: "live", label: "Live" },
             { value: "waiting", label: `Need you${telemetry().waiting ? ` (${telemetry().waiting})` : ""}` },
             ...(telemetry().warnings > 0 || filter() === "warnings"
               ? [{ value: "warnings", label: `Warnings (${telemetry().warnings})` }]
@@ -1360,11 +1402,11 @@ export default function Agents() {
       </div>}>
 
       <div class="agents-workspace" style={{ display: "flex", "flex-direction": "column", "min-height": "0" }}>
-      <Show when={telemetry().allAlerts.length > 0}>
+      <Show when={telemetry().allAlerts.length > 0 || pendingTools().length > 0}>
         <div class="fleet-triage-strip" style={{ flex: "none" }}>
-          <Show when={telemetry().waiting > 0}>
-            <Button size="sm" variant="primary" onClick={() => approveAllWaiting(null)}>
-              ✓ Approve All Waiting ({telemetry().waiting})
+          <Show when={pendingTools().length > 0}>
+            <Button size="sm" busy={batchBusy()} onClick={approveAllWaiting}>
+              Review tool approvals ({pendingTools().length})
             </Button>
           </Show>
           <div class="fleet-triage-alerts">
@@ -1416,7 +1458,7 @@ export default function Agents() {
                   </Show>
                 </div>
               )}</Show>
-              <For each={tree()}>{({ a, d }) => <AgentRow agent={a} depth={d} selected={a.id === selected()} picked={picked().includes(a.id)} pendingAccess={pendingByAgent().get(a.id) ?? 0} onPick={() => pickRow({ metaKey: true }, a.id)} onClick={(e) => pickRow(e, a.id)} />}</For>
+              <For each={tree()}>{({ a, d }) => <AgentRow agent={a} depth={d} selected={a.id === selected()} picked={picked().includes(a.id)} needsToolApproval={needsToolApproval(a)} pendingAccess={pendingByAgent().get(a.id) ?? 0} onPick={() => pickRow({ metaKey: true }, a.id)} onClick={(e) => pickRow(e, a.id)} />}</For>
             </div>
             <Show when={selected()}>{(id) => (
               <Show when={filtered().some((a) => a.id === id())} fallback={
@@ -1436,6 +1478,7 @@ export default function Agents() {
                     {({ a }) => (
                       <AgentGridCard
                         agent={a}
+                        needsToolApproval={needsToolApproval(a)}
                         pendingAccess={pendingByAgent().get(a.id) ?? 0}
                         onOpen={openAgentFocus}
                         onSpawnChild={(parent) => setSpawn({ parent_id: parent.id, role: "worker", repo_id: parent.repo_id })}
@@ -1448,7 +1491,7 @@ export default function Agents() {
               <Show when={viewMode() === "fleet"}>
                 <div class="fleet-heatmap-grid">
                   <For each={tree()}>
-                    {({ a }) => <FleetHeatmapTile agent={a} onOpen={openAgentFocus} />}
+                    {({ a }) => <FleetHeatmapTile agent={a} needsToolApproval={needsToolApproval(a)} onOpen={openAgentFocus} />}
                   </For>
                 </div>
               </Show>

@@ -10,8 +10,17 @@ const MAX_ATTACHMENT_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) fn events(ctx: &Ctx, raw: &str, after: i64, limit: i64) -> Result<Value, String> {
     let Some((path, session)) = locate(ctx, raw)? else { return Ok(json!([])) };
     with_db(&path, |db| read_events(db, &session, after, limit)).map_err(|e| {
-        format!("Saved conversation unavailable: {e}. Retry, or restore the agent's saved HAL data.")
+        format!("Saved conversation unavailable: {e}. Retry history to check again.")
     })
+}
+
+pub(crate) fn page(ctx: &Ctx, raw: &str, after: i64, limit: i64) -> Result<Value, String> {
+    let Some((path, session)) = locate(ctx, raw)? else {
+        return Ok(json!({"events": [], "has_more": false}));
+    };
+    let (events, more) = with_db(&path, |db| read_page(db, &session, after, limit))
+        .map_err(|e| format!("Saved conversation unavailable: {e}"))?;
+    Ok(json!({"events": events, "has_more": more}))
 }
 
 /// Raw bytes of an image the user sent in this agent's own session. The hash
@@ -116,10 +125,10 @@ fn with_db<T>(path: &Path, f: impl FnOnce(&Connection) -> Result<T, String>) -> 
     // even under READ_ONLY. When no WAL exists, immutable reads the base snapshot
     // without creating sidecars. Existing WAL must remain visible for live reads.
     let mut header = [0u8; 20];
-    let mut file =
-        std::fs::File::open(path).map_err(|e| format!("cannot open saved history ({e})"))?;
     use std::io::Read;
-    let _ = file.read(&mut header).map_err(|e| e.to_string())?;
+    std::fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut header))
+        .map_err(|e| format!("cannot open the saved database header ({:?})", e.kind()))?;
     let immutable = header[18] == 2 && !wal.exists();
     let encoded = path
         .to_str()
@@ -144,7 +153,10 @@ fn with_db<T>(path: &Path, f: impl FnOnce(&Connection) -> Result<T, String>) -> 
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_URI,
     )
-    .map_err(|e| format!("cannot open saved history ({e})"))?;
+    .map_err(|e| match e.sqlite_error_code() {
+        Some(code) => format!("could not open the saved database ({code:?})"),
+        None => "could not open the saved database".into(),
+    })?;
     db.busy_timeout(Duration::from_millis(250))
         .map_err(|e| e.to_string())?;
     db.pragma_update(None, "query_only", true)
@@ -169,6 +181,10 @@ fn with_db<T>(path: &Path, f: impl FnOnce(&Connection) -> Result<T, String>) -> 
 }
 
 fn read_events(db: &Connection, session: &str, after: i64, limit: i64) -> Result<Value, String> {
+    read_page(db, session, after, limit).map(|(events, _)| Value::Array(events))
+}
+
+fn read_page(db: &Connection, session: &str, after: i64, limit: i64) -> Result<(Vec<Value>, bool), String> {
     let exists: bool = db
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM sessions WHERE id=?1)",
@@ -180,11 +196,12 @@ fn read_events(db: &Connection, session: &str, after: i64, limit: i64) -> Result
         return Err("the recorded session is missing from saved history".into());
     }
     let mut stmt = db.prepare("SELECT seq,length(CAST(payload AS BLOB)),payload FROM events WHERE session_id=?1 AND seq>?2 ORDER BY seq LIMIT ?3").map_err(|e| e.to_string())?;
+    let limit = limit.clamp(1, 10000);
     let mut rows = stmt
         .query(rusqlite::params![
             session,
             after.max(0),
-            limit.clamp(1, 10000)
+            limit + 1
         ])
         .map_err(|e| e.to_string())?;
     let mut bytes = 0usize;
@@ -192,13 +209,17 @@ fn read_events(db: &Connection, session: &str, after: i64, limit: i64) -> Result
     while let Some(row) = rows.next().map_err(|e| e.to_string())? {
         let seq: i64 = row.get(0).map_err(|e| e.to_string())?;
         let size: i64 = row.get(1).map_err(|e| e.to_string())?;
-        if size < 0
-            || size as usize > MAX_EVENT_BYTES
-            || bytes.saturating_add(size as usize) > MAX_PAGE_BYTES
-        {
-            return Err(
-                "saved history page exceeds safety limit; retry with a smaller limit".into(),
-            );
+        if out.len() == limit as usize {
+            return Ok((out, true));
+        }
+        if size < 0 || size as usize > MAX_EVENT_BYTES {
+            if !out.is_empty() {
+                return Ok((out, true));
+            }
+            return Err(format!("saved event at sequence {seq} exceeds the preview safety limit"));
+        }
+        if bytes + size as usize > MAX_PAGE_BYTES {
+            return Ok((out, true));
         }
         bytes += size as usize;
         let payload: String = row.get(2).map_err(|e| e.to_string())?;
@@ -207,7 +228,7 @@ fn read_events(db: &Connection, session: &str, after: i64, limit: i64) -> Result
         })?;
         out.push(event);
     }
-    Ok(Value::Array(out))
+    Ok((out, false))
 }
 
 fn decode(payload: &str, parent: &str, seq: i64) -> Option<Value> {

@@ -9,8 +9,10 @@ export const EMPTY = {
   "app.settings_get": {},
   "app.disk": {},
   "app.events": [],
+  "access.pending": [],
   "providers.default": "",
   "providers.models": [],
+  "activity.quotas": {},
   "stats.summary": { totals: { requests: 0 }, by_agent: [], by_provider: [], by_model: [] },
   "stats.timeseries": { points: [] },
   "stats.efficiency": {},
@@ -23,7 +25,7 @@ export const EMPTY = {
 
 const agent = (id, name, state, extra = {}) => ({
   id, name, state, live: ["running", "waiting", "idle"].includes(state), strict: false, role: "worker",
-  model: "claude/claude-opus-5-5", created_at: now - 90 * min, ...extra,
+  model_ref: "claude/claude-opus-5-5", created_at: now - 90 * min, ...extra,
 });
 const agents = [
   agent("a1", "lion", "running", { task_id: "t2", repo_id: "r1" }),
@@ -75,7 +77,7 @@ const provs = [
   { id: "local", name: "Local Ollama", kind: "openai_chat", base_url: "http://127.0.0.1:11434/v1", has_key: false, trusted: false, enabled: true, guard: "strict", model_count: 3, models_error: "connection refused" },
 ];
 const models = [
-  { provider_id: "claude", provider_name: "Claude", model_id: "claude-opus-5-5", ref: "claude/claude-opus-5-5", display: "Opus 5.5", enabled: 1, context_window: 200000, price_in: 15, price_out: 75 },
+  { provider_id: "claude", provider_name: "Claude", model_id: "claude-opus-5-5", ref: "claude/claude-opus-5-5", display: "Opus 5.5", enabled: 1, effort_details: [{ value: "low", label: "Fast" }, { value: "default", label: "Default" }], context_window: 200000, price_in: 15, price_out: 75 },
   { provider_id: "chatgpt", provider_name: "ChatGPT", model_id: "gpt-6.1", ref: "chatgpt/gpt-6.1", display: "GPT 6.1", enabled: 1, context_window: 400000, price_in: 5, price_out: 20 },
   { provider_id: "local", provider_name: "Local Ollama", model_id: "qwen3-coder", ref: "local/qwen3-coder", display: "Qwen3 Coder", enabled: 1, trust: "untrusted" },
 ];
@@ -168,12 +170,18 @@ export const POPULATED = {
   "reaper.proposals": [{ id: "p1", kind: "worktree", handle: "/Users/demo/Philium/worktrees/old", reason: "Agent removed", state: "proposed" }],
   "reaper.ledger": [{ id: "l1", kind: "worktree", handle: "/Users/demo/Philium/worktrees/lion", state: "live", created_at: now - 3600000 }],
   "activity.list": rows,
+  "activity.quotas": {
+    chatgpt: {
+      observed_at: Math.floor(now / 1000),
+      windows: [{ label: "7d", used_percent: 28, resets_at: Math.floor(now / 1000) + 259200 }],
+    },
+  },
   "stats.summary": {
     totals: { requests: 342, tokens_in: 1.2e6, tokens_out: 3.4e5, cost: 12.8, error_rate: 0.012, avg_tps: 58, avg_ttft_ms: 410, guard_actions: 7, unpriced_requests: 12 },
     by_agent: ["lion", "otter", "heron"].map(statRow), by_provider: ["claude", "chatgpt", "local"].map(statRow), by_model: ["claude-opus-5-5", "gpt-6.1", "qwen3-coder"].map(statRow),
   },
   "stats.timeseries": points,
-  "stats.efficiency": { cached_share: 0.42, cache_available: true, output_input_ratio: 0.28, cost_per_: 0.04 },
+  "stats.efficiency": [],
   "codeindex.status": { files: 5, symbols: 42, indexed_at: now - 60000, state: "ready" },
   "codeindex.tree": tree,
   "codeindex.graph": codeGraph,

@@ -32,13 +32,16 @@ struct Output {
     announced: bool,
 }
 struct Terminal {
-    master: Mutex<Box<dyn MasterPty + Send>>,
-    writer: Mutex<Box<dyn Write + Send>>,
-    child: Mutex<Box<dyn Child + Send + Sync>>,
-    killer: Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>,
+    master: Mutex<Option<Box<dyn MasterPty + Send>>>,
+    writer: Mutex<Option<Box<dyn Write + Send>>>,
+    process: Mutex<Option<TerminalProcess>>,
     pid: Option<u32>,
     output: Mutex<Output>,
     agent: Option<String>,
+}
+struct TerminalProcess {
+    child: Box<dyn Child + Send + Sync>,
+    killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
 }
 struct Manager {
     ctx: Weak<Ctx>,
@@ -178,16 +181,10 @@ fn open_in_repo(ctx: &Arc<Ctx>, o: Opts, repo_id: Option<&str>) -> Result<String
         cmd.env("HOME", home);
     }
     cmd.env("TERM", "xterm-256color");
+    let reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
+    let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
     let mut child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
     drop(pair.slave);
-    let reader = pair.master.try_clone_reader().map_err(|e| {
-        let _ = child.kill();
-        e.to_string()
-    })?;
-    let writer = pair.master.take_writer().map_err(|e| {
-        let _ = child.kill();
-        e.to_string()
-    })?;
     let id = db::new_id();
     if let Err(e) = ctx.db.exec("INSERT INTO terminals(id,agent_id,title,command,cwd,pid,created_at,repo_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)", rusqlite::params![id,o.agent_id,o.title,serde_json::to_string(&command).unwrap(),o.cwd.to_string_lossy(),child.process_id(),db::now(),repo_id]) { let _ = child.kill(); let _ = child.wait(); return Err(e); }
     let pid = child.process_id();
@@ -203,10 +200,9 @@ fn open_in_repo(ctx: &Arc<Ctx>, o: Opts, repo_id: Option<&str>) -> Result<String
         )
     });
     let t = Arc::new(Terminal {
-        master: Mutex::new(pair.master),
-        writer: Mutex::new(writer),
-        child: Mutex::new(child),
-        killer: Mutex::new(killer),
+        master: Mutex::new(Some(pair.master)),
+        writer: Mutex::new(Some(writer)),
+        process: Mutex::new(Some(TerminalProcess { child, killer })),
         pid,
         output: Mutex::new(Output {
             ring: VecDeque::new(),
@@ -230,6 +226,7 @@ fn open_in_repo(ctx: &Arc<Ctx>, o: Opts, repo_id: Option<&str>) -> Result<String
         let mut buf = [0; 8192];
         loop {
             match reader.read(&mut buf) {
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     {
@@ -253,14 +250,22 @@ fn open_in_repo(ctx: &Arc<Ctx>, o: Opts, repo_id: Option<&str>) -> Result<String
                 }
             }
         }
+        drop(reader);
         let code = loop {
-            match t.child.lk().try_wait() {
+            let status = t.process.lk().as_mut().expect("terminal owns its child until exit").child.try_wait();
+            match status {
                 Ok(Some(status)) => break status.exit_code(),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => break 1,
                 Ok(None) => {}
             }
             std::thread::sleep(Duration::from_millis(10));
         };
+        // The terminal entry keeps its output for inspection after exit. Release
+        // the operating-system handles before publishing that it has finished.
+        drop(t.writer.lk().take());
+        drop(t.master.lk().take());
+        drop(t.process.lk().take());
         if let Some(ctx) = weak.upgrade() {
             if let Some(resource) = resource {
                 crate::reaper::release(&ctx, &resource);
@@ -290,25 +295,23 @@ fn get(ctx: &Arc<Ctx>, id: &str) -> Result<Arc<Terminal>, String> {
 }
 pub fn write(ctx: &Arc<Ctx>, id: &str, data: &[u8]) -> Result<(), String> {
     let t = get(ctx, id)?;
-    if t.output.lk().exit.is_some() {
-        return Err("terminal exited".into());
-    }
-    let mut w = t.writer.lk();
+    let mut writer = t.writer.lk();
+    let w = writer.as_mut().ok_or("terminal exited")?;
     w.write_all(data)
         .and_then(|_| w.flush())
         .map_err(|e| e.to_string())
 }
 pub fn kill(ctx: &Arc<Ctx>, id: &str) -> Result<(), String> {
     let t = get(ctx, id)?;
-    if t.output.lk().exit.is_some() {
+    let mut process = t.process.lk();
+    let Some(process) = process.as_mut() else {
         return Ok(());
-    }
+    };
     #[cfg(unix)]
     if let Some(pid) = t.pid {
         // The PTY child is a session leader. Signal only its owned process group,
         // before the child is reaped, so PID reuse cannot target an unrelated group.
-        let mut child = t.child.lk();
-        if child.try_wait().map_err(|e| e.to_string())?.is_none() {
+        if process.child.try_wait().map_err(|e| e.to_string())?.is_none() {
             let rc = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
             if rc == 0 {
                 return Ok(());
@@ -317,8 +320,7 @@ pub fn kill(ctx: &Arc<Ctx>, id: &str) -> Result<(), String> {
             return Ok(());
         }
     }
-    let result = t.killer.lk().kill().map_err(|e| e.to_string());
-    result
+    process.killer.kill().map_err(|e| e.to_string())
 }
 pub fn kill_agent(ctx: &Arc<Ctx>, agent_id: &str) {
     let ids: Vec<_> = manager(ctx)
@@ -452,17 +454,15 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
                 .as_u64()
                 .filter(|n| *n > 0 && *n <= 1000)
                 .ok_or("rows must be 1..1000")?;
-            get(ctx, &id)?
-                .master
-                .lock()
-                .unwrap()
-                .resize(PtySize {
+            if let Some(master) = get(ctx, &id)?.master.lk().as_ref() {
+                master.resize(PtySize {
                     cols: cols as u16,
                     rows: rows as u16,
                     pixel_width: 0,
                     pixel_height: 0,
                 })
                 .map_err(|e| e.to_string())?;
+            }
         }
         "rename" => {
             let title = arg_str(&args, "title")?;
@@ -641,6 +641,21 @@ mod tests {
                 .unwrap()[0]["exit_code"],
             7
         );
+    }
+
+    #[test]
+    fn exited_terminals_keep_output_without_retaining_handles() {
+        let ctx = Ctx::test();
+        init(&ctx).unwrap();
+        for _ in 0..100 {
+            let id = open(&ctx, options("printf finished", None)).unwrap();
+            wait(&ctx, &id);
+            let terminal = get(&ctx, &id).unwrap();
+            assert!(terminal.master.lk().is_none());
+            assert!(terminal.writer.lk().is_none());
+            assert!(terminal.process.lk().is_none());
+            assert_eq!(snapshot(&ctx, &id, CAP).as_deref(), Some("finished"));
+        }
     }
 }
 
