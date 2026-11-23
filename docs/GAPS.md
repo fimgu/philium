@@ -48,7 +48,7 @@ these it needs:
 | U3  | UX    | Git and PR flow in the UI                         | [Partly closed](gaps/U3.md) (commit, push and PR actions per worktree; check status in panel open) |
 | U4  | UX    | Mid-run steering                                  | [Partly closed](gaps/U4.md) (Philium steer RPC and button with queue fallback; HAL steer endpoint open) |
 | U5  | UX    | Cross-session search, fork from any message       | [Closed (Philium side)](gaps/U5.md) |
-| U6  | UX    | Native OS notifications                           | [Verified](gaps/U6.md) |
+| U6  | UX    | Native OS notifications                           | [Partly closed](gaps/U6.md) (native notifications for finish, failure and approval, opt-in; click-to-agent routing open) |
 | U7  | UX    | Shortcuts, onboarding, multi-agent grid           | [Partly closed](gaps/U7.md) (shortcut map in `src/lib/shortcuts.js`; onboarding readiness and pinned panes open) |
 | I1  | Infra | CI                                                | [Verified](gaps/I1.md) (missing checked-in CI only) |
 | I2  | Infra | Code signing and notarization                     | [Verified for release signing, partly true as phrased](gaps/I2.md) |

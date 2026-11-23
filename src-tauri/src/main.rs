@@ -49,6 +49,7 @@ mod memory_ledger;
 mod memory_skills;
 mod mcp;
 mod mcp_servers;
+mod notify;
 mod oauth;
 mod skills;
 mod pipeline;
@@ -343,6 +344,7 @@ fn main() {
     let builder=tauri::Builder::default();
     #[cfg(target_os="macos")] let builder=if offscreen{builder.activate_ignoring_other_apps(false)}else{builder};
     let mut tauri_app = builder
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             // PHILIUM_DATA_DIR isolates Improve-Philium previews from real data.
             let data_dir = match std::env::var("PHILIUM_DATA_DIR") {

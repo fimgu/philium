@@ -734,6 +734,14 @@ export default function Settings() {
             onChange={(v) => save("show_workday", v ? "true" : "false")}
           />
         </Field>
+        <Field label="Notifications" hint="A system notification when an agent finishes, stops with a problem or waits for approval while Philium is in the background. It shows only the agent name, never its output. The first one may ask for permission.">
+          <Toggle
+            on={value("notifications", "false") === "true"}
+            disabled={busy()}
+            label="Notify me in the background"
+            onChange={(v) => save("notifications", v ? "true" : "false")}
+          />
+        </Field>
       </section>
       <StrictSandboxSection busy={busy()} />
       <PlaybooksSection busy={busy()} />

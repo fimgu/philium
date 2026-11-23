@@ -1259,6 +1259,10 @@ fn apply_event(
     } else {
         *dirty_active = true;
     }
+    if crate::notify::classify(ty).is_some() {
+        let name = get_row(ctx, id).and_then(|r| r["name"].as_str().map(str::to_string)).unwrap_or_default();
+        crate::notify::on_event(ctx, id, &name, ev);
+    }
     match ty {
         "permission.requested" => {
             ctx.emit("agents:approval", json!({ "id": id, "event": ev }));
