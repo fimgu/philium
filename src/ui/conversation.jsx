@@ -1168,6 +1168,16 @@ export function Composer(props) {
           </Show>
           <Show when={record().error()}><span class="composer-notice" role="alert">{record().error()} <button type="button" class="link" disabled={record().loading() || record().pending()} onClick={() => record().retry?.()}>Retry</button></span></Show>
         </div>
+        <Show when={props.busy && props.onSteer && !empty() && !images().length}>
+          <button type="button" class="btn sm ghost" title="Add this to the current turn after the running tool finishes. If the agent cannot take it mid-turn, it is queued instead."
+            disabled={props.disabled || !record().ready() || sending()}
+            onClick={async () => {
+              const target = record(), draft = target.text();
+              target.setSending(true);
+              try { if ((await props.onSteer(draft.trim())) !== false) clearSentDraft(target, draft, []); }
+              finally { target.setSending(false); }
+            }}>Steer now</button>
+        </Show>
         <Show when={props.busy && props.onQueue && !empty()}>
           <button type="button" class="composer-send" aria-label="Queue message" title="Queue (Enter): sent when this step ends" onClick={send} disabled={props.disabled || !record().ready() || sending() || adding() > 0}><Icon name="send" size={13} /></button>
         </Show>

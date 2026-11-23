@@ -46,7 +46,7 @@ these it needs:
 | U1  | UX    | Per-hunk accept, reject, stage, revert            | [Partly closed](gaps/U1.md) (stage/unstage/revert per hunk and file; accept-as-reviewed decision open) |
 | U2  | UX    | @-mentions in the composer                        | [Partly closed](gaps/U2.md) (file and symbol @-mentions in the agent composer; URL fetch and compact cards open) |
 | U3  | UX    | Git and PR flow in the UI                         | [Partly closed](gaps/U3.md) (commit, push and PR actions per worktree; check status in panel open) |
-| U4  | UX    | Mid-run steering                                  | [Verified](gaps/U4.md) |
+| U4  | UX    | Mid-run steering                                  | [Partly closed](gaps/U4.md) (Philium steer RPC and button with queue fallback; HAL steer endpoint open) |
 | U5  | UX    | Cross-session search, fork from any message       | [Closed (Philium side)](gaps/U5.md) |
 | U6  | UX    | Native OS notifications                           | [Verified](gaps/U6.md) |
 | U7  | UX    | Shortcuts, onboarding, multi-agent grid           | [Partly closed](gaps/U7.md) (shortcut map in `src/lib/shortcuts.js`; onboarding readiness and pinned panes open) |

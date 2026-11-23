@@ -15,6 +15,7 @@ import { pendingAccessByAgent, agentNeedsUser } from "../lib/access-helpers.js";
 import { rpc, fmt, sendError } from "../lib/rpc.js";
 import { route, go, params, registerCommands } from "../lib/nav.js";
 import HunkReview from "../ui/hunk-review.jsx";
+import { steerKey } from "../lib/steer.js";
 import { matchShortcut, shortcutLabel, cycle } from "../lib/shortcuts.js";
 import { useStore, activeRepoId, agentEventsCache } from "../lib/store.js";
 import { useScreenVisible, useVisibleEvent } from "../lib/visibility.js";
@@ -540,6 +541,13 @@ function AgentView(props) {
     try { await rpc("agents.queue_add", { id: props.id, text, images }, { action: true }); refetchQueue(); return true; }
     catch (e) { toast(String(e), "danger"); return false; }
   };
+  const steer = async (text) => {
+    try {
+      const r = await rpc("agents.steer", { id: props.id, text, key: steerKey(props.id, text) }, { action: true });
+      if (r?.mode === "queued") { refetchQueue(); toast("This agent cannot take messages mid-turn yet, so it was queued for when this step ends."); }
+      return true;
+    } catch (e) { toast(String(e), "danger"); return false; }
+  };
   const send = async (text, images = []) => {
     try { await rpc("agents.send", { id: props.id, text, images }, { action: true }); return true; }
     catch (e) {
@@ -740,7 +748,7 @@ function AgentView(props) {
             <Conversation agent={a()?.name} events={events()} busy={busy()} readOnly={!live()} loadAttachment={agentAttachmentLoader(props.id)} onForkAt={handleForkAt} emptyText={historyLoading() ? "Loading saved conversation…" : historyError() ? "History could not be loaded. Retry above." : live() ? "Send the first message to start." : "No saved messages. This agent is stopped. Resume it to continue."}
               onApprove={(id, scope) => decide(id, "approve", scope)} onDeny={(id) => decide(id, "deny")} />
             <Composer draftKey={`agent:${props.id}`} mentionTarget={a()?.worktree_id ? { worktree_id: a().worktree_id } : null} dropTarget={() => agentMain} onSend={send} busy={busy()} disabled={!live()}
-              onQueue={queue} queued={queued() ?? []} queueTarget={a()?.name}
+              onQueue={queue} onSteer={steer} queued={queued() ?? []} queueTarget={a()?.name}
               onTakeQueued={(q) => rpc("agents.queue_take", { id: props.id, item: q.id }).then((r) => r?.text).catch((e) => { toast(String(e), "danger"); return null; })}
               onRemoveQueued={(q) => rpc("agents.queue_remove", { id: props.id, item: q.id }).catch((e) => toast(String(e), "danger"))} onCancel={() => rpc("agents.cancel", { id: props.id }, { action: true }).catch((e) => toast(String(e), "danger"))}
               effort={effort()} speed={effortSpeed(effort())} effortOptions={activeModel()?.effort_details ?? []} effortPending={effortPending()} onEffort={changeEffort} onSpeed={changeEffort} onSlashModel={handleSlashModel}

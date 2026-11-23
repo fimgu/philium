@@ -1352,6 +1352,32 @@ pub async fn send_with_images(ctx: &Arc<Ctx>, id: &str, text: &str, images: Valu
         .await
 }
 
+/// U4: steering is a HAL session primitive. A HAL that does not offer it answers 404/405,
+/// and the message goes to the ordinary queue instead, so nothing is lost or reordered.
+pub(crate) fn steer_unsupported(err: &str) -> bool {
+    err.starts_with("HAL 404") || err.starts_with("HAL 405") || err.starts_with("HAL 501")
+}
+
+/// Ask HAL to add `text` at the next tool boundary of the running turn.
+/// Returns `{mode:"steer", receipt}` or `{mode:"queued", queue}` when HAL cannot steer.
+async fn steer(ctx: &Arc<Ctx>, id: &str, text: &str, key: &str) -> Result<Value, String> {
+    if text.trim().is_empty() {
+        return Err("Nothing to send".into());
+    }
+    let r = rt(id)?;
+    let body = json!({ "text": text, "idempotency_key": key });
+    match r.hal.call(reqwest::Method::POST, &format!("/sessions/{}/steer", r.session), Some(body)).await {
+        Ok(receipt) => Ok(json!({ "mode": "steer", "receipt": receipt })),
+        Err(e) if steer_unsupported(&e) => {
+            ctx.db.exec("INSERT INTO agent_queue(agent_id,text,images,created_at) VALUES(?1,?2,'[]',?3)", rusqlite::params![id, text, now()])?;
+            ctx.emit("agents:queue", json!({ "id": id }));
+            deliver_mail(ctx, id);
+            Ok(json!({ "mode": "queued", "queue": queue_list(ctx, id)? }))
+        }
+        Err(e) => Err(e),
+    }
+}
+
 fn plan_key(id: &str) -> String {
     format!("agent.{id}.plan")
 }
@@ -1848,6 +1874,12 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
             queue_list(ctx, &id)
         }
         "queue_list" => queue_list(ctx, &id()?),
+        "steer" => {
+            let id = id()?;
+            let text = ctx::arg_str(&args, "text").unwrap_or_default();
+            let key = ctx::arg_str(&args, "key").unwrap_or_else(|_| crate::db::new_id());
+            steer(ctx, &id, &text, &key).await
+        }
         // Edit takes a queued message back into the box; remove drops it.
         "queue_take" | "queue_remove" => {
             let id = id()?;
@@ -2638,6 +2670,14 @@ mod tests {
         // The secret denies must be the last read rule touching .env (nothing re-opens it).
         let last_read = s["rules"].as_array().unwrap().iter().rev().find(|r| r["action"] == "read").unwrap();
         assert_eq!(last_read["effect"], "deny");
+    }
+
+    #[test]
+    fn steer_falls_back_only_when_hal_lacks_it() {
+        assert!(steer_unsupported("HAL 404 Not Found: {}"));
+        assert!(steer_unsupported("HAL 405 Method Not Allowed: {}"));
+        assert!(!steer_unsupported("HAL 409 Conflict: busy"));
+        assert!(!steer_unsupported("connection refused"));
     }
 
     #[test]
