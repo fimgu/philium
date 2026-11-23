@@ -25,6 +25,7 @@ use serde_json::{json, Value};
 use tokio::sync::broadcast;
 
 pub(crate) mod gemini;
+pub(crate) mod progress;
 pub(crate) mod stale;
 pub(crate) mod translate;
 
@@ -35,6 +36,31 @@ const LOG_CAPACITY: usize = 500;
 const BODY_CAP: usize = 512 * 1024;
 const HEAD_CAP: usize = 64 * 1024;
 const TAIL_CAP: usize = 64 * 1024;
+/// No streamed bytes for this long is a real stall (normal turns stream continuously).
+const STREAM_IDLE: std::time::Duration = std::time::Duration::from_secs(90);
+
+type ByteStream = futures_util::stream::BoxStream<'static, Result<Bytes, String>>;
+
+fn byte_stream(r: reqwest::Response) -> ByteStream {
+    r.bytes_stream().map(|x| x.map_err(|e| e.to_string())).boxed()
+}
+
+fn err_stream(msg: String) -> ByteStream {
+    futures_util::stream::iter([Err(msg)]).boxed()
+}
+
+/// End the stream with an error once no chunk arrives within `idle`.
+fn idle_guard(s: ByteStream, idle: std::time::Duration) -> ByteStream {
+    futures_util::stream::unfold(Some(s), move |st| async move {
+        let mut s = st?;
+        match tokio::time::timeout(idle, s.next()).await {
+            Ok(Some(item)) => Some((item, Some(s))),
+            Ok(None) => None,
+            Err(_) => Some((Err(format!("upstream stalled: no stream bytes for {}s", idle.as_secs())), None)),
+        }
+    })
+    .boxed()
+}
 
 /// A provider with its real key, as the gateway sees it.
 #[derive(Clone)]
@@ -97,6 +123,8 @@ pub struct Gateway {
     slots: Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
     next_id: AtomicU64,
     pub events: broadcast::Sender<Activity>,
+    /// Live per-request stream progress (thinking, tool-arg streaming, bytes), throttled.
+    pub progress: broadcast::Sender<progress::StreamProgress>,
     log_tx: Option<std::sync::mpsc::SyncSender<Activity>>,
     /// Source of OAuth access tokens for subscription routes.
     pub tokens: TokenSource,
@@ -176,6 +204,7 @@ impl Gateway {
             slots: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             events: broadcast::channel(256).0,
+            progress: broadcast::channel(256).0,
             log_tx,
             tokens: TokenSource::new(),
             signatures: Mutex::new(HashMap::new()),
@@ -343,6 +372,10 @@ impl Gateway {
 
     pub fn clear(&self) {
         self.log.lk().clear();
+    }
+
+    pub fn emit_progress(&self, p: progress::StreamProgress) {
+        let _ = self.progress.send(p);
     }
 
     fn push(&self, rec: Record) {
@@ -931,6 +964,40 @@ async fn proxy(
     gw.update(id, |r| r.summary.status = Some(status.as_u16()));
     let content_type = resp.headers().get("content-type").cloned();
     let retry_after = resp.headers().get("retry-after").cloned();
+    let mut upstream = byte_stream(resp);
+    let mut pre: Option<Result<Bytes, String>> = None;
+    if stream && status.is_success() {
+        // Stall before the first byte: nothing reached the client yet, so resend once invisibly.
+        match tokio::time::timeout(STREAM_IDLE, upstream.next()).await {
+            Ok(x) => pre = x,
+            Err(_) => {
+                eprintln!("[gateway] request {id}: no stream bytes for {}s, retrying once", STREAM_IDLE.as_secs());
+                gw.emit_progress(progress::StreamProgress { id, agent: agent_name.clone(), stalled: true, ..Default::default() });
+                upstream = match build_req(&outgoing, &dropped_betas).send().await {
+                    Ok(r) if r.status().is_success() => byte_stream(r),
+                    Ok(r) => err_stream(format!("upstream stalled; retry returned {}", r.status())),
+                    Err(e) => err_stream(format!("upstream stalled; retry failed: {e}")),
+                };
+            }
+        }
+    }
+    let upstream = idle_guard(futures_util::stream::iter(pre).chain(upstream).boxed(), if stream { STREAM_IDLE } else { std::time::Duration::from_secs(3600) });
+    let mut sniff = progress::Sniffer::new(id, agent_name.clone());
+    let mut last_emit: Option<Instant> = None;
+    let gw_p = gw.clone();
+    let mut track = move |chunk: &[u8], err: bool| {
+        if !stream {
+            return;
+        }
+        sniff.feed(chunk);
+        if err {
+            sniff.p.stalled = true;
+        }
+        if err || sniff.p.done || last_emit.is_none_or(|t| t.elapsed().as_millis() >= 250) {
+            gw_p.emit_progress(sniff.p.clone());
+            last_emit = Some(Instant::now());
+        }
+    };
 
     let mut fin = Finalizer {
         gw: gw.clone(),
@@ -947,23 +1014,29 @@ async fn proxy(
     let mut out = if convert && stream {
         let tr = Arc::new(Mutex::new(translate::StreamTranslator::new()));
         let tr2 = tr.clone();
-        let body = resp.bytes_stream().map(move |item| {
+        let body = upstream.map(move |item| {
             match item {
                 Ok(chunk) => {
                     let s = tr.lk().feed(&chunk);
                     fin.feed(s.as_bytes());
+                    track(s.as_bytes(), false);
                     Ok(Bytes::from(s))
                 }
                 Err(e) => {
                     fin.error = Some(format!("upstream stream error: {e}"));
+                    track(b"", true);
                     Err(e)
                 }
             }
         });
-        let tail = futures_util::stream::once(async move { Ok(Bytes::from(tr2.lk().end())) });
+        let tail = futures_util::stream::once(async move { Ok::<_, String>(Bytes::from(tr2.lk().end())) });
         Response::new(Body::from_stream(body.chain(tail)))
     } else if convert {
-        let bytes = resp.bytes().await.unwrap_or_default();
+        let mut bytes = Vec::new();
+        let mut upstream = upstream;
+        while let Some(Ok(c)) = upstream.next().await {
+            bytes.extend_from_slice(&c);
+        }
         let outb = match serde_json::from_slice::<Value>(&bytes) {
             Ok(v) => translate::response(&v).to_string().into_bytes(),
             Err(_) => bytes.to_vec(),
@@ -971,10 +1044,16 @@ async fn proxy(
         fin.feed(&outb);
         Response::new(Body::from(outb))
     } else {
-        let body = resp.bytes_stream().map(move |item| {
+        let body = upstream.map(move |item| {
             match &item {
-                Ok(chunk) => fin.feed(chunk),
-                Err(e) => fin.error = Some(format!("upstream stream error: {e}")),
+                Ok(chunk) => {
+                    fin.feed(chunk);
+                    track(chunk, false);
+                }
+                Err(e) => {
+                    fin.error = Some(format!("upstream stream error: {e}"));
+                    track(b"", true);
+                }
             }
             item
         });

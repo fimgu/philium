@@ -4,3 +4,5 @@
 .conversation-activity .activity-hint { flex-basis: 100%; padding-left: 14px; font-size: var(--fs-xs); color: var(--text-faint); }
 .conv-tool-toggle { width: 100%; background: none; border: 0; padding: 0; color: inherit; font: inherit; text-align: left; cursor: pointer; }
 .conv-tool-toggle:focus-visible { outline: 2px solid currentColor; outline-offset: 3px; }
+.conversation-activity .activity-meter { font-variant-numeric: tabular-nums; color: var(--text-faint); font-size: var(--fs-xs); }
+.conversation-activity[data-activity="stalled"] .activity-dot { background: var(--warning, #d98e04); animation: none; }

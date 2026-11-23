@@ -386,6 +386,19 @@ fn main() {
                 }
             });
 
+            // Live stream progress -> conversation activity indicator.
+            let mut prx = gateway.progress.subscribe();
+            let c3 = ctx.clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    match prx.recv().await {
+                        Ok(p) => c3.emit("gateway:progress", p),
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(_) => break,
+                    }
+                }
+            });
+
             // Keep philium.db-wal from growing without bound between restarts.
             let c_wal = ctx.clone();
             tauri::async_runtime::spawn(async move {

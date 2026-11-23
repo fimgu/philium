@@ -601,7 +601,7 @@ export function Conversation(props) {
             </Switch>
           )}
         </Index>
-        <ConversationActivity events={props.events ?? []} busy={props.busy} readOnly={props.readOnly || props.hidden} />
+        <ConversationActivity agent={props.agent} events={props.events ?? []} busy={props.busy} readOnly={props.readOnly || props.hidden} />
       </div>
       <Show when={!stick() && store.items.length > 0}>
         <div class="conv-jump-wrap">
