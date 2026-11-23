@@ -104,6 +104,22 @@ A general comparison with running one command-line agent in one terminal. It is 
 | Setup | One binary | Desktop app plus the HAL runtime |
 | Works from a plain SSH session | Yes | No, needs a desktop |
 
+## Install
+
+Philium runs on Apple Silicon Macs (M1 or later) with macOS 12 or newer.
+
+1. Download the latest `Philium_*_aarch64.dmg` from [Releases](https://github.com/fimgu/philium/releases/latest).
+2. Open the DMG and drag Philium into Applications.
+3. The app is not notarized yet, so macOS blocks the first launch. Run this once, then open Philium normally:
+
+   ```sh
+   xattr -dr com.apple.quarantine /Applications/Philium.app
+   ```
+
+   Or: try to open it, then go to System Settings, Privacy & Security, and choose Open Anyway.
+
+To build from source instead, see Quick start below.
+
 ## Quick start
 
 ```sh
