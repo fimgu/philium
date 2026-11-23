@@ -11,6 +11,7 @@
 //! The web UI never sees a token or key.
 
 mod access;
+mod account_usage;
 mod app_id;
 mod access_fs;
 mod agents;
@@ -240,6 +241,7 @@ async fn rpc_inner(app: &App, method: String, args: Option<Value>) -> Result<Val
         "codeindex" => codeindex::call(&ctx, m, args).await,
         "sandbox" => sandbox::call(&ctx, m, args).await,
         "stats" => stats::call(&ctx, m, args).await,
+        "usage" => account_usage::call(&ctx, m, args).await,
         "storage" => storage::call(&ctx, m, args).await,
         "reaper" => reaper::call(&ctx, m, args).await,
         "library" => library::call(&ctx, m, args).await,
@@ -457,7 +459,7 @@ fn main() {
             });
 
             // Module init. Failures are logged, never fatal: the UI shows them.
-            let inits: [(&str, fn(&Arc<Ctx>) -> Result<(), String>); 20] = [
+            let inits: [(&str, fn(&Arc<Ctx>) -> Result<(), String>); 21] = [
                 ("workday", workday::init),
                 ("access", access::init),
                 ("library", library::init),
@@ -475,6 +477,7 @@ fn main() {
                 ("graph", graph::init),
                 ("codeindex", codeindex::init),
                 ("stats", stats::init),
+                ("usage", account_usage::init),
                 ("reaper", reaper::init),
                 ("selfdev", selfdev::init),
                 ("pr_review", pr_review::init),

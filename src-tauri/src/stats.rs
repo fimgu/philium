@@ -392,8 +392,118 @@ fn dispatch(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, String> 
             }
             Ok(json!(gs))
         }
+        "insights" => {
+            let today = args["today_start"].as_i64().filter(|t| *t > 0 && *t <= db::now()).unwrap_or(db::now() - 86_400_000);
+            let tz = args["tz_offset_min"].as_i64().unwrap_or(0).clamp(-14 * 60, 14 * 60);
+            ctx.db.with(|c| insights(c, start, repo_id, today, tz))
+        }
         _ => Err(format!("unknown stats.{method}")),
     }
+}
+
+fn pctl(v: &mut [f64], p: f64) -> Option<f64> {
+    if v.is_empty() {
+        return None;
+    }
+    v.sort_by(f64::total_cmp);
+    Some(v[(((v.len() - 1) as f64) * p).round() as usize])
+}
+
+/// One query for the redesigned Stats page. All Philium-local.
+/// Args: range, repo_id?, today_start (local midnight, ms), tz_offset_min (local minus UTC).
+fn insights(c: &rusqlite::Connection, start: i64, repo_id: Option<&str>, today: i64, tz_min: i64) -> rusqlite::Result<Value> {
+    let now = db::now();
+    let spend = |from: i64| -> rusqlite::Result<Value> {
+        c.query_row(
+            "SELECT COALESCE(SUM(cost),0.0), COUNT(*), COALESCE(SUM(CASE WHEN cost IS NULL AND COALESCE(billing,'') != 'included' THEN 1 ELSE 0 END),0), COALESCE(SUM(CASE WHEN billing='included' THEN 1 ELSE 0 END),0)
+             FROM requests WHERE ts >= ?1 AND (?2 IS NULL OR repo_id = ?2)",
+            rusqlite::params![from, repo_id],
+            |r| Ok(json!({ "cost": r.get::<_, f64>(0)?, "requests": r.get::<_, i64>(1)?, "unpriced": r.get::<_, i64>(2)?, "included": r.get::<_, i64>(3)? })),
+        )
+    };
+    let mut models: BTreeMap<(String, String), (Vec<f64>, Value)> = BTreeMap::new();
+    {
+        let mut st = c.prepare(
+            "SELECT r.provider_id, r.model, r.ttft_ms, r.tps, r.tokens_in, r.tokens_out, r.tokens_cached, r.cost,
+                    CASE WHEN COALESCE(r.status,0) >= 400 OR o.state IN ('error','blocked') THEN 1 ELSE 0 END
+             FROM requests r LEFT JOIN stats_outcomes o ON o.request_id = r.id
+             WHERE r.ts >= ?1 AND (?2 IS NULL OR r.repo_id = ?2)",
+        )?;
+        let mut rows = st.query(rusqlite::params![start, repo_id])?;
+        while let Some(r) = rows.next()? {
+            let key = (r.get::<_, String>(0)?, r.get::<_, String>(1)?);
+            let e = models.entry(key).or_insert_with(|| (vec![], json!({ "requests": 0, "tokens_in": 0.0, "tokens_out": 0.0, "tokens_cached": 0.0, "cost": 0.0, "errors": 0, "tps_sum": 0.0, "tps_n": 0 })));
+            if let Some(t) = r.get::<_, Option<f64>>(2)? {
+                e.0.push(t);
+            }
+            let v = &mut e.1;
+            let add = |v: &mut Value, k: &str, x: f64| v[k] = json!(v[k].as_f64().unwrap_or(0.0) + x);
+            add(v, "requests", 1.0);
+            add(v, "tokens_in", r.get::<_, f64>(4)?);
+            add(v, "tokens_out", r.get::<_, f64>(5)?);
+            add(v, "tokens_cached", r.get::<_, f64>(6)?);
+            add(v, "cost", r.get::<_, Option<f64>>(7)?.unwrap_or(0.0));
+            add(v, "errors", r.get::<_, i64>(8)? as f64);
+            if let Some(t) = r.get::<_, Option<f64>>(3)? {
+                add(v, "tps_sum", t);
+                add(v, "tps_n", 1.0);
+            }
+        }
+    }
+    let mut model_rows: Vec<Value> = models
+        .into_iter()
+        .map(|((p, m), (mut tt, mut v))| {
+            let n = number(&v, "requests");
+            let tin = number(&v, "tokens_in");
+            v["provider_id"] = json!(p);
+            v["model"] = json!(m);
+            v["p50_ttft_ms"] = json!(pctl(&mut tt, 0.5));
+            v["p95_ttft_ms"] = json!(pctl(&mut tt, 0.95));
+            v["avg_tps"] = if number(&v, "tps_n") > 0.0 { json!(number(&v, "tps_sum") / number(&v, "tps_n")) } else { Value::Null };
+            v["cache_hit"] = if tin > 0.0 { json!(number(&v, "tokens_cached") / tin) } else { Value::Null };
+            v["error_rate"] = json!(if n > 0.0 { number(&v, "errors") / n } else { 0.0 });
+            if let Some(o) = v.as_object_mut() {
+                o.remove("tps_sum");
+                o.remove("tps_n");
+            }
+            v
+        })
+        .collect();
+    model_rows.sort_by(|a, b| number(b, "requests").total_cmp(&number(a, "requests")));
+
+    let mut heat = vec![vec![0i64; 24]; 7];
+    {
+        let off = tz_min * 60_000;
+        let mut st = c.prepare(
+            "SELECT ((ts + ?3) / 86400000 + 4) % 7 AS dow, ((ts + ?3) / 3600000) % 24 AS h, COUNT(*)
+             FROM requests WHERE ts >= ?1 AND (?2 IS NULL OR repo_id = ?2) GROUP BY dow, h",
+        )?;
+        let rows = st.query_map(rusqlite::params![start, repo_id, off], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))?;
+        for row in rows {
+            let (d, h, n) = row?;
+            // 1970-01-01 was a Thursday; +4 maps it to 0 = Sunday. Shift to Monday-first.
+            let d = ((d + 6) % 7).clamp(0, 6) as usize;
+            heat[d][h.clamp(0, 23) as usize] += n;
+        }
+    }
+    let group = |sql: &str| -> rusqlite::Result<Vec<Value>> {
+        let mut st = c.prepare(sql)?;
+        let rows = st.query_map(rusqlite::params![start, repo_id], |r| {
+            Ok(json!({ "id": r.get::<_, Option<String>>(0)?, "name": r.get::<_, Option<String>>(1)?, "requests": r.get::<_, i64>(2)?, "tokens": r.get::<_, f64>(3)?, "cost": r.get::<_, f64>(4)?, "unpriced": r.get::<_, i64>(5)? }))
+        })?;
+        rows.collect()
+    };
+    let cols = "COUNT(*) AS n, COALESCE(SUM(CAST(r.tokens_in + r.tokens_out AS REAL)),0.0), COALESCE(SUM(r.cost),0.0), COALESCE(SUM(CASE WHEN r.cost IS NULL AND COALESCE(r.billing,'') != 'included' THEN 1 ELSE 0 END),0)";
+    let repos = group(&format!("SELECT r.repo_id, rp.name, {cols} FROM requests r LEFT JOIN repos rp ON rp.id = r.repo_id WHERE r.ts >= ?1 AND (?2 IS NULL OR r.repo_id = ?2) GROUP BY r.repo_id ORDER BY 4 DESC LIMIT 12"))?;
+    let agents = group(&format!("SELECT r.agent_id, r.agent_id, {cols} FROM requests r WHERE r.ts >= ?1 AND (?2 IS NULL OR r.repo_id = ?2) GROUP BY r.agent_id ORDER BY 4 DESC LIMIT 12"))?;
+    Ok(json!({
+        "totals": sql_totals(c, start, repo_id)?,
+        "spend": { "today": spend(today)?, "week": spend(now - 7 * 86_400_000)?, "month": spend(now - 30 * 86_400_000)? },
+        "models": model_rows,
+        "heatmap": heat,
+        "repos": repos,
+        "agents": agents,
+    }))
 }
 
 pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, String> {
@@ -525,6 +635,34 @@ mod tests {
             .as_array()
             .unwrap()
             .is_empty());
+    }
+    #[tokio::test]
+    async fn insights_shape_percentiles_and_empty() {
+        let c = Ctx::test();
+        init(&c).unwrap();
+        let e = call(&c, "insights", json!({"range":"7d"})).await.unwrap();
+        assert_eq!(e["models"].as_array().unwrap().len(), 0);
+        assert_eq!(e["heatmap"].as_array().unwrap().len(), 7);
+        assert_eq!(e["spend"]["today"]["requests"], 0);
+        for (i, t) in [100u64, 200, 300, 400, 5000].into_iter().enumerate() {
+            let mut a = activity();
+            a.id = 10 + i as u64;
+            a.ttft_ms = Some(t);
+            a.duration_ms = Some(t + 1000);
+            a.cached_tokens = Some(250);
+            a.agent = Some("lion".into());
+            record(&c, &a);
+        }
+        let v = call(&c, "insights", json!({"range":"24h","today_start": db::now() - 1000, "tz_offset_min": 60})).await.unwrap();
+        let m = &v["models"][0];
+        assert_eq!(m["requests"], 5.0);
+        assert_eq!(m["p50_ttft_ms"], 300.0);
+        assert_eq!(m["p95_ttft_ms"], 5000.0);
+        assert_eq!(m["cache_hit"], 0.25);
+        let heat: i64 = v["heatmap"].as_array().unwrap().iter().flat_map(|d| d.as_array().unwrap().iter().map(|n| n.as_i64().unwrap())).sum();
+        assert_eq!(heat, 5);
+        assert_eq!(v["agents"][0]["id"], "lion");
+        assert_eq!(v["spend"]["week"]["requests"], 5);
     }
     #[tokio::test]
     async fn repo_attribution_and_filtering() {
