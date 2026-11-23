@@ -2027,14 +2027,6 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
             tokio::task::spawn_blocking(move || history::events(&c, &raw, after, limit))
                 .await.map_err(|e| format!("saved agent history task failed: {e}"))?
         }
-        "messages" => hal_get(&id()?, "/messages").await,
-        "permissions" => hal_get(&id()?, "/permissions").await,
-        "permission" => {
-            let r = rt(&id()?)?;
-            let rid = ctx::arg_str(&args, "request_id")?;
-            if !rid.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
-                return Err("bad request id".into());
-            }
         "search_history" => {
             let q = args["query"].as_str().unwrap_or("").to_string();
             let limit = args["limit"].as_u64().unwrap_or(50) as usize;
@@ -2050,6 +2042,14 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
                 .await.map_err(|e| format!("fork task failed: {e}"))?
                 .map(|t| json!({"transcript": t}))
         }
+        "messages" => hal_get(&id()?, "/messages").await,
+        "permissions" => hal_get(&id()?, "/permissions").await,
+        "permission" => {
+            let r = rt(&id()?)?;
+            let rid = ctx::arg_str(&args, "request_id")?;
+            if !rid.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+                return Err("bad request id".into());
+            }
             let (path, body) = match ctx::arg_str(&args, "decision")?.as_str() {
                 "approve" => (
                     "approve",

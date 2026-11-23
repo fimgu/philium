@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
-import { createRoot, createSignal, createMemo, createEffect } from "solid-js/dist/solid.js";
+import { createRoot, createSignal, createMemo, createEffect, onCleanup } from "solid-js/dist/solid.js";
 import { workspaceAgents, selectedAgentId, spawnRepoDefault } from "./agent-workspace.js";
 import { repoLabels } from './repo-labels.js';
 
@@ -56,8 +56,8 @@ test("actual Agents reactive setup isolates focus, warnings, counts and batch ap
     const [activeRepoId, setRepo] = createSignal("phi"); selectRepo = setRepo;
     const context = {
       useStore: () => ({ agents: () => agents, repos: () => repos, refetchAgents() {} }),
-      createSignal, createMemo, createEffect, workspaceAgents, selectedAgentId, activeRepoId,
-      params: () => ({ id: "lion" }), registerCommands() {},
+      createSignal, createMemo, createEffect, onCleanup, setTimeout, clearTimeout, workspaceAgents, selectedAgentId, activeRepoId,
+      params: () => ({ id: "lion" }), registerCommands() {}, shortcutLabel: () => "",
       localStorage: { getItem: () => null, setItem() {} },
       rpc: async (method, args) => { calls.push({ method, args }); return { resolved: 1 }; },
       toast() {}, go() {},

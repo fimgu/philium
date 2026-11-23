@@ -61,8 +61,8 @@ pub fn server_path() -> PathBuf {
     let dir = exe.parent().expect("exe dir");
     let name = if cfg!(windows) { "hal-desktop-server.exe" } else { "hal-desktop-server" };
     let path = dir.join(name);
-    // Test binaries live one level down (target/debug/deps).
-    if cfg!(debug_assertions) && !path.exists() {
+    // Test binaries live one level down (target/<profile>/deps), in debug and release.
+    if !path.exists() && dir.file_name().is_some_and(|n| n == "deps") {
         if let Some(up) = dir.parent() {
             return up.join(name);
         }

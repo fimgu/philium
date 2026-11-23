@@ -165,7 +165,6 @@ function Tool(props) {
 /**
  * props: events (array, reactive), onApprove(id, scope), onDeny(id), busy
  */
-export function Conversation(props) {
 /** Quiet per-message action: start a new agent from the conversation up to here. */
 function ForkHere(props) {
   return (
@@ -175,6 +174,7 @@ function ForkHere(props) {
   );
 }
 
+export function Conversation(props) {
   let el, timelineEl;
   const [store, setStore] = createStore({ items: [] });
   const [stick, setStick] = createSignal(true);
@@ -557,8 +557,8 @@ function ForkHere(props) {
               <Match when={it().kind === "assistant"}>
                 <div class={`msg assistant ${it().live && props.busy && !props.readOnly ? "live" : ""}`} data-seq={it().seq}>
                   <AssistantReply text={it().text} live={it().live && props.busy && !props.readOnly} />
-                  <Show when={it().usage && (it().usage.input_tokens || it().usage.output_tokens)}>
                   <Show when={!it().live}><ForkHere item={it()} onFork={props.onForkAt} /></Show>
+                  <Show when={it().usage && (it().usage.input_tokens || it().usage.output_tokens)}>
                     {(() => {
                       const u = it().usage || {};
                       const inp = Number(u.input_tokens || u.prompt_tokens || 0);

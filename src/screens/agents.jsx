@@ -632,8 +632,6 @@ function AgentView(props) {
     }
   };
 
-  return (
-    <div class="agent-view">
   const handleForkAt = async (seq) => {
     try {
       const cur = a();
@@ -667,6 +665,8 @@ function AgentView(props) {
     });
   });
 
+  return (
+    <div class="agent-view">
       <div class="agent-head">
         <Dot state={stateDot(a()?.state)} />
         <AgentChip name={a()?.name} />
@@ -1141,8 +1141,6 @@ export default function Agents() {
   }
   const [filter, setFilter] = createSignal("all");
   const [search, setSearch] = createSignal("");
-  const savedMode = localStorage.getItem("agents.viewMode");
-  const initialMode = savedMode === "grid" || savedMode === "fleet" ? savedMode : "split";
   // Search across every agent's saved conversation, debounced and read-only.
   const [historyQuery, setHistoryQuery] = createSignal("");
   const [historyHits, setHistoryHits] = createSignal(null);
@@ -1157,6 +1155,8 @@ export default function Agents() {
     }, 200);
   };
   onCleanup(() => clearTimeout(historyTimer));
+  const savedMode = localStorage.getItem("agents.viewMode");
+  const initialMode = savedMode === "grid" || savedMode === "fleet" ? savedMode : "split";
   const [viewMode, setViewModeRaw] = createSignal(initialMode);
   const setViewMode = (m) => { setViewModeRaw(m); localStorage.setItem("agents.viewMode", m); };
   createEffect(() => {
@@ -1333,8 +1333,6 @@ export default function Agents() {
             value={search()}
             onInput={(e) => setSearch(e.currentTarget.value)}
           />
-          <Segmented value={filter()} onChange={setFilter} options={[
-            { value: "all", label: "All" },
           <input
             type="search"
             class="input fleet-search"
@@ -1344,6 +1342,8 @@ export default function Agents() {
             onInput={(e) => runHistorySearch(e.currentTarget.value)}
             onKeyDown={(e) => { if (e.key === "Escape") runHistorySearch(""); }}
           />
+          <Segmented value={filter()} onChange={setFilter} options={[
+            { value: "all", label: "All" },
             { value: "live", label: "Running" },
             { value: "waiting", label: `Need you${telemetry().waiting ? ` (${telemetry().waiting})` : ""}` },
             ...(telemetry().warnings > 0 || filter() === "warnings"
@@ -1403,8 +1403,6 @@ export default function Agents() {
                   <Button size="sm" variant="ghost" onClick={() => setPicked([])}>Clear</Button>
                 </div>
               </Show>
-              <For each={tree()}>{({ a, d }) => <AgentRow agent={a} depth={d} selected={a.id === selected()} picked={picked().includes(a.id)} pendingAccess={pendingByAgent().get(a.id) ?? 0} onPick={() => pickRow({ metaKey: true }, a.id)} onClick={(e) => pickRow(e, a.id)} />}</For>
-            </div>
               <Show when={historyHits()}>{(hits) => (
                 <div class="history-hits" role="region" aria-label="Conversation search results">
                   <Show when={!hits().error} fallback={<p class="small dim" role="alert">Search unavailable: {hits().error}</p>}>
@@ -1418,6 +1416,8 @@ export default function Agents() {
                   </Show>
                 </div>
               )}</Show>
+              <For each={tree()}>{({ a, d }) => <AgentRow agent={a} depth={d} selected={a.id === selected()} picked={picked().includes(a.id)} pendingAccess={pendingByAgent().get(a.id) ?? 0} onPick={() => pickRow({ metaKey: true }, a.id)} onClick={(e) => pickRow(e, a.id)} />}</For>
+            </div>
             <Show when={selected()}>{(id) => (
               <Show when={filtered().some((a) => a.id === id())} fallback={
                 <NotFound title="Agent not found" action={<Button onClick={() => go("agents", {})}>Back to agents</Button>}>

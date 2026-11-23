@@ -535,17 +535,17 @@ fn stage_preview_sidecar(wt: &Path, src: &Path, target: &str) -> Result<(), Stri
     Ok(())
 }
 
+fn prepare_worktree(ctx: &Ctx, wt: &Path) -> Result<(), String> {
+    let src = source_dir(ctx).ok_or("Philium source not found.")?;
+    stage_preview_sidecar(wt, &src, env!("PHILIUM_TARGET_TRIPLE"))
+}
+
 // Every fresh worktree would otherwise compile all crates cold (many minutes).
 // Reuse the source checkout's debug target dir so only Philium itself rebuilds.
 fn shared_target(ctx: &Ctx) -> Vec<(String, String)> {
     source_dir(ctx)
         .map(|s| vec![("CARGO_TARGET_DIR".into(), s.join("src-tauri").join("target").to_string_lossy().into())])
         .unwrap_or_default()
-}
-
-fn prepare_worktree(ctx: &Ctx, wt: &Path) -> Result<(), String> {
-    let src = source_dir(ctx).ok_or("Philium source not found.")?;
-    stage_preview_sidecar(wt, &src, env!("PHILIUM_TARGET_TRIPLE"))
 }
 
 /// Run the changed app side by side: own data dir, own root, keychain off.
