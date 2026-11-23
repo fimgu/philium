@@ -154,7 +154,7 @@ let m = await until(modal, 'spawn dialog');
 await fill('Name', P.lead, m);
 choose(field('Role', m), 'orchestrator');
 const preset = { role: txt(field('Role', m).selectedOptions[0]), repo: txt(field('Repo', m).selectedOptions[0]) };
-await click('Start Agent', m);
+await click('Start', m);
 const started = await until(() => (!modal() ? 'started' : (all('.err', m).map(txt)[0] || null)), 'spawn result', 45000);
 if (started !== 'started') return { entry, preset, started };
 const head = () => txt(document.querySelector('.agent-head'));
@@ -319,7 +319,7 @@ await go('Agents'); await click('New agent');
 const m = await until(modal, 'spawn dialog');
 await fill('Name', P.name, m);
 choose(field('Repo', m), 'No repo');
-await click('Start Agent', m);
+await click('Start', m);
 const started = await until(() => (!modal() ? 'started' : (all('.err', m).map(txt)[0] || null)), 'spawn result', 45000);
 if (started !== 'started') return { opened: false, started };
 await until(() => head().startsWith(P.name) && /Idle/.test(head()), 'the new agent is idle', 45000).catch(() => null);
@@ -357,9 +357,7 @@ return { opened: true, modelBefore, first, other, everything, searched, focused,
 
 DRAFT = r'''
 await workspace(P.checkout);
-await go('Review');
-const box = await until(() => all('details[aria-label="Release PR revisions"]')[0], 'release section', 15000);
-if (!box.open) box.querySelector('summary').click();
+const box = await releaseCheck();
 const setup = box.querySelector('details[aria-label="Release verification setup"]');
 if (!setup.open) setup.querySelector('summary').click();
 const status = () => txt(all('p[role="status"]', box)[0]);
@@ -379,16 +377,14 @@ await click('Use these checks', live());
 const shown = await until(() => all('section[aria-label="Checks to confirm"]', setup)[0], 'checks to confirm', 20000).catch(() => null);
 if (!shown) return { before, started, by, proposed, status: status(), alerts: all('[role="alert"]', box).map(txt), connected: prop.isConnected, redrawn, sections: all('section[aria-label="Proposed checks"]', setup).length, buttons: all('button', setup).map((b) => txt(b) + (b.disabled ? ' (off)' : '')), toasts: toasts() };
 const toConfirm = all('section[aria-label="Checks to confirm"] [data-check]', setup).map(txt);
-await click('Confirm and pin these checks', setup);
+await click('Confirm and pin', setup);
 const pinned = await until(() => { const t = txt(setup.querySelector('[aria-label="Pinned verifier"]')); return t.includes('You confirmed') ? t : null; }, 'pinned', 25000).catch(() => status());
 return { before, started, by, proposed, toConfirm, pinned, redrawn, summary: txt(box.querySelector('[aria-label="Verification setup summary"]')), labels: Array.from(picker().options).map(txt), left: all('section[aria-label="Proposed checks"]', setup).length };
 '''
 
 CONNECT = r'''
 await workspace(P.checkout);
-await go('Review');
-const box = await until(() => all('details[aria-label="Release PR revisions"]')[0], 'release section', 15000);
-if (!box.open) box.querySelector('summary').click();
+const box = await releaseCheck();
 const line = () => txt(box.querySelector('[aria-label="GitHub connection"]'));
 const before = await until(() => (line().startsWith('GitHub') ? line() : null), 'connection line', 10000);
 await click('Connect GitHub', box);
@@ -398,9 +394,7 @@ return { before, said, after: line() };
 
 ORCHESTRATE = r'''
 await workspace(P.checkout);
-await go('Review');
-const box = await until(() => all('details[aria-label="Release PR revisions"]')[0], 'release section', 15000);
-if (!box.open) box.querySelector('summary').click();
+const box = await releaseCheck();
 const status = () => txt(all('p[role="status"]', box)[0]);
 type(box.querySelector('form input[type="url"]'), P.url);
 await click('Review with agents', box);
@@ -504,7 +498,7 @@ if (P.provider) {
 }
 await fill('Mission Brief', 'PROBE ENVIRONMENT', m);
 const picked = txt(m.querySelector('button[aria-label="Choose model"]'));
-await click('Start Agent', m);
+await click('Start', m);
 const started = await until(() => (!modal() ? 'started' : (all('.err', m).map(txt)[0] || null)), 'spawn result', 45000);
 if (started !== 'started') return { started, picked };
 const result = await until(() => { const t = convo(); const i = t.lastIndexOf('PROBE RESULT'); return i >= 0 ? t.slice(i, i + 3200) : null; }, 'probe result', 60000).catch((e) => String(e) + ' :: ' + convo().slice(-300));
@@ -522,7 +516,7 @@ const start = async (name, role) => {
   await fill('Name', name, m);
   choose(field('Role', m), role);
   await fill('Mission Brief', 'CONTEXT PROBE', m);
-  await click('Start Agent', m);
+  await click('Start', m);
   return until(() => (!modal() ? 'started' : (all('.err', m).map(txt)[0] || null)), 'spawn result', 45000);
 };
 const out = { started: {}, result: {} };
@@ -607,11 +601,9 @@ return { parts, last, disk: txt(all('p', sec)[0]) };
 
 GATE = r'''
 await workspace(P.checkout);
-await go('Review');
-const box = await until(() => all('details[aria-label="Release PR revisions"]')[0], 'release section', 15000);
-if (!box.open) box.querySelector('summary').click();
+const box = await releaseCheck();
 type(box.querySelector('form input[type="url"]'), P.url);
-await click('Verify release', box);
+await click('Verify PR', box);
 const panel = await until(() => all('section[aria-label="Checks on this pull request"]')[0], 'checks panel', 110000);
 const head = () => txt(panel.querySelector('h3'));
 const rows = () => all('tr[data-check]', panel);
@@ -630,9 +622,7 @@ return { outcomes, waiting, after, tracked: txt(all(`tr[data-check="${P.preexist
 
 REVIEW = r'''
 await workspace(P.checkout);
-await go('Review');
-const box = await until(() => all('details[aria-label="Release PR revisions"]')[0], 'release section', 15000);
-if (!box.open) box.querySelector('summary').click();
+const box = await releaseCheck();
 const setup = await until(() => box.querySelector('details[aria-label="Release verification setup"]'), 'setup');
 const pinned = () => txt(setup.querySelector('[aria-label="Pinned verifier"]'));
 const access = () => txt(setup.querySelector('[aria-label="Origin read access"]'));
@@ -646,12 +636,12 @@ if (P.pin) {
   choose(sel, P.pin.driver);
   if (P.pin.port) type(setup.querySelector('input[type="number"]'), String(P.pin.port));
   const proposal = await until(() => all('section[aria-label="Checks to confirm"]', setup)[0] || all('[role="alert"]', setup).map(txt)[0], 'checks shown before pinning', 20000);
-  if (typeof proposal === 'string') return { refused: proposal, canPin: !all('button', setup).find((b) => txt(b) === 'Confirm and pin these checks').disabled };
+  if (typeof proposal === 'string') return { refused: proposal, canPin: !all('button', setup).find((b) => txt(b) === 'Confirm and pin').disabled };
   out.proposed = all('[data-check]', proposal).map(txt);
   out.proposedTargets = all('[data-target]', proposal).map((t) => txt(t.querySelector('p')));
   for (const [name, path] of Object.entries(P.pin.programs || {})) type(await until(() => proposal.querySelector(`input[aria-label="Path of ${name}"]`), `path field for ${name}`), path);
-  await click('Confirm and pin these checks', setup);
-  out.pinResult = await until(() => (pinned().includes(out.proposed.length ? 'You confirmed its checks' : 'pinned at') && !all('button', setup).find((b) => txt(b) === 'Confirm and pin these checks').disabled ? 'pinned' : (status_().startsWith('Checks confirmed') ? 'pinned' : (status_() && !status_().startsWith('Checks') ? status_() : null))), 'verifier pinned', 25000).catch((e) => String(e));
+  await click('Confirm and pin', setup);
+  out.pinResult = await until(() => (pinned().includes(out.proposed.length ? 'You confirmed its checks' : 'pinned at') && !all('button', setup).find((b) => txt(b) === 'Confirm and pin').disabled ? 'pinned' : (status_().startsWith('Checks confirmed') ? 'pinned' : (status_() && !status_().startsWith('Checks') ? status_() : null))), 'verifier pinned', 25000).catch((e) => String(e));
 }
 if (P.token) {
   if (!setup.open) setup.querySelector('summary').click();
@@ -686,14 +676,14 @@ const read = () => {
 };
 if (P.url) {
   type(box.querySelector('form input[type="url"]'), P.url);
-  await click('Verify release', box);
+  await click('Verify PR', box);
   await until(() => !box.querySelector('form button').disabled && (all('section[aria-label="Release decision"]', box).length || status().startsWith('Not checked')), 'verification finished', 110000);
   await sleep(400);
   out.verified = read();
 }
 if (P.inspect) {
   const row = await until(() => all(`p[data-generation="${P.inspect}"]`, box)[0], `generation ${P.inspect}`, 10000);
-  await click('Inspect local ancestry', row);
+  await click('Inspect', row);
   await until(() => status().startsWith('Inspected') || status().startsWith('Revisions recorded'), 'inspected', 30000);
   await sleep(300);
   out.inspected = read();

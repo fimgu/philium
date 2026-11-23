@@ -56,11 +56,27 @@
       const s = await until(() => { const p = picker(); return p && Array.from(p.options).some((o) => txt(o).includes(label)) ? p : null; }, `workspace ${label}`);
       choose(s, label); note(`workspace ${label}`); await sleep(200);
     };
+    // The release gate panel lives under Review > Release engineering tools, which a setting shows.
+    const releaseCheck = async () => {
+      await go('Review');
+      if (!all('details[aria-label="More review tools"]').length) {
+        await go('Settings');
+        const t = await until(() => all('label.toggle').find((x) => txt(x) === 'Enable release engineering tools'), 'release tools toggle');
+        if (!t.classList.contains('on')) t.click();
+        await until(() => t.classList.contains('on'), 'release tools on');
+        await go('Review');
+      }
+      const tools = await until(() => all('details[aria-label="More review tools"]')[0], 'release tools', 15000);
+      if (!tools.open) tools.querySelector('summary').click();
+      const box = await until(() => all('details[aria-label="Release check"]', tools)[0], 'release check', 15000);
+      if (!box.open) box.querySelector('summary').click();
+      note('open Release check'); return box;
+    };
     const modal = () => all('.modal[role="dialog"]')[0] || null;
     const toasts = () => all('.toast').map(txt);
     const alerts = () => all('[role="alert"], .shield.danger, .err, .board-error').map(txt).filter(Boolean);
-    A.api = { P, note, sleep, until, all, txt, pane, button, click, type, field, fill, choose, go, picker, workspace, modal, toasts, alerts };
-    (async () => { const { P, note, sleep, until, all, txt, pane, button, click, type, field, fill, choose, go, picker, workspace, modal, toasts, alerts } = A.api;
+    A.api = { P, note, sleep, until, all, txt, pane, button, click, type, field, fill, choose, go, picker, workspace, releaseCheck, modal, toasts, alerts };
+    (async () => { const { P, note, sleep, until, all, txt, pane, button, click, type, field, fill, choose, go, picker, workspace, releaseCheck, modal, toasts, alerts } = A.api;
 /*SCENARIO*/
     })().then((r) => { A.result = r ?? {}; }, (e) => { A.error = String(e?.message || e); A.alerts = (A.api.alerts() || []).slice(0, 6); }).finally(() => { A.done = true; });
   }
