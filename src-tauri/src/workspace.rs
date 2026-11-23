@@ -1,7 +1,7 @@
 //! Workspace RPC: repos_list, repo_add {path}, repo_clone {url,name?}, repo_remove {id},
 //! repo_set {id,integration_branch?,default_branch?}, branches {repo_id}, worktrees {repo_id?},
 //! worktree_status {id}, worktree_create {repo_id,name}, worktree_remove {id,force?},
-//! diff {worktree_id}, log {repo_id|worktree_id,limit?}, open_in {path,app},
+//! diff {worktree_id}, hunks {worktree_id,layer}, hunk_apply {worktree_id,layer,op,id}, log {repo_id|worktree_id,limit?}, open_in {path,app},
 //! relocate {repo_id,path} (moved/renamed repo; must share a root commit or origin).
 //! branches rows: {name, commit, upstream, current, date (ms), subject, remote}.
 //! repos_list rows add: branch, dirty, remote_url, worktree_count, missing?, error?.
@@ -889,6 +889,23 @@ fn dispatch(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, String> 
             Ok(
                 json!({"stat":stat,"patch":patch,"truncated":cut,"untracked":untracked,"note":"New files that are not added yet are listed. Small text files are shown in full."}),
             )
+        }
+        "hunks" => {
+            let w = worktree(ctx, &arg_str(&args, "worktree_id")?)?;
+            crate::hunks::list(Path::new(text(&w, "path")?), args["layer"].as_str().unwrap_or("unstaged"))
+        }
+        "hunk_apply" => {
+            let w = worktree(ctx, &arg_str(&args, "worktree_id")?)?;
+            let lock = repo_lock(text(&w, "repo_id")?);
+            let _queue = lock.lock().map_err(|e| e.to_string())?;
+            let r = crate::hunks::apply(
+                Path::new(text(&w, "path")?),
+                &arg_str(&args, "layer")?,
+                &arg_str(&args, "op")?,
+                &arg_str(&args, "id")?,
+            )?;
+            changed(ctx);
+            Ok(r)
         }
         "log" => {
             let row = if let Some(id) = args["worktree_id"].as_str() {

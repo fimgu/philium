@@ -43,7 +43,7 @@ these it needs:
 | A5  | Agent | Dollar cost tracking and price table              | [Partly true](gaps/A5.md) |
 | A6  | Agent | Web fetch/search and LSP/code-index tools         | [Partly true](gaps/A6.md) |
 | A7  | Agent | Compaction controls                               | [Partly true](gaps/A7.md) |
-| U1  | UX    | Per-hunk accept, reject, stage, revert            | [Verified](gaps/U1.md) |
+| U1  | UX    | Per-hunk accept, reject, stage, revert            | [Partly closed](gaps/U1.md) (stage/unstage/revert per hunk and file; accept-as-reviewed decision open) |
 | U2  | UX    | @-mentions in the composer                        | [Verified](gaps/U2.md) |
 | U3  | UX    | Git and PR flow in the UI                         | [Verified](gaps/U3.md) (action flow, not read-side integration) |
 | U4  | UX    | Mid-run steering                                  | [Verified](gaps/U4.md) |

@@ -39,6 +39,7 @@ mod gateway;
 mod codeindex;
 mod graph;
 mod guard;
+mod hunks;
 mod hal;
 mod library;
 mod dream;

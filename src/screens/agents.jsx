@@ -14,6 +14,7 @@ import { AccessApprovalBar } from "../ui/access-requests.jsx";
 import { pendingAccessByAgent, agentNeedsUser } from "../lib/access-helpers.js";
 import { rpc, fmt, sendError } from "../lib/rpc.js";
 import { route, go, params, registerCommands } from "../lib/nav.js";
+import HunkReview from "../ui/hunk-review.jsx";
 import { matchShortcut, shortcutLabel, cycle } from "../lib/shortcuts.js";
 import { useStore, activeRepoId, agentEventsCache } from "../lib/store.js";
 import { useScreenVisible, useVisibleEvent } from "../lib/visibility.js";
@@ -208,6 +209,7 @@ function Changes(props) {
       <Show when={diff() && !diff().error && !(diff().patch || diff().stat)}><Empty title="No changes yet" /></Show>
       <Show when={(diff()?.untracked || []).length}><p class="small" aria-label="New files not added yet">{diff().untracked.length} new file(s) not added yet: {diff().untracked.slice(0, 12).join(", ")}{diff().untracked.length > 12 ? " …" : ""}</p></Show>
       <Show when={diff()?.truncated}><p class="small dim">Some changes are too large to show here. Open the worktree to inspect everything.</p></Show>
+      <Show when={a()?.worktree_id}><HunkReview worktreeId={a().worktree_id} onChanged={refetch} /></Show>
       <Show when={diff()?.stat}><pre class="conv-pre">{diff().stat}</pre></Show>
       <Show when={diff()?.patch}><pre class="conv-pre diff">{diff().patch}</pre></Show>
     </div>
