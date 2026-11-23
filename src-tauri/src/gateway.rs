@@ -748,6 +748,13 @@ async fn proxy(
             }
         }
     }
+    // A4: native API-key /messages gets the same breakpoints as translated traffic.
+    if needs_native_cache_marks(p.kind, &method, &rest, translating) {
+        if let Some(v) = parsed.as_mut() {
+            translate::inject_cache_breakpoints(v, true);
+            dirty = true;
+        }
+    }
     let mut url = format!("{}/{}", p.base_url.trim_end_matches('/'), rest);
     if let Some(q) = query {
         url = format!("{url}?{q}");
@@ -1093,6 +1100,11 @@ async fn proxy(
 /// Antigravity answers one whole turn per call. Translate, retry what its
 /// refusals ask for, keep each call's signature, and answer as chat.completions.
 #[allow(clippy::too_many_arguments)]
+/// Claude OAuth marks after shaping; translated bodies were marked already.
+pub(crate) fn needs_native_cache_marks(kind: Kind, method: &Method, rest: &str, translating: bool) -> bool {
+    kind == Kind::Anthropic && *method == Method::POST && rest == "messages" && !translating
+}
+
 async fn antigravity(
     gw: &Arc<Gateway>,
     p: &crate::providers::Provider,
@@ -1252,6 +1264,15 @@ mod tests {
     use std::sync::Mutex as StdMutex;
 
     type Seen = Arc<StdMutex<Vec<(HeaderMap, String)>>>;
+
+    #[test]
+    fn native_api_key_messages_get_cache_marks_once() {
+        assert!(needs_native_cache_marks(Kind::Anthropic, &Method::POST, "messages", false));
+        assert!(!needs_native_cache_marks(Kind::Anthropic, &Method::POST, "messages", true));
+        assert!(!needs_native_cache_marks(Kind::ClaudeOauth, &Method::POST, "messages", false));
+        assert!(!needs_native_cache_marks(Kind::Anthropic, &Method::POST, "messages/count_tokens", false));
+        assert!(!needs_native_cache_marks(Kind::Anthropic, &Method::GET, "messages", false));
+    }
 
     /// Fake provider: records what it receives, replies with SSE + usage.
     async fn upstream() -> (String, Seen) {

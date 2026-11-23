@@ -39,7 +39,7 @@ these it needs:
 | A1  | Agent | Undo and checkpoints for file edits               | [Partly true](gaps/A1.md) (Philium proxy + undo UI done, HAL routes open) |
 | A2  | Agent | Todo/plan tool and plan mode                      | [Partly true](gaps/A2.md) (plan latch done, UI buttons and HAL checklist tool open) |
 | A3  | Agent | User-configurable tool hooks                      | [Verified](gaps/A3.md) (user lifecycle hooks) |
-| A4  | Agent | Prompt caching on every request path              | [Partly true](gaps/A4.md) |
+| A4  | Agent | Prompt caching on every request path              | [Partly true](gaps/A4.md) (native API-key path marked, write counters open) |
 | A5  | Agent | Dollar cost tracking and price table              | [Partly closed](gaps/A5.md) (runtime price refresh, catalog fallback, cache-read pricing, included vs unknown; cache-write and session attribution open) |
 | A6  | Agent | Web fetch/search and LSP/code-index tools         | [Partly true](gaps/A6.md) |
 | A7  | Agent | Compaction controls                               | [Partly true](gaps/A7.md) (focused /compact done, window provenance open) |
