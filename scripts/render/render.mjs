@@ -101,6 +101,17 @@ const stub = (fx, setName) => {
         if (a.method === "providers.oauth_start" && a.args.kind === "chatgpt_oauth") {
           return { id: "chatgpt-test", user_code: "TEST-CODE", verify_url: "https://example.com/verify" };
         }
+        if (a.method === "release_intake.origin_connection" || a.method === "release_intake.origin_accounts" || a.method === "release_intake.origin_connect") {
+          const id = a.args.repo_id;
+          const origin = id === "r2" ? "demo/hal" : "demo/philium";
+          const selections = window.__test.github ??= {};
+          if (a.method === "release_intake.origin_accounts") return { accounts: ["work-account", "personal-account"] };
+          if (a.method === "release_intake.origin_connect") {
+            if (!a.args.login) throw new Error("Expected an explicit login");
+            selections[origin] = a.args.login;
+          }
+          return { origin, login: selections[origin] ?? null, token_saved: false };
+        }
         if(a.method==='managed.list' && a.args.task_id==='t2' && a.args.repo_id==='r1')return {tasks:[{id:'t2',agent:'a1',owner:'lion',title:'Refactor worktree cleanup'}],jobs:[{id:'board-job',task:'t2',agent:'a1',cid:'c'.repeat(64),state:'active',expires:Date.now()+60000}]};
         if(a.method==='managed.logs' && a.args.id==='board-job') {if(a.args.task_id!=='t2'||a.args.repo_id!=='r1')throw Error('Unscoped task logs');return {text:'board task fixture output'};}
         if(a.method==='managed.list') return {tasks:[{id:'t1',agent:'a1',owner:'lion',title:'Offline check'}],jobs:window.__test.managed?[{...window.__test.managed}]:[]};
@@ -307,6 +318,22 @@ for (const setName of sets) {
       }
       if (s === "code" && setName === "populated") {
         for (const error of await checkCodeGraph(page, shot)) problems.push(`${w} code review: ${error}`);
+      }
+      if (s === "repos" && setName === "populated") {
+        try {
+          const chooseRepo = async (i) => page.evaluate(index => document.querySelectorAll(".ws-repo")[index].click(), i);
+          const picker = 'select[aria-label="GitHub account"]';
+          const connect = async login => {
+            await page.waitForFunction(sel => !document.querySelector(sel)?.disabled && document.querySelector(sel)?.options.length === 3, { timeout: 4000 }, picker);
+            await page.select(picker, login);
+            if (!await clickText(page, "button", "Connect GitHub")) throw new Error("Account connect button not found");
+            await page.waitForFunction(name => document.querySelector('[aria-label="GitHub connection"] strong')?.textContent === name, { timeout: 4000 }, login);
+          };
+          await chooseRepo(0); await connect("work-account");
+          await chooseRepo(1); await connect("personal-account");
+          await chooseRepo(0);
+          await page.waitForFunction(() => document.querySelector('[aria-label="GitHub connection"] strong')?.textContent === "work-account", { timeout: 4000 });
+        } catch (e) { problems.push(`${w} GitHub repository accounts: ${e.message}`); }
       }
       if (s === "providers") {
         if (setName === "empty") {

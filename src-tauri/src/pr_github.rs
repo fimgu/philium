@@ -3,13 +3,12 @@ use serde_json::{json, Value};
 const MARKER: &str = "<!-- philium-pr-review -->";
 const QUERY: &str = r#"query($owner:String!,$repo:String!,$pr:Int!,$comments:String,$reviews:String,$threads:String,$checks:String){viewer{login} repository(owner:$owner,name:$repo){pullRequest(number:$pr){number title body url isDraft state author{login __typename} baseRefOid headRefOid baseRefName headRefName comments(first:100,after:$comments){totalCount nodes{databaseId author{login __typename} body url createdAt} pageInfo{hasNextPage endCursor}} reviews(first:100,after:$reviews){totalCount nodes{databaseId author{login __typename} state body url} pageInfo{hasNextPage endCursor}} reviewThreads(first:100,after:$threads){totalCount nodes{id isResolved isOutdated path line comments(first:20){totalCount nodes{author{login __typename} body url} pageInfo{hasNextPage endCursor}}} pageInfo{hasNextPage endCursor}} commits(last:1){totalCount nodes{commit{statusCheckRollup{contexts(first:100,after:$checks){totalCount nodes{... on CheckRun{name conclusion status detailsUrl} ... on StatusContext{context state targetUrl}} pageInfo{hasNextPage endCursor}}}}}}}}}"#;
 
-async fn graphql(origin: &str, query: &str, variables: Value) -> Result<Value, String> {
+async fn graphql(token: &str, query: &str, variables: Value) -> Result<Value, String> {
     let input = json!({"query":query,"variables":variables}).to_string();
-    let output = crate::release_intake::gh_as(
-        origin,
+    let output = crate::release_intake::run_github(
         &["api", "graphql", "--input", "-"],
         Some(&input),
-        false,
+        Some(token),
         45,
     )
     .await?;
@@ -32,8 +31,9 @@ fn repository(origin: &str) -> Result<(&str, &str), String> {
 
 pub async fn snapshot(origin: &str, pr: i64) -> Result<Value, String> {
     let (owner, repo) = repository(origin)?;
+    let token = crate::release_intake::github_cli_read_token(origin).await?;
     let variables = json!({"owner":owner,"repo":repo,"pr":pr});
-    let mut raw = graphql(origin, QUERY, variables.clone()).await?;
+    let mut raw = graphql(&token, QUERY, variables.clone()).await?;
     if !raw["data"]["repository"]["pullRequest"].is_object() {
         return Err(format!("GitHub pull request not found: {}", raw["errors"]));
     }
@@ -58,7 +58,7 @@ pub async fn snapshot(origin: &str, pr: i64) -> Result<Value, String> {
                     .ok_or("Missing pagination cursor")?;
                 let mut vars = variables.clone();
                 vars[variable] = json!(cursor);
-                let page = graphql(origin, QUERY, vars).await?;
+                let page = graphql(&token, QUERY, vars).await?;
                 errors.extend(page["errors"].as_array().into_iter().flatten().cloned());
                 let next = page.pointer(path).ok_or("Missing paginated connection")?;
                 if next["pageInfo"]["endCursor"] == cursor {
@@ -87,7 +87,7 @@ pub async fn snapshot(origin: &str, pr: i64) -> Result<Value, String> {
                 let cursor = thread["comments"]["pageInfo"]["endCursor"]
                     .as_str()
                     .ok_or("Missing thread cursor")?;
-                let page = graphql(origin, r#"query($id:ID!,$after:String!){node(id:$id){... on PullRequestReviewThread{comments(first:100,after:$after){totalCount nodes{author{login __typename} body url} pageInfo{hasNextPage endCursor}}}}}"#, json!({"id":thread["id"],"after":cursor})).await?;
+                let page = graphql(&token, r#"query($id:ID!,$after:String!){node(id:$id){... on PullRequestReviewThread{comments(first:100,after:$after){totalCount nodes{author{login __typename} body url} pageInfo{hasNextPage endCursor}}}}}"#, json!({"id":thread["id"],"after":cursor})).await?;
                 errors.extend(page["errors"].as_array().into_iter().flatten().cloned());
                 let next = &page["data"]["node"]["comments"];
                 if next["pageInfo"]["endCursor"] == cursor {
@@ -314,6 +314,7 @@ pub fn claims(body: &str) -> Vec<Value> {
 
 pub async fn post(
     origin: &str,
+    login: &str,
     pr: i64,
     head: &str,
     event: &str,
@@ -332,7 +333,8 @@ pub async fn post(
     let mut payload = json!({"commit_id":head,"event":event,"body":format!("{MARKER}\n{body}"),"comments":comments});
     let args = ["api", "--method", "POST", endpoint.as_str(), "--input", "-"];
     let input = payload.to_string();
-    let output = match crate::release_intake::gh_as(origin, &args, Some(&input), true, 45).await {
+    let token = crate::release_intake::github_write_token(origin, login).await?;
+    let output = match crate::release_intake::run_github(&args, Some(&input), Some(&token), 45).await {
         Ok(output) => output,
         Err(error)
             if !inline.is_empty()
@@ -349,7 +351,7 @@ pub async fn post(
             }
             payload["body"] = json!(expanded);
             payload.as_object_mut().unwrap().remove("comments");
-            crate::release_intake::gh_as(origin, &args, Some(&payload.to_string()), true, 45)
+            crate::release_intake::run_github(&args, Some(&payload.to_string()), Some(&token), 45)
                 .await?
         }
         Err(error) => return Err(error),
@@ -360,12 +362,13 @@ pub async fn post(
 
 pub async fn review_requested(origin: &str) -> Result<Vec<i64>, String> {
     repository(origin)?;
+    let token = crate::release_intake::github_cli_read_token(origin).await?;
     let query = r#"query($search:String!,$after:String){search(query:$search,type:ISSUE,first:100,after:$after){nodes{... on PullRequest{number}} pageInfo{hasNextPage endCursor}}}"#;
     let mut variables =
         json!({"search":format!("is:pr is:open review-requested:@me repo:{origin}")});
     let mut result = Vec::new();
     loop {
-        let page = graphql(origin, query, variables.clone()).await?;
+        let page = graphql(&token, query, variables.clone()).await?;
         if let Some(errors) = page["errors"].as_array().filter(|v| !v.is_empty()) {
             return Err(format!("GitHub review-request search: {}", json!(errors)));
         }

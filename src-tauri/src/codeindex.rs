@@ -2660,7 +2660,7 @@ pub fn prompt_map(ctx: &Ctx, repo_id: &str, wt_path: Option<&Path>, tokens: usiz
     };
     let view = index_target(ctx, &t.repo_id, &t.repo_path, &t.branch, wt_arg, false).ok().map(|(v, _)| v);
     let mut landscape_block = String::new();
-    if let Some(land) = landscape.then(|| crate::workspace::repo_landscape(ctx, repo_id, false).ok()).flatten() {
+    if let Some(land) = landscape.then(|| crate::workspace::repo_landscape(ctx, repo_id).ok()).flatten() {
         let mut lines = vec![];
         let def_br = land["default_branch"].as_str().unwrap_or("main");
         if let Some(wts) = land["worktrees"].as_array() {
@@ -2740,7 +2740,9 @@ fn render_repo_context(ctx: &Ctx, l: &Loaded, a: &Value, cap: usize) -> String {
     let mut b = Out::new(cap);
     let include_prs = a["include_prs"].as_bool().unwrap_or(true);
     if let Some(pr_num) = a["pr"].as_u64() {
-        if let Some(pr) = crate::workspace::github_pr_view(&l.t.repo_path, pr_num) {
+        // Repo context runs on a blocking worker; the bounded GitHub subprocess is async.
+        let pr = tokio::runtime::Handle::current().block_on(crate::workspace::github_pr_view(ctx, &l.t.repo_id, pr_num));
+        if let Ok(pr) = pr {
             b.line(format!(
                 "PR #{}: {} [{} / {}] ({} -> {}) by @{}",
                 pr["number"].as_u64().unwrap_or(pr_num),
@@ -2798,7 +2800,11 @@ fn render_repo_context(ctx: &Ctx, l: &Loaded, a: &Value, cap: usize) -> String {
         render_branch_ast_diff(&mut b, l, branch_ref.trim());
         return b.finish("code_symbol <name> to inspect any changed symbol");
     }
-    if let Ok(land) = crate::workspace::repo_landscape(ctx, &l.t.repo_id, include_prs) {
+    if let Ok(mut land) = crate::workspace::repo_landscape(ctx, &l.t.repo_id) {
+        if include_prs {
+            let prs = tokio::runtime::Handle::current().block_on(crate::workspace::github_prs(land["remote_url"].as_str().unwrap_or("")));
+            land["prs"] = prs;
+        }
         let def_br = land["default_branch"].as_str().unwrap_or(&l.t.branch);
         b.line(format!(
             "repo: {} ({}) default_branch={def_br}",

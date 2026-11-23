@@ -33,6 +33,7 @@ pub fn init(ctx: &Arc<Ctx>) -> Result<(), String> {
         "ALTER TABLE pr_items ADD COLUMN basis TEXT",
         "ALTER TABLE pr_reviews ADD COLUMN coverage TEXT",
         "ALTER TABLE pr_reviews ADD COLUMN errors TEXT",
+        "ALTER TABLE pr_reviews ADD COLUMN github_login TEXT",
     ] {
         if let Err(e) = ctx.db.exec(sql, []) {
             if !e.contains("duplicate column") {
@@ -242,20 +243,24 @@ fn parse_pr_url(url: &str, expected: &str) -> Result<i64, String> {
 /// Start a review for a PR, or reuse one already running at the same head.
 async fn start_review(ctx: &Arc<Ctx>, repo: &str, pr: i64, auto: bool) -> Result<Value, String> {
     let origin = origin_for(ctx, repo)?;
+    let login = crate::release_intake::require_login(&origin)?;
     let snapshot = pr_github::snapshot(&origin, pr).await?;
+    if !snapshot["viewer"].as_str().is_some_and(|viewer| viewer.eq_ignore_ascii_case(&login)) {
+        return Err("Could not confirm the repository's selected GitHub account. Reload and try again.".into());
+    }
     let head = snapshot["head"].as_str().ok_or("Missing head commit")?.to_string();
     let base = snapshot["base"].as_str().ok_or("Missing base commit")?.to_string();
     // Missing coverage/errors (an older snapshot shape) is not the same as empty: say so.
     let coverage_json = if snapshot["coverage"].is_object() { snapshot["coverage"].to_string() } else { "{}".to_string() };
     let errors_json = if snapshot["errors"].is_array() { snapshot["errors"].to_string() } else { "[]".to_string() };
     if let Some(existing) = ctx.db.query(
-        "SELECT id FROM pr_reviews WHERE repo=?1 AND pr=?2 AND head=?3 AND state IN ('queued','running','needs_you') ORDER BY started DESC LIMIT 1",
-        params![repo, pr, head],
+        "SELECT id FROM pr_reviews WHERE repo=?1 AND pr=?2 AND head=?3 AND github_login=?4 AND state IN ('queued','running','needs_you') ORDER BY started DESC LIMIT 1",
+        params![repo, pr, head, login],
     )?.pop() {
         return row(ctx, existing["id"].as_str().unwrap_or(""));
     }
-    // Supersede any running review for this PR at an older head.
-    let olds = ctx.db.query("SELECT id FROM pr_reviews WHERE repo=?1 AND pr=?2 AND state IN ('queued','running','needs_you') AND head!=?3", params![repo, pr, head])?;
+    // Supersede runs for an older head or a different GitHub account.
+    let olds = ctx.db.query("SELECT id FROM pr_reviews WHERE repo=?1 AND pr=?2 AND state IN ('queued','running','needs_you')", params![repo, pr])?;
     for o in &olds {
         supersede(ctx, o["id"].as_str().unwrap_or("")).await?;
     }
@@ -264,8 +269,8 @@ async fn start_review(ctx: &Arc<Ctx>, repo: &str, pr: i64, auto: bool) -> Result
     let running = ctx.db.query("SELECT count(*) AS n FROM pr_reviews WHERE state='running'", [])?.first().and_then(|r| r["n"].as_i64()).unwrap_or(0);
     let state = if running < 2 { "running" } else { "queued" };
     ctx.db.exec(
-        "INSERT INTO pr_reviews(id,repo,origin,pr,base,head,state,verdict,own,title,url,auto,started,prev,coverage,errors) VALUES(?1,?2,?3,?4,?5,?6,?7,'pending',?8,?9,?10,?11,?12,?13,?14,?15)",
-        params![id, repo, origin, pr, base, head, state, snapshot["own"].as_bool().unwrap_or(false) as i64, snapshot["title"].as_str().unwrap_or(""), snapshot["url"].as_str().unwrap_or(""), auto as i64, now(), prev.as_ref().and_then(|p| p["id"].as_str()), coverage_json, errors_json],
+        "INSERT INTO pr_reviews(id,repo,origin,pr,base,head,state,verdict,own,title,url,auto,started,prev,coverage,errors,github_login) VALUES(?1,?2,?3,?4,?5,?6,?7,'pending',?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+        params![id, repo, origin, pr, base, head, state, snapshot["own"].as_bool().unwrap_or(false) as i64, snapshot["title"].as_str().unwrap_or(""), snapshot["url"].as_str().unwrap_or(""), auto as i64, now(), prev.as_ref().and_then(|p| p["id"].as_str()), coverage_json, errors_json, login],
     )?;
     let notes = notes_for(ctx, repo, pr)?;
     for it in checklist_items(&snapshot, &notes) {
@@ -629,7 +634,11 @@ pub async fn pr_review_submit(ctx: &Arc<Ctx>, agent_row: &Value, summary: &str) 
     }
     let origin = r["origin"].as_str().unwrap_or("").to_string();
     let pr = r["pr"].as_i64().unwrap_or(0);
+    let login = r["github_login"].as_str().ok_or("Restart this review to bind it to the repository's GitHub account.")?;
     let snapshot = pr_github::snapshot(&origin, pr).await?;
+    if !snapshot["viewer"].as_str().is_some_and(|viewer| viewer.eq_ignore_ascii_case(login)) {
+        return Err("The repository's GitHub account changed. Restart this review before posting.".into());
+    }
     let current_head = snapshot["head"].as_str().unwrap_or("").to_string();
     if current_head != r["head"].as_str().unwrap_or("") {
         ctx.db.exec("UPDATE pr_reviews SET state='superseded', finished=?1 WHERE id=?2", params![now(), id])?;
@@ -640,7 +649,7 @@ pub async fn pr_review_submit(ctx: &Arc<Ctx>, agent_row: &Value, summary: &str) 
     ctx.db.exec("UPDATE pr_reviews SET state='posting' WHERE id=?1", [&id])?;
     let (body, inline) = build_body(&r, &items, &v, summary);
     let event = if r["own"].as_i64() == Some(1) { "COMMENT" } else if v["verdict"] == "approve" { "APPROVE" } else { "REQUEST_CHANGES" };
-    let posted = match pr_github::post(&origin, pr, &current_head, event, &body, &inline).await {
+    let posted = match pr_github::post(&origin, login, pr, &current_head, event, &body, &inline).await {
         Ok(p) => p,
         Err(e) => {
             ctx.db.exec("UPDATE pr_reviews SET state='failed', error=?1, finished=?2 WHERE id=?3", params![e.clone(), now(), id])?;
@@ -748,10 +757,11 @@ async fn tick(ctx: &Arc<Ctx>) -> Result<(), String> {
     for repo in &repos {
         let Some(id) = repo["id"].as_str() else { continue };
         let Ok(origin) = crate::release_intake::origin_of(repo["remote_url"].as_str().unwrap_or("")) else { continue };
+        let Some(login) = crate::release_intake::selected_login(&origin) else { continue };
         if auto {
             if let Ok(prs) = pr_github::review_requested(&origin).await {
                 for pr in prs {
-                    let already = ctx.db.query("SELECT id FROM pr_reviews WHERE repo=?1 AND pr=?2 AND state IN ('queued','running','needs_you','posted')", params![id, pr])?;
+                    let already = ctx.db.query("SELECT id FROM pr_reviews WHERE repo=?1 AND pr=?2 AND github_login=?3 AND state IN ('queued','running','needs_you','posted')", params![id, pr, login])?;
                     if already.is_empty() {
                         let _ = start_review(ctx, id, pr, true).await;
                     }
@@ -759,7 +769,7 @@ async fn tick(ctx: &Arc<Ctx>) -> Result<(), String> {
             }
         }
         // Rerun on moved head for every posted/running/needs_you review.
-        let active = ctx.db.query("SELECT id,pr,head FROM pr_reviews WHERE repo=?1 AND state IN ('posted','running','needs_you')", [id])?;
+        let active = ctx.db.query("SELECT id,pr,head FROM pr_reviews WHERE repo=?1 AND github_login=?2 AND state IN ('posted','running','needs_you') ORDER BY started DESC", params![id, login])?;
         let mut seen_prs = std::collections::HashSet::new();
         for r in active {
             let Some(pr) = r["pr"].as_i64() else { continue };

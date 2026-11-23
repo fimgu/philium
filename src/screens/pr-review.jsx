@@ -3,6 +3,8 @@
 // before and during a review. Earlier heads (superseded reviews) collapse under history.
 import { createResource, createSignal, For, Show } from 'solid-js';
 import { rpc } from '../lib/rpc.js';
+import { go } from '../lib/nav.js';
+import { useGitHubConnection } from '../ui/github-account.jsx';
 import { useVisibleEvent } from '../lib/visibility.js';
 import { plainError } from '../lib/plain-error.js';
 import { Markdown } from '../ui/markdown.jsx';
@@ -105,6 +107,7 @@ function ReviewCard(props) {
           <h3>{verdictLabel(r())}</h3>
           <p>
             #{r()?.pr} · {t().done} of {t().total} done
+            <Show when={r()?.github_login}>{' · '}GitHub @{r().github_login}</Show>
             <Show when={r()?.state === 'posted' && r()?.posted_url}>
               {' · '}<a href={r().posted_url} target="_blank" rel="noreferrer">Posted review</a>
             </Show>
@@ -130,6 +133,7 @@ export function PrReviewer(props) {
   const [url, setUrl] = createSignal('');
   const [busy, setBusy] = createSignal(false);
   const [pr, setPr] = createSignal(null);
+  const [github] = useGitHubConnection(() => props.repo);
 
   const [settings, { refetch: reloadSettings }] = createResource(() =>
     rpc('pr_review.settings_get', { repo_id: props.repo }, { local: true }).catch(() => ({ auto: false })));
@@ -175,6 +179,13 @@ export function PrReviewer(props) {
   return (
     <section aria-label="PR reviewer">
       <div class="row"><h2 class="grow">PR reviewer</h2></div>
+      <p class="small faint" aria-label="Reviewer GitHub identity">
+        {github.latest?.login ? <>GitHub review account: <strong>{github.latest.login}</strong>.</>
+          : github.loading ? 'Checking reviewer GitHub account…'
+          : github.latest?.error ? 'Reviewer GitHub account unavailable.'
+          : 'No GitHub account configured for this repository.'}{' '}
+        <a href="#" onClick={e => { e.preventDefault(); go('repos', { repo_id: props.repo }); }}>Repository settings</a>
+      </p>
       <form class="row" style={{ 'flex-wrap': 'wrap', gap: '8px' }} onSubmit={(e) => { e.preventDefault(); startReview(); }}>
         <input
           aria-label="Pull request URL"
