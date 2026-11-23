@@ -737,9 +737,6 @@ function AgentView(props) {
         <AgentChip name={a()?.name} />
         <RoleBadge role={a()?.role} />
         <span class="small dim">{stateLabel(state())}</span>
-        <Show when={tps()}>{(speed) => (
-          <span class="mono xs dim" title="Estimated tokens per second from streamed output. Hidden reasoning is not counted.">~{speed().toFixed(1)} TPS</span>
-        )}</Show>
         <ModelPicker
           compact
           value={a()?.model_ref || ""}
@@ -784,7 +781,7 @@ function AgentView(props) {
       </div>
       <Show when={tab() === "chat"}>
         <div style={{ padding: "6px 16px 0" }}>
-          <KvTelemetryBar kv={a()?.kv} compact />
+          <KvTelemetryBar kv={a()?.kv} liveTps={tps()} compact />
         </div>
       </Show>
       <Show when={(a()?.children ?? []).length}>

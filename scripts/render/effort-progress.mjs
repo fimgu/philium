@@ -3,14 +3,17 @@ export async function checkLiveTps(page) {
   return page.evaluate(async () => {
     const errors = [];
     const wait = (ms) => new Promise((r) => setTimeout(r, ms));
-    const rates = () => document.querySelector('.agent-head')?.innerText.match(/~[\d.]+ TPS/g) ?? [];
+    const rates = () => document.querySelector('.agent-view')?.innerText.match(/~[\d.]+ TPS/g) ?? [];
     const sendProgress = (agent, tokens) => window.__emit('gateway:progress', { agent, id: 410, phase: 'text', tokens });
     sendProgress('lion', 10); sendProgress('otter', 10);
     await wait(550);
     sendProgress('otter', 105);
     if (rates().length) errors.push('another agent’s TPS appeared in the selected header');
     sendProgress('lion', 50);
-    if (rates().length !== 1) errors.push('live TPS missing from selected agent header');
+    const out = document.querySelector('.agent-view .kv-telemetry-top .kv-legend-item.out');
+    if (rates().length !== 1 || !/^~[\d.]+ TPS$/.test(out?.nextElementSibling?.innerText ?? '')) {
+      errors.push('expected one live TPS readout immediately after Out in the selected session telemetry row');
+    }
     window.__emit('activity', { agent: 'lion', id: 410, state: 'done' });
     if (rates().length) errors.push('TPS remained after the model request completed');
     return errors;
