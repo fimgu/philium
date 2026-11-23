@@ -739,7 +739,7 @@ function AgentView(props) {
             <AccessApprovalBar agentId={props.id} agentName={a()?.name} repoId={a()?.repo_id} strict={!!a()?.strict} />
             <Conversation agent={a()?.name} events={events()} busy={busy()} readOnly={!live()} loadAttachment={agentAttachmentLoader(props.id)} onForkAt={handleForkAt} emptyText={historyLoading() ? "Loading saved conversation…" : historyError() ? "History could not be loaded. Retry above." : live() ? "Send the first message to start." : "No saved messages. This agent is stopped. Resume it to continue."}
               onApprove={(id, scope) => decide(id, "approve", scope)} onDeny={(id) => decide(id, "deny")} />
-            <Composer draftKey={`agent:${props.id}`} dropTarget={() => agentMain} onSend={send} busy={busy()} disabled={!live()}
+            <Composer draftKey={`agent:${props.id}`} mentionTarget={a()?.worktree_id ? { worktree_id: a().worktree_id } : null} dropTarget={() => agentMain} onSend={send} busy={busy()} disabled={!live()}
               onQueue={queue} queued={queued() ?? []} queueTarget={a()?.name}
               onTakeQueued={(q) => rpc("agents.queue_take", { id: props.id, item: q.id }).then((r) => r?.text).catch((e) => { toast(String(e), "danger"); return null; })}
               onRemoveQueued={(q) => rpc("agents.queue_remove", { id: props.id, item: q.id }).catch((e) => toast(String(e), "danger"))} onCancel={() => rpc("agents.cancel", { id: props.id }, { action: true }).catch((e) => toast(String(e), "danger"))}

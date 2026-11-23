@@ -44,7 +44,7 @@ these it needs:
 | A6  | Agent | Web fetch/search and LSP/code-index tools         | [Partly true](gaps/A6.md) |
 | A7  | Agent | Compaction controls                               | [Partly true](gaps/A7.md) (focused /compact done, window provenance open) |
 | U1  | UX    | Per-hunk accept, reject, stage, revert            | [Partly closed](gaps/U1.md) (stage/unstage/revert per hunk and file; accept-as-reviewed decision open) |
-| U2  | UX    | @-mentions in the composer                        | [Verified](gaps/U2.md) |
+| U2  | UX    | @-mentions in the composer                        | [Partly closed](gaps/U2.md) (file and symbol @-mentions in the agent composer; URL fetch and compact cards open) |
 | U3  | UX    | Git and PR flow in the UI                         | [Verified](gaps/U3.md) (action flow, not read-side integration) |
 | U4  | UX    | Mid-run steering                                  | [Verified](gaps/U4.md) |
 | U5  | UX    | Cross-session search, fork from any message       | [Closed (Philium side)](gaps/U5.md) |

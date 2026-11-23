@@ -55,3 +55,7 @@
 .composer-queue { display: grid; gap: 4px; padding: 8px 10px 6px; border-bottom: 1px solid var(--line); }
 .composer-queued { display: flex; align-items: baseline; gap: 10px; font-size: var(--fs-s); color: var(--text); }
 .composer-queued-text { flex: 1; min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+
+.composer-mentions { max-height: 220px; overflow-y: auto; border: 1px solid var(--border, #333); border-radius: 8px; margin-bottom: 6px; }
+.composer-mentions .opt { padding: 4px 8px; cursor: pointer; display: flex; gap: 6px; align-items: baseline; }
+.composer-mentions .opt.on { background: var(--hover, rgba(255,255,255,0.06)); }

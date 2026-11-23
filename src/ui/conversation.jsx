@@ -16,6 +16,7 @@ import { rpc } from "../lib/rpc.js";
 import { activeRepoId } from "../lib/store.js";
 import { draftFor, newDraft, clearSentDraft, attachImage, sendableImages } from "../lib/drafts.js";
 import { compactFocus } from "../lib/compact.js";
+import { mentionAt, insertMention, rankSuggestions, symbolSlice, contextBlock } from "../lib/mentions.js";
 import { validateImages, normalizeImage, createImageCache, MAX_IMAGES } from "../lib/images.js";
 
 /** Fold a list of HAL events into display items. Pure, incremental-safe. */
@@ -797,6 +798,49 @@ export function Composer(props) {
   const [adding, setAdding] = createSignal(0);
   const [menu, setMenu] = createSignal(false);
   let input, picker, attachEl;
+  // @-mentions: files and symbols from the code index of this composer's worktree.
+  const [mention, setMention] = createSignal(null);
+  const [suggest, setSuggest] = createSignal([]);
+  const [suggestIdx, setSuggestIdx] = createSignal(0);
+  const [picked, setPicked] = createSignal([]);
+  let mentionTimer, mentionGen = 0, treeCache = null;
+  const updateMention = () => {
+    const target = props.mentionTarget;
+    const at = target && input ? mentionAt(input.value, input.selectionStart ?? input.value.length) : null;
+    setMention(at);
+    clearTimeout(mentionTimer);
+    if (!at) { setSuggest([]); return; }
+    const gen = ++mentionGen;
+    mentionTimer = setTimeout(async () => {
+      try {
+        treeCache ??= await rpc("codeindex.tree", target).then((r) => r?.files || []);
+        const syms = at.query.length >= 2 ? await rpc("codeindex.find", { ...target, query: at.query }).then((r) => r?.items || []).catch(() => []) : [];
+        if (gen === mentionGen) { setSuggest(rankSuggestions(treeCache, syms, at.query)); setSuggestIdx(0); }
+      } catch { if (gen === mentionGen) setSuggest([]); }
+    }, 120);
+  };
+  const pickMention = (item) => {
+    const at = mention();
+    if (!at || !item) return;
+    const r = insertMention(input.value, at, item.label);
+    setText(r.text);
+    setPicked((p) => [...p.filter((x) => x.label !== item.label), item]);
+    setMention(null); setSuggest([]);
+    queueMicrotask(() => { input.focus(); input.setSelectionRange(r.caret, r.caret); });
+  };
+  const resolveMentions = async (t) => {
+    const used = picked().filter((m) => t.includes(`@${m.label}`));
+    if (!used.length || !props.mentionTarget) return "";
+    const resolved = await Promise.all(used.map(async (m) => {
+      try {
+        const src = await rpc("codeindex.source", { ...props.mentionTarget, path: m.path });
+        if (src?.text == null) return { ...m, error: "not readable as text" };
+        if (m.kind === "symbol") return { ...m, ...symbolSlice(src.text, m.line) };
+        return { ...m, text: src.text, truncated: !!src.truncated };
+      } catch (e) { return { ...m, error: String(e).slice(0, 120) }; }
+    }));
+    return contextBlock(resolved);
+  };
   const syncHeight = () => {
     if (!input) return;
     if (!text()) {
@@ -983,9 +1027,10 @@ export function Composer(props) {
         out = `Use the "${s.name}" skill below.\n\n<skill name="${s.name}">\n${s.body}\n</skill>${sk[2].trim() ? `\n\n${sk[2].trim()}` : ""}`;
       }
       // While the agent works, a message is queued and delivered when the current step ends.
+      out += await resolveMentions(out);
       const deliver = props.busy && props.onQueue ? props.onQueue : props.onSend;
       const accepted = await deliver(out, await sendableImages(attached));
-      if (accepted !== false) clearSentDraft(target, draft, attached);
+      if (accepted !== false) { clearSentDraft(target, draft, attached); setPicked([]); }
     } catch (e) { toast(String(e), "danger"); }
     finally { target.setSending(false); }
   };
@@ -1048,6 +1093,17 @@ export function Composer(props) {
           <Show when={adding()}><div class="composer-image pending" role="status" aria-label="Adding image"><span class="spinner" /></div></Show>
         </div>
       </Show>
+      <Show when={suggest().length}>
+        <div class="composer-mentions" id="composer-mentions" role="listbox" aria-label="Mention a file or symbol">
+          <For each={suggest()}>{(m, i) => (
+            <div class="opt" role="option" aria-selected={i() === suggestIdx()} classList={{ on: i() === suggestIdx() }}
+              onMouseDown={(e) => { e.preventDefault(); pickMention(m); }}>
+              <span class="xs dim">{m.kind === "symbol" ? "symbol" : "file"}</span> <span class="ellipsis">{m.label}</span>
+              <Show when={m.detail}><span class="xs dim"> {m.detail}</span></Show>
+            </div>
+          )}</For>
+        </div>
+      </Show>
       <textarea
         ref={input}
         class="textarea composer-input"
@@ -1055,9 +1111,19 @@ export function Composer(props) {
         placeholder={props.placeholder ?? "Message (or /effort, /model)"}
         value={text()}
         disabled={props.disabled || !record().ready()}
-        onInput={(e) => { setText(e.currentTarget.value); syncHeight(); }}
+        onInput={(e) => { setText(e.currentTarget.value); syncHeight(); updateMention(); }}
+        onBlur={() => setTimeout(() => setSuggest([]), 150)}
         onPaste={(e) => { const f = [...(e.clipboardData?.files ?? [])]; if (f.length) { e.preventDefault(); add(f); } }}
-        onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); } }}
+        role="combobox" aria-expanded={suggest().length > 0} aria-controls="composer-mentions" aria-autocomplete="list"
+        onKeyDown={(e) => {
+          if (suggest().length && !e.isComposing) {
+            if (e.key === "ArrowDown") { e.preventDefault(); setSuggestIdx((i) => (i + 1) % suggest().length); return; }
+            if (e.key === "ArrowUp") { e.preventDefault(); setSuggestIdx((i) => (i - 1 + suggest().length) % suggest().length); return; }
+            if (e.key === "Enter" || e.key === "Tab") { e.preventDefault(); pickMention(suggest()[suggestIdx()]); return; }
+            if (e.key === "Escape") { e.preventDefault(); setSuggest([]); return; }
+          }
+          if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); }
+        }}
       />
       <div class="composer-bar">
         <div class="composer-attach" ref={attachEl}>
