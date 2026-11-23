@@ -234,6 +234,136 @@ fn decode(payload: &str, parent: &str, seq: i64) -> Option<Value> {
     Some(value)
 }
 
+/// Full-text search across every agent's saved conversation. Each HAL database
+/// is opened strictly read-only (same guard as replay), so no index can be
+/// built; matching is a case-insensitive scan of each saved event journal
+/// (newest 2000 matching events per agent), covering every agent with history.
+pub(crate) fn search(ctx: &Ctx, query: &str, limit: usize) -> Result<Value, String> {
+    let terms: Vec<String> = query.split_whitespace().map(str::to_lowercase).filter(|t| !t.is_empty()).take(8).collect();
+    if terms.is_empty() {
+        return Ok(json!([]));
+    }
+    let limit = limit.clamp(1, 200);
+    let agents = ctx.db.query(
+        "SELECT id,name FROM agents WHERE hal_session_id IS NOT NULL AND hal_session_id<>'' ORDER BY last_active_at DESC",
+        [],
+    )?;
+    let mut hits = Vec::new();
+    for a in agents {
+        if hits.len() >= limit {
+            break;
+        }
+        let (Some(id), Some(name)) = (a["id"].as_str(), a["name"].as_str()) else { continue };
+        // Unreadable or missing history is skipped; search must not fail as a whole.
+        let Ok(Some((path, session))) = locate(ctx, id) else { continue };
+        if !path.exists() {
+            continue;
+        }
+        let found = with_db(&path, |db| search_db(db, &session, &terms, limit - hits.len()));
+        for (seq, role, text, at) in found.unwrap_or_default() {
+            hits.push(json!({"agent_id": id, "agent": name, "seq": seq, "role": role, "at": at, "snippet": snippet(&text, &terms[0])}));
+        }
+    }
+    Ok(Value::Array(hits))
+}
+
+fn search_db(db: &Connection, session: &str, terms: &[String], limit: usize) -> Result<Vec<(i64, String, String, String)>, String> {
+    // The event journal carries `seq`, so a hit can open or fork at that exact message.
+    let mut sql = "SELECT seq,payload FROM events WHERE session_id=?1".to_string();
+    for i in 0..terms.len() {
+        sql.push_str(&format!(" AND instr(lower(payload),?{})>0", i + 2));
+    }
+    sql.push_str(" ORDER BY seq DESC LIMIT 2000");
+    let mut stmt = db.prepare(&sql).map_err(|e| e.to_string())?;
+    let mut params: Vec<&dyn rusqlite::ToSql> = vec![&session];
+    for t in terms {
+        params.push(t);
+    }
+    let rows = stmt
+        .query_map(params.as_slice(), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (seq, payload) = row.map_err(|e| e.to_string())?;
+        let Ok(v) = serde_json::from_str::<Value>(&payload) else { continue };
+        // Match visible conversation text only, not JSON keys, tool output or hashes.
+        let (role, text) = match v["type"].as_str() {
+            Some("message.created") if v["role"] == "user" => ("user", v["content"].as_str().unwrap_or("")),
+            Some("assistant.completed") => ("assistant", v["text"].as_str().unwrap_or("")),
+            _ => continue,
+        };
+        let lower = text.to_lowercase();
+        if terms.iter().all(|t| lower.contains(t.as_str())) {
+            out.push((seq, role.to_string(), text.to_string(), v["ts"].as_str().unwrap_or("").to_string()));
+            if out.len() >= limit {
+                break;
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn snippet(text: &str, term: &str) -> String {
+    let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let chars: Vec<char> = flat.chars().collect();
+    let lower: Vec<char> = flat.to_lowercase().chars().collect();
+    let needle: Vec<char> = term.chars().collect();
+    let at = if lower.len() == chars.len() {
+        lower.windows(needle.len().max(1)).position(|w| w == needle.as_slice()).unwrap_or(0)
+    } else { 0 };
+    let start = at.saturating_sub(60);
+    let end = (at + needle.len() + 100).min(chars.len());
+    format!("{}{}{}", if start > 0 { "…" } else { "" }, chars[start..end].iter().collect::<String>(), if end < chars.len() { "…" } else { "" })
+}
+
+/// Conversation text up to and including `seq`, for forking from a message.
+/// Reads saved events only; nothing after the boundary is included and no tool
+/// is replayed. Keeps the newest `max_chars` when the prefix is long.
+pub(crate) fn prefix(ctx: &Ctx, raw: &str, seq: i64, max_chars: usize) -> Result<String, String> {
+    if seq <= 0 {
+        return Err("pick a message to fork from".into());
+    }
+    let (path, session) = locate(ctx, raw)?.ok_or("agent has no saved conversation to fork")?;
+    // A reply's display seq is its first delta; read past it to finish that reply.
+    let events = with_db(&path, |db| read_events(db, &session, 0, seq.saturating_add(5000)))?;
+    let mut turns: Vec<String> = Vec::new();
+    let mut reply = String::new();
+    let mut found = false;
+    for e in events.as_array().into_iter().flatten() {
+        let s = e["seq"].as_i64().unwrap_or(0);
+        let kind = e["type"].as_str().unwrap_or("");
+        if s > seq && (kind == "message.created" || !found) {
+            break;
+        }
+        found |= s == seq;
+        let done = s >= seq && kind == "assistant.completed";
+        match kind {
+            "message.created" if e["role"] == "user" => {
+                if !reply.trim().is_empty() { turns.push(format!("Assistant: {}", reply.trim())); }
+                reply.clear();
+                turns.push(format!("User: {}", e["content"].as_str().unwrap_or("").trim()));
+            }
+            "model.delta" => reply.push_str(e["delta"].as_str().unwrap_or("")),
+            "assistant.completed" if reply.is_empty() => reply.push_str(e["text"].as_str().unwrap_or("")),
+            "assistant.completed" => {}
+            _ => {}
+        }
+        if done {
+            break;
+        }
+    }
+    if !reply.trim().is_empty() { turns.push(format!("Assistant: {}", reply.trim())); }
+    if !found {
+        return Err("that message is not in the saved conversation".into());
+    }
+    let mut text = turns.join("\n\n");
+    let n = text.chars().count();
+    if n > max_chars {
+        text = format!("…{}", text.chars().skip(n - max_chars).collect::<String>());
+    }
+    Ok(text)
+}
+
 #[cfg(test)]
 #[path = "agent_history_tests.rs"]
 mod tests;

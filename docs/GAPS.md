@@ -47,7 +47,7 @@ these it needs:
 | U2  | UX    | @-mentions in the composer                        | [Verified](gaps/U2.md) |
 | U3  | UX    | Git and PR flow in the UI                         | [Verified](gaps/U3.md) (action flow, not read-side integration) |
 | U4  | UX    | Mid-run steering                                  | [Verified](gaps/U4.md) |
-| U5  | UX    | Cross-session search, fork from any message       | [Partly true](gaps/U5.md) |
+| U5  | UX    | Cross-session search, fork from any message       | [Closed (Philium side)](gaps/U5.md) |
 | U6  | UX    | Native OS notifications                           | [Verified](gaps/U6.md) |
 | U7  | UX    | Shortcuts, onboarding, multi-agent grid           | [Partly closed](gaps/U7.md) (shortcut map in `src/lib/shortcuts.js`; onboarding readiness and pinned panes open) |
 | I1  | Infra | CI                                                | [Verified](gaps/I1.md) (missing checked-in CI only) |

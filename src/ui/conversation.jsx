@@ -164,6 +164,15 @@ function Tool(props) {
  * props: events (array, reactive), onApprove(id, scope), onDeny(id), busy
  */
 export function Conversation(props) {
+/** Quiet per-message action: start a new agent from the conversation up to here. */
+function ForkHere(props) {
+  return (
+    <Show when={props.onFork && props.item.seq}>
+      <button type="button" class="link fork-here" title="Start a new agent with this conversation up to here. Files are not rewound." onClick={() => props.onFork(props.item.seq)}>Fork from here</button>
+    </Show>
+  );
+}
+
   let el, timelineEl;
   const [store, setStore] = createStore({ items: [] });
   const [stick, setStick] = createSignal(true);
@@ -542,11 +551,12 @@ export function Conversation(props) {
         <Index each={store.items}>
           {(it) => (
             <Switch>
-              <Match when={it().kind === "user"}><div class="msg user"><SentImages item={it()} load={props.loadAttachment} />{it().text}</div></Match>
+              <Match when={it().kind === "user"}><div class="msg user" data-seq={it().seq}><SentImages item={it()} load={props.loadAttachment} />{it().text}<ForkHere item={it()} onFork={props.onForkAt} /></div></Match>
               <Match when={it().kind === "assistant"}>
-                <div class={`msg assistant ${it().live && props.busy && !props.readOnly ? "live" : ""}`}>
+                <div class={`msg assistant ${it().live && props.busy && !props.readOnly ? "live" : ""}`} data-seq={it().seq}>
                   <AssistantReply text={it().text} live={it().live && props.busy && !props.readOnly} />
                   <Show when={it().usage && (it().usage.input_tokens || it().usage.output_tokens)}>
+                  <Show when={!it().live}><ForkHere item={it()} onFork={props.onForkAt} /></Show>
                     {(() => {
                       const u = it().usage || {};
                       const inp = Number(u.input_tokens || u.prompt_tokens || 0);

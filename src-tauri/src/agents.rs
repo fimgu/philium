@@ -1991,6 +1991,21 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
             if !rid.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
                 return Err("bad request id".into());
             }
+        "search_history" => {
+            let q = args["query"].as_str().unwrap_or("").to_string();
+            let limit = args["limit"].as_u64().unwrap_or(50) as usize;
+            let c = ctx.clone();
+            tokio::task::spawn_blocking(move || history::search(&c, &q, limit))
+                .await.map_err(|e| format!("history search task failed: {e}"))?
+        }
+        "fork_context" => {
+            let raw = ctx::arg_str(&args, "id")?;
+            let seq = args["seq"].as_i64().unwrap_or(0);
+            let c = ctx.clone();
+            tokio::task::spawn_blocking(move || history::prefix(&c, &raw, seq, 60_000))
+                .await.map_err(|e| format!("fork task failed: {e}"))?
+                .map(|t| json!({"transcript": t}))
+        }
             let (path, body) = match ctx::arg_str(&args, "decision")?.as_str() {
                 "approve" => (
                     "approve",

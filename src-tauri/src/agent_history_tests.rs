@@ -387,3 +387,55 @@ fn sent_attachments_are_scoped_to_own_user_messages_and_read_only() {
     assert_eq!(std::fs::read(f.path("owner")).unwrap(), before);
     assert!(!f.path("owner").with_extension("db-wal").exists());
 }
+
+#[tokio::test]
+async fn history_search_finds_text_across_agents_read_only() {
+    let f = Fixture::new();
+    f.agent("a1", "alpha", Some("session"));
+    f.agent("a2", "beta", Some("session"));
+    f.agent("a3", "gamma", None);
+    for name in ["alpha", "beta"] {
+        let db = f.db(name);
+        let body = if name == "alpha" { "Fix the Flaky Login test please" } else { "unrelated chatter" };
+        let ev = json!({"seq":7,"session_id":"session","ts":"t1","type":"message.created","role":"user","content":body});
+        db.execute("INSERT INTO events VALUES('session',7,'t1','x',?1)", [ev.to_string()]).unwrap();
+        let peer = json!({"seq":1,"session_id":"peer","ts":"t1","type":"message.created","role":"user","content":"flaky login peer"});
+        db.execute("INSERT INTO events VALUES('peer',1,'t1','x',?1)", [peer.to_string()]).unwrap();
+    }
+    let before = std::fs::read(f.path("alpha")).unwrap();
+    let hits = super::super::call(&f.ctx, "search_history", json!({"query":"login FLAKY"})).await.unwrap();
+    let hits = hits.as_array().unwrap();
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!((hits[0]["agent_id"].as_str(), hits[0]["seq"].as_i64()), (Some("a1"), Some(7)));
+    assert!(hits[0]["snippet"].as_str().unwrap().contains("Flaky Login"));
+    // JSON keys are not searchable text.
+    assert!(search(&f.ctx, "session_id", 10).unwrap().as_array().unwrap().is_empty());
+    assert_eq!(search(&f.ctx, "   ", 10).unwrap(), json!([]));
+    assert_eq!(std::fs::read(f.path("alpha")).unwrap(), before);
+    assert!(!f.path("alpha").with_extension("db-wal").exists());
+}
+
+#[tokio::test]
+async fn fork_prefix_stops_at_the_chosen_message() {
+    let f = Fixture::new();
+    f.agent("p", "parent", Some("session"));
+    let db = f.db("parent");
+    let rows = [
+        json!({"type":"message.created","role":"user","content":"remember apple"}),
+        json!({"type":"model.delta","delta":"Noted apple."}),
+        json!({"type":"assistant.completed"}),
+        json!({"type":"message.created","role":"user","content":"secret banana"}),
+    ];
+    for (i, r) in rows.iter().enumerate() {
+        let mut r = r.clone();
+        r["seq"] = json!(i + 1); r["session_id"] = json!("session"); r["ts"] = json!("t");
+        db.execute("INSERT INTO events VALUES('session',?1,'t','x',?2)", params![i as i64 + 1, r.to_string()]).unwrap();
+    }
+    drop(db);
+    let out = super::super::call(&f.ctx, "fork_context", json!({"id":"p","seq":2})).await.unwrap();
+    let t = out["transcript"].as_str().unwrap();
+    assert!(t.contains("User: remember apple") && t.contains("Assistant: Noted apple."), "{t}");
+    assert!(!t.contains("banana"));
+    assert!(super::super::call(&f.ctx, "fork_context", json!({"id":"p","seq":99})).await.unwrap_err().contains("not in"));
+    assert!(super::super::call(&f.ctx, "fork_context", json!({"id":"p","seq":0})).await.is_err());
+}

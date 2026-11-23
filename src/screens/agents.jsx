@@ -624,6 +624,39 @@ function AgentView(props) {
 
   return (
     <div class="agent-view">
+  const handleForkAt = async (seq) => {
+    try {
+      const cur = a();
+      const { transcript } = await rpc("agents.fork_context", { id: props.id, seq }, { local: true });
+      const forked = await rpc("agents.spawn", {
+        role: cur?.role || "worker",
+        repo_id: cur?.repo_id || null,
+        model: cur?.model_ref || null,
+        strict: !!cur?.strict,
+        base: cur?.branch || null,
+        brief: `Forked from ${cur?.name} at an earlier message. Continue from the conversation below; nothing after it happened for you. Files are the current checkout, not rewound.\n\n${transcript}`,
+      });
+      toast(`Forked ${cur?.name} from that message -> ${forked.name}`, "secure");
+      store.refetchAgents?.();
+      go("agents", { id: forked.id });
+    } catch (e) {
+      toast(String(e), "danger");
+    }
+  };
+  // Opened from a history search hit: scroll to the closest message at or before it.
+  createEffect(() => {
+    const seq = Number(params().seq || 0);
+    if (!seq || !events().length) return;
+    queueMicrotask(() => {
+      const nodes = [...(document.querySelectorAll(".agent-view [data-seq]") || [])];
+      const hit = nodes.filter((n) => Number(n.dataset.seq) <= seq).at(-1);
+      if (!hit) return;
+      hit.scrollIntoView({ block: "center" });
+      hit.classList.add("search-hit");
+      setTimeout(() => hit.classList.remove("search-hit"), 2400);
+    });
+  });
+
       <div class="agent-head">
         <Dot state={stateDot(a()?.state)} />
         <AgentChip name={a()?.name} />
@@ -702,7 +735,7 @@ function AgentView(props) {
             <Show when={historyError()}><div class="history-error shield danger" role="alert">Unable to load saved conversation: {historyError()} <Button size="sm" onClick={() => load(props.id, retryAfter)}>Retry history</Button></div></Show>
             <Show when={historyMore()}><div class="history-more small dim" role="status">More saved history is available. Showing loaded pages only. <Button size="sm" disabled={historyLoading()} onClick={() => load(props.id, historyCursor())}>Load more history</Button></div></Show>
             <AccessApprovalBar agentId={props.id} agentName={a()?.name} repoId={a()?.repo_id} strict={!!a()?.strict} />
-            <Conversation agent={a()?.name} events={events()} busy={busy()} readOnly={!live()} loadAttachment={agentAttachmentLoader(props.id)} emptyText={historyLoading() ? "Loading saved conversation…" : historyError() ? "History could not be loaded. Retry above." : live() ? "Send the first message to start." : "No saved messages. This agent is stopped. Resume it to continue."}
+            <Conversation agent={a()?.name} events={events()} busy={busy()} readOnly={!live()} loadAttachment={agentAttachmentLoader(props.id)} onForkAt={handleForkAt} emptyText={historyLoading() ? "Loading saved conversation…" : historyError() ? "History could not be loaded. Retry above." : live() ? "Send the first message to start." : "No saved messages. This agent is stopped. Resume it to continue."}
               onApprove={(id, scope) => decide(id, "approve", scope)} onDeny={(id) => decide(id, "deny")} />
             <Composer draftKey={`agent:${props.id}`} dropTarget={() => agentMain} onSend={send} busy={busy()} disabled={!live()}
               onQueue={queue} queued={queued() ?? []} queueTarget={a()?.name}
@@ -1100,6 +1133,20 @@ export default function Agents() {
   const [search, setSearch] = createSignal("");
   const savedMode = localStorage.getItem("agents.viewMode");
   const initialMode = savedMode === "grid" || savedMode === "fleet" ? savedMode : "split";
+  // Search across every agent's saved conversation, debounced and read-only.
+  const [historyQuery, setHistoryQuery] = createSignal("");
+  const [historyHits, setHistoryHits] = createSignal(null);
+  let historyTimer;
+  const runHistorySearch = (q) => {
+    setHistoryQuery(q);
+    clearTimeout(historyTimer);
+    if (!q.trim()) return setHistoryHits(null);
+    historyTimer = setTimeout(async () => {
+      const hits = await rpc("agents.search_history", { query: q, limit: 50 }, { local: true }).catch((e) => ({ error: String(e) }));
+      if (historyQuery() === q) setHistoryHits(hits);
+    }, 200);
+  };
+  onCleanup(() => clearTimeout(historyTimer));
   const [viewMode, setViewModeRaw] = createSignal(initialMode);
   const setViewMode = (m) => { setViewModeRaw(m); localStorage.setItem("agents.viewMode", m); };
   createEffect(() => {
@@ -1278,6 +1325,15 @@ export default function Agents() {
           />
           <Segmented value={filter()} onChange={setFilter} options={[
             { value: "all", label: "All" },
+          <input
+            type="search"
+            class="input fleet-search"
+            placeholder="Search all conversations…"
+            aria-label="Search all agent conversations"
+            value={historyQuery()}
+            onInput={(e) => runHistorySearch(e.currentTarget.value)}
+            onKeyDown={(e) => { if (e.key === "Escape") runHistorySearch(""); }}
+          />
             { value: "live", label: "Running" },
             { value: "waiting", label: `Need you${telemetry().waiting ? ` (${telemetry().waiting})` : ""}` },
             ...(telemetry().warnings > 0 || filter() === "warnings"
@@ -1339,6 +1395,19 @@ export default function Agents() {
               </Show>
               <For each={tree()}>{({ a, d }) => <AgentRow agent={a} depth={d} selected={a.id === selected()} picked={picked().includes(a.id)} pendingAccess={pendingByAgent().get(a.id) ?? 0} onPick={() => pickRow({ metaKey: true }, a.id)} onClick={(e) => pickRow(e, a.id)} />}</For>
             </div>
+              <Show when={historyHits()}>{(hits) => (
+                <div class="history-hits" role="region" aria-label="Conversation search results">
+                  <Show when={!hits().error} fallback={<p class="small dim" role="alert">Search unavailable: {hits().error}</p>}>
+                    <p class="small dim" role="status">{hits().length ? `${hits().length}${hits().length >= 50 ? "+" : ""} match${hits().length === 1 ? "" : "es"}` : "No conversation mentions that."}</p>
+                    <For each={hits()}>{(h) => (
+                      <button type="button" class="history-hit" onClick={() => go("agents", { id: h.agent_id, seq: h.seq })}>
+                        <span class="small"><strong>{h.agent}</strong> · {h.role === "user" ? "you" : "reply"}{h.at ? ` · ${fmt.ago(Date.parse(h.at))}` : ""}</span>
+                        <span class="small dim">{h.snippet}</span>
+                      </button>
+                    )}</For>
+                  </Show>
+                </div>
+              )}</Show>
             <Show when={selected()}>{(id) => (
               <Show when={filtered().some((a) => a.id === id())} fallback={
                 <NotFound title="Agent not found" action={<Button onClick={() => go("agents", {})}>Back to agents</Button>}>
