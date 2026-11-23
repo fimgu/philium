@@ -58,11 +58,15 @@ impl Drop for OwnedProcess {
 }
 
 fn run_command(
-    mut command: Command,
+    command: Command,
     cap: usize,
     diff: bool,
     timeout: Duration,
 ) -> Result<(Vec<u8>, bool), String> {
+    run_command_input(command, cap, diff, timeout, None)
+}
+
+fn run_command_input(mut command: Command, cap: usize, diff: bool, timeout: Duration, input: Option<Vec<u8>>) -> Result<(Vec<u8>, bool), String> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -70,12 +74,16 @@ fn run_command(
     }
     let deadline = Instant::now() + timeout;
     let child = command
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .map_err(|e| e.to_string())?;
     let mut owned = OwnedProcess(Some(child));
+    if let Some(input) = input {
+        let mut stdin = owned.0.as_mut().unwrap().stdin.take().ok_or("missing stdin")?;
+        std::thread::spawn(move || { use std::io::Write; let _ = stdin.write_all(&input); });
+    }
     let stdout = owned
         .0
         .as_mut()
@@ -126,6 +134,28 @@ fn run_command(
 /// Exit 1 counts as success, as for grep and diff with nothing to report.
 pub(super) fn bounded_output(command: Command, cap: usize, timeout: Duration) -> Result<Vec<u8>, String> {
     run_command(command, cap, true, timeout).map(|(out, _)| out)
+}
+
+// main adopts the login PATH before RPC dispatch. Resolve afresh, without a shell.
+fn delta_on_path(path: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    std::env::split_paths(&path?).map(|p| p.join(if cfg!(windows) { "delta.exe" } else { "delta" })).find(|p| {
+        let Ok(m) = std::fs::metadata(p) else { return false };
+        #[cfg(unix)]
+        { use std::os::unix::fs::PermissionsExt; m.is_file() && m.permissions().mode() & 0o111 != 0 }
+        #[cfg(not(unix))]
+        { m.is_file() }
+    })
+}
+
+fn delta_patch(exe: Option<PathBuf>, patch: &str) -> Result<(String, bool), String> {
+    let exe = exe.ok_or("Delta is not installed on the login PATH. Showing native diff.")?;
+    let mut command = Command::new(exe);
+    command.args(["--no-gitconfig", "--paging=never", "--true-color=always", "--dark", "--width=120"])
+        .env("CLICOLOR_FORCE", "1").env("TERM", "xterm-256color");
+    let (out, truncated) = run_command_input(command, PATCH_CAP * 4, false, Duration::from_secs(5),
+        Some(patch.as_bytes()[..patch.len().min(PATCH_CAP)].to_vec()))
+        .map_err(|_| "Delta failed or exceeded its execution deadline. Showing native diff.".to_string())?;
+    Ok((bounded_text(&out, PATCH_CAP * 4), truncated))
 }
 
 // Never use workspace::git here: it trims output and has no execution deadline.
@@ -660,14 +690,71 @@ pub(super) fn call(ctx: &Ctx, t: &Target, method: &str, args: &Value) -> Result<
     let (bytes, truncated) = run(root, &cmd, PATCH_CAP, true)?;
     let patch = bounded_text(&bytes, PATCH_CAP);
     let binary = (!matches!(c.status.as_str(), "?" | "U") && c.added.is_none()) || patch.contains("Binary files ");
-    Ok(
-        json!({"path":c.path,"old_path":c.old,"patch":patch,"base_commit":base,"revision":rev,"worktree_id":id,"binary":binary,"truncated":truncated,"note":if truncated {Some("Patch truncated at 512 KiB.")} else if binary {Some("Binary content is not displayed.")} else {None}}),
-    )
+    let mut result = json!({"path":c.path,"old_path":c.old,"patch":patch,"base_commit":base,"revision":rev,"worktree_id":id,"binary":binary,"truncated":truncated,"note":if truncated {Some("Patch truncated at 512 KiB.")} else if binary {Some("Binary content is not displayed.")} else {None}});
+    if args["render"] == "delta" && !binary && !patch.is_empty() {
+        match delta_patch(delta_on_path(std::env::var_os("PATH")), &patch) {
+            Ok((ansi, capped)) => { result["delta"] = json!(ansi); result["delta_truncated"] = json!(capped); }
+            Err(notice) => result["delta_notice"] = json!(notice),
+        }
+    }
+    Ok(result)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delta_missing_and_failed_executables() {
+        assert!(delta_on_path(None).is_none());
+        assert!(delta_on_path(Some("/nonexistent-philium-delta".into())).is_none());
+        assert!(delta_patch(None, "patch").unwrap_err().contains("native diff"));
+        assert!(delta_patch(Some(PathBuf::from("/nonexistent-philium-delta")), "patch").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delta_stdin_timeout_and_output_bounds() {
+        let start = Instant::now();
+        let mut silent = Command::new("sh");
+        silent.args(["-c", "sleep 30"]);
+        assert!(run_command_input(silent, 32, false, Duration::from_millis(100), Some(vec![b'x'; PATCH_CAP])).is_err());
+        assert!(start.elapsed() < Duration::from_secs(3));
+        let mut writer = Command::new("sh");
+        writer.args(["-c", "while :; do printf 'output'; done"]);
+        let (out, truncated) = run_command_input(writer, 32, false, Duration::from_secs(2), Some(vec![b'x'; PATCH_CAP])).unwrap();
+        assert!(truncated);
+        assert_eq!(out.len(), 32);
+        let mut fail = Command::new("sh");
+        fail.args(["-c", "exit 1"]);
+        assert!(run_command_input(fail, 32, false, Duration::from_secs(2), Some(vec![])).is_err());
+    }
+
+    #[test]
+    fn delta_real_subprocess_both_comparisons_and_special_files() {
+        let Some(exe) = delta_on_path(std::env::var_os("PATH")) else {
+            eprintln!("Delta unavailable: real subprocess test skipped"); return;
+        };
+        let f = Fixture::new();
+        std::fs::write(f.wt.join("a.py"), "def committed():\n    pass\n").unwrap();
+        sh(&f.wt, &["add", "a.py"]);
+        sh(&f.wt, &["commit", "-qm", "branch change"]);
+        std::fs::write(f.wt.join("a.py"), "def current():\n    pass\n").unwrap();
+        for comparison in ["base", "working"] {
+            let value = call(&f.ctx, &f.disk, "file_diff", &json!({"path":"a.py", "comparison":comparison, "render":"delta"})).unwrap();
+            assert!(value["delta_notice"].is_null(), "{value}");
+            assert!(value["delta"].as_str().unwrap().contains('\u{1b}'));
+        }
+        for patch in [
+            "diff --git a/file name.py b/file name.py\n--- a/file name.py\n+++ b/file name.py\n@@ -1 +1 @@\n-old\n+new\n",
+            "diff --git a/old name b/new name\nsimilarity index 100%\nrename from old name\nrename to new name\n",
+            "Binary files a/image.bin and b/image.bin differ\n",
+        ] {
+            let (ansi, capped) = delta_patch(Some(exe.clone()), patch).unwrap();
+            assert!(!ansi.is_empty());
+            assert!(!capped);
+        }
+    }
 
     struct Fixture {
         root: PathBuf,
@@ -1110,5 +1197,66 @@ mod tests {
         assert_eq!(source["base_commit"], tree["base_commit"]);
         assert_eq!(source["worktree_id"], "local:fixture");
         assert!(source["text"].as_str().unwrap().contains("local_only"));
+    }
+
+    #[cfg(unix)]
+    fn fake_exe(dir: &Path, name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join(name);
+        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    }
+
+    #[test]
+    fn delta_missing_falls_back_with_notice() {
+        assert!(delta_on_path(Some("/nonexistent-dir".into())).is_none());
+        assert!(delta_on_path(None).is_none());
+        let err = delta_patch(None, "x").unwrap_err();
+        assert!(err.contains("Showing native diff"));
+        let f = Fixture::new();
+        std::fs::write(f.wt.join("a.py"), "def current():\n    pass\n").unwrap();
+        let r = call(&f.ctx, &f.disk, "file_diff", &json!({"path":"a.py","render":"delta"})).unwrap();
+        assert!(r["patch"].as_str().unwrap().contains("+def current():"));
+        assert!(r["delta"].is_string() || r["delta_notice"].is_string());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delta_output_and_time_are_bounded() {
+        let d = std::env::temp_dir().join(format!("philium-delta-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let big = fake_exe(&d, "big", "cat >/dev/null; head -c 3000000 /dev/zero | tr '\\0' 'x'");
+        let (out, capped) = delta_patch(Some(big), "p").unwrap();
+        assert!(capped && out.len() <= PATCH_CAP * 4);
+        let slow = fake_exe(&d, "slow", "sleep 30");
+        let start = Instant::now();
+        let err = delta_patch(Some(slow), "p").unwrap_err();
+        assert!(err.contains("Showing native diff") && start.elapsed() < Duration::from_secs(10));
+        let bad = fake_exe(&d, "bad", "cat >/dev/null; exit 2");
+        assert!(delta_patch(Some(bad), "p").is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn real_delta_renders_both_comparisons_and_odd_paths() {
+        let Some(exe) = delta_on_path(std::env::var_os("PATH")) else {
+            eprintln!("delta not installed, skipping");
+            return;
+        };
+        let patch = "diff --git a/my file.py b/my file.py\n--- a/my file.py\n+++ b/my file.py\n@@ -1 +1 @@\n-old\n+new\n";
+        let (out, capped) = delta_patch(Some(exe.clone()), patch).unwrap();
+        assert!(!capped && out.contains('\u{1b}') && out.contains("new"), "{out:?}");
+        let f = Fixture::new();
+        std::fs::write(f.wt.join("sp ace.py"), "hello\n").unwrap();
+        for args in [json!({"path":"sp ace.py","render":"delta"}), json!({"path":"a.py","render":"delta","comparison":"working"}), json!({"path":"rename.py","render":"delta"})] {
+            let r = call(&f.ctx, &f.disk, "file_diff", &args).unwrap();
+            if !r["patch"].as_str().unwrap().is_empty() {
+                assert!(r["delta"].as_str().is_some_and(|d| d.contains('\u{1b}')), "{r}");
+            }
+        }
+        std::fs::write(f.wt.join("binary.bin"), [0, 3, 4]).unwrap();
+        let r = call(&f.ctx, &f.disk, "file_diff", &json!({"path":"binary.bin","render":"delta"})).unwrap();
+        assert!(r.get("delta").is_none());
     }
 }
