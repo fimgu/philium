@@ -19,6 +19,7 @@ import {
   VirtualList,
 } from "../ui/kit.jsx";
 import { KvTelemetryBar } from "../ui/kv-bar.jsx";
+import { AccountUsageLink } from "../ui/account-usage-link.jsx";
 import { rpc, fmt } from "../lib/rpc.js";
 import { go } from "../lib/nav.js";
 import { activeRepoId, useStore } from "../lib/store.js";
@@ -72,9 +73,10 @@ function ProviderUsage(props) {
     <section class="lane-section">
       <h2>Provider usage</h2>
       <p>
-        Quota meters show the last usage reported by each provider. The date range
-        and repository filters only apply to requests recorded by Philium and
-        their token and cost totals.
+        Requests, tokens, and costs come from model calls made in Philium.
+        The date range and workspace filter apply to those totals.
+        Quota meters show the latest values reported to Philium by each provider.
+        Open a provider’s plan usage page for account-wide usage.
       </p>
       <Show when={props.rows.length} fallback={
         <p>{props.pending ? "Loading providers…" : "No configured providers or recorded usage to show."}</p>
@@ -104,6 +106,7 @@ function ProviderUsage(props) {
                           ? props.quotaStatus
                           : props.pending ? "Loading…" : "Not configured"}
                       />
+                      <div class="xs"><AccountUsageLink kind={row.provider?.kind} /></div>
                     </td>
                     <Show when={row.stats} fallback={<td colspan={usageColumns.length} class="dim">{props.statsStatus}</td>}>
                       <For each={usageValues(row.stats)}>{(value) => <td>{value}</td>}</For>
@@ -332,7 +335,7 @@ export default function Stats() {
           }
         >
           <UsageTable
-            title="Models"
+            title="Model usage in Philium"
             label="Model"
             field="model"
             rows={summary()?.by_model || []}

@@ -5,11 +5,13 @@ import { Icon } from "../ui/icons.jsx";
 import { rpc, useEvent, fmt } from "../lib/rpc.js";
 import { useStore } from "../lib/store.js";
 import { quotaView } from "../lib/quota.js";
+import { go } from "../lib/nav.js";
+import { AccountUsageLink } from "../ui/account-usage-link.jsx";
 
 function QuotaMeter(props) {
   const v = () => quotaView(props.usage);
   return (
-    <Show when={v().rows.length}>
+    <Show when={v().rows.length} fallback={<span class="small dim">{props.empty}</span>}>
       <div class="row small dim" style={{ gap: "10px", "flex-wrap": "wrap" }}>
         <For each={v().rows}>
           {(r) => (
@@ -375,7 +377,9 @@ export default function Providers() {
   const [form, setForm] = createSignal(null);
   const [open, setOpen] = createSignal(null);
   const [busy, setBusy] = createSignal(null);
-  const [quotas, { refetch: refetchQuotas }] = createResource(() => rpc("activity.quotas").catch(() => ({})));
+  const [quotas, { refetch: refetchQuotas }] = createResource(() =>
+    rpc("activity.quotas").then((data) => ({ data })).catch(() => ({ error: true })),
+  );
   const quotaTimer = setInterval(refetchQuotas, 30000);
   onCleanup(() => clearInterval(quotaTimer));
 
@@ -457,7 +461,10 @@ export default function Providers() {
 
   return (
     <Page title="Providers" sub="Keys stay in the local vault; agents receive gateway tokens only."
-      actions={<Button variant="primary" onClick={() => setForm({})}><Icon name="plus" /> Add provider</Button>}>
+      actions={<>
+        <Button variant="ghost" onClick={() => go("stats")}>Usage in Philium</Button>
+        <Button variant="primary" onClick={() => setForm({})}><Icon name="plus" /> Add provider</Button>
+      </>}>
       <Show when={list() && list().length === 0}>
         <Empty icon={<Icon name="key" size={32} />} title="No providers yet"
           action={<Button variant="primary" onClick={() => setForm({})}>Add provider</Button>}>
@@ -498,7 +505,13 @@ export default function Providers() {
                   <Button size="sm" variant="danger" busy={busy() === p.id} onClick={() => remove(p)}>Remove</Button>
                 </div>
               </div>
-              <QuotaMeter usage={quotas()?.[p.id]} />
+              <div class="row" style={{ gap: "10px", "flex-wrap": "wrap" }}>
+                <QuotaMeter
+                  usage={quotas()?.data?.[p.id]}
+                  empty={quotas.loading ? "Loading quota…" : quotas()?.error ? "Quota unavailable" : "No quota reported yet"}
+                />
+                <span class="small"><AccountUsageLink kind={p.kind} /></span>
+              </div>
               <div class="row small dim">
                 <span>{kindLabel(p.kind)}</span>
                 <Show when={p.base_url && !isSub(p.kind)}><span class="mono faint">· {p.base_url}</span></Show>
