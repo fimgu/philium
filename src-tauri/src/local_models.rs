@@ -563,5 +563,68 @@ mod tests {
         assert_eq!(out[0].2 + out[1].2, 0, "scope leak");
         assert!(out[1].1 > out[0].1, "local models must beat keyword-only: {out:?}");
     }
+
+    /// Stale/contradicted set: each memory was right once, then a later session contradicted it.
+    /// Measures recall@1 (current fact first) and wrong-answer rate (stale fact first) before and
+    /// after one dream through the real gateway path. The dream reply is scripted; the validator,
+    /// writes, embeddings and retrieval are real. Uses the real local models when installed.
+    #[tokio::test]
+    #[ignore]
+    async fn stale_recall_before_and_after_one_dream() {
+        use crate::dream::tests::{hal_db, rig, save, set_reply};
+        let cases = [
+            ("Install dependencies with npm.", "We moved off npm, use pnpm for every install now.", "Install dependencies with pnpm.", "which package manager installs dependencies?"),
+            ("The dev proxy listens on port 5173.", "The proxy port changed to 5174 after the Vite bump.", "The dev proxy listens on port 5174.", "what port is the dev proxy on?"),
+            ("Run tests with TMPDIR under ~/.jcode.", "Do not put TMPDIR under ~/.jcode, use the system tmp dir.", "Run tests with the system TMPDIR, not one under ~/.jcode.", "where should TMPDIR point for tests?"),
+            ("Release builds use bundle type dmg.", "We only ship the app bundle now, no more dmg.", "Release builds use --bundles app only.", "which bundle type do release builds use?"),
+            ("OAuth refresh tokens rotate every 90 days.", "Security asked us to rotate refresh tokens every 30 days instead.", "OAuth refresh tokens rotate every 30 days.", "how often do refresh tokens rotate?"),
+            ("The main branch is called master.", "We renamed master to main last sprint.", "The main branch is called main.", "what is the default branch called?"),
+        ];
+        let r = rig("stale-eval").await;
+        let real = std::env::var("HOME").unwrap() + "/Library/Application Support/dev.gunnarsson.philium/models";
+        let models = installed(std::path::Path::new(&real).parent().unwrap(), &EMBED);
+        if models {
+            let _ = std::os::unix::fs::symlink(&real, r.ctx.data_dir.join("models"));
+            set_enabled(&r.ctx, true).unwrap();
+        }
+        let mut stale = vec![];
+        let mut acts = vec![];
+        for (i, (old, said, new, _)) in cases.iter().enumerate() {
+            let id = save(&r.ctx, "repo:ra", old, "agent_inferred", "fact", None);
+            save(&r.ctx, "repo:rb", &format!("SIBLING {old}"), "agent_inferred", "fact", None);
+            let (name, sid) = (format!("evalagent{i}"), format!("sess_eval{i}"));
+            r.ctx.db.exec("INSERT INTO agents(id,name,repo_id,model_ref,strict,hal_session_id,created_at,last_active_at) VALUES(?1,?2,'ra','claude/claude-opus-5-5',0,?3,10,10)", rusqlite::params![format!("e{i}"), name, sid]).unwrap();
+            hal_db(&r.ctx, &name, &sid, &[("user", said)]);
+            acts.push(json!({ "type": "correct", "id": id, "new_content": new, "evidence": [said], "reason": "contradicted later" }));
+            stale.push(id);
+        }
+        let _ = crate::library::sync_vectors_async(&r.ctx).await;
+        let measure = |label: &'static str| {
+            let ctx = r.ctx.clone();
+            let stale = stale.clone();
+            async move {
+                let (mut hit, mut wrong, mut leak) = (0, 0, 0);
+                for (i, (_, _, new, q)) in cases.iter().enumerate() {
+                    let rows = crate::library::agent_memories_async(&ctx, q, "ra", 5).await.unwrap().as_array().cloned().unwrap_or_default();
+                    let top = rows.first().cloned().unwrap_or_default();
+                    if top["content"] == *new { hit += 1; }
+                    if top["id"] == stale[i] { wrong += 1; }
+                    leak += rows.iter().filter(|r| r["scope"] != "repo:ra").count();
+                }
+                eprintln!("STALE_RESULT {label} recall@1={hit}/{} wrong={wrong}/{} leaks={leak}", cases.len(), cases.len());
+                (hit, wrong, leak)
+            }
+        };
+        let before = measure("before").await;
+        set_reply(&r, json!(acts));
+        let out = crate::dream::run(&r.ctx, "ra", true).await.unwrap();
+        assert_eq!(out["applied"].as_array().unwrap().len(), cases.len(), "{out}");
+        let _ = crate::library::sync_vectors_async(&r.ctx).await;
+        let after = measure("after").await;
+        eprintln!("STALE_RESULT local_models={models}");
+        assert_eq!(before.2 + after.2, 0, "scope leak");
+        assert!(after.0 > before.0 && after.1 < before.1 || before.1 == 0, "{before:?} -> {after:?}");
+        assert_eq!(after.1, 0, "no stale answer after dreaming");
+    }
 }
 

@@ -5,13 +5,13 @@ use std::sync::Mutex as StdMutex;
 type Seen = Arc<StdMutex<Vec<String>>>;
 
 /// Real gateway in front of a fake Claude upstream whose reply is swapped per test step.
-struct Rig {
-    ctx: Arc<Ctx>,
-    seen: Seen,
-    reply: Arc<StdMutex<String>>,
+pub(crate) struct Rig {
+    pub(crate) ctx: Arc<Ctx>,
+    pub(crate) seen: Seen,
+    pub(crate) reply: Arc<StdMutex<String>>,
 }
 
-fn hal_db(ctx: &Ctx, name: &str, sid: &str, msgs: &[(&str, &str)]) {
+pub(crate) fn hal_db(ctx: &Ctx, name: &str, sid: &str, msgs: &[(&str, &str)]) {
     let db_path = ctx.agent_dir(name).join("hal/hal/hal.db");
     std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
     let conn = rusqlite::Connection::open(&db_path).unwrap();
@@ -28,7 +28,7 @@ fn hal_db(ctx: &Ctx, name: &str, sid: &str, msgs: &[(&str, &str)]) {
     }
 }
 
-async fn rig(name: &str) -> Rig {
+pub(crate) async fn rig(name: &str) -> Rig {
     let seen: Seen = Default::default();
     let reply: Arc<StdMutex<String>> = Arc::new(StdMutex::new("{\"actions\":[]}".into()));
     let (s, r) = (seen.clone(), reply.clone());
@@ -82,7 +82,7 @@ async fn rig(name: &str) -> Rig {
     Rig { ctx, seen, reply }
 }
 
-fn save(ctx: &Ctx, scope: &str, content: &str, tier: &str, cat: &str, fk: Option<&str>) -> String {
+pub(crate) fn save(ctx: &Ctx, scope: &str, content: &str, tier: &str, cat: &str, fk: Option<&str>) -> String {
     crate::library::save_structured(ctx, crate::library::SaveOpts {
         content, category: cat, scope, source: "agent:x", trust_tier: tier, fact_key: fk, supersedes_id: None, source_event_id: None, provenance: None,
     })
@@ -96,7 +96,7 @@ fn row(ctx: &Ctx, id: &str) -> Value {
     ctx.db.query("SELECT * FROM memories WHERE id=?1", [id]).unwrap().remove(0)
 }
 
-fn set_reply(r: &Rig, actions: Value) {
+pub(crate) fn set_reply(r: &Rig, actions: Value) {
     *r.reply.lock().unwrap() = json!({ "actions": actions }).to_string();
 }
 

@@ -1078,4 +1078,4 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: &Value) -> Option<Result<V
 
 #[cfg(test)]
 #[path = "dream_tests.rs"]
-mod tests;
+pub(crate) mod tests;
