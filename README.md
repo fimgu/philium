@@ -1,18 +1,114 @@
-# Philium
+<p align="center">
+  <img src="docs/assets/banner.png" alt="Philium" width="100%">
+</p>
+
+<p align="center">
+  <a href="https://github.com/fimgu/philium/stargazers"><img src="https://img.shields.io/github/stars/fimgu/philium?style=flat" alt="GitHub stars"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License: MIT"></a>
+  <img src="https://img.shields.io/badge/platform-macOS-lightgrey" alt="Platform: macOS">
+  <a href="https://tauri.app"><img src="https://img.shields.io/badge/built%20with-Tauri%202-24C8DB" alt="Built with Tauri 2"></a>
+  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/Rust-000000?logo=rust" alt="Rust"></a>
+  <a href="https://github.com/fimgu/philium/commits/main"><img src="https://img.shields.io/github/last-commit/fimgu/philium" alt="Last commit"></a>
+</p>
+
+<p align="center"><b>A calm desktop workspace for running coding agents on your own machine.</b></p>
+
+<p align="center">
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#features">Features</a> ·
+  <a href="#requirements">Requirements</a> ·
+  <a href="#roadmap">Roadmap</a> ·
+  <a href="CONTRIBUTING.md">Contributing</a>
+</p>
 
 Philium is a desktop workspace for running coding agents on your own machine. You add your repositories, connect a model provider, and start agents that work in those repos. Philium shows every message, tool call and model request, asks before tools run (unless you tell it not to), and keeps an eye on secrets leaving your machine.
 
-It is built with Tauri 2 and runs on macOS, Windows and Linux. The agent runtime is HAL, a separate project that Philium starts in the background and stops when you quit.
+It is built with Tauri 2. The agent runtime is HAL, a separate project that Philium starts in the background and stops when you quit.
 
-## Screenshots
+## Why Philium
 
-Screenshots will be added here before the first public release.
+- **You can see everything.** Every message, tool call and model request is visible, so nothing happens out of view.
+- **You stay in control.** Tools ask before they run unless you choose otherwise.
+- **Your machine, your data.** Agents run locally, memory search uses local models, and outgoing secrets are watched.
+- **Many agents, one place.** Run several agents across several repositories and follow them from a single window.
 
-<!-- Home with the Get set up card -->
-<!-- An agent timeline -->
-<!-- Memory -->
+## Features
+
+<table>
+  <tr>
+    <td width="50%" valign="top">
+      <b>Home</b><br>
+      Get set up checklist and an overview of what your agents are doing.
+    </td>
+    <td width="50%" valign="top">
+      <b>Board</b><br>
+      Track agent work across repositories in one view.
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <b>Review</b><br>
+      Read diffs and review or publish pull requests with the GitHub CLI.
+    </td>
+    <td width="50%" valign="top">
+      <b>Memory</b><br>
+      Local memory with on-device search models.
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <b>Skills</b><br>
+      Extra tools and MCP servers your agents can use.
+    </td>
+    <td width="50%" valign="top">
+      <b>Stats</b><br>
+      Usage and model request statistics.
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <b>Terminals</b><br>
+      Built-in terminals next to your agents.
+    </td>
+    <td width="50%" valign="top">
+      <b>Improve</b><br>
+      Suggestions for improving how your agents work.
+    </td>
+  </tr>
+</table>
+
+## Compared with single-CLI agents
+
+A general comparison with running one command-line agent in one terminal. It is not a claim about any specific product.
+
+| | Single-CLI agent | Philium |
+| --- | --- | --- |
+| Agents at once | Usually one per terminal | Several, side by side |
+| Repositories | One working directory | Many, added in Repos |
+| Visibility of tool calls and model requests | Scrollback text | Structured timeline |
+| Approval before tools run | Varies | Yes, by default |
+| Secret leak watching | Varies | Built in |
+| Local memory search | Varies | Built in, on-device models |
+| Setup | One binary | Desktop app plus the HAL runtime |
+| Works from a plain SSH session | Yes | No, needs a desktop |
+
+## Quick start
+
+```sh
+git clone https://github.com/fimgu/philium.git
+git clone <your HAL checkout> hal   # must sit next to philium, or set HAL_DIR
+cd philium
+npm install
+npm run sidecar
+npx tauri dev
+```
+
+Details are in [Build](#build) below.
 
 ## Requirements
+
+The HAL agent runtime is required. Philium does not build or run agents without it.
+
 
 - Node.js and npm (a current LTS release)
 - Rust and Cargo, installed with rustup
@@ -91,6 +187,24 @@ To start fresh:
 
 This removes Philium's settings, history, memory and stored secrets. It does not touch your repositories, any `.philium/` folders in them, or `~/.hal`. Remove those yourself if you want a completely clean slate.
 
-## Status
+## Roadmap
 
-Philium is in active development and not yet published. See `docs/PUBLIC-RELEASE.md` for what remains before it goes public.
+Philium is in active development and not yet published. See [docs/PUBLIC-RELEASE.md](docs/PUBLIC-RELEASE.md) for what remains before it goes public.
+
+## Contributing
+
+Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) and the [Code of Conduct](CODE_OF_CONDUCT.md) before opening an issue or pull request.
+
+## Star History
+
+<a href="https://star-history.com/#fimgu/philium&Date">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=fimgu/philium&type=Date&theme=dark">
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=fimgu/philium&type=Date">
+    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=fimgu/philium&type=Date">
+  </picture>
+</a>
+
+## License
+
+[MIT](LICENSE)
