@@ -53,3 +53,28 @@ test("dreamChanges labels actions and undo eligibility", async () => {
   assert.deepEqual(c.map((x) => [x.verb, x.undoable, x.undone]), [["Corrected", true, false], ["Flagged", false, false], ["Merged", false, true]]);
   assert.deepEqual(dreamChanges(null), []);
 });
+
+import { retrievalInUse, customServerFields } from "./memory-format.js";
+
+test("retrieval card shows local models in use and hides idle custom values", () => {
+  const cfg = {
+    active_embed_model: "local:emb-a",
+    active_rerank_model: "local:rr-b",
+    embedding_endpoint: "http://127.0.0.1:1/v1/embeddings",
+    embedding_model: "idle-emb",
+    rerank_endpoint: "http://127.0.0.1:2/rerank",
+    rerank_model: "idle-rr",
+  };
+  assert.equal(retrievalInUse(cfg).line, "Embedder: local:emb-a · Reranker: local:rr-b");
+  const f = customServerFields(cfg);
+  assert.equal(f.open, false);
+  assert.deepEqual([f.embEndpoint, f.embModel, f.rrEndpoint, f.rrModel], ["", "", "", ""]);
+});
+
+test("retrieval card surfaces custom fields only when custom model is active", () => {
+  const f = customServerFields({ active_embed_model: "srv-emb", embedding_model: "srv-emb", embedding_endpoint: "http://127.0.0.1:1/e" });
+  assert.equal(f.open, true);
+  assert.equal(f.embModel, "srv-emb");
+  assert.equal(f.rrModel, "");
+  assert.equal(retrievalInUse(null).line, "Embedder: Lexical (FTS5) · Reranker: Off");
+});

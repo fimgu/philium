@@ -6,7 +6,7 @@ import { useVisibleEvent } from "../lib/visibility.js";
 import "../styles/workspace.css";
 import { Storage } from "./storage.jsx";
 import { McpServersSection } from "./mcp-servers.jsx";
-import { modelsSummary } from "../lib/memory-format.js";
+import { modelsSummary, retrievalInUse, customServerFields } from "../lib/memory-format.js";
 
 function LocalModelsRow() {
   const [st, setSt] = createSignal(null);
@@ -412,12 +412,13 @@ function MemoryEmbeddingsSection(props) {
       const c = await rpc("library.config_get", {}, { local: true });
       if (!c) return;
       setCfg(c);
-      setEmbProvider(c.embedding_provider ?? "");
-      setEmbEndpoint(c.embedding_endpoint ?? "");
-      setEmbModel(c.embedding_model ?? "");
-      setRrProvider(c.rerank_provider ?? "");
-      setRrEndpoint(c.rerank_endpoint ?? "");
-      setRrModel(c.rerank_model ?? "");
+      const f = customServerFields(c);
+      setEmbProvider(f.embProvider);
+      setEmbEndpoint(f.embEndpoint);
+      setEmbModel(f.embModel);
+      setRrProvider(f.rrProvider);
+      setRrEndpoint(f.rrEndpoint);
+      setRrModel(f.rrModel);
     } catch {
       // Degrade gracefully if backend config_get is unavailable.
     }
@@ -484,14 +485,25 @@ function MemoryEmbeddingsSection(props) {
           </div>
         </summary>
         <div class="col" style={{ gap: "14px", "margin-top": "14px" }}>
-          <p class="ws-muted">
-            Optional embeddings and cross-encoder reranking for Memory retrieval. Remote providers route via Philium&apos;s gateway; direct endpoints must be localhost/loopback.
+          <p class="ws-row" data-testid="retrieval-in-use">
+            <span>
+              In use: embedder <code>{retrievalInUse(cfg()).embed}</code>, reranker <code>{retrievalInUse(cfg()).rerank}</code>
+            </span>
+            <Button busy={reindexing() || props.busy} onClick={runReindex}>
+              Reindex
+            </Button>
           </p>
           <LocalModelsRow />
           <DreamingRow />
           <Show when={memErr()}>
             <div class="ws-alert" role="alert">{memErr()}</div>
           </Show>
+          <details open={customServerFields(cfg()).open}>
+            <summary class="ws-muted" style={{ cursor: "pointer" }}>Use a different model server</summary>
+            <div class="col" style={{ gap: "14px", "margin-top": "10px" }}>
+          <p class="ws-muted">
+            Only needed to replace the local models. Remote providers route via Philium&apos;s gateway; direct endpoints must be localhost/loopback.
+          </p>
           <div class="ws-row">
             <Field label="Embedding provider" hint="Trusted gateway provider, or leave on Auto for loopback.">
               <Select
@@ -549,23 +561,15 @@ function MemoryEmbeddingsSection(props) {
             </Field>
           </div>
           <div class="ws-row">
-            <span class="xs faint">
-              <Show when={cfg()?.active_rerank_model}>
-                Active reranker: <code>{cfg().active_rerank_model}</code>
-              </Show>
-              <Show when={!cfg()?.active_rerank_model && cfg()?.mode}>
-                Mode: <code>{cfg().mode}</code>
-              </Show>
-            </span>
+            <span />
             <div class="ws-actions">
               <Button variant="primary" busy={memBusy() || props.busy} onClick={saveConfig}>
                 Save
               </Button>
-              <Button busy={reindexing() || props.busy} onClick={runReindex}>
-                Reindex
-              </Button>
             </div>
           </div>
+            </div>
+          </details>
         </div>
       </details>
     </section>

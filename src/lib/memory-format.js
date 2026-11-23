@@ -110,3 +110,29 @@ export function dreamChanges(actions) {
     undoable: !a.undone_at && a.kind !== "flag" && a.kind !== "confirm",
   }));
 }
+
+// Memory retrieval card: what is actually in use, and which custom server
+// fields to show. Saved custom values are only surfaced when a custom
+// (non-local) model is the active one, so idle leftovers never look "in use".
+export function retrievalInUse(cfg) {
+  const c = cfg ?? {};
+  const embed = c.active_embed_model || "Lexical (FTS5)";
+  const rerank = c.active_rerank_model || (c.reranker_active ? "On" : "Off");
+  return { embed, rerank, line: `Embedder: ${embed} · Reranker: ${rerank}` };
+}
+
+export function customServerFields(cfg) {
+  const c = cfg ?? {};
+  const isCustom = (m) => Boolean(m) && !String(m).startsWith("local:");
+  const embOn = isCustom(c.active_embed_model);
+  const rrOn = isCustom(c.active_rerank_model);
+  return {
+    open: embOn || rrOn,
+    embProvider: embOn ? c.embedding_provider ?? "" : "",
+    embEndpoint: embOn ? c.embedding_endpoint ?? "" : "",
+    embModel: embOn ? c.embedding_model ?? "" : "",
+    rrProvider: rrOn ? c.rerank_provider ?? "" : "",
+    rrEndpoint: rrOn ? c.rerank_endpoint ?? "" : "",
+    rrModel: rrOn ? c.rerank_model ?? "" : "",
+  };
+}
