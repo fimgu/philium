@@ -1,5 +1,5 @@
 // Providers: accounts, trust level, guard mode, live model lists.
-import { For, Show, createResource, createSignal, createMemo, createEffect, onCleanup } from "solid-js";
+import { For, Show, createResource, createSignal, createMemo, createEffect, on, onCleanup } from "solid-js";
 import { Page, Button, Card, Badge, Empty, Field, Input, Select, Toggle, Modal, Shield, toast, confirm } from "../ui/kit.jsx";
 import { Icon } from "../ui/icons.jsx";
 import { rpc, useEvent, fmt } from "../lib/rpc.js";
@@ -7,6 +7,9 @@ import { useStore } from "../lib/store.js";
 import { quotaView } from "../lib/quota.js";
 import { go } from "../lib/nav.js";
 import { AccountUsageLink } from "../ui/account-usage-link.jsx";
+import { AccountUsagePill } from "../ui/account-usage.jsx";
+import { refreshAccountUsage, usageFor } from "../lib/account-usage.js";
+import { useScreenVisible } from "../lib/visibility.js";
 
 function QuotaMeter(props) {
   const v = () => quotaView(props.usage);
@@ -380,8 +383,16 @@ export default function Providers() {
   const [quotas, { refetch: refetchQuotas }] = createResource(() =>
     rpc("activity.quotas").then((data) => ({ data })).catch(() => ({ error: true })),
   );
+  // Live account usage for the card pills: on open and every 60s while visible.
+  const visible = useScreenVisible();
+  refreshAccountUsage();
+  createEffect(on(visible, (v) => v && refreshAccountUsage(), { defer: true }));
   const quotaTimer = setInterval(refetchQuotas, 30000);
-  onCleanup(() => clearInterval(quotaTimer));
+  const usageTimer = setInterval(() => visible() && refreshAccountUsage(), 60000);
+  onCleanup(() => {
+    clearInterval(quotaTimer);
+    clearInterval(usageTimer);
+  });
 
   const syncStore = () =>
     Promise.all([
@@ -497,6 +508,7 @@ export default function Providers() {
                 <Badge tone={p.guard === "off" ? "danger" : "secure"}>Guard: {p.guard}</Badge>
                 <Show when={isSub(p.kind)}><Badge tone={p.signed_in ? "secure" : "danger"}>{p.signed_in ? [p.account?.email, p.account?.plan].filter(Boolean).join(" · ") || "Signed in" : "Sign in again"}</Badge></Show>
                 <Show when={!isSub(p.kind) && !p.has_key}><Badge tone="danger">No API key</Badge></Show>
+                <AccountUsagePill account={usageFor(p.id)} />
                 <div style={{ "margin-left": "auto" }} class="row">
                   <Button size="sm" busy={busy() === p.id} onClick={() => refresh(p)}><Icon name="refresh" size={13} /> Refresh models</Button>
                   <Show when={isSub(p.kind) && p.signed_in}><Button size="sm" busy={busy() === p.id} onClick={() => signOut(p)}>Sign out</Button></Show>

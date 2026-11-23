@@ -1,27 +1,3 @@
-.lane-virtual-table {
-  min-width: 960px;
-  font-size: 12px;
-}
-.lane-usage-row {
-  display: grid;
-  grid-template-columns: minmax(
-      160px,
-      2fr
-    ) 72px 72px 72px 150px 60px 100px 60px minmax(110px, 1fr);
-  height: 44px;
-  align-items: center;
-  border-bottom: 1px solid #2b3039;
-}
-.lane-usage-row > span {
-  padding: 0 10px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.lane-usage-head {
-  color: #9ca6b7;
-  font-weight: 500;
-}
 .terminals-screen {
   width: 100%;
   min-width: 0;
@@ -132,11 +108,6 @@
 .lane-table th {
   color: #9ca6b7;
   font-weight: 500;
-}
-.lane-stats {
-  display: grid;
-  grid-template-columns: repeat(6, minmax(110px, 1fr));
-  gap: 16px;
 }
 .activity-screen {
   width: 100%;
@@ -261,16 +232,12 @@
   margin: 12px 0;
   overflow-wrap: anywhere;
 }
-.stats-screen [role="alert"],
 .activity-screen [role="alert"],
 .terminals-screen [role="alert"] {
   color: #ef9b9b;
   padding: 8px;
 }
 @media (max-width: 1000px) {
-  .lane-stats {
-    grid-template-columns: repeat(3, 1fr);
-  }
   .activity-layout {
     position: relative;
   }

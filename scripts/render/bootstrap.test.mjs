@@ -87,7 +87,7 @@ test('fixture mode renders Stats and exposes approvals even when saved history f
     });
     await page.goto(url + '?screen=stats');
     await page.waitForSelector('.fixture-notice');
-    await page.waitForFunction(() => document.body.innerText.includes('Provider usage'));
+    await page.waitForFunction(() => document.body.innerText.includes('Available now'));
     assert.equal(await page.$('.desktop-notice'), null);
     assert.equal(await page.evaluate(() => !!window.__TAURI_INTERNALS__), false);
     await page.goto(url + '?screen=agents');

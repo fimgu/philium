@@ -36,7 +36,7 @@ fn reset(h: &HeaderMap, k: &str) -> Option<u64> {
 }
 
 /// `YYYY-MM-DDTHH:MM:SS[.frac](Z|±HH:MM)` to unix seconds.
-fn rfc3339(s: &str) -> Option<u64> {
+pub(crate) fn rfc3339(s: &str) -> Option<u64> {
     let b = s.as_bytes();
     if b.len() < 20 || b[4] != b'-' || b[7] != b'-' || !matches!(b[10], b'T' | b't' | b' ') {
         return None;
