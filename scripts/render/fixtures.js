@@ -83,7 +83,7 @@ const models = [
 ];
 const repos = [
   { id: "r1", name: "philium", path: "/Users/demo/Developer/philium", default_branch: "main", integration_branch: null, branch: "main", dirty: false, worktree_count: 2, remote_url: "git@github.com:demo/philium.git" },
-  { id: "r2", name: "hal", path: "/Users/demo/Developer/hal", default_branch: "main", branch: "main", dirty: true, worktree_count: 0, remote_url: "https://github.com/demo/hal.git" },
+  { id: "r2", name: "hal", path: "/Users/demo/Developer/hal", default_branch: "main", branch: "main", dirty: true, dirty_count: 3, dirty_files: [" M src/main.rs", " M Cargo.toml", "?? notes.txt"], worktree_count: 0, remote_url: "https://github.com/demo/hal.git" },
   { id: "r3", name: "philium", path: "/Users/demo/pilot/philium", default_branch: "main", remote_url: "git@github.com:demo/philium.git" },
 ];
 const worktrees = [
@@ -163,6 +163,7 @@ export const POPULATED = {
   "terminals.buffer": { data: Buffer.from("\x1b[38;5;110mlion\x1b[38;5;244m lion $\x1b[0m cargo test -q\r\nrunning 112 tests\r\n........................................\r\ntest result: \x1b[32mok\x1b[0m. 112 passed; 0 failed\r\n\x1b[38;5;110mlion\x1b[38;5;244m lion $\x1b[0m git status -s\r\n M src/screens/agents.jsx\r\n?? src/ui/termview.jsx\r\n\x1b[38;5;110mlion\x1b[38;5;244m lion $\x1b[0m ").toString("base64") },
   "workspace.repos_list": repos,
   "workspace.worktrees": worktrees,
+  "workspace.branches_refresh": { remote: "origin" },
   "workspace.branches": [{ name: "main", current: true, commit: "a1b2c3d4e5", date: now - 3600000 }, { name: "agent/lion", commit: "b2c3d4e5f6", date: now - 600000 }, { name: "agent/otter", commit: "c3d4e5f6a7" }, { name: "origin/main", commit: "a1b2c3d4e5" }, { name: "origin/HEAD" }],
   "workspace.worktree_status": worktrees[0].status,
   "sandbox.grants_get": { grants: [{ path: "/Users/demo/Documents/Parts", write: false }], private: [] },
