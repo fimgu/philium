@@ -9,7 +9,7 @@ import { Markdown } from '../ui/markdown.jsx';
 import { Button, Toggle, TextArea, toast } from '../ui/kit.jsx';
 import {
   verdictLabel, verdictTone, tally, tallyLine, groupByKind,
-  itemMark, verifyLine, originLabel, severityLabel,
+  itemMark, verifyLine, originLabel, severityLabel, basisLabel, coverageLine,
 } from '../lib/pr-review.js';
 
 function ItemRow(props) {
@@ -21,6 +21,7 @@ function ItemRow(props) {
       <th scope="row">
         {String(severityLabel(it) ? `${severityLabel(it)} ` : '')}{it.title}
         <Show when={it.author}><small> · {it.author}{it.human === false || it.human === 0 ? ' (bot)' : ''}</small></Show>
+        <Show when={basisLabel(it)}><span class="badge" title="How this result was established">{basisLabel(it)}</span></Show>
       </th>
       <td>
         <Show when={originLabel(it)}><span class="origin">{originLabel(it)}</span>{' '}</Show>
@@ -93,6 +94,7 @@ function ReviewCard(props) {
   const items = () => props.data?.items || [];
   const verdict = () => props.data?.verdict;
   const t = () => tally(items());
+  const coverage = () => coverageLine(r()?.coverage, r()?.errors);
   return (
     <section aria-label="PR review" class={`decision ${verdictTone(r())}`}>
       <div class="verdict">
@@ -108,6 +110,7 @@ function ReviewCard(props) {
             </Show>
           </p>
           <Show when={items().length}><p><small>{tallyLine(items())}</small></p></Show>
+          <Show when={coverage()}>{c => <p><small class={c().warn ? 'warn' : ''}>{c().text}</small></p>}</Show>
         </div>
         <Show when={r() && !['posted', 'superseded', 'stopped'].includes(r().state)}>
           <Button size="sm" variant="ghost" onClick={() => props.onStop?.(r().id)}>Stop</Button>

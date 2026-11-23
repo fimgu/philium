@@ -112,3 +112,21 @@ export function originLabel(it) {
 export function severityLabel(it) {
   return it?.status === 'fail' && it.severity != null ? `P${it.severity}` : '';
 }
+
+export const BASIS_LABEL = { runtime: 'ran it', source_trace: 'read code', runtime_and_source: 'ran + read' };
+
+/** Chip text for how an item's result was established, or '' when not set. */
+export function basisLabel(it) {
+  return BASIS_LABEL[it?.basis] || '';
+}
+
+/** "Read 21/21 comments, 1/1 reviews, 4/4 threads, 12/12 checks" plus warn when anything is missing or erred. */
+export function coverageLine(coverage, errors) {
+  if (!coverage) return null;
+  const parts = ['comments', 'reviews', 'threads', 'checks']
+    .filter((k) => coverage[k])
+    .map((k) => `${coverage[k].fetched}/${coverage[k].total} ${k}`);
+  if (!parts.length) return null;
+  const missing = ['comments', 'reviews', 'threads', 'checks'].some((k) => coverage[k] && coverage[k].fetched < coverage[k].total);
+  return { text: `Read ${parts.join(', ')}`, warn: missing || Boolean(errors && errors.length) };
+}

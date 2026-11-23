@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { tally, tallyLine, groupByKind, sortWorstFirst, weight, verdictLabel, verdictTone, itemMark, verifyLine, originLabel, severityLabel } from './pr-review.js';
+import { tally, tallyLine, groupByKind, sortWorstFirst, weight, verdictLabel, verdictTone, itemMark, verifyLine, originLabel, severityLabel, basisLabel, coverageLine } from './pr-review.js';
 
 const items = () => [
   { kind: 'claim', status: 'open', title: 'claim 1' },
@@ -74,4 +74,24 @@ test('verifyLine and origin/severity labels only show for relevant items', () =>
   assert.equal(originLabel({ status: 'pass' }), '');
   assert.equal(severityLabel({ status: 'fail', severity: 2 }), 'P2');
   assert.equal(severityLabel({ status: 'pass' }), '');
+});
+
+test('basisLabel chips how an item was established, empty when unset', () => {
+  assert.equal(basisLabel({ basis: 'runtime' }), 'ran it');
+  assert.equal(basisLabel({ basis: 'source_trace' }), 'read code');
+  assert.equal(basisLabel({ basis: 'runtime_and_source' }), 'ran + read');
+  assert.equal(basisLabel({}), '');
+  assert.equal(basisLabel(null), '');
+});
+
+test('coverageLine reports counts per kind and warns when fetched < total or errors exist', () => {
+  const full = { comments: { fetched: 21, total: 21 }, reviews: { fetched: 1, total: 1 }, threads: { fetched: 4, total: 4 }, checks: { fetched: 12, total: 12 } };
+  const ok = coverageLine(full, []);
+  assert.equal(ok.text, 'Read 21/21 comments, 1/1 reviews, 4/4 threads, 12/12 checks');
+  assert.equal(ok.warn, false);
+  const partial = { ...full, threads: { fetched: 2, total: 4 } };
+  assert.equal(coverageLine(partial, []).warn, true);
+  assert.equal(coverageLine(full, ['fetch failed']).warn, true);
+  assert.equal(coverageLine(null), null);
+  assert.equal(coverageLine({}), null);
 });
