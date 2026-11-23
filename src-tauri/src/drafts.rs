@@ -29,7 +29,8 @@ struct ImageRef { sha256: String, media_type: String, name: String, size: usize 
 type Drafts = BTreeMap<String, Draft>;
 
 fn key_valid(key: &str) -> bool {
-    key.strip_prefix("agent:").is_some_and(|id| !id.is_empty() && id.len() <= 128 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'))
+    // Agent composers use `agent:<id>`, Chat uses `chat:<session id>` or `chat:new`.
+    key.strip_prefix("agent:").or_else(|| key.strip_prefix("chat:")).is_some_and(|id| !id.is_empty() && id.len() <= 128 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'))
 }
 fn sha_valid(s: &str) -> bool { s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) }
 
@@ -263,6 +264,13 @@ mod tests {
     fn preview_cannot_resolve_private_storage() {
         assert!(isolated_directory(true, Some(Path::new("/unused"))).is_err());
         assert!(isolated_directory(false, None).is_err());
+    }
+    /// Chat composers key drafts as `chat:<session>` and `chat:new`. Rejecting them showed
+    /// "Draft could not be restored" and blocked sending in Chat.
+    #[test]
+    fn chat_and_agent_keys_are_valid_others_are_not() {
+        for k in ["agent:a-1", "chat:new", "chat:695d91e9-465c-4cdd-b75d-197090c35133"] { assert!(key_valid(k), "{k}"); }
+        for k in ["chat:", "chat:../x", "other:a", "a"] { assert!(!key_valid(k), "{k}"); }
     }
     #[test]
     fn roundtrip_isolation_clear_and_permissions() {
