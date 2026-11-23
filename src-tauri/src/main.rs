@@ -49,6 +49,8 @@ mod local_models;
 mod memory_consolidation;
 mod memory_ledger;
 mod memory_skills;
+#[cfg(test)]
+mod memory_e2e_tests;
 mod mcp;
 mod mcp_servers;
 mod notify;
