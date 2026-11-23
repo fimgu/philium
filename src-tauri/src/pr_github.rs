@@ -1,7 +1,7 @@
 use serde_json::{json, Value};
 
 const MARKER: &str = "<!-- philium-pr-review -->";
-const QUERY: &str = r#"query($owner:String!,$repo:String!,$pr:Int!,$comments:String,$reviews:String,$threads:String,$checks:String){viewer{login} repository(owner:$owner,name:$repo){pullRequest(number:$pr){number title body url isDraft state author{login __typename} baseRefOid headRefOid baseRefName headRefName comments(first:100,after:$comments){nodes{databaseId author{login __typename} body url createdAt} pageInfo{hasNextPage endCursor}} reviews(first:100,after:$reviews){nodes{databaseId author{login __typename} state body url} pageInfo{hasNextPage endCursor}} reviewThreads(first:100,after:$threads){nodes{id isResolved isOutdated path line comments(first:20){nodes{author{login __typename} body url} pageInfo{hasNextPage endCursor}}} pageInfo{hasNextPage endCursor}} commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100,after:$checks){nodes{... on CheckRun{name conclusion status detailsUrl} ... on StatusContext{context state targetUrl}} pageInfo{hasNextPage endCursor}}}}}}}}}"#;
+const QUERY: &str = r#"query($owner:String!,$repo:String!,$pr:Int!,$comments:String,$reviews:String,$threads:String,$checks:String){viewer{login} repository(owner:$owner,name:$repo){pullRequest(number:$pr){number title body url isDraft state author{login __typename} baseRefOid headRefOid baseRefName headRefName comments(first:100,after:$comments){totalCount nodes{databaseId author{login __typename} body url createdAt} pageInfo{hasNextPage endCursor}} reviews(first:100,after:$reviews){totalCount nodes{databaseId author{login __typename} state body url} pageInfo{hasNextPage endCursor}} reviewThreads(first:100,after:$threads){totalCount nodes{id isResolved isOutdated path line comments(first:20){totalCount nodes{author{login __typename} body url} pageInfo{hasNextPage endCursor}}} pageInfo{hasNextPage endCursor}} commits(last:1){totalCount nodes{commit{statusCheckRollup{contexts(first:100,after:$checks){totalCount nodes{... on CheckRun{name conclusion status detailsUrl} ... on StatusContext{context state targetUrl}} pageInfo{hasNextPage endCursor}}}}}}}}}"#;
 
 async fn graphql(origin: &str, query: &str, variables: Value) -> Result<Value, String> {
     let input = json!({"query":query,"variables":variables}).to_string();
@@ -14,8 +14,10 @@ async fn graphql(origin: &str, query: &str, variables: Value) -> Result<Value, S
     )
     .await?;
     let value: Value = serde_json::from_str(&output).map_err(|e| e.to_string())?;
-    if let Some(errors) = value.get("errors") {
-        return Err(format!("GitHub GraphQL: {errors}"));
+    if value.get("data").is_none_or(Value::is_null) {
+        if let Some(errors) = value.get("errors") {
+            return Err(format!("GitHub GraphQL: {errors}"));
+        }
     }
     Ok(value)
 }
@@ -32,6 +34,10 @@ pub async fn snapshot(origin: &str, pr: i64) -> Result<Value, String> {
     let (owner, repo) = repository(origin)?;
     let variables = json!({"owner":owner,"repo":repo,"pr":pr});
     let mut raw = graphql(origin, QUERY, variables.clone()).await?;
+    if !raw["data"]["repository"]["pullRequest"].is_object() {
+        return Err(format!("GitHub pull request not found: {}", raw["errors"]));
+    }
+    let mut errors = raw["errors"].as_array().cloned().unwrap_or_default();
     for (variable, path) in [
         ("comments", "/data/repository/pullRequest/comments"),
         ("reviews", "/data/repository/pullRequest/reviews"),
@@ -41,27 +47,35 @@ pub async fn snapshot(origin: &str, pr: i64) -> Result<Value, String> {
             "/data/repository/pullRequest/commits/nodes/0/commit/statusCheckRollup/contexts",
         ),
     ] {
-        loop {
-            let connection = raw.pointer(path).cloned().unwrap_or(Value::Null);
-            if connection["pageInfo"]["hasNextPage"] != true {
-                break;
+        let result: Result<(), String> = async {
+            loop {
+                let connection = raw.pointer(path).cloned().unwrap_or(Value::Null);
+                if connection["pageInfo"]["hasNextPage"] != true {
+                    break;
+                }
+                let cursor = connection["pageInfo"]["endCursor"]
+                    .as_str()
+                    .ok_or("Missing pagination cursor")?;
+                let mut vars = variables.clone();
+                vars[variable] = json!(cursor);
+                let page = graphql(origin, QUERY, vars).await?;
+                errors.extend(page["errors"].as_array().into_iter().flatten().cloned());
+                let next = page.pointer(path).ok_or("Missing paginated connection")?;
+                if next["pageInfo"]["endCursor"] == cursor {
+                    return Err("GitHub pagination did not advance".into());
+                }
+                let target = raw.pointer_mut(path).ok_or("Missing connection")?;
+                target["nodes"]
+                    .as_array_mut()
+                    .ok_or("Missing nodes")?
+                    .extend(nodes(next).cloned());
+                target["pageInfo"] = next["pageInfo"].clone();
             }
-            let cursor = connection["pageInfo"]["endCursor"]
-                .as_str()
-                .ok_or("Missing pagination cursor")?;
-            let mut vars = variables.clone();
-            vars[variable] = json!(cursor);
-            let page = graphql(origin, QUERY, vars).await?;
-            let next = page.pointer(path).ok_or("Missing paginated connection")?;
-            if next["pageInfo"]["endCursor"] == cursor {
-                return Err("GitHub pagination did not advance".into());
-            }
-            let target = raw.pointer_mut(path).ok_or("Missing connection")?;
-            target["nodes"]
-                .as_array_mut()
-                .ok_or("Missing nodes")?
-                .extend(nodes(next).cloned());
-            target["pageInfo"] = next["pageInfo"].clone();
+            Ok(())
+        }
+        .await;
+        if let Err(error) = result {
+            errors.push(json!(format!("{variable}: {error}")));
         }
     }
     if let Some(threads) = raw
@@ -69,11 +83,12 @@ pub async fn snapshot(origin: &str, pr: i64) -> Result<Value, String> {
         .and_then(Value::as_array_mut)
     {
         for thread in threads {
-            while thread["comments"]["pageInfo"]["hasNextPage"] == true {
+            let result: Result<(), String> = async { while thread["comments"]["pageInfo"]["hasNextPage"] == true {
                 let cursor = thread["comments"]["pageInfo"]["endCursor"]
                     .as_str()
                     .ok_or("Missing thread cursor")?;
-                let page = graphql(origin, r#"query($id:ID!,$after:String!){node(id:$id){... on PullRequestReviewThread{comments(first:100,after:$after){nodes{author{login __typename} body url} pageInfo{hasNextPage endCursor}}}}}"#, json!({"id":thread["id"],"after":cursor})).await?;
+                let page = graphql(origin, r#"query($id:ID!,$after:String!){node(id:$id){... on PullRequestReviewThread{comments(first:100,after:$after){totalCount nodes{author{login __typename} body url} pageInfo{hasNextPage endCursor}}}}}"#, json!({"id":thread["id"],"after":cursor})).await?;
+                errors.extend(page["errors"].as_array().into_iter().flatten().cloned());
                 let next = &page["data"]["node"]["comments"];
                 if next["pageInfo"]["endCursor"] == cursor {
                     return Err("GitHub thread pagination did not advance".into());
@@ -83,9 +98,13 @@ pub async fn snapshot(origin: &str, pr: i64) -> Result<Value, String> {
                     .ok_or("Missing thread comments")?
                     .extend(nodes(next).cloned());
                 thread["comments"]["pageInfo"] = next["pageInfo"].clone();
+            } Ok(()) }.await;
+            if let Err(error) = result {
+                errors.push(json!(format!("thread {}: {error}", text(thread, "id"))));
             }
         }
     }
+    raw["errors"] = json!(errors);
     parse_snapshot(&raw)
 }
 
@@ -147,6 +166,51 @@ pub fn parse_snapshot(raw: &Value) -> Result<Value, String> {
     if !pr.is_object() {
         return Err("GitHub pull request not found".into());
     }
+    let mut errors = raw["errors"].as_array().cloned().unwrap_or_default();
+    let mut coverage = json!({});
+    for (name, connection) in [
+        ("comments", &pr["comments"]),
+        ("reviews", &pr["reviews"]),
+        ("threads", &pr["reviewThreads"]),
+        (
+            "checks",
+            &pr["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"],
+        ),
+    ] {
+        let fetched = nodes(connection).filter(|v| !v.is_null()).count();
+        let total = connection["totalCount"].as_u64().unwrap_or(fetched as u64);
+        coverage[name] = json!({"fetched":fetched,"total":total});
+        if (fetched as u64) < total || connection["pageInfo"]["hasNextPage"] == true {
+            errors.push(json!(format!(
+                "{name}: incomplete collection ({fetched}/{total})"
+            )));
+        }
+        if connection.is_null()
+            && (name != "checks"
+                || pr["commits"]["nodes"][0]["commit"]["statusCheckRollup"].is_object())
+        {
+            errors.push(json!(format!("{name}: collection unavailable")));
+        }
+        if nodes(connection).any(Value::is_null) {
+            errors.push(json!(format!(
+                "{name}: collection contains unavailable entries"
+            )));
+        }
+    }
+    for thread in nodes(&pr["reviewThreads"]) {
+        let connection = &thread["comments"];
+        let fetched = nodes(connection).filter(|v| !v.is_null()).count();
+        let total = connection["totalCount"].as_u64().unwrap_or(fetched as u64);
+        if connection.is_null()
+            || (fetched as u64) < total
+            || connection["pageInfo"]["hasNextPage"] == true
+        {
+            errors.push(json!(format!(
+                "thread {}: incomplete comments ({fetched}/{total})",
+                text(thread, "id")
+            )));
+        }
+    }
     let viewer = text(&raw["data"]["viewer"], "login");
     let (login, _) = author(pr);
     let comments: Vec<Value> = nodes(&pr["comments"])
@@ -201,7 +265,7 @@ pub fn parse_snapshot(raw: &Value) -> Result<Value, String> {
         json!({"key":format!("ci:{name}"),"name":name,"state":state,"url":text(v,if run {"detailsUrl"} else {"targetUrl"})})
     }).collect();
     Ok(
-        json!({"number":pr["number"],"title":text(pr,"title"),"body":text(pr,"body"),"url":text(pr,"url"),"author":login,"viewer":viewer,"own":login==viewer,"is_draft":pr["isDraft"]==true,"state":text(pr,"state"),"head":text(pr,"headRefOid"),"base":text(pr,"baseRefOid"),"head_ref":text(pr,"headRefName"),"base_ref":text(pr,"baseRefName"),"comments":comments,"reviews":reviews,"threads":threads,"checks":checks,"claims":claims(text(pr,"body"))}),
+        json!({"number":pr["number"],"title":text(pr,"title"),"body":text(pr,"body"),"url":text(pr,"url"),"author":login,"viewer":viewer,"own":login==viewer,"is_draft":pr["isDraft"]==true,"state":text(pr,"state"),"head":text(pr,"headRefOid"),"base":text(pr,"baseRefOid"),"head_ref":text(pr,"headRefName"),"base_ref":text(pr,"baseRefName"),"comments":comments,"reviews":reviews,"threads":threads,"checks":checks,"claims":claims(text(pr,"body")),"coverage":coverage,"errors":errors}),
     )
 }
 
@@ -302,6 +366,9 @@ pub async fn review_requested(origin: &str) -> Result<Vec<i64>, String> {
     let mut result = Vec::new();
     loop {
         let page = graphql(origin, query, variables.clone()).await?;
+        if let Some(errors) = page["errors"].as_array().filter(|v| !v.is_empty()) {
+            return Err(format!("GitHub review-request search: {}", json!(errors)));
+        }
         let connection = &page["data"]["search"];
         result.extend(nodes(connection).filter_map(|v| v["number"].as_i64()));
         if connection["pageInfo"]["hasNextPage"] != true {
@@ -332,6 +399,8 @@ mod tests {
         }}}});
         let v = parse_snapshot(&raw).unwrap();
         assert_eq!(v["own"], true);
+        assert_eq!(v["errors"], json!([]));
+        assert_eq!(v["coverage"]["comments"], json!({"fetched":3,"total":3}));
         assert_eq!(v["comments"].as_array().unwrap().len(), 2);
         assert_eq!(v["comments"][0]["bot"], true);
         assert_eq!(v["comments"][1]["bot"], true);
@@ -352,6 +421,45 @@ mod tests {
         );
         assert!(parse_snapshot(&json!({"data":{"repository":{"pullRequest":null}}})).is_err());
     }
+    #[test]
+    fn partial_coverage_is_visible() {
+        let raw = json!({"errors":[{"message":"partial permission failure"}],"data":{"viewer":{"login":"me"},"repository":{"pullRequest":{
+            "number":7,"comments":{"totalCount":3,"nodes":[{"body":"<!-- philium-pr-review --> old verdict"}],"pageInfo":{"hasNextPage":true}},
+            "reviews":{"totalCount":0,"nodes":[]},"reviewThreads":{"totalCount":1,"nodes":[{"id":"t","comments":{"totalCount":2,"nodes":[{"body":"first"}],"pageInfo":{"hasNextPage":true}}}]}
+        }}}});
+        let parsed = parse_snapshot(&raw).unwrap();
+        assert_eq!(
+            parsed["coverage"]["comments"],
+            json!({"fetched":1,"total":3})
+        );
+        assert_eq!(
+            parsed["coverage"]["reviews"],
+            json!({"fetched":0,"total":0})
+        );
+        assert_eq!(
+            parsed["coverage"]["threads"],
+            json!({"fetched":1,"total":1})
+        );
+        assert_eq!(parsed["coverage"]["checks"], json!({"fetched":0,"total":0}));
+        assert_eq!(parsed["comments"], json!([]));
+        assert_eq!(parsed["errors"].as_array().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    #[ignore = "opt-in read-only GitHub integration, requires signed-in gh"]
+    async fn live_snapshot() {
+        let origin = std::env::var("PHILIUM_TEST_PR_ORIGIN").expect("set PHILIUM_TEST_PR_ORIGIN");
+        let pr = std::env::var("PHILIUM_TEST_PR_NUMBER")
+            .expect("set PHILIUM_TEST_PR_NUMBER")
+            .parse()
+            .unwrap();
+        let started = std::time::Instant::now();
+        let snapshot = snapshot(&origin, pr).await.unwrap();
+        println!("snapshot {} elapsed={:.3}s coverage={} errors={} normalized_comments={} normalized_reviews={} normalized_threads={} checks={}",pr,started.elapsed().as_secs_f64(),snapshot["coverage"],snapshot["errors"],snapshot["comments"].as_array().unwrap().len(),snapshot["reviews"].as_array().unwrap().len(),snapshot["threads"].as_array().unwrap().len(),snapshot["checks"].as_array().unwrap().len());
+        assert_eq!(snapshot["number"], pr);
+        assert_eq!(snapshot["errors"], json!([]));
+    }
+
     #[test]
     fn github_timestamps() {
         assert_eq!(timestamp("1970-01-01T00:00:00Z"), Some(0));
