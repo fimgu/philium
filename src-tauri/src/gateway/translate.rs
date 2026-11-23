@@ -407,7 +407,7 @@ pub fn inject_cache_breakpoints(v: &mut Value, anthropic: bool) {
         if !is_claude {
             return;
         }
-        if let Some(msgs) = v["messages"].as_array_mut() {
+        if let Some(msgs) = v.get_mut("messages").and_then(Value::as_array_mut) {
             if let Some(sys) = msgs.iter_mut().rev().find(|m| matches!(m["role"].as_str(), Some("system" | "developer"))) {
                 mark_block_ephemeral(&mut sys["content"]);
             }
@@ -417,7 +417,7 @@ pub fn inject_cache_breakpoints(v: &mut Value, anthropic: bool) {
         }
         return;
     }
-    if let Some(last_tool) = v["tools"].as_array_mut().and_then(|t| t.last_mut()).filter(|t| t.is_object()) {
+    if let Some(last_tool) = v.get_mut("tools").and_then(Value::as_array_mut).and_then(|t| t.last_mut()).filter(|t| t.is_object()) {
         last_tool["cache_control"] = json!({"type": "ephemeral"});
     }
     // A subscription body passes through here twice, with identity blocks added in between.
@@ -428,7 +428,7 @@ pub fn inject_cache_breakpoints(v: &mut Value, anthropic: bool) {
             mark_block_ephemeral(sys);
         }
     }
-    if let Some(msgs) = v["messages"].as_array_mut() {
+    if let Some(msgs) = v.get_mut("messages").and_then(Value::as_array_mut) {
         for m in msgs.iter_mut().rev().take(2) {
             mark_block_ephemeral(&mut m["content"]);
         }
@@ -448,18 +448,20 @@ fn cap_cache_breakpoints(v: &mut Value) {
             }
         }
     }
+    // `v["key"]` on an object inserts `key: null` when it is missing, and Anthropic refuses
+    // `tools: null`. Look keys up with `get_mut` so a request without tools stays without them.
     let mut left = 4usize;
-    if let Some(tools) = v["tools"].as_array_mut() {
+    if let Some(tools) = v.get_mut("tools").and_then(Value::as_array_mut) {
         for b in tools.iter_mut().rev() {
             keep(b, &mut left);
         }
     }
-    if let Some(system) = v["system"].as_array_mut() {
+    if let Some(system) = v.get_mut("system").and_then(Value::as_array_mut) {
         for b in system.iter_mut() {
             keep(b, &mut left);
         }
     }
-    if let Some(msgs) = v["messages"].as_array_mut() {
+    if let Some(msgs) = v.get_mut("messages").and_then(Value::as_array_mut) {
         for m in msgs.iter_mut().rev() {
             if let Some(blocks) = m["content"].as_array_mut() {
                 for b in blocks.iter_mut().rev() {
@@ -642,6 +644,19 @@ mod tests {
         assert_eq!(r["tools"][0]["input_schema"]["properties"]["p"]["type"], "number");
         let blocks = request(&b, false);
         assert_eq!(blocks["system"][1]["text"], "dev");
+    }
+
+    /// Memory observation and dreaming send no tools. Anthropic refuses `tools: null`, so marking
+    /// cache breakpoints must not add a key the request did not have.
+    #[test]
+    fn cache_breakpoints_add_no_missing_keys() {
+        let mut v = request(&json!({"model": "claude-haiku-5-5", "stream": false, "temperature": 0, "max_tokens": 50,
+            "messages": [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]}), true);
+        crate::oauth::shape_claude_body(&mut v);
+        inject_cache_breakpoints(&mut v, true);
+        inject_cache_breakpoints(&mut v, true);
+        assert!(v.get("tools").is_none(), "{v}");
+        assert!(v["system"].is_array() && v["messages"].is_array());
     }
 
     #[test]
