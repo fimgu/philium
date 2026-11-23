@@ -10,7 +10,7 @@
 //!
 //! The web UI never sees a token or key.
 
-mod access;
+mod access; mod updater;
 mod account_usage;
 mod app_id;
 mod access_fs;
@@ -271,6 +271,10 @@ async fn app_call(app: &App, m: &str, args: Value) -> Result<Value, String> {
                 "pilot": pilot::active(),
             }))
         }
+        "update_state" => Ok(updater::state()),
+        "update_check" => updater::check(ctx, false).await,
+        "update_install" => updater::install(ctx).await,
+        "update_restart" => updater::restart(ctx),
         "settings_get" => {
             let rows = ctx.db.query("SELECT k, v FROM kv WHERE k LIKE 'setting.%'", [])?;
             let mut out = serde_json::Map::new();
@@ -387,7 +391,8 @@ fn main() {
     #[cfg(target_os="macos")] let builder=if offscreen{builder.activate_ignoring_other_apps(false)}else{builder};
     let mut tauri_app = builder
         .plugin(tauri_plugin_notification::init())
-        .setup(|app| {
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .setup(move |app| {
             // PHILIUM_DATA_DIR isolates Improve-Philium previews from real data.
             let data_dir = match std::env::var("PHILIUM_DATA_DIR") {
                 Ok(d) if !d.is_empty() => std::path::PathBuf::from(d),
@@ -412,6 +417,7 @@ fn main() {
             let db = db::Db::open(&data_dir.join("philium.db")).map_err(|e| format!("database: {e}"))?;
             let ctx = Ctx::new(db, data_dir, philium_root(), gateway.clone(), gateway_url);
             ctx.set_handle(app.handle().clone());
+            if !offscreen { updater::spawn_background(ctx.clone()); }
             oauth::init_claude_version(&ctx);
             attention::refresh(&ctx);
             let c_learn = ctx.clone();

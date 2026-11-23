@@ -11,7 +11,14 @@
   },
   "app": {
     "windows": [
-      { "title": "Philium", "width": 1200, "height": 800, "minWidth": 800, "minHeight": 500, "dragDropEnabled": false }
+      {
+        "title": "Philium",
+        "width": 1200,
+        "height": 800,
+        "minWidth": 800,
+        "minHeight": 500,
+        "dragDropEnabled": false
+      }
     ],
     "security": {
       "csp": "default-src 'self'; img-src 'self' data: blob: https:; style-src 'self' 'unsafe-inline'; connect-src ipc: http://ipc.localhost; frame-src http://127.0.0.1:*"
@@ -19,9 +26,35 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["dmg", "app", "msi", "appimage", "deb"],
-    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/icon.icns", "icons/icon.ico", "icons/icon.png"],
-    "externalBin": ["binaries/hal-desktop-server"],
-    "macOS": { "signingIdentity": "-", "minimumSystemVersion": "12.0" }
+    "targets": [
+      "dmg",
+      "app",
+      "msi",
+      "appimage",
+      "deb"
+    ],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/icon.icns",
+      "icons/icon.ico",
+      "icons/icon.png"
+    ],
+    "externalBin": [
+      "binaries/hal-desktop-server"
+    ],
+    "macOS": {
+      "signingIdentity": "-",
+      "minimumSystemVersion": "12.0"
+    },
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDE3QjA1RDI2RDk3NTkwNUQKUldSZGtIWFpKbDJ3RjZqYkNrWmpjNE5UaDZzaVBNSmxMZ29jYVZBMStONVd6MXNUay9jKy84WS8K",
+      "endpoints": [
+        "https://github.com/fimgu/philium/releases/latest/download/latest.json"
+      ]
+    }
   }
 }

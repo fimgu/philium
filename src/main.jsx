@@ -6,6 +6,7 @@ import { For, Show, createSignal, createMemo, createEffect, lazy, Suspense, onMo
 import { Dynamic } from "solid-js/web";
 import { ToastHost, ConfirmHost, Guard, toast, cleanError } from "./ui/kit.jsx";
 import { ImproveHost } from "./ui/improve.jsx";
+import { UpdateBanner } from "./ui/update.jsx";
 import { Icon } from "./ui/icons.jsx";
 import { rpc, useEvent, failures, clearFailures } from "./lib/rpc.js";
 import { repoLabels } from "./lib/repo-labels.js";
@@ -273,6 +274,7 @@ function App() {
             <button class="btn ghost sm" onClick={clearFailures} aria-label="Dismiss">Dismiss</button>
           </div>
         </Show>
+        <UpdateBanner />
         <For each={visited()}>
           {(id) => (
             <div class={`screen-pane ${route() === id ? "" : "hidden"}`}>
