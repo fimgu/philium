@@ -70,6 +70,35 @@ const sessions = [
   { id: "s1", title: "Gateway retry failing", model: "claude/claude-opus-5-5", updated_at: now - 5 * min },
   { id: "s2", title: "Plan the onboarding flow", model: "chatgpt/gpt-6.1", updated_at: now - 3600000 },
 ];
+const sec = Math.floor(now / 1000);
+const win = (name, used, resetIn, extra = {}) => ({ name, scope: "account", used_percent: used, resets_at: sec + resetIn, models: [], projected_full_at: null, ...extra });
+const usageAccounts = {
+  checked_at: now,
+  accounts: [
+    { provider_id: "claude", provider_name: "Claude", kind: "claude_oauth", account: "d***@philium.dev", plan: "Max", enabled: true, stale: false, limit_reached: false, error: null, key_status: null,
+      windows: [win("5-hour window", 13, 4 * 3600 + 32 * 60), win("7-day window", 82, 23 * 3600 + 2 * 60, { projected_full_at: sec + 9 * 3600 }), win("7-day Opus window", 26, 23 * 3600 + 2 * 60, { scope: "model", models: ["opus"] })],
+      banked_resets: null, details: [["Extra usage (long context)", "disabled"], ["Session resets", "Not eligible"]], last_used_ms: now - 4 * min, fetched_at: now - 12000 },
+    { provider_id: "chatgpt", provider_name: "ChatGPT", kind: "chatgpt_oauth", account: "d***@philium.dev", plan: "self_serve_business_prolite", enabled: true, stale: false, limit_reached: false, error: null, key_status: null,
+      windows: [win("7-day window", 35, 2 * 86400 + 20 * 3600)], banked_resets: { available: 1, next_available_at: null }, details: [], last_used_ms: now - 40 * min, fetched_at: now - 12000 },
+    { provider_id: "openrouter", provider_name: "OpenRouter", kind: "openai_chat", account: null, plan: null, enabled: true, stale: false, limit_reached: false, error: null, key_status: "valid",
+      windows: [], banked_resets: null, details: [], last_used_ms: null, fetched_at: now - 12000 },
+    { provider_id: "local", provider_name: "Local Ollama", kind: "openai_chat", account: null, plan: null, enabled: true, stale: false, limit_reached: false, error: "Connection refused", key_status: null,
+      windows: [], banked_resets: null, details: [], last_used_ms: null, fetched_at: now - 12000 },
+  ],
+};
+const insights = {
+  range: "24h",
+  totals: { requests: 342, errors: 4, tokens_in: 1.2e6, tokens_out: 3.4e5, tokens_cached: 7.1e5, cost: 12.8 },
+  spend: { today: { cost: 3.42, requests: 88, unpriced: 2, included: 61 }, week: { cost: 12.8, requests: 342, unpriced: 12, included: 230 }, month: { cost: 41.06, requests: 1310, unpriced: 30, included: 902 } },
+  models: [
+    { provider_id: "claude", model: "claude-opus-5-5", requests: 140, p50_ttft_ms: 820, p95_ttft_ms: 2400, avg_tps: 61.2, cache_hit: 0.71, error_rate: 0.007, cost: 0 },
+    { provider_id: "chatgpt", model: "gpt-6.1", requests: 120, p50_ttft_ms: 540, p95_ttft_ms: 1900, avg_tps: 74.5, cache_hit: 0.48, error_rate: 0.017, cost: 0 },
+    { provider_id: "local", model: "qwen3-coder", requests: 82, p50_ttft_ms: 190, p95_ttft_ms: 600, avg_tps: 38.1, cache_hit: null, error_rate: 0.061, cost: null },
+  ],
+  heatmap: Array.from({ length: 7 }, (_, d) => Array.from({ length: 24 }, (_, h) => (h >= 9 && h <= 18 && d !== 2 && d !== 3 ? ((h * 7 + d * 3) % 11) + 2 : h > 20 ? (h + d) % 3 : 0))),
+  repos: [{ id: "r1", name: "philium", requests: 220, tokens: 9.1e5, cost: 8.2 }, { id: "r2", name: "jcode", requests: 90, tokens: 4.4e5, cost: 3.9 }, { id: null, name: null, requests: 32, tokens: 1.1e5, cost: 0.7 }],
+  agents: [{ id: "lion", name: "lion", requests: 150, tokens: 7.2e5, cost: 6.1 }, { id: "otter", name: "otter", requests: 110, tokens: 5.0e5, cost: 4.4 }, { id: "heron", name: "heron", requests: 82, tokens: 2.3e5, cost: 2.3 }],
+};
 const provs = [
   { id: "claude", name: "Claude", kind: "claude_oauth", signed_in: true, trusted: true, enabled: true, guard: "redact", model_count: 6, account: { email: "demo@philium.dev", plan: "Max" }, models_cached_at: now },
   { id: "chatgpt", name: "ChatGPT", kind: "chatgpt_oauth", signed_in: true, trusted: true, enabled: true, guard: "redact", model_count: 5, account: { email: "demo@philium.dev", plan: "Plus" }, models_cached_at: now },
@@ -182,6 +211,8 @@ export const POPULATED = {
   },
   "stats.timeseries": points,
   "stats.efficiency": [],
+  "stats.insights": insights,
+  "usage.accounts": usageAccounts,
   "codeindex.status": { files: 5, symbols: 42, indexed_at: now - 60000, state: "ready" },
   "codeindex.tree": tree,
   "codeindex.graph": codeGraph,
