@@ -1722,7 +1722,7 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
         "names" => Ok(json!(free_names(ctx, 8))),
         "get" => {
             let id = id()?;
-            let mut row = with_live(ctx, get_row(ctx, &id).ok_or("gone")?);
+            let mut row = with_live(ctx, get_row(ctx, &id).ok_or_else(|| crate::ctx::not_found("Agent not found"))?);
             // The view must remain available while HAL or a tool is busy.
             // Live session reads belong to their dedicated endpoints, not metadata.
             row["resources"] = json!(ctx.db.query(
@@ -1918,7 +1918,7 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
         "set_effort" => {
             let id = id()?;
             let raw_effort = ctx::arg_str(&args, "effort")?;
-            let row = get_row(ctx, &id).ok_or("gone")?;
+            let row = get_row(ctx, &id).ok_or_else(|| crate::ctx::not_found("Agent not found"))?;
             let effort = providers::validate_effort_for_ref(ctx, row["model_ref"].as_str(), &raw_effort)?;
             ctx.gateway.set_effort(row["name"].as_str(), Some(&effort));
             if let Some(rt) = runtime(&id) {
@@ -2069,7 +2069,7 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
         "set_model" => {
             let id = id()?;
             let model = ctx::arg_str(&args, "model")?;
-            let row = get_row(ctx, &id).ok_or("gone")?;
+            let row = get_row(ctx, &id).ok_or_else(|| crate::ctx::not_found("Agent not found"))?;
             let (p, m) = providers::resolve(ctx, Some(&model))?;
             let strict = row["strict"].as_i64() == Some(1);
             if strict && !(p.trusted == false && row["model_ref"].as_str().unwrap_or("").starts_with(&format!("{}/", p.id))) {

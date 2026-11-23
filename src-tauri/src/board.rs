@@ -84,7 +84,7 @@ fn raw(ctx: &Arc<Ctx>, id: &str) -> Result<Value, String> {
         .query("SELECT * FROM tasks WHERE id=?1", [id])?
         .into_iter()
         .next()
-        .ok_or("Task not found".into())
+        .ok_or_else(|| crate::ctx::not_found("Task not found"))
 }
 fn identity(ctx: &Arc<Ctx>, actor: &str) -> Result<(String, Option<String>), String> {
     if actor == "you" {

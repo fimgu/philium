@@ -264,3 +264,26 @@ mod event_tests {
         std::fs::remove_dir_all(ctx.data_dir.parent().unwrap()).ok();
     }
 }
+
+/// Marker for a missing optional record (stale id, deleted row). The `rpc` command turns it
+/// into a structured `{kind:"not_found"}` error so the UI never treats it as a load failure.
+const NOT_FOUND: &str = "\u{1}not_found\u{1}";
+pub fn not_found(msg: impl std::fmt::Display) -> String {
+    format!("{NOT_FOUND}{msg}")
+}
+/// Structured IPC error: `kind` is `not_found` or `failed`.
+pub fn rpc_error(e: String) -> Value {
+    match e.strip_prefix(NOT_FOUND) {
+        Some(m) => serde_json::json!({ "kind": "not_found", "message": m }),
+        None => serde_json::json!({ "kind": "failed", "message": e }),
+    }
+}
+#[cfg(test)]
+mod rpc_error_tests {
+    #[test]
+    fn kinds() {
+        assert_eq!(super::rpc_error(super::not_found("Task not found"))["kind"], "not_found");
+        assert_eq!(super::rpc_error(super::not_found("Task not found"))["message"], "Task not found");
+        assert_eq!(super::rpc_error("boom".into())["kind"], "failed");
+    }
+}

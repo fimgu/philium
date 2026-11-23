@@ -4,15 +4,46 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { onCleanup, createSignal } from "solid-js";
 
-// Failed calls are tracked so the shell can say "backend unreachable" instead of
-// screens silently rendering as empty. A later success of the same call clears it.
+// Only genuine, persistent load failures of core data reach the global banner: a core
+// call must fail with kind "failed" twice in a row. Not-found records, screen-local
+// calls and actions never do. A later success of the same call clears it.
+export const CORE = new Set(["app.status", "agents.list", "workspace.repos_list", "providers.list"]);
+const STRIKES = 2;
 const [failures, setFailures] = createSignal({});
 export { failures };
-export const clearFailures = () => setFailures({});
-const track = (key, p) => p.then(
-  (v) => { if (failures()[key]) setFailures((f) => { const n = { ...f }; delete n[key]; return n; }); return v; },
-  (e) => { setFailures((f) => ({ ...f, [key]: e })); throw e; },
-);
+export const clearFailures = () => { strikes.clear(); setFailures({}); };
+const strikes = new Map();
+
+/** Backend errors arrive as `{kind, message}`. Turn them into an Error carrying `kind`. */
+export function toRpcError(e) {
+  if (e instanceof Error) { e.kind ??= "failed"; return e; }
+  const structured = e && typeof e === "object" && typeof e.message === "string";
+  const err = new Error(structured ? e.message : String(e ?? "Something went wrong"));
+  err.kind = structured && e.kind ? e.kind : "failed";
+  // Screens render String(e) inline. Keep that the plain backend message.
+  err.toString = () => err.message;
+  return err;
+}
+export const isNotFound = (e) => e?.kind === "not_found";
+
+export function track(key, p) {
+  return p.then(
+    (v) => {
+      strikes.delete(key);
+      if (failures()[key]) setFailures((f) => { const n = { ...f }; delete n[key]; return n; });
+      return v;
+    },
+    (raw) => {
+      const e = toRpcError(raw);
+      if (CORE.has(key) && e.kind === "failed") {
+        const n = (strikes.get(key) ?? 0) + 1;
+        strikes.set(key, n);
+        if (n >= STRIKES) setFailures((f) => ({ ...f, [key]: e }));
+      }
+      throw e;
+    },
+  );
+}
 
 const inFlight = new Map();
 
@@ -28,7 +59,7 @@ export const rpc = (method, args, options = {}) => {
     if (key && inFlight.has(key)) return inFlight.get(key);
   }
   const request = invoke("rpc", { method, args: args ?? null });
-  const tracked = options.action || options.local ? request : track(method, request);
+  const tracked = options.action || options.local || !CORE.has(method) ? request.catch((e) => { throw toRpcError(e); }) : track(method, request);
   if (key) {
     const shared = tracked.finally(() => {
       if (inFlight.get(key) === shared) inFlight.delete(key);
@@ -41,7 +72,7 @@ export const rpc = (method, args, options = {}) => {
 
 export const hal = (method, path, body) => {
   const request = invoke("hal", { method, path, body });
-  return method === "GET" ? track(`hal ${method} ${String(path).split("?")[0]}`, request) : request;
+  return request;
 };
 
 export const sendError = (error) => /session is busy|"type"\s*:\s*"busy"/i.test(String(error))

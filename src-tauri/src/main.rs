@@ -144,7 +144,7 @@ async fn hal(app: State<'_, App>, method: String, path: String, body: Option<Val
 
 /// One entry point for every feature module: `rpc("terminals.open", {...})`.
 #[tauri::command]
-async fn rpc(app: State<'_, App>, method: String, args: Option<Value>) -> Result<Value, String> {
+async fn rpc(app: State<'_, App>, method: String, args: Option<Value>) -> Result<Value, Value> {
     use futures_util::FutureExt;
     // A bug in one handler must not take the IPC call (or app) down with it:
     // turn panics into an error the UI can show.
@@ -160,7 +160,7 @@ async fn rpc(app: State<'_, App>, method: String, args: Option<Value>) -> Result
     };
     // The person's own actions, by name and outcome only, for the workday ledger.
     workday::record(&app.ctx, &label, &scope, result.is_ok());
-    result
+    result.map_err(ctx::rpc_error)
 }
 
 async fn rpc_inner(app: &App, method: String, args: Option<Value>) -> Result<Value, String> {

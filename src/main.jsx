@@ -152,7 +152,7 @@ function App() {
     if (running > 0) return { count: String(running), warn: false, title: `${running} agent${running === 1 ? "" : "s"} running` };
     return null;
   });
-  const failing = () => Object.entries(failures()).filter(([k]) => !k.startsWith("browser.") && k !== "app.status");
+  const failing = () => Object.entries(failures());
   const retry = () => {
     clearFailures();
     store.refetchStatus();

@@ -205,7 +205,7 @@ fn repo_identity(path: &Path) -> (Vec<String>, Option<String>) {
 /// Point a moved/renamed repo at its new folder. Only accepted when it is the
 /// same repository: a shared root commit, or the same origin remote.
 fn relocate(ctx: &Arc<Ctx>, id: &str, path: &str) -> Result<Value, String> {
-    let r = repo(ctx, id).ok_or("Unknown repository")?;
+    let r = repo(ctx, id).ok_or_else(|| crate::ctx::not_found("Unknown repository"))?;
     let wanted = expand_home(path);
     let dir = std::fs::canonicalize(&wanted).map_err(|_| format!("No folder at {}", wanted.display()))?;
     let top = git(&dir, &["rev-parse", "--show-toplevel"]).map_err(|_| format!("{} is not inside a Git repository", dir.display()))?;
@@ -234,7 +234,7 @@ fn relocate(ctx: &Arc<Ctx>, id: &str, path: &str) -> Result<Value, String> {
     invalidate_status_cache();
     ctx.emit("workspace:changed", json!({"repo_id":id}));
     ctx.notify("workspace");
-    repo(ctx, id).ok_or_else(|| "Unknown repository".into())
+    repo(ctx, id).ok_or_else(|| crate::ctx::not_found("Unknown repository"))
 }
 fn worktree(ctx: &Arc<Ctx>, id: &str) -> Result<Value, String> {
     ctx.db.query("SELECT w.*,a.name AS agent_name FROM worktrees w LEFT JOIN agents a ON a.id=w.agent_id WHERE w.id=?1", [id])?.into_iter().next().ok_or_else(|| "Unknown worktree".into())
@@ -321,7 +321,7 @@ pub fn create_worktree(
             return Err("Unknown agent".into());
         }
     }
-    let r = repo(ctx, repo_id).ok_or("Unknown repository")?;
+    let r = repo(ctx, repo_id).ok_or_else(|| crate::ctx::not_found("Unknown repository"))?;
     let repo_dir = repo_dir(&r)?;
     let repo_path = repo_dir.as_path();
     let base = base
@@ -416,7 +416,7 @@ pub fn worktree_status(ctx: &Arc<Ctx>, id: &str) -> Result<Value, String> {
         path,
         &["status", "--porcelain=v2", "--branch", "--untracked-files=all"],
     )?);
-    let r = repo(ctx, text(&w, "repo_id")?).ok_or("Unknown repository")?;
+    let r = repo(ctx, text(&w, "repo_id")?).ok_or_else(|| crate::ctx::not_found("Unknown repository"))?;
     let target = r["integration_branch"]
         .as_str()
         .or(r["default_branch"].as_str())
@@ -494,7 +494,7 @@ pub fn remove_worktree(ctx: &Arc<Ctx>, id: &str, force: bool) -> Result<(), Stri
     {
         return Err("Refusing to remove a worktree outside Philium".into());
     }
-    let r = repo(ctx, text(&w, "repo_id")?).ok_or("Unknown repository")?;
+    let r = repo(ctx, text(&w, "repo_id")?).ok_or_else(|| crate::ctx::not_found("Unknown repository"))?;
     let repo_dir = repo_dir(&r)?;
     let repo_path = repo_dir.as_path();
     if path.exists() {
@@ -686,7 +686,7 @@ fn dispatch(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, String> 
     match method {
         "overview" => {
             let id = arg_str(&args, "repo_id")?;
-            let r = repo(ctx, &id).ok_or("Unknown repository")?;
+            let r = repo(ctx, &id).ok_or_else(|| crate::ctx::not_found("Unknown repository"))?;
             // IDs only. No host scan, kubeconfig access, Git invocation, or legacy name inference.
             let tasks = ctx.db.query("SELECT id,title,status,owner,assigned FROM tasks WHERE repo_id=?1 AND status NOT IN ('done','cancelled') ORDER BY updated_at DESC,id LIMIT 21", [&id])?;
             let agents = ctx.db.query("SELECT id,name,state,role FROM agents WHERE repo_id=?1 ORDER BY CASE state WHEN 'waiting' THEN 0 WHEN 'failed' THEN 1 ELSE 2 END,last_active_at DESC,id LIMIT 21", [&id])?;
@@ -801,7 +801,7 @@ fn dispatch(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, String> 
             let id = arg_str(&args, "id")?;
             let lock = repo_lock(&id);
             let _q = lock.lock().map_err(|e| e.to_string())?;
-            let r = repo(ctx, &id).ok_or("Unknown repository")?;
+            let r = repo(ctx, &id).ok_or_else(|| crate::ctx::not_found("Unknown repository"))?;
             for key in ["default_branch", "integration_branch"] {
                 if let Some(v) = args.get(key) {
                     if !v.is_null() || key == "default_branch" {
@@ -822,7 +822,7 @@ fn dispatch(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, String> 
             Ok(repo(ctx, &id).unwrap())
         }
         "branches" => {
-            let r = repo(ctx, &arg_str(&args, "repo_id")?).ok_or("Unknown repository")?;
+            let r = repo(ctx, &arg_str(&args, "repo_id")?).ok_or_else(|| crate::ctx::not_found("Unknown repository"))?;
             let s = git(
                 &repo_dir(&r)?,
                 &[
@@ -894,7 +894,7 @@ fn dispatch(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, String> 
             let row = if let Some(id) = args["worktree_id"].as_str() {
                 worktree(ctx, id)?
             } else {
-                repo(ctx, &arg_str(&args, "repo_id")?).ok_or("Unknown repository")?
+                repo(ctx, &arg_str(&args, "repo_id")?).ok_or_else(|| crate::ctx::not_found("Unknown repository"))?
             };
             let limit = args["limit"]
                 .as_u64()
@@ -1002,7 +1002,7 @@ fn path_status(path: &Path, target: &str) -> Value {
 
 /// Discover all worktrees of `repo_id` (main checkout + Philium-managed + pre-existing external git worktrees).
 pub fn discover_worktrees(ctx: &Ctx, repo_id: &str) -> Result<Vec<Value>, String> {
-    let r = ctx.db.query("SELECT * FROM repos WHERE id=?1", [repo_id])?.into_iter().next().ok_or("Unknown repository")?;
+    let r = ctx.db.query("SELECT * FROM repos WHERE id=?1", [repo_id])?.into_iter().next().ok_or_else(|| crate::ctx::not_found("Unknown repository"))?;
     let repo_path = repo_dir(&r)?;
     let target = r["integration_branch"]
         .as_str()
@@ -1208,7 +1208,7 @@ fn parse_branches_with_ab(out: &str, target: &str) -> Vec<Value> {
 
 /// Complete local + remote + GitHub landscape for a repository.
 pub fn repo_landscape(ctx: &Ctx, repo_id: &str, include_prs: bool) -> Result<Value, String> {
-    let r = ctx.db.query("SELECT * FROM repos WHERE id=?1", [repo_id])?.into_iter().next().ok_or("Unknown repository")?;
+    let r = ctx.db.query("SELECT * FROM repos WHERE id=?1", [repo_id])?.into_iter().next().ok_or_else(|| crate::ctx::not_found("Unknown repository"))?;
     let p = repo_dir(&r)?;
     let target = r["integration_branch"]
         .as_str()
