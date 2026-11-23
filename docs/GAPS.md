@@ -36,7 +36,7 @@ these it needs:
 
 | ID  | Area  | Gap                                               | Status   |
 |-----|-------|---------------------------------------------------|----------|
-| A1  | Agent | Undo and checkpoints for file edits               | [Partly true](gaps/A1.md) |
+| A1  | Agent | Undo and checkpoints for file edits               | [Partly true](gaps/A1.md) (Philium proxy + undo UI done, HAL routes open) |
 | A2  | Agent | Todo/plan tool and plan mode                      | [Partly true](gaps/A2.md) |
 | A3  | Agent | User-configurable tool hooks                      | [Verified](gaps/A3.md) (user lifecycle hooks) |
 | A4  | Agent | Prompt caching on every request path              | [Partly true](gaps/A4.md) |

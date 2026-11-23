@@ -24,6 +24,7 @@
 //!   permission {id, request_id, decision: approve|deny, scope?}
 //!   set_model {id, model}
 //!   set_effort {id, effort} / get_effort {id}  -> reasoning effort (default|low|medium|high|...), persisted
+//!   checkpoints {id} / checkpoint_preview|checkpoint_restore {id, turn, paths?} -> HAL turn undo (A1)
 //!   diff {id}                                 -> git diff of the agent's workspace
 //!   names {}                                  -> suggested free names
 //! events: `agents:changed` {id}, `agents:events` {id, events:[...]} (batched ~10 Hz)
@@ -1721,6 +1722,25 @@ fn reserve_local_kind(ctx: &Ctx, aid: &str, name: &str, meta: Value) -> Result<S
     Ok(rid)
 }
 
+/// HAL request for a checkpoint rpc (A1). Paths are optional workspace-relative filters.
+pub(crate) fn checkpoint_request(session: &str, method: &str, args: &Value) -> Result<(reqwest::Method, String, Option<Value>), String> {
+    if method == "checkpoints" {
+        return Ok((reqwest::Method::GET, format!("/sessions/{session}/checkpoints"), None));
+    }
+    let turn = args["turn"].as_str().filter(|t| !t.is_empty() && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')).ok_or("missing or invalid `turn`")?;
+    let action = if method == "checkpoint_preview" { "preview" } else { "restore" };
+    let paths: Vec<&str> = args["paths"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+    if paths.iter().any(|p| p.starts_with('/') || p.split('/').any(|c| c == "..")) {
+        return Err("Paths must stay inside the workspace".into());
+    }
+    let body = if paths.is_empty() { json!({}) } else { json!({ "paths": paths }) };
+    Ok((reqwest::Method::POST, format!("/sessions/{session}/checkpoints/{turn}/{action}"), Some(body)))
+}
+
+pub(crate) fn hal_unsupported(err: &str) -> bool {
+    err.starts_with("HAL 404") || err.starts_with("HAL 405")
+}
+
 pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, String> {
     if crate::pilot::active() && matches!(method,"kind_create" | "kind_delete") {
         return Err("Host cluster changes are disabled in the side-by-side pilot".into());
@@ -2116,6 +2136,15 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
             ctx.emit("agents:changed", json!({ "id": id, "effort": next_eff }));
             Ok(json!(r))
         }
+        // A1: turn checkpoints live in HAL. Older HAL answers 404, shown as unavailable.
+        "checkpoints" | "checkpoint_preview" | "checkpoint_restore" => {
+            let r = rt(&id()?)?;
+            let (m, path, body) = checkpoint_request(&r.session, method, &args)?;
+            match r.hal.call(m, &path, body).await {
+                Err(e) if hal_unsupported(&e) => Ok(json!({ "available": false, "reason": "Checkpoints are not available in this HAL version yet." })),
+                other => other,
+            }
+        }
         "diff" => {
             let id = id()?;
             let wt = ctx.db.query("SELECT id FROM worktrees WHERE agent_id=?1 AND state='active' LIMIT 1", [&id])?;
@@ -2288,6 +2317,18 @@ async fn remove_one(ctx: &Arc<Ctx>, id: &str, force: bool) -> Result<Value, Stri
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn checkpoint_requests_map_to_hal_routes() {
+        let (m, p, _) = checkpoint_request("s1", "checkpoints", &json!({})).unwrap();
+        assert_eq!((m, p.as_str()), (reqwest::Method::GET, "/sessions/s1/checkpoints"));
+        let (_, p, b) = checkpoint_request("s1", "checkpoint_restore", &json!({"turn":"t-9","paths":["a/b.rs"]})).unwrap();
+        assert_eq!(p, "/sessions/s1/checkpoints/t-9/restore");
+        assert_eq!(b.unwrap()["paths"][0], "a/b.rs");
+        assert!(checkpoint_request("s1", "checkpoint_preview", &json!({"turn":"../x"})).is_err());
+        assert!(checkpoint_request("s1", "checkpoint_preview", &json!({"turn":"t","paths":["../etc"]})).is_err());
+        assert!(hal_unsupported("HAL 404 Not Found: x") && !hal_unsupported("HAL 409 Conflict: x"));
+    }
+
     #[test]
     fn checklist_parses_markdown_boxes() {
         let l = super::parse_checklist("Plan:\n- [x] read code\n* [ ] write UI\n  2. [X] build\n- plain\n- [ ]   \n");

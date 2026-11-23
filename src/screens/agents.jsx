@@ -151,6 +151,37 @@ function Impact(props) {
   );
 }
 
+function Checkpoints(props) {
+  const [cps, { refetch }] = createResource(() => props.id, (id) => rpc("agents.checkpoints", { id }).catch(() => null));
+  const [note, setNote] = createSignal("");
+  const list = () => (Array.isArray(cps()) ? cps() : cps()?.checkpoints) || [];
+  const undo = async (turn) => {
+    setNote("");
+    try {
+      const p = await rpc("agents.checkpoint_preview", { id: props.id, turn });
+      if ((p?.conflicts || []).length) return setNote(`Not restored. These files changed since that turn: ${p.conflicts.join(", ")}`);
+      if (!confirm(`Restore ${(p?.paths || []).length} file(s) to how they were before this turn?`)) return;
+      await rpc("agents.checkpoint_restore", { id: props.id, turn });
+      setNote("Restored.");
+      refetch();
+      props.onRestored?.();
+    } catch (e) { setNote(String(e)); }
+  };
+  return (
+    <Show when={cps()}>
+      <Show when={cps().available !== false} fallback={<p class="small dim">{cps().reason}</p>}>
+        <For each={list()}>{(c) => (
+          <div class="row small">
+            <span class="grow">Turn {c.turn} · {(c.paths || []).length} file(s){c.available === false ? " · no longer available" : ""}</span>
+            <Button size="sm" variant="ghost" disabled={c.available === false} onClick={() => undo(c.turn)}>Undo turn</Button>
+          </div>
+        )}</For>
+        <Show when={note()}><p class="small">{note()}</p></Show>
+      </Show>
+    </Show>
+  );
+}
+
 function Changes(props) {
   const [diff, { refetch }] = createResource(() => props.id, (id) => rpc("agents.diff", { id }).catch((e) => ({ error: String(e) })));
   const a = () => props.agent;
@@ -172,6 +203,7 @@ function Changes(props) {
         <Button size="sm" onClick={refetch}><Icon name="refresh" size={12} /> Refresh</Button>
       </div>
       <Impact id={props.id} />
+      <Checkpoints id={props.id} onRestored={refetch} />
       <Show when={diff()?.error}><div class="err small">{diff().error}</div></Show>
       <Show when={diff() && !diff().error && !(diff().patch || diff().stat)}><Empty title="No changes yet" /></Show>
       <Show when={(diff()?.untracked || []).length}><p class="small" aria-label="New files not added yet">{diff().untracked.length} new file(s) not added yet: {diff().untracked.slice(0, 12).join(", ")}{diff().untracked.length > 12 ? " …" : ""}</p></Show>
