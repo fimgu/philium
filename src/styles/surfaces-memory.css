@@ -365,3 +365,8 @@
   border-radius: var(--radius);
   background: var(--bg-sunken);
 }
+
+.mem-dream { display: flex; flex-direction: column; gap: 4px; }
+.mem-dream-changes > summary { cursor: pointer; display: flex; align-items: center; gap: 8px; padding: 2px 10px; }
+.mem-dream-line { display: flex; align-items: center; gap: 10px; padding: 2px 10px; }
+.mem-dream-line.undone .grow { text-decoration: line-through; opacity: 0.6; }

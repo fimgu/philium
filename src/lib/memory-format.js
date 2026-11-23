@@ -85,3 +85,28 @@ export function modelsSummary(st) {
   if (failed) return { state: "failed", text: `Failed: ${shortErr(failed.error)}`, action: "Retry", downloading: false };
   return { state: "missing", text: "Not downloaded", action: "Download", downloading: false };
 }
+
+const DREAM_VERBS = { confirm: "Confirmed", correct: "Corrected", merge: "Merged", retire: "Retired", demote: "Demoted", promote: "Promoted", new: "Added", propose: "Proposed", flag: "Flagged" };
+
+/** One header line for the Memory screen's dreaming row. */
+export function dreamSummary(st, now = Date.now()) {
+  if (!st) return { text: "", canRun: false };
+  if (st.running) return { text: "Dreaming…", canRun: false };
+  if (!st.enabled) return { text: "Dreaming off", canRun: false };
+  const last = st.last_dreamed_at ? `Last dreamed ${relTime(st.last_dreamed_at, now)}` : "Not dreamed yet";
+  const budget = Number(st.daily_tokens || 0);
+  const over = budget > 0 && Number(st.used_today || 0) >= budget;
+  return { text: over ? `${last} · daily budget used` : last, canRun: !over };
+}
+
+/** Normalize dream_actions rows for the Changes list: newest run, one line each. */
+export function dreamChanges(actions) {
+  return (actions || []).map((a) => ({
+    id: a.id,
+    verb: DREAM_VERBS[a.kind] || a.kind,
+    text: a.summary || "",
+    reason: a.reason || "",
+    undone: !!a.undone_at,
+    undoable: !a.undone_at && a.kind !== "flag" && a.kind !== "confirm",
+  }));
+}

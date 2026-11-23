@@ -43,6 +43,31 @@ function LocalModelsRow() {
   );
 }
 
+function DreamingRow() {
+  const [cfg, setCfg] = createSignal(null);
+  const load = () => rpc("library.dream_config_get", {}, { local: true }).then(setCfg).catch(() => null);
+  async function save(patch) {
+    try { setCfg(await rpc("library.dream_config_set", patch, { local: true })); }
+    catch (e) { toast(String(e), "danger"); load(); }
+  }
+  onMount(load);
+  return (
+    <div class="ws-row">
+      <div class="col" style={{ gap: "2px" }}>
+        <strong style={{ "font-size": "12px" }}>Dreaming</strong>
+        <span class="xs faint">When a repo is idle, re-read recent sessions to fix, merge and re-rank its memories.</span>
+      </div>
+      <div class="ws-actions">
+        <Show when={cfg()}>
+          <Input type="number" min="0" step="10000" style={{ width: "96px" }} title="Daily token budget per repo" value={String(cfg().daily_tokens)} onChange={(e) => save({ daily_tokens: Math.max(0, parseInt(e.currentTarget.value, 10) || 0) })} />
+          <span class="xs faint">tokens/day</span>
+          <Toggle on={!!cfg().enabled} label="" onChange={(v) => save({ enabled: v })} />
+        </Show>
+      </div>
+    </div>
+  );
+}
+
 function StrictSandboxSection(props) {
   const [sbStatus, setSbStatus] = createSignal(null);
   const [allowInput, setAllowInput] = createSignal("");
@@ -463,6 +488,7 @@ function MemoryEmbeddingsSection(props) {
             Optional embeddings and cross-encoder reranking for Memory retrieval. Remote providers route via Philium&apos;s gateway; direct endpoints must be localhost/loopback.
           </p>
           <LocalModelsRow />
+          <DreamingRow />
           <Show when={memErr()}>
             <div class="ws-alert" role="alert">{memErr()}</div>
           </Show>

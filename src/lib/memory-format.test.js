@@ -31,3 +31,25 @@ test("modelsSummary states", () => {
   assert.equal(modelsSummary({ embed: r("missing"), rerank: r("missing") }).action, "Download");
   assert.equal(categoryLabel("gotcha"), "Gotcha");
 });
+
+test("dreamSummary reads SQLite UTC timestamps and budget", async () => {
+  const { dreamSummary } = await import("./memory-format.js");
+  const now = Date.parse("2026-11-23T12:00:00Z");
+  assert.equal(dreamSummary(null).text, "");
+  assert.equal(dreamSummary({ enabled: true, last_dreamed_at: "2026-11-23 10:00:00", daily_tokens: 50000, used_today: 10 }, now).text, "Last dreamed 2h ago");
+  assert.equal(dreamSummary({ enabled: true, daily_tokens: 100, used_today: 100 }, now).text, "Not dreamed yet · daily budget used");
+  assert.equal(dreamSummary({ enabled: true, daily_tokens: 100, used_today: 100 }, now).canRun, false);
+  assert.equal(dreamSummary({ enabled: false }).text, "Dreaming off");
+  assert.equal(dreamSummary({ enabled: true, running: true }).canRun, false);
+});
+
+test("dreamChanges labels actions and undo eligibility", async () => {
+  const { dreamChanges } = await import("./memory-format.js");
+  const c = dreamChanges([
+    { id: 1, kind: "correct", summary: "Corrected X", reason: "r" },
+    { id: 2, kind: "flag", summary: "Flagged Y" },
+    { id: 3, kind: "merge", summary: "Merged", undone_at: "2026-11-23 10:00:00" },
+  ]);
+  assert.deepEqual(c.map((x) => [x.verb, x.undoable, x.undone]), [["Corrected", true, false], ["Flagged", false, false], ["Merged", false, true]]);
+  assert.deepEqual(dreamChanges(null), []);
+});

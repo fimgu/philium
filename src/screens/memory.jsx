@@ -5,7 +5,7 @@ import { Icon } from "../ui/icons.jsx";
 import { rpc } from "../lib/rpc.js";
 import { useStore, activeRepoId } from "../lib/store.js";
 import { useVisibleEvent } from "../lib/visibility.js";
-import { MEMORY_CATEGORIES, categoryLabel, memoryTitle, fileChips, relTime, modelsSummary } from "../lib/memory-format.js";
+import { MEMORY_CATEGORIES, categoryLabel, memoryTitle, fileChips, relTime, modelsSummary, dreamSummary, dreamChanges } from "../lib/memory-format.js";
 import "../styles/surfaces-memory.css";
 
 const TIER = {
@@ -126,6 +126,27 @@ export default function Memory() {
   const [memConfig, { refetch: refetchConfig }] = createResource(() =>
     rpc("library.config_get", {}, { local: true }).catch(() => null),
   );
+  const [dream, { refetch: refetchDream }] = createResource(
+    () => activeRepoId() || null,
+    (repo_id) => rpc("library.dream_status", { repo_id }, { local: true }).catch(() => null),
+  );
+  const dreamInfo = createMemo(() => dreamSummary(dream()));
+  const changes = createMemo(() => dreamChanges(dream()?.actions));
+  const [dreamBusy, setDreamBusy] = createSignal(false);
+  async function dreamNow() {
+    setDreamBusy(true);
+    try {
+      const r = await rpc("library.dream_now", { repo_id: activeRepoId() }, { local: true });
+      if (r?.skipped) toast(r.reason || "Skipped");
+      else toast(`Dream: ${r?.applied?.length || 0} changes`, "good");
+    } catch (e) { toast(String(e), "danger"); }
+    finally { setDreamBusy(false); refreshAll(); }
+  }
+  async function undoDream(args) {
+    try { await rpc("library.dream_undo", args, { local: true }); toast("Undone"); }
+    catch (e) { toast(String(e), "danger"); }
+    finally { refreshAll(); }
+  }
   const [rankerStatus, { refetch: refetchRanker }] = createResource(() =>
     rpc("library.ranker_status", {}, { local: true }).catch(() => null),
   );
@@ -217,6 +238,7 @@ export default function Memory() {
     refetchIntentions();
     refetchVersions();
     refetchRanker();
+    refetchDream();
   };
 
   useVisibleEvent("library", refreshAll, { debounceMs: 250 });
@@ -587,6 +609,34 @@ export default function Memory() {
             </span>
             <Show when={modelsInfo().action}>
               <Button size="sm" variant="ghost" busy={modelsBusy()} onClick={downloadModels}>{modelsInfo().action}</Button>
+            </Show>
+          </div>
+        </Show>
+
+        <Show when={activeRepoId() && dream()}>
+          <div class="mem-dream">
+            <div class="mem-models-banner">
+              <span class="grow dim">{dreamInfo().text}</span>
+              <Button size="sm" variant="ghost" busy={dreamBusy() || dream()?.running} disabled={!dreamInfo().canRun} onClick={dreamNow}>Dream now</Button>
+            </div>
+            <Show when={changes().length}>
+              <details class="mem-dream-changes">
+                <summary class="xs dim">Changes ({changes().length})
+                  <Show when={changes().some((c) => c.undoable)}>
+                    <Button size="sm" variant="ghost" onClick={(e) => { e.preventDefault(); undoDream({ run_id: dream()?.last_run?.id }); }}>Undo all</Button>
+                  </Show>
+                </summary>
+                <For each={changes()}>
+                  {(c) => (
+                    <div class="mem-dream-line" classList={{ undone: c.undone }} title={c.reason}>
+                      <span class="grow xs">{c.text || c.verb}</span>
+                      <Show when={c.undoable} fallback={<span class="xs faint">{c.undone ? "Undone" : ""}</span>}>
+                        <Button size="sm" variant="ghost" onClick={() => undoDream({ action_id: c.id })}>Undo</Button>
+                      </Show>
+                    </div>
+                  )}
+                </For>
+              </details>
             </Show>
           </div>
         </Show>
