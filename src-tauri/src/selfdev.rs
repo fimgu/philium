@@ -41,6 +41,9 @@ pub fn init(ctx: &Arc<Ctx>) -> Result<(), String> {
            created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)",
         [],
     )?;
+    // Remembered so Retry and Discard still find the worktree after its agent is gone.
+    let _ = ctx.db.exec("ALTER TABLE selfdev ADD COLUMN worktree_id TEXT", []);
+    reconcile_all(ctx);
     Ok(())
 }
 
@@ -147,8 +150,87 @@ fn term_exit(ctx: &Ctx, id: &str) -> Option<i64> {
         .and_then(|r| r["exit_code"].as_i64())
 }
 
-fn status(ctx: &Arc<Ctx>, id: &str) -> Result<Value, String> {
+/// States in which an improvement still depends on its agent.
+const LIVE: [&str; 2] = ["building", "preview"];
+
+/// Why an in-progress improvement can no longer progress, if it cannot: its agent was removed,
+/// stopped or failed, or its board task was cancelled. `None` while the agent is alive.
+fn lost_reason(ctx: &Ctx, r: &Value) -> Option<(&'static str, String)> {
+    if !LIVE.contains(&r["state"].as_str().unwrap_or_default()) {
+        return None;
+    }
+    let agent = r["agent_id"].as_str().unwrap_or_default();
+    let a = ctx.db.query("SELECT name, state FROM agents WHERE id=?1", [agent]).ok()?.into_iter().next();
+    let task = r["task_id"].as_str().and_then(|t| ctx.db.query("SELECT status FROM tasks WHERE id=?1", [t]).ok()?.into_iter().next());
+    if task.as_ref().is_some_and(|t| t["status"] == "cancelled") {
+        return Some(("stopped", "Its board task was cancelled.".into()));
+    }
+    let Some(a) = a else {
+        return Some(("failed", "Its agent was removed before it finished. Retry starts a new agent in the same worktree, if it is still there.".into()));
+    };
+    let name = a["name"].as_str().unwrap_or("The agent");
+    match a["state"].as_str() {
+        // The agent stops after building; only a 'building' improvement needs it working.
+        Some("failed") if r["state"] == "building" => {
+            let err = ctx.db.kv_get(&format!("agent_error.{agent}")).filter(|e| !e.is_empty());
+            Some(("failed", format!("{name} failed: {}", err.unwrap_or_else(|| "no error recorded".into()))))
+        }
+        Some("stopped") if r["state"] == "building" => {
+            let err = ctx.db.kv_get(&format!("agent_error.{agent}")).filter(|e| !e.is_empty());
+            Some(("stopped", match err {
+                Some(e) => format!("{name} stopped: {e}"),
+                None => format!("{name} was stopped before it finished."),
+            }))
+        }
+        _ => None,
+    }
+}
+
+/// Bring an improvement's state in line with its agent and task. Never leaves 'building'
+/// pointing at an agent that is gone.
+fn reconcile(ctx: &Ctx, id: &str) -> Result<Value, String> {
     let mut r = row(ctx, id)?;
+    if r["worktree_id"].is_null() {
+        let agent = r["agent_id"].as_str().unwrap_or_default();
+        if let Some(w) = ctx.db.query("SELECT id FROM worktrees WHERE agent_id=?1 AND state='active' LIMIT 1", [agent])?.first().and_then(|w| w["id"].as_str().map(str::to_string)) {
+            ctx.db.exec("UPDATE selfdev SET worktree_id=?2 WHERE id=?1", [id, &w])?;
+            r["worktree_id"] = json!(w);
+        }
+    }
+    if let Some((state, reason)) = lost_reason(ctx, &r) {
+        ctx.db.exec(
+            "UPDATE selfdev SET state=?2, error=?3, updated_at=?4 WHERE id=?1",
+            rusqlite::params![id, state, reason, now()],
+        )?;
+        ctx.log_event("selfdev_lost", r["agent_id"].as_str(), &json!({ "id": id, "state": state, "reason": reason }));
+        ctx.emit("selfdev:changed", json!({ "id": id }));
+        return row(ctx, id);
+    }
+    Ok(r)
+}
+
+/// Reconcile every in-progress improvement. Cheap: a few indexed lookups per row.
+pub fn reconcile_all(ctx: &Ctx) {
+    let Ok(rows) = ctx.db.query("SELECT id FROM selfdev WHERE state IN ('building','preview')", []) else { return };
+    for r in rows {
+        if let Some(id) = r["id"].as_str() {
+            let _ = reconcile(ctx, id);
+        }
+    }
+}
+
+/// The improvement's worktree, whether its agent still exists or not.
+fn own_worktree(ctx: &Ctx, r: &Value) -> Option<Value> {
+    let agent = r["agent_id"].as_str().unwrap_or_default();
+    if let Some(w) = ctx.db.query("SELECT * FROM worktrees WHERE agent_id=?1 AND state='active' LIMIT 1", [agent]).ok()?.into_iter().next() {
+        return Some(w);
+    }
+    let id = r["worktree_id"].as_str()?;
+    ctx.db.query("SELECT * FROM worktrees WHERE id=?1 AND state='active'", [id]).ok()?.into_iter().next()
+}
+
+fn status(ctx: &Arc<Ctx>, id: &str) -> Result<Value, String> {
+    let mut r = reconcile(ctx, id)?;
     let agent = r["agent_id"].as_str().unwrap_or_default().to_string();
     if let Some(t) = r["preview_terminal"].as_str() {
         let terminal = ctx.db.query("SELECT state, exit_code FROM terminals WHERE id=?1", [t])?;
@@ -184,6 +266,8 @@ fn status(ctx: &Arc<Ctx>, id: &str) -> Result<Value, String> {
         r["agent_name"] = a["name"].clone();
         r["agent_state"] = a["state"].clone();
     }
+    r["agent_exists"] = json!(r["agent_name"].is_string());
+    r["worktree"] = json!(own_worktree(ctx, &r).and_then(|w| w["path"].as_str().map(str::to_string)));
     Ok(r)
 }
 
@@ -206,30 +290,8 @@ fn request(ctx: &Arc<Ctx>, text: &str, context: &Value, model: Option<String>) -
         None,
     )?;
     let task_id = task["id"].as_str().unwrap_or_default().to_string();
-    let brief = format!(
-        "You are improving Philium itself, in a worktree of its source. Never touch the running app or its data.\n\
-         Request from the user:\n{text}\n\nWhere they were: {context}\n\n\
-         Rules:\n\
-         - Keep the existing design system (src/ui/kit.jsx, src/styles). No em dashes in UI text.\n\
-         - Run `cargo test <module>::` for modules you touched in src-tauri and `npx vite build` before you say you are done.\n\
-         - Commit on your branch with a plain message. No Co-authored-by or agent signatures.\n\
-         - Do not change gateway, guard, providers, sandbox, mcp or agents code unless the request needs it; if you do, explain why in your final message.\n\
-         - When finished, say DONE and summarize what changed and how to try it."
-    );
-    let agent = crate::agents::spawn(
-        ctx,
-        crate::agents::SpawnReq {
-            name: None,
-            role: Some("selfdev".into()),
-            model,
-            repo_id: Some(repo_id),
-            task_id: Some(task_id.clone()),
-            brief: Some(brief),
-            parent_id: None,
-            strict: false,
-            base: None,
-        },
-    )?;
+    let brief = improver_brief(&text, &context);
+    let agent = spawn_improver(ctx, &repo_id, &task_id, brief, model, None)?;
     let id = new_id();
     ctx.db.exec(
         "INSERT INTO selfdev(id,request,context,agent_id,task_id,state,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,'building',?6,?6)",
@@ -238,6 +300,79 @@ fn request(ctx: &Arc<Ctx>, text: &str, context: &Value, model: Option<String>) -
     ctx.log_event("selfdev_requested", agent["id"].as_str(), &json!({ "id": id, "title": title }));
     ctx.emit("selfdev:changed", json!({ "id": id }));
     Ok(json!({ "id": id, "agent": agent }))
+}
+
+/// Big requests take hours: the improver is a full agent with no turn or time limit of its own,
+/// and the board renews its task lease for as long as its runtime is alive.
+fn improver_brief(text: &str, context: &str) -> String {
+    format!(
+        "You are improving Philium itself, in a worktree of its source. Never touch the running app or its data.\n\
+         Request from the user:\n{text}\n\nWhere they were: {context}\n\n\
+         Rules:\n\
+         - Large requests are expected. Plan first (write a checklist), then work through it for as long as it takes. Commit after each working step so nothing is lost if you are stopped.\n\
+         - Keep the existing design system (src/ui/kit.jsx, src/styles). No em dashes in UI text.\n\
+         - Run `cargo test <module>::` for modules you touched in src-tauri and `npx vite build` before you say you are done.\n\
+         - Commit on your branch with a plain message. No Co-authored-by or agent signatures.\n\
+         - Do not change gateway, guard, providers, sandbox, mcp or agents code unless the request needs it; if you do, explain why in your final message.\n\
+         - When finished, say DONE and summarize what changed and how to try it."
+    )
+}
+
+/// Same role as a normal working agent, so it gets the same prompt, limits and lease renewal.
+fn spawn_improver(ctx: &Arc<Ctx>, repo_id: &str, task_id: &str, brief: String, model: Option<String>, worktree_id: Option<&str>) -> Result<Value, String> {
+    crate::agents::spawn_adopting(
+        ctx,
+        crate::agents::SpawnReq {
+            name: None,
+            role: Some("worker".into()),
+            model,
+            repo_id: Some(repo_id.to_string()),
+            task_id: Some(task_id.to_string()),
+            brief: Some(brief),
+            parent_id: None,
+            strict: false,
+            base: None,
+        },
+        worktree_id,
+    )
+}
+
+/// A new agent on the same request, continuing in the same worktree when it still exists.
+fn retry(ctx: &Arc<Ctx>, id: &str) -> Result<Value, String> {
+    let r = reconcile(ctx, id)?;
+    if r["state"] == "building" {
+        return Err("This improvement is still being built.".into());
+    }
+    if matches!(r["state"].as_str(), Some("accepted")) {
+        return Err("This improvement was already accepted.".into());
+    }
+    let (repo_id, _) = source_repo(ctx)?;
+    let wt = own_worktree(ctx, &r);
+    // The old agent hands over its worktree; stop it first so two agents never share one.
+    if let Some(old) = r["agent_id"].as_str().filter(|a| crate::agents::get_row(ctx, a).is_some()) {
+        crate::agents::stop(ctx, old, "stopped");
+    }
+    let request = r["request"].as_str().unwrap_or_default().to_string();
+    let context = r["context"].as_str().unwrap_or_default().to_string();
+    let title: String = request.lines().next().unwrap_or("Improve Philium").chars().take(80).collect();
+    let task_open = r["task_id"].as_str().and_then(|t| ctx.db.query("SELECT status FROM tasks WHERE id=?1", [t]).ok()?.into_iter().next()).is_some_and(|t| !matches!(t["status"].as_str(), Some("done" | "cancelled")));
+    let task_id = match r["task_id"].as_str().filter(|_| task_open) {
+        Some(t) => t.to_string(),
+        None => crate::board::create(ctx, "you", &format!("Philium: {title}"), &format!("{request}\n\nWhere: {context}"), Some("normal"), Some(&repo_id), &[], None)?["id"].as_str().unwrap_or_default().to_string(),
+    };
+    let mut brief = improver_brief(&request, &context);
+    if wt.is_some() {
+        brief.push_str("\n\nAn earlier agent started on this in your worktree and was stopped. Check `git log` and `git status` first and continue from there.");
+    }
+    let wt_id = wt.as_ref().and_then(|w| w["id"].as_str().map(str::to_string));
+    let agent = spawn_improver(ctx, &repo_id, &task_id, brief, None, wt_id.as_deref())?;
+    ctx.db.exec(
+        "UPDATE selfdev SET agent_id=?2, task_id=?3, state='building', error=NULL, test_terminal=NULL, tested_commit=NULL, worktree_id=COALESCE(?4, worktree_id), updated_at=?5 WHERE id=?1",
+        rusqlite::params![id, agent["id"].as_str(), task_id, wt_id, now()],
+    )?;
+    ctx.log_event("selfdev_retried", agent["id"].as_str(), &json!({ "id": id, "same_worktree": wt_id.is_some() }));
+    ctx.emit("selfdev:changed", json!({ "id": id }));
+    Ok(json!({ "id": id, "agent": agent, "same_worktree": wt_id.is_some() }))
 }
 
 fn test(ctx: &Arc<Ctx>, id: &str) -> Result<Value, String> {
@@ -511,7 +646,50 @@ fn rollback(ctx: &Arc<Ctx>, id: &str) -> Result<Value, String> {
 pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, String> {
     match method {
         "source" => Ok(json!(source_dir(ctx).map(|p| p.to_string_lossy().to_string()))),
-        "list" => Ok(json!(ctx.db.query("SELECT * FROM selfdev ORDER BY created_at DESC LIMIT 200", [])?)),
+        "list" => {
+            let c = ctx.clone();
+            tokio::task::spawn_blocking(move || reconcile_all(&c)).await.map_err(|e| e.to_string())?;
+            Ok(json!(ctx.db.query("SELECT * FROM selfdev ORDER BY created_at DESC LIMIT 200", [])?))
+        }
+        "retry" => {
+            let c = ctx.clone();
+            let id = arg_str(&args, "id")?;
+            tokio::task::spawn_blocking(move || retry(&c, &id)).await.map_err(|e| e.to_string())?
+        }
+        // Throw the change away: its agent (if any), worktree and branch.
+        "discard" => {
+            let id = arg_str(&args, "id")?;
+            let r = reconcile(ctx, &id)?;
+            if r["state"] == "accepted" {
+                return Err("Accepted changes are rolled back, not discarded.".into());
+            }
+            let force = args["force"].as_bool().unwrap_or(false);
+            let wt = own_worktree(ctx, &r);
+            if let Some(a) = r["agent_id"].as_str().filter(|a| crate::agents::get_row(ctx, a).is_some()) {
+                let rep = crate::agents::call(ctx, "remove", json!({ "id": a, "force": force })).await?;
+                if rep["needs_confirmation"] == true {
+                    return Ok(rep);
+                }
+            }
+            if let Some(w) = wt.and_then(|w| w["id"].as_str().map(str::to_string)) {
+                if ctx.db.query("SELECT id FROM worktrees WHERE id=?1 AND state='active'", [&w])?.first().is_some() {
+                    if !force {
+                        let path = ctx.db.query("SELECT path FROM worktrees WHERE id=?1", [&w])?.first().and_then(|x| x["path"].as_str().map(PathBuf::from));
+                        if path.is_some_and(|p| p.is_dir() && git(&p, &["status", "--porcelain"]).map(|s| !s.is_empty()).unwrap_or(false)) {
+                            return Ok(json!({ "needs_confirmation": true, "reason": "The worktree has uncommitted changes." }));
+                        }
+                    }
+                    let c = ctx.clone();
+                    tokio::task::spawn_blocking(move || crate::workspace::remove_worktree(&c, &w, true)).await.map_err(|e| e.to_string())??;
+                }
+            }
+            if let Some(t) = r["task_id"].as_str() {
+                let _ = ctx.db.exec("UPDATE tasks SET status='cancelled', updated_at=?2 WHERE id=?1 AND status NOT IN ('done','cancelled')", rusqlite::params![t, now()]);
+            }
+            ctx.db.exec("UPDATE selfdev SET state='discarded', updated_at=?2 WHERE id=?1", rusqlite::params![id, now()])?;
+            ctx.emit("selfdev:changed", json!({ "id": id }));
+            Ok(json!({ "discarded": true }))
+        }
         "get" => {
             let c = ctx.clone();
             let id = arg_str(&args, "id")?;
@@ -872,5 +1050,53 @@ mod tests {
             .unwrap();
         set(&ctx, "x", "state", "preview").unwrap();
         assert_eq!(row(&ctx, "x").unwrap()["state"], "preview");
+    }
+
+    // The 'lion' run: its agent was removed while building, and the improvement stayed
+    // 'building' for 11 hours. Now the first look at it marks it failed with a reason.
+    #[test]
+    fn deleted_agent_fails_the_improvement() {
+        let ctx = Ctx::test();
+        init(&ctx).unwrap();
+        ctx.db.exec("INSERT INTO agents(id,name,model_ref,state,created_at,last_active_at) VALUES('a','lion','p/m','running',0,0)", []).unwrap();
+        ctx.db.exec("INSERT INTO selfdev(id,request,agent_id,state,created_at,updated_at) VALUES('s','r','a','building',0,0)", []).unwrap();
+        assert_eq!(reconcile(&ctx, "s").unwrap()["state"], "building", "a working agent keeps it building");
+        ctx.db.exec("DELETE FROM agents WHERE id='a'", []).unwrap();
+        let r = reconcile(&ctx, "s").unwrap();
+        assert_eq!(r["state"], "failed");
+        assert!(r["error"].as_str().unwrap().contains("removed"), "{r}");
+        // Startup and list sweeps do the same for rows nobody opened.
+        ctx.db.exec("INSERT INTO selfdev(id,request,agent_id,state,created_at,updated_at) VALUES('t','r','gone','building',0,0)", []).unwrap();
+        reconcile_all(&ctx);
+        assert_eq!(row(&ctx, "t").unwrap()["state"], "failed");
+    }
+
+    #[test]
+    fn stopped_agent_or_cancelled_task_stops_the_improvement() {
+        let ctx = Ctx::test();
+        init(&ctx).unwrap();
+        ctx.db.exec("INSERT INTO agents(id,name,model_ref,state,created_at,last_active_at) VALUES('a','lion','p/m','stopped',0,0)", []).unwrap();
+        ctx.db.exec("INSERT INTO selfdev(id,request,agent_id,state,created_at,updated_at) VALUES('s','r','a','building',0,0)", []).unwrap();
+        let r = reconcile(&ctx, "s").unwrap();
+        assert_eq!(r["state"], "stopped");
+        assert!(r["error"].as_str().unwrap().contains("lion"), "{r}");
+        // A stopped agent after building is normal: preview keeps working.
+        ctx.db.exec("INSERT INTO selfdev(id,request,agent_id,state,created_at,updated_at) VALUES('p','r','a','preview',0,0)", []).unwrap();
+        assert_eq!(reconcile(&ctx, "p").unwrap()["state"], "preview");
+        ctx.db.exec("INSERT INTO tasks(id,title,status,created_at,updated_at) VALUES('tk','Philium: x','claimed',0,0)", []).unwrap();
+        let tid = "tk";
+        ctx.db.exec("UPDATE agents SET state='idle' WHERE id='a'", []).unwrap();
+        ctx.db.exec("INSERT INTO selfdev(id,request,agent_id,task_id,state,created_at,updated_at) VALUES('c','r','a',?1,'building',0,0)", [tid]).unwrap();
+        assert_eq!(reconcile(&ctx, "c").unwrap()["state"], "building");
+        ctx.db.exec("UPDATE tasks SET status='cancelled' WHERE id=?1", [tid]).unwrap();
+        let r = reconcile(&ctx, "c").unwrap();
+        assert_eq!(r["state"], "stopped");
+        assert!(r["error"].as_str().unwrap().contains("cancelled"));
+    }
+
+    #[test]
+    fn improver_is_a_normal_long_running_worker() {
+        let b = improver_brief("big", "{}");
+        assert!(b.contains("Plan first") && b.contains("as long as it takes"));
     }
 }

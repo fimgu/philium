@@ -5,6 +5,7 @@ import { Modal, Button, Field, Input, TextArea, Badge, Dot, Empty, confirm, toas
 import { Icon } from "../ui/icons.jsx";
 import { rpc, useEvent, fmt } from "../lib/rpc.js";
 import { improveOpen, closeImprove, go } from "../lib/nav.js";
+import { AgentProgressPanel } from "./agent-progress.jsx";
 
 const STATES = {
   building: ["busy", "Agent is building"],
@@ -12,6 +13,9 @@ const STATES = {
   accepted: ["live", "Accepted"],
   rejected: ["", "Rejected"],
   rolled_back: ["warn", "Rolled back"],
+  failed: ["warn", "Failed"],
+  stopped: ["warn", "Stopped"],
+  discarded: ["", "Discarded"],
 };
 
 export function previewLabel(status) {
@@ -50,7 +54,23 @@ function Item(props) {
       await rpc("selfdev.reject", { id: props.id, force: true });
     }
   });
+  const retry = () => run("retry", async () => {
+    const r = await rpc("selfdev.retry", { id: props.id });
+    toast(r?.same_worktree ? "A new agent continues in the same worktree" : "A new agent is working on it", "secure");
+  });
+  const discard = () => run("discard", async () => {
+    if (!(await confirm("Discard this change?", "Removes its agent, worktree and branch. Nothing is merged.", { danger: true, ok: "Discard" }))) return;
+    let r = await rpc("selfdev.discard", { id: props.id });
+    if (r?.needs_confirmation) {
+      if (!(await confirm("Unsaved work", `${r.reason ?? "The worktree has uncommitted changes."} Delete it anyway?`, { danger: true, ok: "Delete anyway" }))) return;
+      await rpc("selfdev.discard", { id: props.id, force: true });
+    }
+  });
   const s = () => st() ?? {};
+  // Live progress of the agent building it, refreshed with the agent list.
+  const [agent, { refetch: refetchAgent }] = createResource(() => s().agent_exists && s().agent_id, (id) => rpc("agents.get", { id }).catch(() => null));
+  useEvent("agents:changed", (p) => { if (!p?.id || p.id === s().agent_id) { refetch(); refetchAgent(); } });
+  const openAgent = () => { closeImprove(); go("agents", { id: s().agent_id }); };
   const [showDiff, setShowDiff] = createSignal(false);
   const [diff, { refetch: refetchDiff }] = createResource(() => showDiff() && props.id, (id) => rpc("selfdev.diff", { id }).catch((e) => ({ error: String(e) })));
   useEvent("selfdev:changed", (p) => p.id === props.id && showDiff() && refetchDiff());
@@ -68,14 +88,25 @@ function Item(props) {
       <div class="row small dim" style={{ "flex-wrap": "wrap", gap: "6px" }}>
         <span>{s().state === "preview" ? previewLabel(s().preview) : STATES[s().state]?.[1] ?? s().state}</span>
         <Show when={s().state === "preview" && s().preview_exit_code != null}><span>exit {s().preview_exit_code}</span></Show>
-        <Show when={s().agent_name}><span>by <a href="#" onClick={(e) => { e.preventDefault(); closeImprove(); go("agents", { id: s().agent_id }); }}>{s().agent_name}</a> ({s().agent_state})</span></Show>
+        <Show when={s().agent_name}><span>by <a href="#" onClick={(e) => { e.preventDefault(); openAgent(); }}>{s().agent_name}</a> ({s().agent_state})</span></Show>
         <Show when={s().files?.length}><Badge>{s().files.length} files</Badge></Show>
         <Show when={s().tests}><Badge tone={testTone()}>tests {s().tests}</Badge></Show>
         <Show when={s().tests === "passed" && s().tested_commit !== s().head}><Badge tone="strict">changed since tests</Badge></Show>
         <Show when={s().flagged?.length}><Badge tone="strict" title={s().flagged.join("\n")}><Icon name="shield" size={11} /> security files</Badge></Show>
         <Show when={s().build}><Badge tone={s().build === "passed" ? "secure" : s().build === "failed" ? "danger" : ""}>build {s().build}</Badge></Show>
       </div>
+      <Show when={s().error && ["failed", "stopped"].includes(s().state)}>
+        <div class="small danger">{s().error}</div>
+      </Show>
+      <Show when={s().state === "building" && agent()}><AgentProgressPanel agent={agent()} /></Show>
       <div class="row" style={{ "flex-wrap": "wrap" }}>
+        <Show when={s().agent_exists}><Button size="sm" variant="ghost" onClick={openAgent}>Open agent</Button></Show>
+        <Show when={["failed", "stopped", "rejected"].includes(s().state)}>
+          <Button size="sm" variant="primary" busy={busy() === "retry"} title={s().worktree ? "New agent, same request, same worktree" : "New agent, same request"} onClick={retry}>Retry</Button>
+        </Show>
+        <Show when={!["accepted", "rolled_back", "discarded"].includes(s().state)}>
+          <Button size="sm" variant="ghost" busy={busy() === "discard"} title="Remove its worktree and branch" onClick={discard}>Discard</Button>
+        </Show>
         <Show when={["building", "preview"].includes(s().state)}>
           <Button size="sm" busy={busy() === "test"} onClick={() => run("test", () => rpc("selfdev.test", { id: props.id }))}>Run tests</Button>
           <Button size="sm" busy={busy() === "preview"} disabled={s().preview === "active"} onClick={() => run("preview", () => rpc("selfdev.preview", { id: props.id }))}>Open preview</Button>

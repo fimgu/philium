@@ -493,6 +493,12 @@ pub struct SpawnReq {
 
 /// Create the agent row and start provisioning in the background.
 pub fn spawn(ctx: &Arc<Ctx>, req: SpawnReq) -> Result<Value, String> {
+    spawn_adopting(ctx, req, None)
+}
+
+/// Like `spawn`, but the new agent continues in an existing worktree (by id) instead of a
+/// fresh one. The worktree is handed over before provisioning starts, so there is no race.
+pub fn spawn_adopting(ctx: &Arc<Ctx>, req: SpawnReq, worktree_id: Option<&str>) -> Result<Value, String> {
     if let Some(parent) = req.parent_id.as_deref() {
         helper_scope(ctx, parent, req.repo_id.as_deref(), req.model.as_deref(), req.task_id.as_deref(), req.strict)?;
     }
@@ -555,6 +561,13 @@ pub fn spawn(ctx: &Arc<Ctx>, req: SpawnReq) -> Result<Value, String> {
         if let Err(e) = crate::board::assign(ctx, &by, task, &id) {
             let _ = ctx.db.exec("DELETE FROM agents WHERE id=?1", [&id]);
             return Err(e);
+        }
+    }
+    if let Some(w) = worktree_id {
+        let path = ctx.db.query("SELECT path FROM worktrees WHERE id=?1 AND state='active'", [w])?.first().and_then(|r| r["path"].as_str().map(str::to_string));
+        if let Some(path) = path {
+            ctx.db.exec("UPDATE worktrees SET agent_id=?2 WHERE id=?1", rusqlite::params![w, id])?;
+            ctx.db.exec("UPDATE resources SET agent_id=?2 WHERE kind='worktree' AND handle=?1 AND state!='released'", rusqlite::params![path, id])?;
         }
     }
     ctx.log_event("agent_spawned", Some(&id), &json!({ "name": name, "model": model_ref, "strict": strict }));
@@ -1859,6 +1872,11 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
                 }
                 _ => return Err("scope is finished, tree or selected".into()),
             };
+            // An Improve Philium run still in progress is not swept up by a bulk clean-up: its
+            // worktree is the user's pending change. Discard it from Improve, or pick it explicitly.
+            if args["scope"] != "selected" {
+                picked.retain(|id| ctx.db.query("SELECT id FROM selfdev WHERE agent_id=?1 AND state IN ('building','preview')", [id.as_str()]).map(|r| r.is_empty()).unwrap_or(true));
+            }
             if let (Some(only), false) = (args["ids"].as_array(), args["scope"] == "selected") {
                 let only: Vec<&str> = only.iter().filter_map(Value::as_str).collect();
                 picked.retain(|id| only.contains(&id.as_str()));
