@@ -26,6 +26,7 @@ mod release_members;
 mod release_composition;
 mod release_command;
 mod review_run;
+mod pr_review;
 mod pr_github;
 mod release_document;
 mod release_stage;
@@ -197,6 +198,7 @@ async fn rpc_inner(app: &App, method: String, args: Option<Value>) -> Result<Val
         "checks" => checks::call(&ctx, m, args).await,
         "release_intake" if m=="verify_url" => release_verify::run(&ctx,&ctx::arg_str(&args,"repo_id")?,&ctx::arg_str(&args,"url")?).await,
         "release_intake" => release_intake::call(&ctx,m,args).await,
+        "pr_review" => pr_review::call(&ctx, m, args).await,
         "environments" => environments::call(m, args).await,
         #[cfg(unix)] "managed" => managed::call(&ctx, m, args).await,
         "browser" => browser::call(&ctx, m, args).await,
@@ -418,7 +420,7 @@ fn main() {
             });
 
             // Module init. Failures are logged, never fatal: the UI shows them.
-            let inits: [(&str, fn(&Arc<Ctx>) -> Result<(), String>); 19] = [
+            let inits: [(&str, fn(&Arc<Ctx>) -> Result<(), String>); 20] = [
                 ("workday", workday::init),
                 ("access", access::init),
                 ("library", library::init),
@@ -438,6 +440,7 @@ fn main() {
                 ("stats", stats::init),
                 ("reaper", reaper::init),
                 ("selfdev", selfdev::init),
+                ("pr_review", pr_review::init),
                 // Last: check runs Philium quit during continue, with every module ready.
                 ("pipeline", pipeline::app::init),
             ];

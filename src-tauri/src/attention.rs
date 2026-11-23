@@ -16,6 +16,7 @@ pub fn needing_you(ctx: &Ctx) -> i64 {
     n("SELECT count(*) AS n FROM agents WHERE state IN ('waiting','failed')")
         + n("SELECT count(*) AS n FROM kv k JOIN agents a ON k.k='agent.retry.'||a.id WHERE k.v LIKE '%\"gave_up\":true%' AND a.state='idle'")
         + crate::access::pending_count(ctx)
+        + crate::pr_review::needing_you(ctx)
 }
 
 /// Bring the badge up to date; bounce once when more agents need the person than before.

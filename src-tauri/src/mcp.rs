@@ -269,6 +269,15 @@ pub fn tool_list() -> Vec<Value> {
         t("review_report", "Release review, orchestrator: save the final report in Markdown, verdict first.", json!({ "markdown": s }), &["markdown"]),
         t("checks_propose", "Propose release checks for your checkout: facts that must be true in every release. Send {contracts:{schema?,cases:[...]}} once, when asked to draft checks. A person reviews and confirms them in Review; nothing counts before that.",
           json!({ "contracts": { "type": "object" } }), &["contracts"]),
+        t("pr_checklist", "Hands-off PR review: the checklist for the review belonging to your lead tree, plus the current verdict.", json!({}), &[]),
+        t("pr_checklist_add", "Hands-off PR review, orchestrator only: add risk items you found reading the diff. 1 to 40, riskiest first, each {title, detail, path?, line?}.",
+          json!({ "items": { "type": "array", "items": { "type": "object" } } }), &["items"]),
+        t("pr_item_result", "Hands-off PR review: record the outcome of one checklist item. For a non-human item (risk/claim/ci), status is pass, fail or blocked. For a human comment/review/thread, status is addressed, not_addressed, outdated, not_applicable or blocked. evidence is the exact commands you ran and what they showed, on which commit; for blocked, exactly what credential, environment or decision is needed. A fail needs severity (0-5: 0/1 block) and origin (introduced, pre_existing, or unverified, found by running the same check on base and head).",
+          json!({ "id": s, "status": s, "evidence": s, "severity": { "type": "integer", "minimum": 0, "maximum": 5 }, "origin": { "type": "string", "enum": ["introduced", "pre_existing", "unverified"] }, "path": s, "line": i }), &["id", "status", "evidence"]),
+        t("pr_item_verify", "Hands-off PR review: independently verify an item awaiting verification (verify=needed). You must not be the agent that recorded it. verdict is confirm (keeps the result; your severity/origin win if sent) or refute (reopens the item for redo with your evidence).",
+          json!({ "id": s, "verdict": { "type": "string", "enum": ["confirm", "refute"] }, "evidence": s, "severity": i, "origin": s }), &["id", "verdict", "evidence"]),
+        t("pr_review_submit", "Hands-off PR review, orchestrator only: submit the finished review. Philium recomputes the verdict and, unless pending or needs_you, posts Approve/Request changes (or Comment on your own PR) to GitHub itself.",
+          json!({ "summary": s }), &["summary"]),
         t("session_search", "Search same-repository Philium sessions and bounded raw turn/tool-output excerpts bound to this repository ID. Cross-repo and imported histories are excluded.",
           json!({ "q": s, "repo_only": b, "limit": i }), &[]),
         t("resource_register", "Declare something you created outside Philium's tools (container, process, temp dir) so it is cleaned up with you. Use kind_cluster for managed clusters.",
@@ -659,6 +668,11 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
         "review_plan" => crate::review_run::plan(ctx, &me, &row, &a["items"]),
         "review_result" => crate::review_run::result(ctx, agent, &me, &row, arg(&a, "task_id")?, arg(&a, "result")?, a["severity"].as_i64().or_else(|| a["severity"].as_str().and_then(|s| s.trim().trim_start_matches(['P', 'p']).parse().ok())), a["origin"].as_str(), arg(&a, "evidence")?),
         "review_report" => crate::review_run::report(ctx, &me, &row, arg(&a, "markdown")?),
+        "pr_checklist" => crate::pr_review::pr_checklist(ctx, &row),
+        "pr_checklist_add" => crate::pr_review::pr_checklist_add(ctx, &row, &a["items"]),
+        "pr_item_result" => crate::pr_review::pr_item_result(ctx, &row, arg(&a, "id")?, arg(&a, "status")?, arg(&a, "evidence")?, a["severity"].as_i64(), a["origin"].as_str(), a["path"].as_str(), a["line"].as_i64()),
+        "pr_item_verify" => crate::pr_review::pr_item_verify(ctx, &row, arg(&a, "id")?, arg(&a, "verdict")?, arg(&a, "evidence")?, a["severity"].as_i64(), a["origin"].as_str()),
+        "pr_review_submit" => crate::pr_review::pr_review_submit(ctx, &row, arg(&a, "summary")?).await,
         "checks_propose" => {
             let repo = row["repo_id"].as_str().filter(|id| !id.is_empty()).ok_or("Release checks belong to a registered checkout")?;
             crate::release_sql::propose(ctx, repo, &me, &a["contracts"])
