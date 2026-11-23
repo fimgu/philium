@@ -133,12 +133,8 @@ export default function Review() {
           {id => (
             <>
               <PrReviewer repo={id} />
-              <Show when={key()} keyed fallback={
-                <Show when={!branchAgents().length}>
-                  <Empty title="No PR remote or agent branch" body="Add a GitHub remote for PR links, or start an agent to review its branch." />
-                </Show>
-              }>
-                {k => <ReleaseIntake repo={JSON.parse(k)[0]} releaseTools={Boolean(releaseTools())} />}
+              <Show when={!key() && !branchAgents().length}>
+                <Empty title="No PR remote or agent branch" body="Add a GitHub remote for PR links, or start an agent to review its branch." />
               </Show>
               <Show when={branchAgents().length}>
                 <BranchReviewBar repoId={id} agents={branchAgents()} />
@@ -146,6 +142,10 @@ export default function Review() {
               <Show when={releaseTools()}>
                 <details aria-label="More review tools">
                   <summary>Release engineering tools</summary>
+                  {/* The release gate review. Everyday PR review is the PR reviewer above. */}
+                  <Show when={key()} keyed>
+                    {k => <ReleaseIntake repo={JSON.parse(k)[0]} releaseTools />}
+                  </Show>
                   <LocalChecks repo={id} />
                   <Show when={key()} keyed>
                     {_identity => <Reader workspace={workspace} slug={slug()} />}
