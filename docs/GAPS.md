@@ -15,6 +15,11 @@ Each item gets a grounding brief in `docs/gaps/<ID>.md` (see "Grounding brief
 format" at the bottom). This file stays the index. Update the status column
 when a brief lands.
 
+All 22 items have source-grounding briefs as of 2026-11-23. Statuses below
+describe the audit claims, not implementation completion or runtime acceptance.
+Linked briefs carry the qualifications and remaining gaps; the original audit
+descriptions below are retained as context and may be overstated.
+
 ## Where fixes can live
 
 Agent-core items mostly sit in HAL (`~/Developer/hal`). `docs/LANES.md` treats
@@ -31,28 +36,28 @@ these it needs:
 
 | ID  | Area  | Gap                                               | Status   |
 |-----|-------|---------------------------------------------------|----------|
-| A1  | Agent | Undo and checkpoints for file edits               | Claimed  |
-| A2  | Agent | Todo/plan tool and plan mode                      | Claimed  |
-| A3  | Agent | User-configurable tool hooks                      | Claimed (needs check) |
-| A4  | Agent | Prompt caching on every request path              | Partly true (see below) |
-| A5  | Agent | Dollar cost tracking and price table              | Claimed  |
-| A6  | Agent | Web fetch/search and LSP/code-index tools         | Claimed  |
-| A7  | Agent | Compaction controls                               | Claimed  |
-| U1  | UX    | Per-hunk accept, reject, stage, revert            | Claimed  |
-| U2  | UX    | @-mentions in the composer                        | Claimed (needs check) |
-| U3  | UX    | Git and PR flow in the UI                         | Claimed  |
-| U4  | UX    | Mid-run steering                                  | Claimed  |
-| U5  | UX    | Cross-session search, fork from any message       | Claimed  |
-| U6  | UX    | Native OS notifications                           | Claimed  |
-| U7  | UX    | Shortcuts, onboarding, multi-agent grid           | Claimed  |
-| I1  | Infra | CI                                                | Verified (no `.github` in Philium or HAL) |
-| I2  | Infra | Code signing and notarization                     | Verified (`signingIdentity: "-"`) |
-| I3  | Infra | Auto-update                                       | Claimed  |
-| I4  | Infra | Secrets in plaintext JSON                         | Claimed  |
-| I5  | Infra | Sandbox is macOS-only but Linux/Windows ship      | Verified (`sandbox.rs:109`) |
-| I6  | Infra | Network blocking for sandboxed agents             | Claimed (unverified behavior) |
-| I7  | Infra | Logging and diagnostics                           | Claimed  |
-| I8  | Infra | Frontend tests, lint, version mismatch            | Verified (0.1.0 vs 1.0.0) |
+| A1  | Agent | Undo and checkpoints for file edits               | [Partly true](gaps/A1.md) |
+| A2  | Agent | Todo/plan tool and plan mode                      | [Partly true](gaps/A2.md) |
+| A3  | Agent | User-configurable tool hooks                      | [Verified](gaps/A3.md) (user lifecycle hooks) |
+| A4  | Agent | Prompt caching on every request path              | [Partly true](gaps/A4.md) |
+| A5  | Agent | Dollar cost tracking and price table              | [Partly true](gaps/A5.md) |
+| A6  | Agent | Web fetch/search and LSP/code-index tools         | [Partly true](gaps/A6.md) |
+| A7  | Agent | Compaction controls                               | [Partly true](gaps/A7.md) |
+| U1  | UX    | Per-hunk accept, reject, stage, revert            | [Verified](gaps/U1.md) |
+| U2  | UX    | @-mentions in the composer                        | [Verified](gaps/U2.md) |
+| U3  | UX    | Git and PR flow in the UI                         | [Verified](gaps/U3.md) (action flow, not read-side integration) |
+| U4  | UX    | Mid-run steering                                  | [Verified](gaps/U4.md) |
+| U5  | UX    | Cross-session search, fork from any message       | [Partly true](gaps/U5.md) |
+| U6  | UX    | Native OS notifications                           | [Verified](gaps/U6.md) |
+| U7  | UX    | Shortcuts, onboarding, multi-agent grid           | [Partly true](gaps/U7.md) (substantially stale) |
+| I1  | Infra | CI                                                | [Verified](gaps/I1.md) (missing checked-in CI only) |
+| I2  | Infra | Code signing and notarization                     | [Verified for release signing, partly true as phrased](gaps/I2.md) |
+| I3  | Infra | Auto-update                                       | [Verified](gaps/I3.md) (Philium, not standalone HAL) |
+| I4  | Infra | Secrets in plaintext JSON                         | [Verified](gaps/I4.md) (existing file-permission containment) |
+| I5  | Infra | Sandbox is macOS-only but Linux/Windows ship      | [Partly true](gaps/I5.md) (safe refusal exists, shipping unverified) |
+| I6  | Infra | Network blocking for sandboxed agents             | [Partly true](gaps/I6.md) (integration proof remains) |
+| I7  | Infra | Logging and diagnostics                           | [Partly true](gaps/I7.md) |
+| I8  | Infra | Frontend tests, lint, version mismatch            | [Partly true](gaps/I8.md) |
 
 ## Agent core (mostly HAL)
 
