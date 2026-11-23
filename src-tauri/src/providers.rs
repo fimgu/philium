@@ -386,6 +386,12 @@ pub struct Discovered {
     pub context_window: Option<i64>,
     pub price_in: Option<f64>,
     pub price_out: Option<f64>,
+    /// USD per 1M cached-input tokens, when the source reports it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub price_cache_read: Option<f64>,
+    /// Prices came from the runtime price catalog, not the provider's own `/models`.
+    #[serde(skip)]
+    pub from_catalog: bool,
     /// Explicitly advertised reasoning effort options from upstream `/models`
     /// (`supported_reasoning_levels`, `reasoning_efforts`, `supported_parameters`, etc.).
     /// `None` means upstream `/models` did not include effort metadata for this model.
@@ -653,6 +659,8 @@ pub fn parse_models_ordered(body: &Value) -> Vec<Discovered> {
                 // OpenRouter reports $/token as strings; store $/1M tokens.
                 price_in: num(m.pointer("/pricing/prompt")).map(|x| x * 1e6),
                 price_out: num(m.pointer("/pricing/completion")).map(|x| x * 1e6),
+                price_cache_read: num(m.pointer("/pricing/input_cache_read")).map(|x| x * 1e6),
+                from_catalog: false,
                 efforts: parse_discovered_efforts(m),
                 id,
             })
@@ -776,13 +784,46 @@ async fn discover_antigravity(ctx: &Arc<Ctx>, client: &reqwest::Client, p: &Prov
         .map(|(id, display, _)| {
             let l = id.to_ascii_lowercase();
             let context_window = Some(if l.starts_with("gemini") { 1_000_000 } else if l.contains("claude") { 200_000 } else { 131_072 });
-            Discovered { id, display, context_window, price_in: None, price_out: None, efforts: Some(vec![]) }
+            Discovered { id, display, context_window, price_in: None, price_out: None, price_cache_read: None, from_catalog: false, efforts: Some(vec![]) }
         })
         .collect();
     if list.is_empty() {
         return Err("Antigravity listed no models for this account".into());
     }
     Ok(list)
+}
+
+/// Live public price catalog (`pins::PRICE_CATALOG_URL`), cached for 6h in memory.
+/// Returns None when unreachable: prices then stay unknown, never zero.
+async fn price_catalog() -> Option<Arc<Vec<Discovered>>> {
+    static CACHE: std::sync::Mutex<Option<(i64, Arc<Vec<Discovered>>)>> = std::sync::Mutex::new(None);
+    if let Some((at, v)) = CACHE.lock().ok()?.as_ref() {
+        if now() - at < 6 * 3600 * 1000 {
+            return Some(v.clone());
+        }
+    }
+    let resp = http_client().get(crate::pins::PRICE_CATALOG_URL).send().await.ok()?;
+    let body: Value = resp.error_for_status().ok()?.json().await.ok()?;
+    let v = Arc::new(parse_models(&body).into_iter().filter(|m| m.price_in.is_some()).collect::<Vec<_>>());
+    if v.is_empty() {
+        return None;
+    }
+    *CACHE.lock().ok()? = Some((now(), v.clone()));
+    Some(v)
+}
+
+/// Fill unpriced models from the catalog by exact model id (catalog ids are
+/// `vendor/model`; only the part after the slash must match exactly).
+pub fn fill_from_catalog(found: &mut [Discovered], cat: &[Discovered]) {
+    for m in found.iter_mut().filter(|m| m.price_in.is_none()) {
+        let hit = cat.iter().find(|c| c.id == m.id || c.id.rsplit_once('/').is_some_and(|(_, tail)| tail == m.id));
+        if let Some(c) = hit {
+            m.price_in = c.price_in;
+            m.price_out = c.price_out;
+            m.price_cache_read = c.price_cache_read;
+            m.from_catalog = true;
+        }
+    }
 }
 
 /// Refresh one provider's models into SQLite. User edits (enabled, prices,
@@ -806,6 +847,12 @@ async fn refresh_models_inner(ctx: &Arc<Ctx>, id: &str, emit: bool) -> Result<(V
             return Err(e);
         }
     };
+    let mut found = found;
+    if !p.kind.is_subscription() && found.iter().any(|m| m.price_in.is_none()) {
+        if let Some(cat) = price_catalog().await {
+            fill_from_catalog(&mut found, &cat);
+        }
+    }
     let prev_order = ctx.db.kv_get(&format!("models_order.{id}"));
     let prev_efforts = ctx.db.kv_get(&format!("models_efforts.{id}"));
     let t = now();
@@ -813,12 +860,17 @@ async fn refresh_models_inner(ctx: &Arc<Ctx>, id: &str, emit: bool) -> Result<(V
         let tx = c.unchecked_transaction()?;
         for m in &found {
             tx.execute(
-                "INSERT INTO models(provider_id,model_id,display,context_window,price_in,price_out,discovered_at)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7)
+                // Fresh runtime prices replace older ones; a manual edit is kept.
+                "INSERT INTO models(provider_id,model_id,display,context_window,price_in,price_out,price_cache_read,price_source,priced_at,discovered_at)
+                 VALUES(?1,?2,?3,?4,?5,?6,?8,CASE WHEN ?5 IS NULL THEN NULL ELSE ?9 END,CASE WHEN ?5 IS NULL THEN NULL ELSE ?7 END,?7)
                  ON CONFLICT(provider_id,model_id) DO UPDATE SET discovered_at=?7,
                    display=COALESCE(display,?3), context_window=COALESCE(context_window,?4),
-                   price_in=COALESCE(price_in,?5), price_out=COALESCE(price_out,?6)",
-                rusqlite::params![id, m.id, m.display, m.context_window, m.price_in, m.price_out, t],
+                   price_in=CASE WHEN price_source='manual' OR ?5 IS NULL THEN price_in ELSE ?5 END,
+                   price_out=CASE WHEN price_source='manual' OR ?6 IS NULL THEN price_out ELSE ?6 END,
+                   price_cache_read=CASE WHEN price_source='manual' OR ?5 IS NULL THEN price_cache_read ELSE ?8 END,
+                   priced_at=CASE WHEN price_source='manual' OR ?5 IS NULL THEN priced_at ELSE ?7 END,
+                   price_source=CASE WHEN price_source='manual' OR ?5 IS NULL THEN price_source ELSE ?9 END",
+                rusqlite::params![id, m.id, m.display, m.context_window, m.price_in, m.price_out, t, m.price_cache_read, if m.from_catalog { "catalog" } else { "live" }],
             )?;
         }
         let del = tx.execute("DELETE FROM models WHERE provider_id=?1 AND discovered_at<?2", rusqlite::params![id, t])?;
@@ -950,6 +1002,10 @@ pub fn migrate_legacy(ctx: &Ctx) {
 }
 
 pub fn init(ctx: &Arc<Ctx>) -> Result<(), String> {
+    // Price provenance: 'live' (provider /models), 'catalog' (runtime catalog) or 'manual'.
+    for ddl in ["price_cache_read REAL", "price_source TEXT", "priced_at INTEGER"] {
+        let _ = ctx.db.exec(&format!("ALTER TABLE models ADD COLUMN {ddl}"), []);
+    }
     migrate_legacy(ctx);
     sync_routes(ctx);
     // Refresh stale model lists in the background (6h TTL) concurrently.
@@ -1125,6 +1181,9 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
                 if !v.is_null() {
                     let sql = format!("UPDATE models SET {col}=?3 WHERE provider_id=?1 AND model_id=?2");
                     ctx.db.exec(&sql, rusqlite::params![pid, mid, v.as_f64()])?;
+                    if col != "context_window" {
+                        ctx.db.exec("UPDATE models SET price_source='manual', priced_at=?3 WHERE provider_id=?1 AND model_id=?2", rusqlite::params![pid, mid, now()])?;
+                    }
                 }
             }
             if let Some(e) = args["enabled"].as_bool() {
@@ -1283,8 +1342,21 @@ mod tests {
     }
 
     #[test]
+    fn catalog_fills_only_unpriced_exact_ids() {
+        let cat = parse_models(&json!({"data": [
+            {"id": "vendor/model-x", "pricing": {"prompt": "0.000002", "completion": "0.00001", "input_cache_read": "0.0000005"}},
+            {"id": "vendor/model-xl", "pricing": {"prompt": "0.000009", "completion": "0.00009"}}]}));
+        let d = |id: &str, p: Option<f64>| Discovered { id: id.into(), display: None, context_window: None, price_in: p, price_out: p, price_cache_read: None, from_catalog: false, efforts: None };
+        let mut v = vec![d("model-x", None), d("model-xl", Some(1.0)), d("model", None)];
+        fill_from_catalog(&mut v, &cat);
+        assert!((v[0].price_in.unwrap() - 2.0).abs() < 1e-9 && (v[0].price_cache_read.unwrap() - 0.5).abs() < 1e-9 && v[0].from_catalog);
+        assert_eq!((v[1].price_in, v[1].from_catalog), (Some(1.0), false));
+        assert_eq!(v[2].price_in, None);
+    }
+
+    #[test]
     fn alias_dedupe() {
-        let d = |id: &str| Discovered { id: id.into(), display: None, context_window: None, price_in: None, price_out: None, efforts: None };
+        let d = |id: &str| Discovered { id: id.into(), display: None, context_window: None, price_in: None, price_out: None, price_cache_read: None, from_catalog: false, efforts: None };
         let mut v = vec![d("opus"), d("claude-opus-5-5"), d("gpt-6"), d("gpt-6")];
         dedupe_aliases(&mut v);
         assert_eq!(v.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["claude-opus-5-5", "gpt-6"]);

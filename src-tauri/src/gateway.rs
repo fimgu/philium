@@ -26,6 +26,7 @@ use tokio::sync::broadcast;
 
 pub(crate) mod gemini;
 pub(crate) mod progress;
+pub(crate) mod quota;
 pub(crate) mod stale;
 pub(crate) mod translate;
 
@@ -134,6 +135,8 @@ pub struct Gateway {
     rejected: Mutex<std::collections::HashSet<String>>,
     /// Antigravity default model learned from this app's last catalog fetch.
     pub antigravity_default: Mutex<Option<String>>,
+    /// Latest usage windows each provider reported in its own response headers.
+    quotas: Mutex<HashMap<String, quota::Usage>>,
 }
 
 type TokenFn = dyn Fn(String, Kind) -> futures_util::future::BoxFuture<'static, Result<crate::oauth::Creds, String>> + Send + Sync;
@@ -210,6 +213,7 @@ impl Gateway {
             signatures: Mutex::new(HashMap::new()),
             rejected: Mutex::new(Default::default()),
             antigravity_default: Mutex::new(None),
+            quotas: Mutex::new(HashMap::new()),
         })
     }
 
@@ -273,6 +277,18 @@ impl Gateway {
         Router::new()
             .route("/p/{provider}/{*rest}", any(proxy))
             .with_state(self.clone())
+    }
+
+    /// Remember the usage windows a provider advertised on its latest response.
+    pub fn note_quota(&self, provider: &str, h: &reqwest::header::HeaderMap) {
+        if let Some(u) = quota::parse(h) {
+            self.quotas.lk().insert(provider.to_string(), u);
+        }
+    }
+
+    /// Live usage per provider, as last reported by each provider itself.
+    pub fn quotas(&self) -> HashMap<String, quota::Usage> {
+        self.quotas.lk().clone()
     }
 
     pub fn recent(&self) -> Vec<Activity> {
@@ -961,6 +977,7 @@ async fn proxy(
     }
     let resp = upstream_resp.expect("response or buffered error");
     let status = resp.status();
+    gw.note_quota(&provider, resp.headers());
     gw.update(id, |r| r.summary.status = Some(status.as_u16()));
     let content_type = resp.headers().get("content-type").cloned();
     let retry_after = resp.headers().get("retry-after").cloned();
@@ -1149,6 +1166,7 @@ async fn antigravity(
             Err(e) => return fail(StatusCode::BAD_GATEWAY, "philium_upstream", format!("upstream unreachable: {e}")),
         };
         let status = resp.status();
+        gw.note_quota(&p.id, resp.headers());
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
             match gemini::fix_for(status.as_u16(), &text) {

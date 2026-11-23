@@ -176,6 +176,7 @@ async fn rpc_inner(app: &App, method: String, args: Option<Value>) -> Result<Val
         "app" => app_call(app, m, args).await,
         "activity" => match m {
             "list" => Ok(json!(ctx.gateway.recent())),
+            "quotas" => Ok(json!(ctx.gateway.quotas())),
             "detail" => Ok(json!(ctx.gateway.detail(args["id"].as_u64().ok_or("id")?))),
             "clear" => {
                 ctx.gateway.clear();

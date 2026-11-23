@@ -40,7 +40,7 @@ these it needs:
 | A2  | Agent | Todo/plan tool and plan mode                      | [Partly true](gaps/A2.md) (plan latch done, UI buttons and HAL checklist tool open) |
 | A3  | Agent | User-configurable tool hooks                      | [Verified](gaps/A3.md) (user lifecycle hooks) |
 | A4  | Agent | Prompt caching on every request path              | [Partly true](gaps/A4.md) |
-| A5  | Agent | Dollar cost tracking and price table              | [Partly true](gaps/A5.md) |
+| A5  | Agent | Dollar cost tracking and price table              | [Partly closed](gaps/A5.md) (runtime price refresh, catalog fallback, cache-read pricing, included vs unknown; cache-write and session attribution open) |
 | A6  | Agent | Web fetch/search and LSP/code-index tools         | [Partly true](gaps/A6.md) |
 | A7  | Agent | Compaction controls                               | [Partly true](gaps/A7.md) (focused /compact done, window provenance open) |
 | U1  | UX    | Per-hunk accept, reject, stage, revert            | [Partly closed](gaps/U1.md) (stage/unstage/revert per hunk and file; accept-as-reviewed decision open) |

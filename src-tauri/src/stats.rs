@@ -11,6 +11,9 @@ pub fn init(ctx: &Arc<Ctx>) -> Result<(), String> {
     ctx.db.exec("CREATE TABLE IF NOT EXISTS stats_seen (session TEXT NOT NULL, activity_id INTEGER NOT NULL, PRIMARY KEY(session,activity_id))",[])?;
     ctx.db.exec("CREATE TABLE IF NOT EXISTS stats_outcomes (request_id INTEGER PRIMARY KEY REFERENCES requests(id) ON DELETE CASCADE, state TEXT NOT NULL)",[])?;
     let _ = ctx.db.exec("ALTER TABLE requests ADD COLUMN repo_id TEXT", []);
+    // 'estimated' (priced), 'included' (subscription) or 'unknown' (no runtime price).
+    let _ = ctx.db.exec("ALTER TABLE requests ADD COLUMN billing TEXT", []);
+    let _ = ctx.db.exec("ALTER TABLE models ADD COLUMN price_cache_read REAL", []);
     ctx.db.exec("CREATE INDEX IF NOT EXISTS requests_repo_ts ON requests(repo_id, ts)", [])?;
     let _ = ctx.db.exec(
         "UPDATE requests SET repo_id = (SELECT a.repo_id FROM agents a WHERE a.name = requests.agent_id OR a.id = requests.agent_id LIMIT 1) WHERE repo_id IS NULL AND agent_id IS NOT NULL",
@@ -26,6 +29,15 @@ pub fn init(ctx: &Arc<Ctx>) -> Result<(), String> {
     )?;
     Ok(())
 }
+/// USD for one request. `input` already includes cached tokens; those are
+/// charged once, at the cache-read rate when the source gave one.
+pub fn cost_usd(input: u64, cached: u64, output: u64, p_in: f64, p_out: f64, p_cache: Option<f64>) -> Option<f64> {
+    let cached = cached.min(input);
+    let fresh = input - cached;
+    let c = fresh as f64 * p_in + cached as f64 * p_cache.unwrap_or(p_in) + output as f64 * p_out;
+    c.is_finite().then_some(c / 1_000_000.0)
+}
+
 pub fn record(ctx: &Arc<Ctx>, a: &Activity) {
     if !matches!(a.state, "done" | "error" | "blocked") {
         return;
@@ -39,8 +51,11 @@ pub fn record(ctx: &Arc<Ctx>, a: &Activity) {
     let result=ctx.db.with(|c|{
         let tx=c.unchecked_transaction()?;
         if tx.execute("INSERT OR IGNORE INTO stats_seen(session,activity_id) VALUES(?1,?2)",rusqlite::params![session,a.id as i64])?==0{return Ok(())}
-        let prices=tx.query_row("SELECT price_in,price_out FROM models WHERE provider_id=?1 AND model_id=?2",rusqlite::params![a.provider,model],|r|Ok((r.get::<_,Option<f64>>(0)?,r.get::<_,Option<f64>>(1)?))).ok();
-        let cost=prices.and_then(|(i,o)|Some((a.input_tokens.unwrap_or(0) as f64*i?+a.output_tokens.unwrap_or(0) as f64*o?)/1_000_000.0));
+        let kind=tx.query_row("SELECT kind FROM providers WHERE id=?1",rusqlite::params![a.provider],|r|r.get::<_,String>(0)).ok();
+        let included=kind.as_deref().and_then(|k|crate::providers::Kind::parse(k).ok()).is_some_and(|k|k.is_subscription());
+        let prices=if included{None}else{tx.query_row("SELECT price_in,price_out,price_cache_read FROM models WHERE provider_id=?1 AND model_id=?2",rusqlite::params![a.provider,model],|r|Ok((r.get::<_,Option<f64>>(0)?,r.get::<_,Option<f64>>(1)?,r.get::<_,Option<f64>>(2)?))).ok()};
+        let cost=prices.and_then(|(i,o,c)|cost_usd(a.input_tokens.unwrap_or(0),a.cached_tokens.unwrap_or(0),a.output_tokens.unwrap_or(0),i?,o?,c));
+        let billing=if included{"included"}else if cost.is_some(){"estimated"}else{"unknown"};
         let repo_id: Option<String> = match a.agent.as_deref() {
             Some(ag) if !ag.is_empty() => tx
                 .query_row(
@@ -52,7 +67,7 @@ pub fn record(ctx: &Arc<Ctx>, a: &Activity) {
                 .flatten(),
             _ => None,
         };
-        tx.execute("INSERT INTO requests(ts,agent_id,provider_id,model,status,tokens_in,tokens_out,tokens_cached,ttft_ms,duration_ms,tps,cost,guard_action,repo_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",rusqlite::params![a.started_ms as i64,a.agent,a.provider,model,a.status,a.input_tokens.unwrap_or(0).min(i64::MAX as u64) as i64,a.output_tokens.unwrap_or(0).min(i64::MAX as u64) as i64,a.cached_tokens.unwrap_or(0).min(i64::MAX as u64) as i64,a.ttft_ms.map(|n|n.min(i64::MAX as u64) as i64),a.duration_ms.map(|n|n.min(i64::MAX as u64) as i64),tps,cost,a.guard,repo_id])?;
+        tx.execute("INSERT INTO requests(ts,agent_id,provider_id,model,status,tokens_in,tokens_out,tokens_cached,ttft_ms,duration_ms,tps,cost,guard_action,repo_id,billing) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",rusqlite::params![a.started_ms as i64,a.agent,a.provider,model,a.status,a.input_tokens.unwrap_or(0).min(i64::MAX as u64) as i64,a.output_tokens.unwrap_or(0).min(i64::MAX as u64) as i64,a.cached_tokens.unwrap_or(0).min(i64::MAX as u64) as i64,a.ttft_ms.map(|n|n.min(i64::MAX as u64) as i64),a.duration_ms.map(|n|n.min(i64::MAX as u64) as i64),tps,cost,a.guard,repo_id,billing])?;
         tx.execute("INSERT INTO stats_outcomes(request_id,state) VALUES(?1,?2)",rusqlite::params![tx.last_insert_rowid(),a.state])?;
         tx.commit()
     });
@@ -137,7 +152,7 @@ const AGG_COLS: &str = "
     GROUP_CONCAT(r.ttft_ms),
     AVG(r.tps),
     COALESCE(SUM(r.cost), 0.0),
-    COALESCE(SUM(CASE WHEN r.cost IS NULL THEN 1 ELSE 0 END), 0),
+    COALESCE(SUM(CASE WHEN r.cost IS NULL AND COALESCE(r.billing, '') != 'included' THEN 1 ELSE 0 END), 0),
     COALESCE(SUM(CASE WHEN COALESCE(r.status, 0) >= 400 OR o.state IN ('error', 'blocked') THEN 1 ELSE 0 END), 0)
 ";
 
@@ -415,6 +430,31 @@ mod tests {
             error: None,
         }
     }
+    #[tokio::test]
+    async fn cache_charged_once_and_subscriptions_are_included_not_unknown() {
+        // 1000 input of which 400 cached, 100 output; $2 in, $0.5 cached, $10 out per 1M.
+        let c = cost_usd(1000, 400, 100, 2.0, 10.0, Some(0.5)).unwrap();
+        assert!((c - (600.0 * 2.0 + 400.0 * 0.5 + 100.0 * 10.0) / 1e6).abs() < 1e-15);
+        assert!((cost_usd(10, 50, 0, 2.0, 10.0, None).unwrap() - 20.0 / 1e6).abs() < 1e-15);
+
+        let c = Ctx::test();
+        init(&c).unwrap();
+        c.db.exec("INSERT INTO providers(id,name,kind,created_at) VALUES('s','S','claude_oauth',0)", []).unwrap();
+        c.db.exec("INSERT INTO models(provider_id,model_id,price_in,price_out,discovered_at) VALUES('s','m',2,10,0)", []).unwrap();
+        let mut a = activity();
+        a.provider = "s".into();
+        record(&c, &a);
+        a.id = 2;
+        a.provider = "nobody".into();
+        record(&c, &a);
+        let rows = c.db.query("SELECT billing, cost FROM requests ORDER BY id", []).unwrap();
+        assert_eq!(rows[0]["billing"], "included");
+        assert!(rows[0]["cost"].is_null());
+        assert_eq!(rows[1]["billing"], "unknown");
+        let s = call(&c, "summary", json!({})).await.unwrap();
+        assert_eq!(s["totals"]["unpriced_requests"], 1);
+    }
+
     #[tokio::test]
     async fn dedup_cost_tps_and_groups() {
         let c = Ctx::test();

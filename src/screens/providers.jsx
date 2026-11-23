@@ -1,9 +1,33 @@
 // Providers: accounts, trust level, guard mode, live model lists.
-import { For, Show, createResource, createSignal, createMemo, createEffect } from "solid-js";
+import { For, Show, createResource, createSignal, createMemo, createEffect, onCleanup } from "solid-js";
 import { Page, Button, Card, Badge, Empty, Field, Input, Select, Toggle, Modal, Shield, toast, confirm } from "../ui/kit.jsx";
 import { Icon } from "../ui/icons.jsx";
 import { rpc, useEvent, fmt } from "../lib/rpc.js";
 import { useStore } from "../lib/store.js";
+import { quotaView } from "../lib/quota.js";
+
+function QuotaMeter(props) {
+  const v = () => quotaView(props.usage);
+  return (
+    <Show when={v().rows.length}>
+      <div class="row small dim" style={{ gap: "10px", "flex-wrap": "wrap" }}>
+        <For each={v().rows}>
+          {(r) => (
+            <span title={r.title} class="row" style={{ gap: "4px" }}>
+              <span class="mono">{r.label}</span>
+              <span style={{ width: "48px", height: "4px", background: "var(--line, #8883)", "border-radius": "2px", overflow: "hidden", display: "inline-block" }}>
+                <span style={{ width: `${r.pct}%`, height: "100%", display: "block", background: r.near ? "var(--warn, #c90)" : "var(--accent, #6a8)" }} />
+              </span>
+              <span>{r.pct}%</span>
+              <Show when={r.reset}><span class="faint">{r.reset}</span></Show>
+            </span>
+          )}
+        </For>
+      </div>
+      <Show when={v().warning}><div class="small" style={{ color: "var(--warn, #c90)" }}>{v().warning}</div></Show>
+    </Show>
+  );
+}
 
 const KINDS = [
   { value: "openai_chat", label: "OpenAI-compatible (chat/completions)", url: "https://api.example.com/v1" },
@@ -338,6 +362,9 @@ export default function Providers() {
   const [form, setForm] = createSignal(null);
   const [open, setOpen] = createSignal(null);
   const [busy, setBusy] = createSignal(null);
+  const [quotas, { refetch: refetchQuotas }] = createResource(() => rpc("activity.quotas").catch(() => ({})));
+  const quotaTimer = setInterval(refetchQuotas, 30000);
+  onCleanup(() => clearInterval(quotaTimer));
 
   const syncStore = () =>
     Promise.all([
@@ -458,6 +485,7 @@ export default function Providers() {
                   <Button size="sm" variant="danger" busy={busy() === p.id} onClick={() => remove(p)}>Remove</Button>
                 </div>
               </div>
+              <QuotaMeter usage={quotas()?.[p.id]} />
               <div class="row small dim">
                 <span>{kindLabel(p.kind)}</span>
                 <Show when={p.base_url && !isSub(p.kind)}><span class="mono faint">· {p.base_url}</span></Show>

@@ -61,6 +61,11 @@ pub const ALLOWLIST: &[(&str, &str)] = &[
     ("gemini-3.1-pro-high", "Catalog alias the backend rejects by name; remapped to gemini-pro-agent. Live catalog supplies all other IDs."),
 ];
 
+/// Public live price catalog, used only for models whose own provider's `/models`
+/// returns no prices. Fetched at runtime (6h cache); never a compiled price table.
+/// Kept current by its host; if it moves, prices show as unknown, never as zero.
+pub const PRICE_CATALOG_URL: &str = "https://openrouter.ai/api/v1/models";
+
 const CONSTANTS: &[&str] = &[
     CLAUDE_CLI_FLOOR, ANTHROPIC_VERSION, CLAUDE_BETA, CLAUDE_PROFILE_BETA, GOOGLE_USER_AGENT,
     GEMINI_CLI_VERSION, GEMINI_FALLBACK_MODEL, CHATGPT_CLIENT_VERSION, ALPINE_IMAGE, GEMINI_API_CLIENT, MCP_PROTOCOL_VERSION,
