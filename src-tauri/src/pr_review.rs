@@ -47,7 +47,8 @@ pub fn init(ctx: &Arc<Ctx>) -> Result<(), String> {
         params![now()],
     )?;
     let weak = Arc::downgrade(ctx);
-    tokio::spawn(async move {
+    // init runs on the main thread outside any Tokio context, so use Tauri's runtime.
+    tauri::async_runtime::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(120)).await;
             let Some(ctx) = weak.upgrade() else { break };
