@@ -98,6 +98,9 @@ const stub = (fx, setName) => {
         throw fixtures.__fail[window.__n % fixtures.__fail.length];
       }
       if (cmd === "rpc") {
+        if (a.method === "providers.oauth_start" && a.args.kind === "chatgpt_oauth") {
+          return { id: "chatgpt-test", user_code: "TEST-CODE", verify_url: "https://example.com/verify" };
+        }
         if(a.method==='managed.list' && a.args.task_id==='t2' && a.args.repo_id==='r1')return {tasks:[{id:'t2',agent:'a1',owner:'lion',title:'Refactor worktree cleanup'}],jobs:[{id:'board-job',task:'t2',agent:'a1',cid:'c'.repeat(64),state:'active',expires:Date.now()+60000}]};
         if(a.method==='managed.logs' && a.args.id==='board-job') {if(a.args.task_id!=='t2'||a.args.repo_id!=='r1')throw Error('Unscoped task logs');return {text:'board task fixture output'};}
         if(a.method==='managed.list') return {tasks:[{id:'t1',agent:'a1',owner:'lion',title:'Offline check'}],jobs:window.__test.managed?[{...window.__test.managed}]:[]};
@@ -306,6 +309,25 @@ for (const setName of sets) {
         for (const error of await checkCodeGraph(page, shot)) problems.push(`${w} code review: ${error}`);
       }
       if (s === "providers") {
+        if (setName === "empty") {
+          try {
+            await page.evaluate(() => {
+              Object.defineProperty(navigator, "clipboard", { value: { writeText: async (text) => {
+                if (window.__test.denyCopy) throw new Error("Clipboard denied");
+                window.__test.copiedCode = text;
+              } } });
+            });
+            if (!await clickText(page, "button", "Sign in with ChatGPT")) throw new Error("ChatGPT sign-in is missing");
+            await page.waitForFunction(() => document.body.innerText.includes("TEST-CODE"), { timeout: 4000 });
+            if (!await clickText(page, "button", "Copy code")) throw new Error("Copy button is missing");
+            await page.waitForFunction(() => window.__test.copiedCode === "TEST-CODE" && document.body.innerText.includes("Code copied"), { timeout: 4000 });
+            await page.evaluate(() => { window.__test.denyCopy = true; });
+            await clickText(page, "button", "Copy code");
+            await page.waitForFunction(() => document.body.innerText.includes("Could not copy the code"), { timeout: 4000 });
+            await clickText(page, "button", "Cancel");
+            await page.waitForFunction(() => !document.body.innerText.includes("TEST-CODE"), { timeout: 4000 });
+          } catch (e) { problems.push(`${w} ChatGPT code copy: ${e.message}`); }
+        }
         if (await clickText(page, "button", "Add provider")) { await sleep(300); await shot(page, "modal-add-provider"); }
       }
       if (s === "chat" && setName === "populated") {
