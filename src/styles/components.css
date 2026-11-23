@@ -2,6 +2,8 @@
    here. Screens should compose these rather than invent new styles. */
 
 /* ---------- layout ---------- */
+.desktop-notice { display: grid; place-content: center; justify-items: center; gap: 8px; height: 100%; padding: 24px; text-align: center; }
+.desktop-notice > p { margin: 0; color: var(--text-dim); }
 .app { display: grid; grid-template-columns: var(--sidebar-w) 1fr; height: 100%; }
 .sidebar {
   display: flex; flex-direction: column; gap: 2px;

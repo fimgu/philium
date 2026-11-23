@@ -16,8 +16,6 @@ import { useStore, activeRepoId, setActiveRepoId } from "./lib/store.js";
 import { ScreenVisibilityProvider } from "./lib/visibility.js";
 import { soundEnabled, setSoundEnabled, playSound } from "./lib/sound.js";
 import "./lib/alerts.js";
-import "./styles/tokens.css";
-import "./styles/components.css";
 import "./styles/sheet.css";
 import "./styles/surfaces-memory.css";
 
