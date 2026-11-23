@@ -150,6 +150,7 @@ fn set_state(ctx: &Ctx, id: &str, state: &str) {
         rusqlite::params![id, state, now()],
     );
     ctx.emit("agents:changed", json!({ "id": id, "state": state }));
+    crate::dream::on_agent_state(ctx, id, state);
     crate::attention::refresh(ctx);
 }
 
@@ -389,7 +390,7 @@ pub(crate) fn agent_session_context_with_budget(
                 out.push_str(&block);
             }
             let shown: Vec<String> = slate["items"].as_array().map(|a| a.iter().filter_map(|i| i["id"].as_str().map(str::to_string)).collect()).unwrap_or_default();
-            if let Some(index) = crate::library::memory_index_prompt(ctx, rid, &shown, 40, 4000) {
+            if let Some(index) = crate::library::memory_index_prompt(ctx, rid, &shown, crate::dream::INDEX_BUDGET, 4000) {
                 out.push_str(&index);
             }
         }
@@ -433,7 +434,7 @@ async fn agent_session_context_async(
                 out.push_str(&block);
             }
             let shown: Vec<String> = slate["items"].as_array().map(|a| a.iter().filter_map(|i| i["id"].as_str().map(str::to_string)).collect()).unwrap_or_default();
-            if let Some(index) = crate::library::memory_index_prompt(ctx, rid, &shown, 40, 4000) {
+            if let Some(index) = crate::library::memory_index_prompt(ctx, rid, &shown, crate::dream::INDEX_BUDGET, 4000) {
                 out.push_str(&index);
             }
         }

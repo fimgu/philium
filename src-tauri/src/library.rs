@@ -131,6 +131,10 @@ fn migrate_columns(ctx: &Ctx) -> Result<(), String> {
         ("valid_to", "ALTER TABLE memories ADD COLUMN valid_to TEXT"),
         ("title", "ALTER TABLE memories ADD COLUMN title TEXT"),
         ("files", "ALTER TABLE memories ADD COLUMN files TEXT"),
+        // Dreaming: last time a dream checked this memory against transcripts, and index pinning
+        // (1 = promoted into the session index, -1 = demoted out of it, 0 = recency order).
+        ("dream_verified_at", "ALTER TABLE memories ADD COLUMN dream_verified_at TEXT"),
+        ("index_rank", "ALTER TABLE memories ADD COLUMN index_rank INTEGER NOT NULL DEFAULT 0"),
     ];
     for (name, sql) in additions {
         if !cols.iter().any(|c| c == name) {
@@ -589,6 +593,7 @@ pub fn init(ctx: &Arc<Ctx>) -> Result<(), String> {
     crate::memory_ledger::init(ctx)?;
     crate::memory_skills::init(ctx)?;
     crate::memory_consolidation::init(ctx)?;
+    crate::dream::init(ctx)?;
     // Idempotent: remaps previously imported `project:<abs_path>` rows onto
     // their registered `repo:<id>` scopes (no-op when nothing matches).
     sync_imported_repo_scopes(ctx);
@@ -1521,7 +1526,7 @@ pub fn format_trigger_reminders(kind: &str, items: &[Value]) -> Option<String> {
 
 // ---------- Offline Consolidation (v3 preview with REAL safety + recall assertions) ----------
 
-fn normalized_text(s: &str) -> String {
+pub(crate) fn normalized_text(s: &str) -> String {
     s.to_lowercase()
         .split(|c: char| !c.is_alphanumeric())
         .filter(|t| !t.is_empty())
@@ -2304,8 +2309,8 @@ pub fn memory_index_prompt(ctx: &Ctx, repo_id: &str, exclude: &[String], max_ite
         .db
         .query(
             "SELECT id, category, title, content, files FROM memories
-             WHERE scope=?1 AND status='active' AND active=1
-             ORDER BY COALESCE(updated_at, created_at) DESC LIMIT 200",
+             WHERE scope=?1 AND status='active' AND active=1 AND index_rank >= 0
+             ORDER BY index_rank DESC, COALESCE(updated_at, created_at) DESC LIMIT 200",
             [format!("repo:{repo_id}")],
         )
         .ok()?;
@@ -2522,7 +2527,7 @@ fn load_hal_events_cached(path: &Path, sid: &str) -> Option<CachedHalEvents> {
 }
 
 /// Extract searchable raw turns & tool outputs from a Philium agent's read-only HAL SQLite event journal.
-fn extract_hal_db_entries(ctx: &Ctx, agent_id: &str, sid: &str, after_seq: i64, limit: i64) -> Vec<(i64, String, String, String)> {
+pub(crate) fn extract_hal_db_entries(ctx: &Ctx, agent_id: &str, sid: &str, after_seq: i64, limit: i64) -> Vec<(i64, String, String, String)> {
     let Ok(Value::Array(events)) = crate::agents::history::events(ctx, agent_id, after_seq, limit) else {
         return vec![];
     };
@@ -2940,7 +2945,7 @@ fn append_note_line(existing: &str, addition: &str) -> String {
 
 /// Cheapest sibling model on the same provider for background observation: a small, fast tier
 /// when the provider offers one, otherwise the agent's own model. Never crosses providers.
-fn observation_model(ctx: &Ctx, pid: &str, agent_model: &str) -> String {
+pub(crate) fn observation_model(ctx: &Ctx, pid: &str, agent_model: &str) -> String {
     const CHEAP: [&str; 6] = ["haiku", "flash-lite", "flash", "mini", "luna", "nano"];
     let ids: Vec<String> = ctx
         .db
@@ -3008,7 +3013,7 @@ fn completion_text(body: &str) -> Option<String> {
 }
 
 /// The first balanced top-level JSON object in a model reply (tolerates fences and prose).
-fn first_json_object(raw: &str) -> Option<Value> {
+pub(crate) fn first_json_object(raw: &str) -> Option<Value> {
     let start = raw.find('{')?;
     let (mut depth, mut in_str, mut esc) = (0i32, false, false);
     for (i, ch) in raw[start..].char_indices() {
@@ -3067,6 +3072,35 @@ async fn try_llm_session_observation(
         }
         transcript.push_str(&line);
     }
+    let text = match gateway_completion(ctx, &p, &mid, OBSERVE_PROMPT, &transcript, 1200, "memory-observer").await {
+        Ok(t) => t,
+        Err(status) => {
+            ctx.log_event("memory:observe_llm_failed", None, &json!({ "provider": p.id, "model": mid, "status": status }));
+            return None;
+        }
+    };
+    let parsed = first_json_object(&text)?;
+    let obs = parse_observation(&parsed);
+    ctx.log_event("memory:observe_llm", None, &json!({ "provider": p.id, "model": mid, "observations": obs.candidates.len() }));
+    Some(obs)
+}
+
+/// One bounded completion through Philium's gateway (`/p/<provider>/...`), authenticated with the
+/// gateway token so the gateway attaches the provider's API key or OAuth subscription. Shared by
+/// session observation and dreaming; never talks to a provider directly. Err carries the HTTP status
+/// (0 = transport failure or unusable reply).
+pub(crate) async fn gateway_completion(
+    ctx: &Ctx,
+    p: &crate::providers::Provider,
+    mid: &str,
+    system: &str,
+    user: &str,
+    max_tokens: u32,
+    agent_tag: &str,
+) -> Result<String, u16> {
+    if ctx.gateway_url.ends_with(":9") || ctx.gateway_url.is_empty() {
+        return Err(0);
+    }
     use crate::providers::Kind;
     let base = format!("{}/p/{}", ctx.gateway_url.trim_end_matches('/'), p.id);
     let (url, body) = match p.kind {
@@ -3076,8 +3110,8 @@ async fn try_llm_session_observation(
                 "model": mid,
                 "stream": p.kind == Kind::ChatgptOauth,
                 "store": false,
-                "instructions": OBSERVE_PROMPT,
-                "input": [{ "role": "user", "content": [{ "type": "input_text", "text": transcript }] }],
+                "instructions": system,
+                "input": [{ "role": "user", "content": [{ "type": "input_text", "text": user }] }],
             }),
         ),
         // chat.completions; the gateway translates for Anthropic, Claude and Antigravity.
@@ -3087,10 +3121,10 @@ async fn try_llm_session_observation(
                 "model": mid,
                 "stream": false,
                 "temperature": 0,
-                "max_tokens": 1200,
+                "max_tokens": max_tokens,
                 "messages": [
-                    { "role": "system", "content": OBSERVE_PROMPT },
-                    { "role": "user", "content": transcript }
+                    { "role": "system", "content": system },
+                    { "role": "user", "content": user }
                 ]
             }),
         ),
@@ -3098,20 +3132,16 @@ async fn try_llm_session_observation(
     let resp = observe_http_client()
         .post(&url)
         .bearer_auth(&ctx.gateway.token)
-        .header("x-philium-agent", "memory-observer")
+        .header("x-philium-agent", agent_tag)
         .json(&body)
         .send()
         .await
-        .ok()?;
+        .map_err(|_| 0u16)?;
     if !resp.status().is_success() {
-        ctx.log_event("memory:observe_llm_failed", None, &json!({ "provider": p.id, "model": mid, "status": resp.status().as_u16() }));
-        return None;
+        return Err(resp.status().as_u16());
     }
-    let text = resp.text().await.ok()?;
-    let parsed = first_json_object(&completion_text(&text)?)?;
-    let obs = parse_observation(&parsed);
-    ctx.log_event("memory:observe_llm", None, &json!({ "provider": p.id, "model": mid, "observations": obs.candidates.len() }));
-    Some(obs)
+    let text = resp.text().await.map_err(|_| 0u16)?;
+    completion_text(&text).ok_or(0)
 }
 
 fn observe_http_client() -> &'static reqwest::Client {
@@ -3210,6 +3240,7 @@ pub async fn observe_session(ctx: &Arc<Ctx>, agent_id: &str) -> Result<Value, St
         None => extract_deterministic_observation(&entries),
     };
 
+    let observed_n = entries.len();
     let (c_save, aid_save, name_save, repo_save, sid_save) = (ctx.clone(), agent_id.to_string(), name, repo_id, sid);
     let (saved_ids, active_to_embed, source_event_id) = tokio::task::spawn_blocking(move || -> Result<(Vec<Value>, Vec<(String, String)>, Option<String>), String> {
         let scope = format!("repo:{repo_save}");
@@ -3287,6 +3318,7 @@ pub async fn observe_session(ctx: &Arc<Ctx>, agent_id: &str) -> Result<Value, St
         }
 
         let _ = c_save.db.kv_set(&format!("memory.observed_seq.{aid_save}"), &max_seq.to_string());
+        crate::dream::note_observed(&c_save, &repo_save, observed_n);
         let _ = crate::memory_skills::mine_verified_runs(&c_save, &repo_save);
         Ok((saved, to_embed, source_event_id))
     })
@@ -3325,6 +3357,10 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
         }
         "reindex" => sync_vectors_async(ctx).await,
         "observe_session" => observe_session(ctx, &crate::ctx::arg_str(&args, "agent_id")?).await,
+        m if m.starts_with("dream_") => match crate::dream::call(ctx, m, &args).await {
+            Some(r) => r,
+            None => Err(format!("unknown library.{m}")),
+        },
         "skills" => skill_list(ctx),
         "memories" => match args["repo_id"].as_str() {
             Some(repo) => agent_memories_async(ctx, args["q"].as_str().unwrap_or(""), repo, args["limit"].as_i64().unwrap_or(50)).await,
