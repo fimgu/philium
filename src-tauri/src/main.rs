@@ -62,6 +62,7 @@ mod secrets;
 mod drafts;
 mod capture;
 mod selfdev;
+mod setup;
 mod pins;
 mod publish;
 mod pilot;
@@ -215,6 +216,7 @@ async fn rpc_inner(app: &App, method: String, args: Option<Value>) -> Result<Val
         "mcp" if m.starts_with("servers_") => mcp_servers::call(&ctx, m, args).await,
         "mcp" => mcp::call(&ctx, m, args).await,
         "workday" => workday::call(&ctx, m, args).await,
+        "setup" => setup::call(m).await,
         "pipeline" => pipeline::app::call(&ctx, m, args).await,
         _ => Err(format!("unknown module {module}")),
     }

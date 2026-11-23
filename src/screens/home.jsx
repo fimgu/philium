@@ -9,6 +9,7 @@ import { go } from "../lib/nav.js";
 import { useStore, activeRepoId } from "../lib/store.js";
 import { useVisibleEvent } from "../lib/visibility.js";
 import CheckoutHome from "./checkout-home.jsx";
+import { setupSteps, setupVisible } from "../lib/setup-steps.js";
 import "../styles/home.css";
 
 const n = (x) => {
@@ -55,7 +56,7 @@ function GlobalHome() {
   const [clashes, cl] = createResource(() => rpc("codeindex.clashes", {}).then((r) => r?.clashes ?? []).catch(() => []));
   const [libStatus, libSt] = createResource(() => rpc("library.status", {}, { local: true }).catch(() => null));
   const [spawn, setSpawn] = createSignal(false);
-  const [hideOnboarding, setHideOnboarding] = createSignal(false);
+  const [hideSetup, setHideSetup] = createSignal(false);
 
   useVisibleEvent("agents:changed", () => ev.refetch(), { debounceMs: 300 });
   useVisibleEvent("board:changed", () => tk.refetch(), { debounceMs: 200 });
@@ -79,35 +80,49 @@ function GlobalHome() {
   const proposedMemories = () => Number(libStatus()?.proposed ?? 0);
   const attention = () => waiting().length + (proposals() ?? []).length + (leaked() ?? []).length + failed().length + (clashes() ?? []).length + (proposedMemories() > 0 ? 1 : 0);
 
-  const hasProviders = () => (providers() ?? []).length > 0;
-  const hasRepos = () => (repos() ?? []).length > 0;
-  const hasAgents = () => (agents() ?? []).length > 0;
-  const showOnboarding = () =>
-    !hideOnboarding() &&
-    providers.state === "ready" &&
-    repos.state === "ready" &&
-    agents.state === "ready" &&
-    (!hasProviders() || !hasRepos() || !hasAgents());
+  const [setupRaw, su] = createResource(async () => {
+    const [models, github, runtimes, settings, skills, mcp] = await Promise.all([
+      rpc("library.models_status", {}, { local: true }).catch(() => null),
+      rpc("setup.github", {}, { local: true }).catch(() => ({ installed: false, signed_in: false })),
+      rpc("environments.runtimes", {}, { local: true }).catch(() => []),
+      rpc("app.settings_get", {}, { local: true }).catch(() => ({})),
+      rpc("skills.list", {}, { local: true }).then((r) => r?.skills?.length ?? 0).catch(() => 0),
+      rpc("mcp.servers_list", {}, { local: true }).then((r) => r?.length ?? 0).catch(() => 0),
+    ]);
+    return { models: models ?? { embed: { state: "missing" } }, github, runtimes: runtimes ?? [], notifications: settings?.notifications === "true", skills, mcp };
+  });
+  useVisibleEvent("library", () => su.refetch(), { debounceMs: 500 });
+  const setupRows = createMemo(() => setupSteps({
+    ...(setupRaw() ?? {}),
+    providers: providers.state === "ready" ? providers() ?? [] : undefined,
+    repos: repos.state === "ready" ? repos() ?? [] : undefined,
+  }));
+  const showSetup = () => !hideSetup() && setupRaw.state === "ready" && setupVisible(setupRows());
 
   return (
     <Page title="Home" actions={<Button variant="primary" onClick={() => setSpawn(true)}><Icon name="plus" size={12} /> New agent</Button>}>
-      <Show when={showOnboarding()}>
-        <Card class="home-hero">
-          <div class="row" style={{ "margin-bottom": "10px" }}>
-            <h2 class="grow" style={{ margin: 0 }}>Get started</h2>
-            <Button size="sm" variant="ghost" onClick={() => setHideOnboarding(true)}>Dismiss</Button>
+      <Show when={showSetup()}>
+        <Card class="home-hero home-setup">
+          <div class="row" style={{ "margin-bottom": "6px" }}>
+            <h2 class="grow" style={{ margin: 0 }}>Get set up</h2>
+            <Button size="sm" variant="ghost" onClick={() => su.refetch()}>Check again</Button>
+            <Button size="sm" variant="ghost" onClick={() => setHideSetup(true)}>Later</Button>
           </div>
-          <div class="row" style={{ "flex-wrap": "wrap", gap: "8px" }}>
-            <Show when={!hasProviders()} fallback={<Badge tone="secure">1. Provider ✓</Badge>}>
-              <Button size="sm" variant="primary" onClick={() => go("providers")}><Icon name="key" size={12} /> 1. Add provider</Button>
-            </Show>
-            <Show when={!hasRepos()} fallback={<Badge tone="secure">2. Repo ✓</Badge>}>
-              <Button size="sm" variant={hasProviders() ? "primary" : ""} onClick={() => go("repos")}><Icon name="repo" size={12} /> 2. Add repo</Button>
-            </Show>
-            <Show when={!hasAgents()} fallback={<Badge tone="secure">3. Agent ✓</Badge>}>
-              <Button size="sm" variant={hasProviders() && hasRepos() ? "primary" : ""} onClick={() => setSpawn(true)}><Icon name="plus" size={12} /> 3. Start agent</Button>
-            </Show>
-          </div>
+          <p class="muted">A few things make Philium useful. Each one updates as you go.</p>
+          <ul class="setup-list">
+            <For each={setupRows()}>{(r) => (
+              <li class={r.done ? "done" : ""}>
+                <button type="button" onClick={() => go(r.screen)}>
+                  <span class="setup-mark" aria-hidden="true">{r.done ? "✓" : "○"}</span>
+                  <span class="grow">
+                    <b>{r.label}</b>{r.optional ? <span class="muted"> · optional</span> : null}
+                    <span class="setup-detail muted">{r.detail}</span>
+                  </span>
+                  <span class="sr-only">{r.done ? "Done" : "Not done"}</span>
+                </button>
+              </li>
+            )}</For>
+          </ul>
         </Card>
       </Show>
 

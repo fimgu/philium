@@ -13,3 +13,10 @@
 .checkout-home > *, .checkout-row > * { min-width: 0; overflow-wrap: anywhere; }
 .checkout-row { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding: 6px 0; border-bottom: 1px solid var(--line); }
 .checkout-row small { color: var(--dim); }
+.setup-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; }
+.setup-list button { all: unset; box-sizing: border-box; width: 100%; display: flex; gap: 10px; align-items: flex-start; padding: 6px 8px; border-radius: 6px; cursor: pointer; }
+.setup-list button:hover, .setup-list button:focus-visible { background: var(--bg-2, rgba(127,127,127,.08)); }
+.setup-list .setup-mark { width: 14px; text-align: center; opacity: .6; }
+.setup-list li.done .setup-mark { color: var(--ok, var(--accent)); opacity: 1; }
+.setup-list li.done b { font-weight: 500; opacity: .7; }
+.setup-detail { display: block; font-size: 12px; }
