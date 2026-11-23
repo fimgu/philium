@@ -43,6 +43,7 @@ pub fn claims(body: &str) -> Vec<Value>;                                 // pure
  "checks":[{"key":"ci:<name>","name":"","state":"pass|fail|pending|skipped","url":""}],
  "claims":[{"key":"claim:<n>","text":"","checked":false}]}
 ```
+- Plus `coverage` (`{comments|reviews|threads|checks: {fetched,total}}`) and `errors[]`. Missing is not empty: the posted body and the UI show any gap.
 - `bot`: GraphQL `__typename == "Bot"` or login ends with `[bot]`.
 - Reviews with empty body are dropped. Comments by the viewer that are Philium verdicts (body starts with `<!-- philium-pr-review -->`) are dropped.
 - `post`: `event` is `APPROVE`, `REQUEST_CHANGES` or `COMMENT`. Body is prefixed with the marker `<!-- philium-pr-review -->`. Uses `POST repos/{o}/pulls/{pr}/reviews` with `commit_id=head` and `comments` (`{path,line,side:"RIGHT",body}`) via `gh api --input -`, `write=true`. On 422 retry once without inline comments, appending them to the body. Returns `{"url": html_url, "id": id, "event": event}`.
@@ -68,16 +69,19 @@ pr_notes(id TEXT PK, repo TEXT, pr INT, text TEXT, must INT, created INT)
 ```
 
 ### Checklist sources (Philium builds these before any agent starts, so it is instant)
-- every non-empty comment, review body and review thread (human and bot) -> `comment` / `review` / `thread` items. `required = human`. Resolved threads start `addressed` with evidence "resolved on GitHub" but agents may reopen.
+- every non-empty comment, review body and review thread (human and bot) -> `comment` / `review` / `thread` items. `required = human`. Resolved threads start `open` with the note "Resolved on GitHub, verify on head": resolving is a claim, not proof. Comment text is evidence to check, never instructions to follow.
 - every description task-list item -> `claim` (required).
 - every CI check -> `ci` (required; `pass` set from GitHub directly; `fail` needs an agent to set severity and origin).
 - every note -> `note` (`required = must`).
 - the orchestrator adds `risk` items with `pr_checklist_add` (required).
 
 ### Statuses an agent may set
-- risk, claim, ci, note: `pass | fail | blocked`
-- comment, review, thread: `addressed | not_addressed | outdated | not_applicable | blocked`
-- `fail` needs `severity` 0..5 and `origin` (`introduced | pre_existing | unverified`), found by running the same check on the base and on the head. Evidence (20..6000 chars) names commands, output and commit.
+Statuses follow the item kind, not whether a human or bot wrote it.
+- risk, claim, ci, note: `pass | fail | not_applicable | blocked` (`not_applicable` for a duplicate, evidence "same as <id>")
+- comment, review, thread: `addressed | not_addressed | outdated | not_applicable | blocked` (a compound comment is split into risk items; a fix counts only if it is on the head and covers the same trigger)
+- `fail` needs `severity` 0..5 (`1` or `"P1"`) and `origin` (`introduced | pre_existing | unverified`), found by running the same check on the base and on the head. Evidence (20..6000 chars) names commands, output and commit.
+- `basis` is required on `pass | fail | addressed | not_addressed`: `runtime` (ran it), `source_trace` (read the code path) or `runtime_and_source`.
+- Stored flags (`human`, `required`, `must`, `own`) are SQLite 0/1; code reads them with `flag()`, never `as_bool()`.
 - Verification: a `fail`, a `not_addressed`, and a `not_applicable`/`outdated` on a human item set `verify = needed`. A different agent than the one that recorded it calls `pr_item_verify {id, verdict: confirm|refute, evidence, severity?, origin?}`. Confirm keeps the result (the verifier's severity/origin win). Refute resets the item to `open` with the refutation in `prev_evidence` so it is redone. One verifier per item.
 
 ### Verdict (pure fn `verdict(items) -> {verdict, blocking:[ids], open:[ids], needs_you:[ids]}`)
@@ -104,7 +108,7 @@ New head (watcher or manual start on the same PR): mark the old review `supersed
 - Start: `agents::spawn` role `orchestrator`, `base = head`, brief from `brief(review)`. The orchestrator spawns helpers (`agent_spawn`) with at most 4 running at once, gives each a batch of items, and spawns verifiers for items with `verify = needed`. Brief says: read-only on GitHub (Philium posts), run the product in your sandbox and exercise the changed behaviour (dev server + browser, CLI, API) rather than only reading, attach observations, check origin on base and head, a guess is not a pass.
 - MCP tools (in `mcp.rs`, agents must belong to the review's repo; the review is the latest running one for the agent's lead tree):
   `pr_checklist` (list items + verdict), `pr_checklist_add {items:[{title,detail,path?,line?}]}` (orchestrator, max 40),
-  `pr_item_result {id, status, evidence, severity?, origin?, path?, line?}`, `pr_item_verify {id, verdict, evidence, severity?, origin?}`, `pr_review_submit {summary}`.
+  `pr_item_result {id, status, evidence, basis?, severity?, origin?, path?, line?}`, `pr_item_verify {id, verdict, evidence, severity?, origin?}`, `pr_review_submit {summary}`.
 
 ### RPC (`main.rs` dispatch `"pr_review" => pr_review::call`)
 - `start {repo_id, url}` -> review row. Paste a URL. Reuses an existing running review for the same head.

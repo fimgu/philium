@@ -708,4 +708,25 @@ mod tests {
         v["headRefOid"] = json!("moving");
         assert!(record(&db, "checkout", &o, 7, &v).is_err());
     }
+
+    /// Who a PR review would be posted as, without posting: `gh_as(write=true)` with GET-only
+    /// requests must authenticate as the CLI account connected for the origin (not the active
+    /// one, not a stray GH_TOKEN), and stdin must reach `gh api --input -`.
+    #[tokio::test]
+    #[ignore = "opt-in, read-only; needs signed-in gh and PHILIUM_TEST_DATA_DIR with a connected origin"]
+    async fn live_gh_as_writes_as_connected_account() {
+        let data = std::env::var("PHILIUM_TEST_DATA_DIR").expect("set PHILIUM_TEST_DATA_DIR");
+        let origin = std::env::var("PHILIUM_TEST_PR_ORIGIN").expect("set PHILIUM_TEST_PR_ORIGIN");
+        crate::secrets::init(std::path::Path::new(&data));
+        let want = gh_logins().get(&origin.to_ascii_lowercase()).and_then(Value::as_str).map(str::to_owned).expect("origin connected in this data dir");
+        std::env::set_var("GH_TOKEN", "not-a-real-token");
+        let me: Value = serde_json::from_str(&gh_as(&origin, &["api", "user"], None, true, 20).await.unwrap()).unwrap();
+        assert_eq!(me["login"].as_str(), Some(want.as_str()), "writes must use the connected account");
+        let q = json!({"query": format!("query{{repository(owner:\"{}\",name:\"{}\"){{viewerPermission}}}}", origin.split('/').next().unwrap(), origin.split('/').nth(1).unwrap())}).to_string();
+        let r: Value = serde_json::from_str(&gh_as(&origin, &["api", "graphql", "--input", "-"], Some(&q), true, 20).await.unwrap()).unwrap();
+        let perm = r["data"]["repository"]["viewerPermission"].as_str().unwrap_or("");
+        println!("posts as {want}, permission {perm}");
+        assert!(["WRITE", "MAINTAIN", "ADMIN", "TRIAGE", "READ"].contains(&perm), "{r}");
+        assert!(gh_as(&origin, &["api", "repos/{owner}/does-not-exist-philium"], None, true, 20).await.is_err());
+    }
 }
