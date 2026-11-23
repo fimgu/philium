@@ -49,7 +49,7 @@ these it needs:
 | U4  | UX    | Mid-run steering                                  | [Verified](gaps/U4.md) |
 | U5  | UX    | Cross-session search, fork from any message       | [Partly true](gaps/U5.md) |
 | U6  | UX    | Native OS notifications                           | [Verified](gaps/U6.md) |
-| U7  | UX    | Shortcuts, onboarding, multi-agent grid           | [Partly true](gaps/U7.md) (substantially stale) |
+| U7  | UX    | Shortcuts, onboarding, multi-agent grid           | [Partly closed](gaps/U7.md) (shortcut map in `src/lib/shortcuts.js`; onboarding readiness and pinned panes open) |
 | I1  | Infra | CI                                                | [Verified](gaps/I1.md) (missing checked-in CI only) |
 | I2  | Infra | Code signing and notarization                     | [Verified for release signing, partly true as phrased](gaps/I2.md) |
 | I3  | Infra | Auto-update                                       | [Verified](gaps/I3.md) (Philium, not standalone HAL) |

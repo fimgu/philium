@@ -11,6 +11,7 @@ import { rpc, useEvent, failures, clearFailures } from "./lib/rpc.js";
 import { repoLabels } from "./lib/repo-labels.js";
 import { workspaceAgents } from "./lib/agent-workspace.js";
 import { route, go, commands, improve } from "./lib/nav.js";
+import { isMac } from "./lib/shortcuts.js";
 import { useStore, activeRepoId, setActiveRepoId } from "./lib/store.js";
 import { ScreenVisibilityProvider } from "./lib/visibility.js";
 import { soundEnabled, setSoundEnabled, playSound } from "./lib/sound.js";
@@ -52,7 +53,7 @@ function Palette(props) {
   const all = createMemo(() => {
     const screenCmds = SCREENS.map((s, idx) => ({
       label: `Go to ${s.label}`,
-      kbd: idx < 9 ? `⌘${idx + 1}` : undefined,
+      kbd: idx < 9 ? `${isMac() ? "⌘" : "Ctrl+"}${idx + 1}` : undefined,
       run: () => go(s.id),
     }));
     const repoCmds = [

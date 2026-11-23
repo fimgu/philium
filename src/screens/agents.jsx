@@ -14,6 +14,7 @@ import { AccessApprovalBar } from "../ui/access-requests.jsx";
 import { pendingAccessByAgent, agentNeedsUser } from "../lib/access-helpers.js";
 import { rpc, fmt, sendError } from "../lib/rpc.js";
 import { route, go, params, registerCommands } from "../lib/nav.js";
+import { matchShortcut, shortcutLabel, cycle } from "../lib/shortcuts.js";
 import { useStore, activeRepoId, agentEventsCache } from "../lib/store.js";
 import { useScreenVisible, useVisibleEvent } from "../lib/visibility.js";
 import "../styles/agents.css";
@@ -1078,10 +1079,44 @@ export default function Agents() {
     }
   });
 
+  let searchEl;
+  const switchAgent = (dir) => {
+    const ids = filtered().map((a) => a.id);
+    const next = ids[cycle(ids.indexOf(selected()), ids.length, dir)];
+    if (next) go("agents", { id: next });
+  };
+  const focusPane = (dir) => {
+    const inputs = [...document.querySelectorAll(".agent-card-input, .conversation textarea")].filter((el) => !el.disabled);
+    const el = inputs[cycle(inputs.indexOf(document.activeElement), inputs.length, dir)];
+    el?.focus();
+  };
+  const shortcutActions = {
+    "agent.new": () => setSpawn({}),
+    "agent.next": () => switchAgent(1),
+    "agent.prev": () => switchAgent(-1),
+    "agent.split": () => setViewMode("split"),
+    "agent.grid": () => setViewMode("grid"),
+    "pane.next": () => focusPane(1),
+    "pane.prev": () => focusPane(-1),
+    "agent.search": () => searchEl?.focus(),
+  };
+  const onShortcut = (e) => {
+    if (!screenVisible() || (typeof route === "function" && route() !== "agents") || spawn()) return;
+    const run = shortcutActions[matchShortcut(e)];
+    if (run) { e.preventDefault(); run(); }
+  };
+  if (typeof window !== "undefined") {
+    window.addEventListener("keydown", onShortcut);
+    onCleanup(() => window.removeEventListener("keydown", onShortcut));
+  }
+
   const unregisterCommands = registerCommands([
-    { id: "agent.new", label: "New agent or coordinator", run: () => setSpawn({}) },
-    { id: "agent.split", label: "Agents: Focus view", run: () => setViewMode("split") },
-    { id: "agent.grid", label: "Agents: Grid view", run: () => setViewMode("grid") },
+    { id: "agent.new", label: "New agent or coordinator", kbd: shortcutLabel("agent.new"), run: () => setSpawn({}) },
+    { id: "agent.next", label: "Agents: Next agent", kbd: shortcutLabel("agent.next"), run: () => switchAgent(1) },
+    { id: "agent.prev", label: "Agents: Previous agent", kbd: shortcutLabel("agent.prev"), run: () => switchAgent(-1) },
+    { id: "agent.search", label: "Agents: Search", kbd: shortcutLabel("agent.search"), run: () => searchEl?.focus() },
+    { id: "agent.split", label: "Agents: Focus view", kbd: shortcutLabel("agent.split"), run: () => setViewMode("split") },
+    { id: "agent.grid", label: "Agents: Grid view", kbd: shortcutLabel("agent.grid"), run: () => setViewMode("grid") },
     { id: "agent.fleet", label: "Agents: Fleet view", run: () => setViewMode("fleet") },
   ]);
   if (typeof onCleanup === "function" && unregisterCommands) onCleanup(unregisterCommands);
@@ -1202,6 +1237,7 @@ export default function Agents() {
         </Show>
         <Show when={scoped().length}>
           <input
+            ref={searchEl}
             type="search"
             class="input fleet-search"
             placeholder="Filter agents…"
