@@ -192,6 +192,12 @@ pub fn request(body: &Value, project: &str, request_id: &str, signature: &dyn Fn
             _ => push(&mut contents, "user", user_parts(&m["content"])),
         }
     }
+    // Gemini refuses a function call turn that does not follow a user turn or a function
+    // response. A compacted history can start with the model's call (its earlier turns are now
+    // in the system summary), so give it a user turn to follow.
+    if contents.first().is_some_and(|c| c["role"] == "model") {
+        contents.insert(0, json!({"role": "user", "parts": [{"text": "Continue from the summary above."}]}));
+    }
     let mut req = Map::new();
     req.insert("contents".into(), json!(contents));
     let tools: Vec<Value> = if body["tool_choice"] == "none" {
@@ -581,6 +587,21 @@ mod tests {
 
     fn none(_: &str) -> Option<String> {
         None
+    }
+
+    /// History cut by compaction can start with the model's tool call. Gemini needs a user
+    /// turn before it.
+    #[test]
+    fn history_starting_with_a_call_gets_a_user_turn_first() {
+        let body = json!({"model": "gemini-3-flash", "messages": [
+            {"role": "system", "content": "Summary of earlier work."},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "ls", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "x"}],
+            "tools": [{"type": "function", "function": {"name": "ls", "parameters": {"type": "object"}}}]});
+        let w = request(&body, "p", "r", &none, &Shaping::default());
+        let c = w["request"]["contents"].as_array().unwrap();
+        assert_eq!(c.iter().map(|x| x["role"].as_str().unwrap()).collect::<Vec<_>>(), ["user", "model", "user"]);
+        assert!(c[1]["parts"][0].get("functionCall").is_some());
     }
 
     #[test]
