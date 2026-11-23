@@ -192,7 +192,8 @@ const stub = (fx, setName, serveOnly = false) => {
           const deleted = a.args.path === "src/deleted.py";
           const binary = a.args.path === "image.bin";
           if (a.method === "codeindex.source") return { ...base, exists: !deleted, binary, language: "python", text: deleted || binary ? "" : `# ${base.revision}\n\ndef review():\n    return ${live ? 42 : 1}\n`, note: deleted ? "File was deleted in this worktree." : binary ? "Binary file." : "" };
-          return { ...base, binary, patch: !live || binary ? "" : `diff --git a/${a.args.path} b/${a.args.path}\n--- a/${a.args.path}\n+++ b/${a.args.path}\n@@ -3,2 +3,2 @@\n def review():\n-    return 1\n+    return 42\n`, note: binary ? "Binary files differ." : !live ? "No changes in base commit view." : "" };
+          const delta = a.args.render === "delta" && live && !binary ? { delta: `\x1b[1;38;2;255;255;255m${a.args.path}\x1b[0m\n\x1b[38;2;143;184;255m\u2022 \x1b[0m\x1b[38;2;143;184;255m@@ -3,2 +3,2 @@\x1b[0m def review():\n\x1b[48;2;60;20;28m-    return 1\x1b[0m\n\x1b[48;2;20;60;32m+    return \x1b[48;2;30;110;50m42\x1b[0m\n`, delta_truncated: false } : {};
+          return { ...base, ...delta, ...(a.args.render === "delta" && window.__test.deltaMissing ? { delta: null, delta_notice: "Delta is not installed on the login PATH. Showing native diff." } : {}), ...(delta.delta && window.__test.deltaTruncated ? { delta_truncated: true } : {}), binary, patch: !live || binary ? "" : `diff --git a/${a.args.path} b/${a.args.path}\n--- a/${a.args.path}\n+++ b/${a.args.path}\n@@ -3,2 +3,2 @@\n def review():\n-    return 1\n+    return 42\n`, note: binary ? "Binary files differ." : !live ? "No changes in base commit view." : "" };
         }
         if (["agents.cancel", "agents.stop"].includes(a.method) && window.__test.failCancel) throw 'Cancellation unavailable';
         if (a.method === "agents.shell" && window.__test.holdShell) {

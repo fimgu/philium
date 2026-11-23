@@ -2,6 +2,7 @@ import { For, Show, createEffect, createMemo, createSignal, onCleanup } from "so
 import { rpc } from "../lib/rpc.js";
 import { openCodeDraft } from "../lib/code-context.js";
 import { VirtualList } from "./kit.jsx";
+import { AnsiDiff } from "./ansi-diff.jsx";
 
 // Tokens remain ordinary JSX text nodes, never HTML. Covers Python and common C-like languages.
 const tokens = (text) => text.split(/("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\/\/.*$|#.*$|\b(?:def|class|import|from|as|return|if|else|elif|for|while|in|is|not|and|or|None|True|False|async|await|try|except|finally|with|yield|raise|pass|const|let|var|function|export|default|new|throw|catch|public|private|fn|pub|use|struct|impl|match)\b|\b\d+(?:\.\d+)?\b)/g).map((s) => ({ text: s, kind: /^["']/.test(s) ? "string" : /^(#|\/\/)/.test(s) ? "comment" : /^\d/.test(s) ? "number" : /^(def|class|import|from|as|return|if|else|elif|for|while|in|is|not|and|or|None|True|False|async|await|try|except|finally|with|yield|raise|pass|const|let|var|function|export|default|new|throw|catch|public|private|fn|pub|use|struct|impl|match)$/.test(s) ? "keyword" : "" }));
@@ -33,12 +34,13 @@ export default function CodeInspector(props) {
   const [draftError, setDraftError] = createSignal("");
   const [layout, setLayout] = createSignal("inline");
   const [moreContext, setMoreContext] = createSignal(false);
+  const [deltaMode, setDeltaMode] = createSignal(false);
   const [currentHunk, setCurrentHunk] = createSignal(-1);
   let generation = 0, body, vlist;
   const path = () => props.selected?.file;
   createEffect(() => {
     const target = props.target, file = path(), tab = props.tab;
-    const options = tab === "diff" ? { comparison: props.comparison, more_context: moreContext() } : {};
+    const options = tab === "diff" ? { comparison: props.comparison, more_context: moreContext(), ...(deltaMode() ? { render: "delta" } : {}) } : {};
     void props.tick;
     const request = ++generation;
     setData(null); setError(""); setSelection(null); setChooser(null); setLoading(false); setCurrentHunk(-1);
@@ -83,6 +85,7 @@ export default function CodeInspector(props) {
   const sourceStart = createMemo(() => Math.max(0, Math.min(lines().length - 3000, (props.selected?.line ?? 1) - 500)));
   const visibleSource = createMemo(() => lines().slice(sourceStart(), sourceStart() + 3000).map((text, i) => ({ text, index: sourceStart() + i, line: sourceStart() + i + 1 })));
   const displayedSource = createMemo(() => visibleSource().map((row) => ({ both: row })));
+  const deltaText = createMemo(() => deltaMode() && props.tab === "diff" && data()?.delta ? data().delta : null);
   const visibleDiff = createMemo(() => diffLines().slice(0, 3000));
   const paired = createMemo(() => {
     const inline = new Map();
@@ -193,10 +196,11 @@ export default function CodeInspector(props) {
       <nav aria-label="Code inspector tabs"><For each={["source", "diff", "references"]}>{(tab) => <button classList={{ active: props.tab === tab }} onClick={() => props.onTab(tab)}>{tab[0].toUpperCase() + tab.slice(1)}</button>}</For></nav>
       <Show when={props.tab === "diff" && data()?.patch && !data()?.binary}>
         <div class="diff-controls row gap-4" aria-label="Diff controls">
-          <button aria-pressed={layout() === "inline"} onClick={() => { setLayout("inline"); setCurrentHunk(-1); }}>Inline</button>
-          <button aria-pressed={layout() === "split"} onClick={() => { setLayout("split"); setCurrentHunk(-1); }}>Side by side</button>
-          <button disabled={currentHunk() <= 0} onClick={() => jumpHunk(-1)}>Previous hunk</button>
-          <button disabled={currentHunk() >= hunkRows().length - 1} onClick={() => jumpHunk(1)}>Next hunk</button>
+          <button aria-pressed={!deltaMode() && layout() === "inline"} onClick={() => { setDeltaMode(false); setLayout("inline"); setCurrentHunk(-1); }}>Inline</button>
+          <button aria-pressed={!deltaMode() && layout() === "split"} onClick={() => { setDeltaMode(false); setLayout("split"); setCurrentHunk(-1); }}>Side by side</button>
+          <button disabled={!!deltaText() || currentHunk() <= 0} onClick={() => jumpHunk(-1)}>Previous hunk</button>
+          <button disabled={!!deltaText() || currentHunk() >= hunkRows().length - 1} onClick={() => jumpHunk(1)}>Next hunk</button>
+          <button aria-pressed={deltaMode()} title="Render with the Delta executable" onClick={() => { setDeltaMode((v) => !v); setCurrentHunk(-1); }}>Delta</button>
           <button aria-pressed={moreContext()} onClick={() => setMoreContext((value) => !value)}>{moreContext() ? "Less context" : "More context"}</button>
         </div>
       </Show>
@@ -210,20 +214,24 @@ export default function CodeInspector(props) {
         <Show when={data()}>
           <Show when={data().note}><div class="inspector-note">{data().note}</div></Show>
           <Show when={data().truncated}><div class="inspector-note">Large file: this is a truncated preview, not the full file.</div></Show>
+          <Show when={deltaMode() && data().delta_notice}><div class="inspector-note" role="status">{data().delta_notice}</div></Show>
+          <Show when={deltaText() && data().delta_truncated}><div class="inspector-note">Delta output truncated.</div></Show>
           <Show when={data().binary}><div class="code-empty">Binary file. Text preview is unavailable.</div></Show>
           <Show when={props.tab === "source" && data().exists === false}><div class="code-empty">File is missing or deleted in this target. Open Diff to inspect its removal.</div></Show>
           <Show when={!data().binary && !(props.tab === "source" && data().exists === false)}>
             <Show when={props.tab === "source" || data().patch} fallback={<div class="code-empty">No textual diff for this file against the selected base.</div>}>
               <Show when={lines().length > 3000}><div class="inspector-note">Rendering a bounded preview: {props.tab === "source" ? `lines ${sourceStart() + 1}–${Math.min(sourceStart() + 3000, lines().length)} of ${lines().length}. Select another symbol to jump to its region.` : `first 3000 of ${lines().length} diff lines.`}</div></Show>
               <div class="code-text" style={{ flex: 1, "min-height": 0, height: "100%", padding: 0 }} aria-label={props.tab === "source" ? `Read-only ${data().language ?? "source"}` : "Read-only diff"}>
-                <VirtualList ref={(el) => { vlist = el; }} items={props.tab === "diff" ? displayedDiff() : displayedSource()} rowHeight={LINE_HEIGHT}>
+                <Show when={deltaText()} fallback={<VirtualList ref={(el) => { vlist = el; }} items={props.tab === "diff" ? displayedDiff() : displayedSource()} rowHeight={LINE_HEIGHT}>
                   {(row) => <Show when={row.both && !(props.tab === "diff" && layout() === "split" && row.both.old != null) && row.both} fallback={
                     <div class="code-diff-split">
                       <div>{(row.old ?? row.both) && drawLine(row.old ?? row.both, "old")}</div>
                       <div>{(row.next ?? row.both) && drawLine(row.next ?? row.both, "new")}</div>
                     </div>
                   }>{(line) => drawLine(line())}</Show>}
-                </VirtualList>
+                </VirtualList>}>
+                  <AnsiDiff text={deltaText()} />
+                </Show>
               </div>
             </Show>
           </Show>

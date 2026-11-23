@@ -76,6 +76,13 @@ export async function checkCodeGraph(page, shot) {
   await page.waitForFunction(() => window.__test.codeCalls.some((call) =>
     call.method === 'codeindex.file_diff' && call.more_context && call.comparison === 'working'));
   await shot(page, 'code-diff-inspector');
+  await click('.diff-controls button', 'Delta');
+  await page.waitForSelector('.code-inspector .xterm-rows');
+  await wait();
+  if (!(await page.$eval('.code-inspector', (e) => e.innerText.includes('return')))) errors.push('delta output missing');
+  await page.waitForFunction(() => window.__test.codeCalls.some((call) => call.method === 'codeindex.file_diff' && call.render === 'delta'));
+  await shot(page, 'code-diff-delta');
+  await click('.diff-controls button', 'Delta'); await wait();
   await click('.changed-file', 'src/deleted.py'); await wait();
   await click('[aria-label="Code inspector tabs"] button', 'Source'); await wait();
   if (!(await page.$eval('.code-inspector', (e) => /missing|deleted/i.test(e.innerText)))) errors.push('deleted source not explained');
