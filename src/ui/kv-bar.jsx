@@ -33,6 +33,9 @@ export function KvTelemetryBar(props) {
         <span class="kv-legend-item out" title="Generated output tokens">
           <i /> Out <b>{fmtTok(out())}</b>
         </span>
+        <Show when={props.liveTps}>{(speed) => (
+          <span class="mono xs dim" title="Estimated tokens per second from streamed output. Hidden reasoning is not counted.">~{speed().toFixed(1)} TPS</span>
+        )}</Show>
         <div class="grow" />
         <Show when={ttft() != null}>
           <span class="mono xs faint" title="Average Time To First Token">TTFT {Math.round(ttft())}ms</span>
