@@ -68,6 +68,7 @@ mod surfaces;
 mod terminals;
 mod workday;
 mod workspace;
+mod web;
 
 use std::sync::Arc;
 

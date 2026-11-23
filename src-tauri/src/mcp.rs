@@ -194,7 +194,7 @@ pub async fn dispatch(ctx: &Arc<Ctx>, agent: &str, req: Value) -> Option<Value> 
     })
 }
 
-fn t(name: &str, desc: &str, props: Value, required: &[&str]) -> Value {
+pub(crate) fn t(name: &str, desc: &str, props: Value, required: &[&str]) -> Value {
     json!({ "name": name, "description": desc,
             "inputSchema": { "type": "object", "properties": props, "required": required } })
 }
@@ -275,7 +275,7 @@ pub fn tool_list() -> Vec<Value> {
           json!({ "kind": s, "handle": s, "note": s }), &["kind", "handle"]),
         t("kind_cluster", "Manage an isolated Kubernetes-in-Docker (kind) test cluster scoped to your agent (`philium-<agent>-<suffix>`), pre-registered in Philium's Reaper and wired to your isolated KUBECONFIG and port block. action: create | list | delete.",
           json!({ "action": s, "suffix": s, "cluster": s }), &["action"]),
-    ].into_iter().chain(crate::browser::mcp_tools()).chain(crate::codeindex::mcp_tools()).chain(crate::surfaces::mcp_tools()).collect()
+    ].into_iter().chain(crate::browser::mcp_tools()).chain(crate::codeindex::mcp_tools()).chain(crate::surfaces::mcp_tools()).chain(crate::web::mcp_tools()).collect()
 }
 
 fn arg<'a>(a: &'a Value, k: &str) -> Result<&'a str, String> {
@@ -513,6 +513,7 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
         n if n.starts_with("browser_") => {
             crate::browser::mcp_call(ctx, agent, &me, row["strict"].as_i64() == Some(1), n, a).await
         }
+        "web_fetch" | "web_search" => crate::web::mcp_call(ctx, row["strict"].as_i64() == Some(1), name, a).await,
         n if n.starts_with("surface_") => {
             crate::surfaces::mcp_call(ctx, agent, &me, row["strict"].as_i64() == Some(1), n, a).await
         }
