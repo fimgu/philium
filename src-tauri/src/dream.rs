@@ -932,8 +932,12 @@ fn apply(
                     continue;
                 }
             }
-            for id in &ids {
-                touched.insert(id.clone());
+            // A confirm only stamps dream_verified_at, so a later promote/correct of the same
+            // row in this run stays allowed; undo runs newest first and restores both.
+            if kind != "confirm" {
+                for id in &ids {
+                    touched.insert(id.clone());
+                }
             }
             let all_ids: Vec<String> = ids.iter().chain(created.iter()).cloned().collect();
             tx.execute(

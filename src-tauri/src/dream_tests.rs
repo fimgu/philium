@@ -306,3 +306,23 @@ async fn index_stays_under_budget_after_promote_and_demote() {
     assert!(idx.lines().filter(|l| l.starts_with("- ")).count() <= INDEX_BUDGET);
     assert!(!idx.contains(&ids[0]), "demoted memory leaves the index");
 }
+
+/// Seen live: a real model confirmed a memory and promoted it in the same reply; the promote
+/// was rejected as "already changed". Confirm only stamps verification, so both apply, and
+/// undoing the run restores the row exactly.
+#[tokio::test]
+async fn confirm_then_promote_same_memory_both_apply_and_undo_restores() {
+    let r = rig("dream-confirm-promote").await;
+    let id = save(&r.ctx, "repo:ra", "The repo uses pnpm for installs.", "agent_inferred", "decision", None);
+    let before = row(&r.ctx, &id);
+    set_reply(&r, json!([
+        { "type": "confirm", "id": id, "evidence": ["We switched from npm to pnpm last week"], "reason": "said" },
+        { "type": "promote", "id": id, "reason": "every session" }
+    ]));
+    let out = run(&r.ctx, "ra", true).await.unwrap();
+    assert_eq!(out["applied"].as_array().unwrap().len(), 2, "{out}");
+    let now = row(&r.ctx, &id);
+    assert!(now["dream_verified_at"].is_string() && now["index_rank"].as_i64().unwrap() > 0, "{now}");
+    undo(&r.ctx, &json!({ "run_id": out["run_id"] })).unwrap();
+    assert_eq!(row(&r.ctx, &id), before);
+}
