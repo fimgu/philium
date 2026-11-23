@@ -23,18 +23,21 @@ export function RoleBadge(props) {
 export function KvBadge(props) {
   const kv = () => props.kv || {};
   const reqs = () => kv().requests || 0;
-  const hit = () => kv().cache_hit_pct ?? 0;
-  const inp = () => kv().input_tokens || 0;
+  const hit = () => kv().cache_hit_pct;
+  const inp = () => kv().cache_input_tokens || 0;
   const cached = () => kv().cached_tokens || 0;
   const ttft = () => kv().avg_ttft_ms;
-  const tone = () => (hit() >= 60 ? "ok" : hit() >= 25 ? "warn" : inp() >= 8000 ? "bad" : "neutral");
+  const pending = () => kv().pending_requests > 0;
+  const tone = () => (hit() == null ? "neutral" : hit() >= 60 ? "ok" : hit() >= 25 ? "warn" : inp() >= 8000 ? "bad" : "neutral");
+  const status = () => hit() != null ? `${hit()}% hit (${(cached() / 1000).toFixed(1)}k cached / ${(inp() / 1000).toFixed(1)}k input across ${kv().cache_requests} reporting reqs)`
+    : pending() ? "Telemetry pending" : "Usage not reported";
   return (
     <Show when={reqs() > 0}>
       <span
         class={`kv-badge kv-${tone()}`}
-        title={`KV Cache: ${hit()}% hit (${(cached() / 1000).toFixed(1)}k cached / ${(inp() / 1000).toFixed(1)}k input across ${reqs()} reqs)${ttft() ? ` · avg TTFT ${ttft()}ms` : ""}`}
+        title={`KV Cache: ${status()}${ttft() != null ? ` · avg TTFT ${ttft()}ms` : ""}`}
       >
-        KV {hit()}%
+        KV {hit() != null ? `${hit()}%` : pending() ? "pending" : "—"}
       </span>
     </Show>
   );

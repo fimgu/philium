@@ -35,16 +35,22 @@ export default function Chat() {
 
   const sessionKv = createMemo(() => {
     let reqs = 0, inp = 0, cached = 0, out = 0;
+    let cacheInput = 0;
     for (const ev of events()) {
       const u = ev?.data?.usage;
-      if (u && (u.input_tokens || u.output_tokens || u.prompt_tokens)) {
+      if (u && (u.input_tokens != null || u.output_tokens != null || u.prompt_tokens != null)) {
         reqs += 1;
-        inp += Number(u.input_tokens || u.prompt_tokens || 0);
-        cached += Number(u.cached_tokens || u.cache_read_input_tokens || 0);
+        const input = Number(u.input_tokens ?? u.prompt_tokens ?? 0);
+        const read = u.cached_tokens ?? u.cache_read_input_tokens ?? u.input_tokens_details?.cached_tokens ?? u.prompt_tokens_details?.cached_tokens;
+        inp += input;
+        if (input > 0 && read != null) {
+          cacheInput += input;
+          cached += Math.min(input, Number(read));
+        }
         out += Number(u.output_tokens || u.completion_tokens || 0);
       }
     }
-    return { requests: reqs, input_tokens: inp, cached_tokens: cached, output_tokens: out };
+    return { requests: reqs, input_tokens: inp, cache_input_tokens: cacheInput, cached_tokens: cacheInput > 0 ? cached : null, output_tokens: reqs > 0 ? out : null };
   });
 
   const changeChatModel = async (newRef) => {

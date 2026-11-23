@@ -1611,13 +1611,16 @@ fn with_live_snapshot(snap: &LiveSnapshot, mut row: Value) -> Value {
     let kv = snap.stats.get(&name).cloned().unwrap_or_else(|| {
         json!({
             "requests": 0,
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "cached_tokens": 0,
-            "cache_hit_pct": 0,
-            "last_input_tokens": 0,
-            "last_cached_tokens": 0,
-            "last_cache_hit_pct": 0,
+            "pending_requests": 0,
+            "input_tokens": Value::Null,
+            "output_tokens": Value::Null,
+            "cache_requests": 0,
+            "cache_input_tokens": 0,
+            "cached_tokens": Value::Null,
+            "cache_hit_pct": Value::Null,
+            "last_input_tokens": Value::Null,
+            "last_cached_tokens": Value::Null,
+            "last_cache_hit_pct": Value::Null,
             "guard_alerts": 0,
             "rate_limits": 0,
             "errors": 0,
@@ -1655,15 +1658,16 @@ fn with_live_snapshot(snap: &LiveSnapshot, mut row: Value) -> Value {
             "text": format!("AST {sev} clash with {peer}: {detail}"),
         }));
     }
-    let reqs = kv["requests"].as_u64().unwrap_or(0);
-    let inp = kv["input_tokens"].as_u64().unwrap_or(0);
-    let hit = kv["cache_hit_pct"].as_u64().unwrap_or(0);
-    if reqs >= 4 && inp >= 20_000 && hit < 15 {
-        warnings.push(json!({
-            "kind": "kv_cache",
-            "severity": "med",
-            "text": format!("Cold KV cache ({hit}% hit across {}k input tokens)", inp / 1000),
-        }));
+    let reqs = kv["cache_requests"].as_u64().unwrap_or(0);
+    let inp = kv["cache_input_tokens"].as_u64().unwrap_or(0);
+    if let Some(hit) = kv["cache_hit_pct"].as_u64() {
+        if reqs >= 4 && inp >= 20_000 && hit < 15 {
+            warnings.push(json!({
+                "kind": "kv_cache",
+                "severity": "med",
+                "text": format!("Cold KV cache ({hit}% hit across {}k input tokens)", inp / 1000),
+            }));
+        }
     }
     let guard_alerts = kv["guard_alerts"].as_u64().unwrap_or(0);
     if guard_alerts > 0 {
@@ -2965,11 +2969,11 @@ mod tests {
         // plus benign same_file clash and high-signal same_symbol clash.
         snap.stats.insert(
             "lion".into(),
-            json!({ "requests": 3, "input_tokens": 15_000, "cache_hit_pct": 20, "guard_alerts": 0, "rate_limits": 0 }),
+            json!({ "cache_requests": 3, "cache_input_tokens": 15_000, "cache_hit_pct": 20, "guard_alerts": 0, "rate_limits": 0 }),
         );
         snap.stats.insert(
             "owl".into(),
-            json!({ "requests": 4, "input_tokens": 25_000, "cache_hit_pct": 10, "guard_alerts": 0, "rate_limits": 0 }),
+            json!({ "cache_requests": 4, "cache_input_tokens": 25_000, "cache_hit_pct": 10, "guard_alerts": 0, "rate_limits": 0 }),
         );
         snap.clashes = vec![
             json!({ "a": "lion", "b": "fox", "severity": "same_file", "detail": ["src/a.rs"] }),
