@@ -61,22 +61,26 @@ const feats = [
   ["Any model provider", "Bring the models you already use and switch freely."],
   ["Sandboxed and private", "Agents run contained. Your code and keys stay yours."],
 ];
+// Frame inner width is 1200 - 2*90 padding - 2px border. The screenshot is cut into two
+// slices so the empty band at the top of the conversation (source y 470..640 of 1800) is skipped.
+const FW = 1018, SW = 2880, k = FW / SW, CUT_A = 470, CUT_B = 640;
+const slice = (y0, h) => `<div style="flex:none;height:${Math.round(h * k)}px;background:url(${SHOT}) no-repeat 0 ${-Math.round(y0 * k)}px/100% auto"></div>`;
 const slot = SHOT
-  ? `<img src="${SHOT}" style="width:100%;height:100%;object-fit:cover;object-position:top left;display:block">`
+  ? `<div style="display:flex;flex-direction:column">${slice(0, CUT_A)}<div style="height:1px;background:rgba(255,255,255,.06)"></div>${slice(CUT_B, 1800 - CUT_B)}</div>`
   : `<div style="height:100%;display:flex;gap:14px;padding:44px 22px 22px">
       <div style="width:22%;border-radius:10px;background:var(--surface)"></div>
       ${[0, 1, 2].map(() => `<div style="flex:1;border-radius:10px;background:var(--surface);padding:16px;display:flex;flex-direction:column;gap:10px">${[70, 90, 55, 80, 40].map(w => `<div style="height:8px;width:${w}%;border-radius:4px;background:rgba(255,255,255,.07)"></div>`).join("")}</div>`).join("")}
      </div>`;
 const poster = base(1200, 1500, `
-<div style="position:absolute;inset:0;padding:84px 90px;display:flex;flex-direction:column">
+<div style="position:absolute;inset:0;padding:84px 90px;display:flex;flex-direction:column;${SHOT ? "justify-content:center" : ""}">
  <div style="display:flex;align-items:center;gap:18px"><img class="logo" src="${LOGO}" width="64" height="64"><span class="name" style="font-size:34px">Philium</span></div>
  <h1 class="name" style="font-size:86px;line-height:1.02;margin-top:54px">All your coding agents.<br><span class="acc">One calm workspace.</span></h1>
- <div style="margin-top:56px;height:520px;border-radius:18px;padding:1px;background:linear-gradient(160deg,rgba(139,156,255,.5),rgba(255,255,255,.06) 40%,rgba(139,156,255,.15));box-shadow:0 40px 100px rgba(0,0,0,.55),0 0 80px rgba(139,156,255,.12)">
-  <div style="position:relative;height:100%;border-radius:17px;overflow:hidden;background:var(--raised)">
+ <div style="margin-top:56px;flex:none;${SHOT ? "" : "height:520px;"}border-radius:18px;padding:1px;background:linear-gradient(160deg,rgba(139,156,255,.5),rgba(255,255,255,.06) 40%,rgba(139,156,255,.15));box-shadow:0 40px 100px rgba(0,0,0,.55),0 0 80px rgba(139,156,255,.12)">
+  <div style="position:relative;${SHOT ? "" : "height:100%;"}border-radius:17px;overflow:hidden;background:var(--raised)">
    <div style="position:absolute;top:0;left:0;right:0;height:30px;display:flex;gap:7px;align-items:center;padding-left:14px;z-index:1;${SHOT ? "" : "background:var(--raised)"}">${SHOT ? "" : ["#ff5f57", "#febc2e", "#28c840"].map(c => `<i style="width:11px;height:11px;border-radius:50%;background:${c};opacity:.7"></i>`).join("")}</div>
    ${slot}
   </div></div>
- <div style="margin-top:auto;display:grid;grid-template-columns:repeat(3,1fr);gap:40px 44px">
+ <div style="margin-top:${SHOT ? "64px" : "auto"};display:grid;grid-template-columns:repeat(3,1fr);gap:40px 44px">
   ${feats.map(([t, d]) => `<div style="border-top:1px solid rgba(139,156,255,.35);padding-top:18px"><div style="font-size:23px;font-weight:650;letter-spacing:-.01em">${t}</div><div class="tag" style="font-size:17px;line-height:1.45;margin-top:8px">${d}</div></div>`).join("")}
  </div>
 </div>`);

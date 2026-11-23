@@ -23,6 +23,10 @@
 
 Philium is a desktop workspace for running coding agents on your own machine. You add your repositories, connect a model provider, and start agents that work in those repos. Philium shows every message, tool call and model request, asks before tools run (unless you tell it not to), and keeps an eye on secrets leaving your machine.
 
+<p align="center"><img src="docs/assets/screenshots/agents.png" alt="Philium agents view" width="100%"></p>
+
+<p align="center"><img src="docs/assets/demo.gif" alt="Philium demo" width="100%"></p>
+
 It is built with Tauri 2. The agent runtime is HAL, a separate project that Philium starts in the background and stops when you quit.
 
 ## Why Philium
@@ -37,40 +41,48 @@ It is built with Tauri 2. The agent runtime is HAL, a separate project that Phil
 <table>
   <tr>
     <td width="50%" valign="top">
+      <img src="docs/assets/screenshots/home.png" alt="Home" width="100%"><br>
       <b>Home</b><br>
       Get set up checklist and an overview of what your agents are doing.
     </td>
     <td width="50%" valign="top">
+      <img src="docs/assets/screenshots/board.png" alt="Board" width="100%"><br>
       <b>Board</b><br>
       Track agent work across repositories in one view.
     </td>
   </tr>
   <tr>
     <td width="50%" valign="top">
+      <img src="docs/assets/screenshots/review.png" alt="Review" width="100%"><br>
       <b>Review</b><br>
       Read diffs and review or publish pull requests with the GitHub CLI.
     </td>
     <td width="50%" valign="top">
+      <img src="docs/assets/screenshots/memory.png" alt="Memory" width="100%"><br>
       <b>Memory</b><br>
       Local memory with on-device search models.
     </td>
   </tr>
   <tr>
     <td width="50%" valign="top">
+      <img src="docs/assets/screenshots/skills.png" alt="Skills" width="100%"><br>
       <b>Skills</b><br>
       Extra tools and MCP servers your agents can use.
     </td>
     <td width="50%" valign="top">
+      <img src="docs/assets/screenshots/stats.png" alt="Stats" width="100%"><br>
       <b>Stats</b><br>
       Usage and model request statistics.
     </td>
   </tr>
   <tr>
     <td width="50%" valign="top">
+      <img src="docs/assets/screenshots/terminals.png" alt="Terminals" width="100%"><br>
       <b>Terminals</b><br>
       Built-in terminals next to your agents.
     </td>
     <td width="50%" valign="top">
+      <img src="docs/assets/screenshots/improve.png" alt="Improve" width="100%"><br>
       <b>Improve</b><br>
       Suggestions for improving how your agents work.
     </td>
