@@ -62,8 +62,18 @@ pub fn init(ctx: &Arc<Ctx>) -> Result<(), String> {
     Ok(())
 }
 
-const RESULTS_NON_HUMAN: [&str; 3] = ["pass", "fail", "blocked"];
-const RESULTS_HUMAN: [&str; 4] = ["addressed", "not_addressed", "outdated", "not_applicable"];
+const RESULTS_CHECK: [&str; 3] = ["pass", "fail", "not_applicable"];
+const RESULTS_COMMENT: [&str; 4] = ["addressed", "not_addressed", "outdated", "not_applicable"];
+
+/// SQLite hands booleans back as 0/1 integers while fixtures use JSON booleans: accept both.
+/// Reading a stored flag with `as_bool()` alone silently yields false.
+fn flag(v: &Value) -> bool {
+    v.as_bool().or_else(|| v.as_i64().map(|n| n != 0)).unwrap_or(false)
+}
+
+fn is_comment_kind(kind: &str) -> bool {
+    matches!(kind, "comment" | "review" | "thread")
+}
 const ORIGINS: [&str; 3] = ["introduced", "pre_existing", "unverified"];
 
 fn origin_of(raw: &str) -> Option<&'static str> {
@@ -119,7 +129,7 @@ fn checklist_items(snapshot: &Value, notes: &[Value]) -> Vec<Value> {
         items.push(mk(check["key"].as_str().unwrap_or(""), "ci", check["name"].as_str().unwrap_or("").to_string(), "", check["url"].as_str().unwrap_or(""), "", true, true, status, None, None));
     }
     for n in notes {
-        let must = n["must"].as_bool().unwrap_or(false);
+        let must = flag(&n["must"]);
         items.push(mk(&format!("note:{}", n["id"].as_str().unwrap_or("")), "note", n["text"].as_str().unwrap_or("").chars().take(120).collect(), n["text"].as_str().unwrap_or(""), "", "you", true, must, "open", None, None));
     }
     items
@@ -182,15 +192,15 @@ fn is_blocker(i: &Value) -> bool {
                 && i["severity"].as_i64().is_some_and(|s| s <= 1)
                 && matches!(i["origin"].as_str(), Some("introduced") | Some("unverified"))
         }
-        Some("note") => i["required"].as_bool().unwrap_or(false) && i["status"].as_str() == Some("fail"),
-        Some("comment") | Some("review") | Some("thread") => i["human"].as_bool().unwrap_or(false) && i["status"].as_str() == Some("not_addressed"),
+        Some("note") => flag(&i["required"]) && i["status"].as_str() == Some("fail"),
+        Some("comment") | Some("review") | Some("thread") => flag(&i["human"]) && i["status"].as_str() == Some("not_addressed"),
         _ => false,
     }
 }
 
 /// Pure verdict function over a review's items, per `docs/pr-reviewer.md`.
 pub fn verdict(items: &[Value]) -> Value {
-    let open: Vec<&Value> = items.iter().filter(|i| i["required"].as_bool().unwrap_or(false) && matches!(i["status"].as_str(), Some("open") | Some("doing"))).collect();
+    let open: Vec<&Value> = items.iter().filter(|i| flag(&i["required"]) && matches!(i["status"].as_str(), Some("open") | Some("doing"))).collect();
     let needing_verify: Vec<&Value> = items.iter().filter(|i| i["verify"].as_str() == Some("needed")).collect();
     if !open.is_empty() || !needing_verify.is_empty() {
         let mut ids: Vec<Value> = open.iter().map(|i| i["id"].clone()).collect();
@@ -201,7 +211,7 @@ pub fn verdict(items: &[Value]) -> Value {
     if !blockers.is_empty() {
         return json!({"verdict":"request_changes","blocking":blockers,"open":[],"needs_you":[]});
     }
-    let needs_you: Vec<Value> = items.iter().filter(|i| i["required"].as_bool().unwrap_or(false) && i["status"].as_str() == Some("blocked")).map(|i| i["id"].clone()).collect();
+    let needs_you: Vec<Value> = items.iter().filter(|i| flag(&i["required"]) && i["status"].as_str() == Some("blocked")).map(|i| i["id"].clone()).collect();
     if !needs_you.is_empty() {
         return json!({"verdict":"needs_you","blocking":[],"open":[],"needs_you":needs_you});
     }
@@ -412,12 +422,14 @@ pub fn pr_item_result(ctx: &Ctx, agent_row: &Value, id: &str, status: &str, evid
     let r = review_for_agent(ctx, agent_row)?;
     let rid = r["id"].as_str().unwrap_or("");
     let item = item_in_review(ctx, rid, id)?;
-    let human = item["human"].as_bool().unwrap_or(false);
+    // Statuses follow the item kind, not who wrote it: a bot comment is still answered as
+    // addressed/not_addressed, and a claim, CI check or note is pass/fail.
     let kind = item["kind"].as_str().unwrap_or("");
-    let allowed: &[&str] = if human { &RESULTS_HUMAN } else { &RESULTS_NON_HUMAN };
+    let comment = is_comment_kind(kind);
+    let allowed: &[&str] = if comment { &RESULTS_COMMENT } else { &RESULTS_CHECK };
     let status = status.trim().to_ascii_lowercase();
     if status != "blocked" && !allowed.contains(&status.as_str()) {
-        let wanted = if human { "addressed, not_addressed, outdated, not_applicable, or blocked" } else { "pass, fail, or blocked" };
+        let wanted = if comment { "addressed, not_addressed, outdated, not_applicable, or blocked" } else { "pass, fail, not_applicable (duplicate: evidence \"same as <id>\"), or blocked" };
         return Err(format!("status is {wanted}"));
     }
     // Required on every settled finding (pass/fail/addressed/not_addressed): how you know.
@@ -430,7 +442,7 @@ pub fn pr_item_result(ctx: &Ctx, agent_row: &Value, id: &str, status: &str, evid
     } else {
         None
     };
-    let is_fail = (!human && status == "fail") || kind == "ci" && status == "fail";
+    let is_fail = !comment && status == "fail";
     let origin_v = match (is_fail, origin.filter(|o| !o.trim().is_empty())) {
         (true, None) => return Err("A failure needs its origin. Run the same check on the base too, then send origin: introduced, pre_existing, or unverified.".into()),
         (true, Some(o)) => Some(origin_of(o).ok_or("origin is introduced, pre_existing, or unverified")?),
@@ -446,7 +458,8 @@ pub fn pr_item_result(ctx: &Ctx, agent_row: &Value, id: &str, status: &str, evid
     if evidence.len() < 20 || evidence.len() > 6000 {
         return Err("evidence says what you ran and what it showed, on which commit: 20 to 6000 characters".into());
     }
-    let verify_needed = status == "fail" || status == "not_addressed" || status == "not_applicable" || status == "outdated";
+    // Anything that could block, or that dismisses a person's comment, gets a second opinion.
+    let verify_needed = status == "fail" || status == "not_addressed" || (flag(&item["human"]) && (status == "not_applicable" || status == "outdated"));
     let me = agent_row["name"].as_str().unwrap_or("agent");
     ctx.db.exec(
         "UPDATE pr_items SET status=?1, evidence=?2, severity=?3, origin=?4, agent=?5, path=COALESCE(?6,path), line=COALESCE(?7,line),
@@ -973,5 +986,77 @@ mod tests {
         let (body, _inline) = build_body(&r, &items, &v, "summary text");
         assert!(body.contains("Coverage"));
         assert!(body.contains("checks 2/5"));
+    }
+
+    /// The whole flow through the real tables and the agent-facing functions, with stored rows
+    /// (SQLite integers for flags), short of GitHub I/O: checklist build, a live must-note, tool
+    /// validation, independent verification, refute, and the verdict each step produces.
+    #[tokio::test]
+    async fn stored_review_flows_from_checklist_to_verdict() {
+        let ctx = Ctx::test();
+        init(&ctx).unwrap();
+        let t = now();
+        ctx.db.exec("INSERT INTO repos(id,name,path,remote_url,added_at) VALUES('r1','inv','/tmp/pr-review-flow','https://github.com/o/inv.git',?1)", [t]).unwrap();
+        for (id, name, role, parent) in [("lead", "lead", "orchestrator", None), ("h1", "helper", "worker", Some("lead")), ("v1", "verifier", "worker", Some("lead")), ("x", "stranger", "orchestrator", None)] {
+            ctx.db.exec("INSERT INTO agents(id,name,role,model_ref,parent_id,repo_id,created_at,last_active_at) VALUES(?1,?2,?3,'m',?4,'r1',?5,?5)", params![id, name, role, parent, t]).unwrap();
+        }
+        ctx.db.exec("INSERT INTO pr_reviews(id,repo,origin,pr,base,head,state,lead,started,coverage,errors) VALUES('rv','r1','o/inv',7,'b','h','running','lead',?1,'{}','[]')", [t]).unwrap();
+        let snapshot = json!({
+            "comments":[{"key":"comment:1","author":"bot[bot]","bot":true,"body":"maybe a leak","url":""}],
+            "threads":[{"key":"thread:t","author":"ana","bot":false,"body":"null check missing","path":"a.rs","line":3,"resolved":true,"url":""}],
+            "checks":[{"key":"ci:build","name":"build","state":"pass","url":""}],
+        });
+        for it in checklist_items(&snapshot, &[]) { insert_item(&ctx, "rv", &it).unwrap(); }
+        // A must-note added while running becomes a required item right away.
+        call(&ctx, "note_add", json!({"repo_id":"r1","pr":7,"text":"Upgrade path from 1.0 still works","must":true})).await.unwrap();
+        let agent = |id: &str| ctx.db.query("SELECT * FROM agents WHERE id=?1", [id]).unwrap().pop().unwrap();
+        let (lead, h1, v1, x) = (agent("lead"), agent("h1"), agent("v1"), agent("x"));
+        let items = items_of(&ctx, "rv").unwrap();
+        let id_of = |k: &str| items.iter().find(|i| i["key"].as_str().unwrap().starts_with(k)).unwrap()["id"].as_str().unwrap().to_string();
+        let (bot, thread, note) = (id_of("comment:1"), id_of("thread:t"), id_of("note:"));
+        assert_eq!(items.iter().find(|i| i["id"] == note.as_str()).unwrap()["required"], 1, "must-note is required");
+        assert_eq!(verdict(&items)["verdict"], "pending", "resolved thread is not proof; it stays open");
+
+        // Outside agents cannot touch the review; the orchestrator alone adds risks.
+        assert!(pr_checklist(&ctx, &x).is_err());
+        assert!(pr_checklist_add(&ctx, &h1, &json!([{"title":"t","detail":"d"}])).is_err());
+        let risk = pr_checklist_add(&ctx, &lead, &json!([{"title":"Token logged on retry","detail":"run sync with a failing upstream and grep logs","path":"sync.rs","line":40}])).unwrap()["items"][0]["id"].as_str().unwrap().to_string();
+
+        let ev = "ran cargo test sync::retry on head h and base b, output attached";
+        assert!(pr_item_result(&ctx, &h1, &thread, "pass", ev, None, None, None, None, Some("runtime")).is_err(), "comments are answered, not passed");
+        assert!(pr_item_result(&ctx, &h1, &risk, "fail", ev, Some(1), Some("introduced"), None, None, None).is_err(), "basis is required");
+        assert!(pr_item_result(&ctx, &h1, &risk, "fail", ev, Some(1), None, None, None, Some("runtime")).is_err(), "origin is required on a fail");
+        pr_item_result(&ctx, &h1, &risk, "fail", ev, Some(1), Some("introduced"), None, None, Some("runtime")).unwrap();
+        // A bot comment is answered like any comment and not escalated to verification when dismissed.
+        assert_eq!(pr_item_result(&ctx, &h1, &bot, "not_applicable", "same as the token risk item, checked sync.rs:40 on head", None, None, None, None, None).unwrap()["verify"], "none");
+        pr_item_result(&ctx, &h1, &thread, "addressed", "head a.rs:3 now returns early on None; test null_input passes on head", None, None, None, None, Some("runtime_and_source")).unwrap();
+        pr_item_result(&ctx, &h1, &note, "pass", "upgraded a 1.0 data dir with the head build; app opened and migrated", None, None, None, None, Some("runtime")).unwrap();
+        assert_eq!(verdict(&items_of(&ctx, "rv").unwrap())["verdict"], "pending", "a fail waits for its verifier");
+
+        // The recorder cannot verify its own result; a refute reopens the item.
+        assert!(pr_item_verify(&ctx, &h1, &risk, "confirm", "looks right to me after rereading", None, None).is_err());
+        pr_item_verify(&ctx, &v1, &risk, "refute", "token is redacted by the logger filter at log.rs:12", None, None).unwrap();
+        let reopened = items_of(&ctx, "rv").unwrap().into_iter().find(|i| i["id"] == risk.as_str()).unwrap();
+        assert_eq!(reopened["status"], "open");
+        assert!(reopened["prev_evidence"].as_str().unwrap().contains("Refuted"));
+
+        // Redo, then an independent confirm: a confirmed introduced P1 requests changes.
+        pr_item_result(&ctx, &h1, &risk, "fail", "redaction skipped on the retry path: ran sync with failing upstream, token in logs", Some("P1".trim_start_matches('P').parse().unwrap()), Some("introduced"), None, None, Some("runtime")).unwrap();
+        pr_item_verify(&ctx, &v1, &risk, "confirm", "reproduced on head h; base b has no retry path so it is introduced", None, None).unwrap();
+        let v = verdict(&items_of(&ctx, "rv").unwrap());
+        assert_eq!(v["verdict"], "request_changes");
+        assert_eq!(v["blocking"], json!([risk]));
+
+        // Only the orchestrator submits, and submit refuses while anything is pending.
+        assert!(pr_review_submit(&ctx, &h1, "a summary that is long enough").await.is_err());
+        call(&ctx, "note_add", json!({"repo_id":"r1","pr":7,"text":"Docs mention the flag","must":true})).await.unwrap();
+        let e = pr_review_submit(&ctx, &lead, "a summary that is long enough").await.unwrap_err();
+        assert!(e.contains("not done"), "{e}");
+
+        // get returns what the UI reads.
+        let got = call(&ctx, "get", json!({"repo_id":"r1","pr":7})).await.unwrap();
+        assert_eq!(got["review"]["coverage"], json!({}));
+        assert_eq!(got["notes"].as_array().unwrap().len(), 2);
+        assert!(got["items"].as_array().unwrap().iter().any(|i| i["basis"] == "runtime"));
     }
 }

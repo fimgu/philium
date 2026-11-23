@@ -291,6 +291,11 @@ fn arg<'a>(a: &'a Value, k: &str) -> Result<&'a str, String> {
     a[k].as_str().filter(|s| !s.is_empty()).ok_or_else(|| format!("missing `{k}`"))
 }
 
+/// Severity as 1 or "P1": models send both.
+fn severity_arg(a: &Value) -> Option<i64> {
+    a["severity"].as_i64().or_else(|| a["severity"].as_str().and_then(|s| s.trim().trim_start_matches(['P', 'p']).parse().ok()))
+}
+
 fn agent_row(ctx: &Ctx, agent: &str) -> Result<Value, String> {
     crate::agents::get_row(ctx, agent).ok_or_else(|| "unknown agent".to_string())
 }
@@ -670,8 +675,8 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
         "review_report" => crate::review_run::report(ctx, &me, &row, arg(&a, "markdown")?),
         "pr_checklist" => crate::pr_review::pr_checklist(ctx, &row),
         "pr_checklist_add" => crate::pr_review::pr_checklist_add(ctx, &row, &a["items"]),
-        "pr_item_result" => crate::pr_review::pr_item_result(ctx, &row, arg(&a, "id")?, arg(&a, "status")?, arg(&a, "evidence")?, a["severity"].as_i64(), a["origin"].as_str(), a["path"].as_str(), a["line"].as_i64(), a["basis"].as_str()),
-        "pr_item_verify" => crate::pr_review::pr_item_verify(ctx, &row, arg(&a, "id")?, arg(&a, "verdict")?, arg(&a, "evidence")?, a["severity"].as_i64(), a["origin"].as_str()),
+        "pr_item_result" => crate::pr_review::pr_item_result(ctx, &row, arg(&a, "id")?, arg(&a, "status")?, arg(&a, "evidence")?, severity_arg(&a), a["origin"].as_str(), a["path"].as_str(), a["line"].as_i64(), a["basis"].as_str()),
+        "pr_item_verify" => crate::pr_review::pr_item_verify(ctx, &row, arg(&a, "id")?, arg(&a, "verdict")?, arg(&a, "evidence")?, severity_arg(&a), a["origin"].as_str()),
         "pr_review_submit" => crate::pr_review::pr_review_submit(ctx, &row, arg(&a, "summary")?).await,
         "checks_propose" => {
             let repo = row["repo_id"].as_str().filter(|id| !id.is_empty()).ok_or("Release checks belong to a registered checkout")?;
