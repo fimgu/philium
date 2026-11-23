@@ -1775,6 +1775,14 @@ pub(crate) fn checkpoint_request(session: &str, method: &str, args: &Value) -> R
     Ok((reqwest::Method::POST, format!("/sessions/{session}/checkpoints/{turn}/{action}"), Some(body)))
 }
 
+/// HAL compact body (A7): `{focus}` only when the person gave one.
+pub(crate) fn compact_body(focus: Option<&str>) -> Value {
+    match focus.map(str::trim).filter(|f| !f.is_empty()) {
+        Some(f) => json!({ "focus": f }),
+        None => json!({}),
+    }
+}
+
 pub(crate) fn hal_unsupported(err: &str) -> bool {
     err.starts_with("HAL 404") || err.starts_with("HAL 405")
 }
@@ -1851,7 +1859,7 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
         }
         "compact" => {
             let r = rt(&id()?)?;
-            r.hal.call(reqwest::Method::POST, &format!("/sessions/{}/compact", r.session), Some(json!({}))).await
+            r.hal.call(reqwest::Method::POST, &format!("/sessions/{}/compact", r.session), Some(compact_body(args["focus"].as_str()))).await
         }
         "plan_get" => Ok(plan_state(ctx, &id()?)),
         "plan_mode" => {
@@ -2392,6 +2400,13 @@ mod tests {
         assert!(plan_locked(&ctx, "a"));
         set_plan(&ctx, "a", false, Some(1)).unwrap();
         assert!(!plan_locked(&ctx, "a"));
+    }
+
+    #[test]
+    fn compact_sends_focus_only_when_given() {
+        assert_eq!(compact_body(None), json!({}));
+        assert_eq!(compact_body(Some("  ")), json!({}));
+        assert_eq!(compact_body(Some(" keep API notes ")), json!({ "focus": "keep API notes" }));
     }
 
     #[test]

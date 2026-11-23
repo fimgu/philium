@@ -15,6 +15,7 @@ import { plainError } from "../lib/plain-error.js";
 import { rpc } from "../lib/rpc.js";
 import { activeRepoId } from "../lib/store.js";
 import { draftFor, newDraft, clearSentDraft, attachImage, sendableImages } from "../lib/drafts.js";
+import { compactFocus } from "../lib/compact.js";
 import { validateImages, normalizeImage, createImageCache, MAX_IMAGES } from "../lib/images.js";
 
 /** Fold a list of HAL events into display items. Pure, incremental-safe. */
@@ -969,8 +970,8 @@ export function Composer(props) {
       return;
     }
     if (!attached.length && /^\/compact(\s+.*)?$/i.test(t) && props.onSlashCompact) {
-      await props.onSlashCompact();
-      clearSentDraft(target, draft, attached);
+      const ok = await props.onSlashCompact(compactFocus(t));
+      if (ok !== false) clearSentDraft(target, draft, attached);
       return;
     }
     target.setSending(true);

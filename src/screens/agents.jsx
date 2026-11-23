@@ -744,7 +744,7 @@ function AgentView(props) {
               onTakeQueued={(q) => rpc("agents.queue_take", { id: props.id, item: q.id }).then((r) => r?.text).catch((e) => { toast(String(e), "danger"); return null; })}
               onRemoveQueued={(q) => rpc("agents.queue_remove", { id: props.id, item: q.id }).catch((e) => toast(String(e), "danger"))} onCancel={() => rpc("agents.cancel", { id: props.id }, { action: true }).catch((e) => toast(String(e), "danger"))}
               effort={effort()} speed={effortSpeed(effort())} effortOptions={activeModel()?.effort_details ?? []} effortPending={effortPending()} onEffort={changeEffort} onSpeed={changeEffort} onSlashModel={handleSlashModel}
-              onSlashContext={() => setAside("context")} onSlashRemember={handleSlashRemember} onSlashFork={handleSlashFork} onSlashCompact={() => rpc("agents.compact", { id: props.id }, { action: true }).then(() => toast("Context compacted.", "success")).catch((e) => toast(String(e), "danger"))}
+              onSlashContext={() => setAside("context")} onSlashRemember={handleSlashRemember} onSlashFork={handleSlashFork} onSlashCompact={(focus) => rpc("agents.compact", { id: props.id, ...(focus ? { focus } : {}) }, { action: true }).then((r) => toast(r?.compacted === 0 ? "Nothing to compact yet." : "Context compacted.", "success")).catch((e) => { toast(String(e), "danger"); return false; })}
               placeholder={live() ? `Message ${a()?.name ?? ""}…` : "Stopped"} />
           </Show>
           <Show when={tab() === "terms"}><Terminals id={props.id} /></Show>
