@@ -224,13 +224,14 @@ test("UI components wire the exact backend access RPC and event contracts", () =
   const agentsSrc = readFileSync(new URL("../screens/agents.jsx", import.meta.url), "utf8");
   const contextSrc = readFileSync(new URL("../ui/agent-context.jsx", import.meta.url), "utf8");
   const reposSrc = readFileSync(new URL("../screens/repos.jsx", import.meta.url), "utf8");
+  const storeSrc = readFileSync(new URL("./store.js", import.meta.url), "utf8");
 
   for (const method of ["access.pending", "access.decide", "access.grant_create", "access.catalog", "app.pick_folder"]) {
     assert.ok(requestsSrc.includes(`"${method}"`), `access-requests.jsx should call ${method}`);
   }
   for (const topic of ["access:requested", "access:changed"]) {
     assert.ok(requestsSrc.includes(`"${topic}"`), `access-requests.jsx should subscribe to ${topic}`);
-    assert.ok(agentsSrc.includes(`"${topic}"`), `agents.jsx should subscribe to ${topic}`);
+    assert.ok(storeSrc.includes(`"${topic}"`), `the shared store should subscribe to ${topic}`);
   }
   assert.ok(agentsSrc.includes("<AccessApprovalBar"));
   assert.ok(contextSrc.includes("Shared Access"));

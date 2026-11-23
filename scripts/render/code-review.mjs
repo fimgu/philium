@@ -19,6 +19,7 @@ export async function checkCodeGraph(page, shot) {
   await page.waitForSelector('.composer textarea');
   await page.$eval('.composer textarea', (el) => { el.value = 'My existing instructions'; el.dispatchEvent(new Event('input', { bubbles: true })); });
   await click('.nav-item', 'Code'); await wait();
+  await click('.code-bar button', 'Graph');
   await page.waitForSelector('.pgraph canvas');
   await wait();
   const zoom = await page.evaluate(async () => {
@@ -63,10 +64,17 @@ export async function checkCodeGraph(page, shot) {
   await click('.nav-item', 'Code'); await wait();
   await page.waitForSelector('.pgraph canvas');
   await target('local');
-  await click('.code-bar label, .code-bar button', 'Changes'); await wait();
   if (!(await click('.changed-file', 'src/review.py'))) return [...errors, 'changed-file list missing'];
   await page.waitForSelector('.code-diff-line');
   if (!(await page.$eval('.code-inspector', (e) => e.innerText.includes('return 42')))) errors.push('diff contents missing');
+  if (!(await page.$('.diff-word-change'))) errors.push('modified words are not emphasized');
+  await click('.diff-controls button', 'Next hunk');
+  await click('.diff-controls button', 'Side by side');
+  await page.waitForSelector('.code-diff-split');
+  await click('.diff-controls button', 'Inline');
+  await click('.diff-controls button', 'More context');
+  await page.waitForFunction(() => window.__test.codeCalls.some((call) =>
+    call.method === 'codeindex.file_diff' && call.more_context && call.comparison === 'working'));
   await shot(page, 'code-diff-inspector');
   await click('.changed-file', 'src/deleted.py'); await wait();
   await click('[aria-label="Code inspector tabs"] button', 'Source'); await wait();
@@ -82,6 +90,7 @@ export async function checkCodeGraph(page, shot) {
   if (!switched.includes('working-tree:w2') || switched.includes('working-tree:w1')) errors.push('stale worktree source shown after rapid target switch');
   await page.evaluate(() => { window.__test.slowSource = false; });
   await target('w1'); await click('.changed-file', 'src/review.py'); await wait();
+  await click('.changed-files button', 'Against base'); await wait();
   await click('.hunk-select', 'Select hunk'); await wait();
   if (!(await page.$('.code-selection'))) return [...errors, 'hunk selection missing'];
   await click('.code-selection button', 'Explain'); await wait();

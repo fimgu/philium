@@ -322,6 +322,16 @@ function SignIn(props) {
     catch (e) { setErr(String(e)); }
   };
   const cancel = async () => { await rpc("providers.oauth_cancel", { kind: props.kind }).catch(() => {}); setSt(null); };
+  const copyCode = async () => {
+    const code = st()?.user_code;
+    if (!code) return;
+    try {
+      await navigator.clipboard.writeText(code);
+      toast("Code copied", "good");
+    } catch {
+      toast("Could not copy the code. Select it and press ⌘C to copy.", "bad");
+    }
+  };
   const btnLabel = () => {
     const who = claude ? "Claude" : google ? "Google" : "ChatGPT";
     return props.again ? `Sign in again with ${who}` : `Sign in with ${who}`;
@@ -341,7 +351,10 @@ function SignIn(props) {
           </Show>
           <Show when={!claude && !google}>
             <div class="small">Open <span class="mono">{st().verify_url}</span> and enter this code:</div>
-            <div class="mono" style={{ "font-size": "28px", "letter-spacing": "4px" }}>{st().user_code}</div>
+            <div class="row" style={{ gap: "12px", "flex-wrap": "wrap" }}>
+              <span class="mono" style={{ "font-size": "28px", "letter-spacing": "4px", "user-select": "text" }}>{st().user_code}</span>
+              <Button type="button" size="sm" onClick={copyCode}>Copy code</Button>
+            </div>
             <div class="xs faint">Waiting for you to approve. This page updates automatically.</div>
           </Show>
           <div><Button size="sm" onClick={cancel}>Cancel</Button></div>

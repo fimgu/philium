@@ -653,12 +653,23 @@ fn cap(mut s: String) -> (String, bool) {
     (s, truncated)
 }
 pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, String> {
+    if method == "pr_create" {
+        let w = worktree(ctx, &arg_str(&args, "worktree_id")?)?;
+        return crate::publish::pr(Path::new(text(&w, "path")?), &arg_str(&args, "base")?, &arg_str(&args, "title")?,
+            args["body"].as_str().unwrap_or(""), &arg_str(&args, "github_login")?, &arg_str(&args, "github_origin")?).await;
+    }
     // Blocking Git never occupies an async runtime worker.
     let ctx = ctx.clone();
     let method = method.to_owned();
-    tokio::task::spawn_blocking(move || dispatch(&ctx, &method, args))
+    let include_prs = method == "landscape" && args["include_prs"].as_bool().unwrap_or(true);
+    let mut result = tokio::task::spawn_blocking(move || dispatch(&ctx, &method, args))
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())??;
+    if include_prs {
+        let prs = github_prs(result["remote_url"].as_str().unwrap_or("")).await;
+        result["prs"] = prs;
+    }
+    Ok(result)
 }
 /// Rows from `for-each-ref` (see `branches`). Skips symbolic `<remote>/HEAD`.
 fn parse_branches(out: &str) -> Vec<Value> {
@@ -907,11 +918,19 @@ fn dispatch(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, String> 
             changed(ctx);
             Ok(r)
         }
-        "publish_state" | "commit" | "push" | "pr_create" => {
+        "publish_state" | "commit" | "push" => {
             let w = worktree(ctx, &arg_str(&args, "worktree_id")?)?;
             let path = Path::new(text(&w, "path")?);
             if method == "publish_state" {
-                return crate::publish::state(path);
+                let mut state = crate::publish::state(path)?;
+                match crate::publish::pr_target(path) {
+                    Ok((_, origin)) => {
+                        state["github_login"] = json!(crate::release_intake::selected_login(&origin));
+                        state["github_origin"] = json!(origin);
+                    }
+                    Err(error) => state["github_error"] = json!(error),
+                }
+                return Ok(state);
             }
             let lock = repo_lock(text(&w, "repo_id")?);
             let _queue = lock.lock().map_err(|e| e.to_string())?;
@@ -921,7 +940,7 @@ fn dispatch(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, String> 
                     crate::publish::commit(path, &paths, &arg_str(&args, "message")?, args["expect_head"].as_str())
                 }
                 "push" => crate::publish::push(path),
-                _ => crate::publish::pr(path, &arg_str(&args, "base")?, &arg_str(&args, "title")?, args["body"].as_str().unwrap_or("")),
+                _ => unreachable!(),
             }?;
             changed(ctx);
             Ok(r)
@@ -962,11 +981,7 @@ fn dispatch(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, String> 
             }
             Ok(Value::Null)
         }
-        "landscape" => repo_landscape(
-            ctx,
-            &arg_str(&args, "repo_id")?,
-            args["include_prs"].as_bool().unwrap_or(true),
-        ),
+        "landscape" => repo_landscape(ctx, &arg_str(&args, "repo_id")?),
         _ => Err(format!("workspace.{method}: unknown method")),
     }
 }
@@ -1103,103 +1118,84 @@ pub fn discover_worktrees(ctx: &Ctx, repo_id: &str) -> Result<Vec<Value>, String
     Ok(out)
 }
 
-fn run_gh_bounded(repo_path: &Path, args: &[&str], timeout_ms: u64) -> Option<Value> {
-    let mut child = Command::new("gh")
-        .args(args)
-        .current_dir(repo_path)
-        .env("GH_PROMPT_DISABLED", "1")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let start = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                if !status.success() {
-                    return None;
-                }
-                let out = child.wait_with_output().ok()?;
-                return serde_json::from_slice(&out.stdout).ok();
-            }
-            Ok(None) => {
-                if start.elapsed() > std::time::Duration::from_millis(timeout_ms) {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return None;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(25));
-            }
-            Err(_) => return None,
-        }
-    }
+fn empty_prs() -> Value {
+    json!({ "open": [], "recently_merged": [] })
 }
 
-/// Cached open + recently merged GitHub PRs via `gh pr list` (60s TTL, 3.5s timeout).
-pub fn github_prs(repo_path: &Path) -> Value {
-    use std::sync::OnceLock;
-    static CACHE: OnceLock<Mutex<std::collections::HashMap<PathBuf, (std::time::Instant, Value)>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
-    if let Ok(g) = cache.lock() {
-        if let Some((t, v)) = g.get(repo_path) {
-            if t.elapsed() < std::time::Duration::from_secs(60) {
-                return v.clone();
-            }
-        }
+// The executable override is only passed by the hermetic tests, never by an RPC or environment setting.
+async fn github_pr_json(origin: &str, token: &str, args: &[&str], secs: u64, fake: Option<&str>) -> Result<Value, String> {
+    let repo = format!("github.com/{origin}");
+    let args = [args, &["--repo", &repo]].concat();
+    let out = match fake {
+        Some(exe) => crate::release_intake::run_github_at(exe, &args, None, Some(token), secs).await?,
+        None => crate::release_intake::run_github(&args, None, Some(token), secs).await?,
+    };
+    serde_json::from_str(&out).map_err(|_| "Invalid GitHub pull request response".into())
+}
+
+pub(crate) async fn github_prs(remote: &str) -> Value {
+    if crate::release_intake::fixture_origin().is_some() {
+        return empty_prs();
     }
-    let open = run_gh_bounded(
-        repo_path,
-        &[
-            "pr",
-            "list",
-            "--state",
-            "open",
-            "--limit",
-            "15",
-            "--json",
-            "number,title,headRefName,baseRefName,author,isDraft,reviewDecision,updatedAt,url",
-        ],
-        3500,
-    )
-    .unwrap_or_else(|| json!([]));
-    let merged = run_gh_bounded(
-        repo_path,
-        &[
-            "pr",
-            "list",
-            "--state",
-            "merged",
-            "--limit",
-            "5",
-            "--json",
-            "number,title,headRefName,baseRefName,author,mergedAt,url",
-        ],
-        2500,
-    )
-    .unwrap_or_else(|| json!([]));
-    let val = json!({ "open": open, "recently_merged": merged });
+    let Ok(origin) = crate::release_intake::origin_of(remote) else { return empty_prs() };
+    let Ok(token) = crate::release_intake::github_cli_read_token(&origin).await else { return empty_prs() };
+    github_prs_as(&origin, &token, None).await
+}
+
+async fn github_prs_as(origin: &str, token: &str, fake: Option<&str>) -> Value {
+    use sha2::{Digest, Sha256};
+    use std::{collections::HashMap, sync::OnceLock, time::{Duration, Instant}};
+    type PrCache = HashMap<(String, [u8; 32]), (Instant, Value)>;
+    static CACHE: OnceLock<Mutex<PrCache>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    // Scope the cache to the effective credential, not the checkout, active CLI login or a raw token.
+    let key = (origin.to_string(), Sha256::digest(token.as_bytes()).into());
     if let Ok(mut g) = cache.lock() {
-        g.insert(repo_path.to_path_buf(), (std::time::Instant::now(), val.clone()));
+        g.retain(|_, (checked, _)| checked.elapsed() < Duration::from_secs(60));
+        if let Some((_, prs)) = g.get(&key) {
+            return prs.clone();
+        }
     }
-    val
+    let (open, merged) = tokio::join!(
+        github_pr_json(origin, token, &[
+            "pr", "list", "--state", "open", "--limit", "15", "--json",
+            "number,title,headRefName,baseRefName,author,isDraft,reviewDecision,updatedAt,url",
+        ], 4, fake),
+        github_pr_json(origin, token, &[
+            "pr", "list", "--state", "merged", "--limit", "5", "--json",
+            "number,title,headRefName,baseRefName,author,mergedAt,url",
+        ], 3, fake),
+    );
+    let open = open.ok().filter(Value::is_array);
+    let merged = merged.ok().filter(Value::is_array);
+    let complete = open.is_some() && merged.is_some();
+    let prs = json!({ "open": open.unwrap_or_else(|| json!([])), "recently_merged": merged.unwrap_or_else(|| json!([])) });
+    if complete {
+        if let Ok(mut g) = cache.lock() {
+            g.insert(key, (Instant::now(), prs.clone()));
+        }
+    }
+    prs
 }
 
-/// Detailed view of a single GitHub PR (`gh pr view <num>`).
-pub fn github_pr_view(repo_path: &Path, pr_number: u64) -> Option<Value> {
+/// Detailed PR lookup scoped to the registered repository, not the worktree's gh defaults.
+pub(crate) async fn github_pr_view(ctx: &Ctx, repo_id: &str, pr_number: u64) -> Result<Value, String> {
+    let row = ctx.db.query("SELECT remote_url FROM repos WHERE id=?1", [repo_id])?.pop().ok_or("Unknown repository")?;
+    let origin = crate::release_intake::origin_of(row["remote_url"].as_str().unwrap_or(""))?;
+    let token = crate::release_intake::github_cli_read_token(&origin).await?;
+    github_pr_view_as(&origin, &token, pr_number, None).await
+}
+
+async fn github_pr_view_as(origin: &str, token: &str, pr_number: u64, fake: Option<&str>) -> Result<Value, String> {
     let n = pr_number.to_string();
-    run_gh_bounded(
-        repo_path,
-        &[
-            "pr",
-            "view",
-            &n,
-            "--json",
-            "number,title,state,isDraft,headRefName,baseRefName,author,body,reviewDecision,statusCheckRollup,reviews,comments,files,url",
-        ],
-        4500,
-    )
+    let pr = github_pr_json(origin, token, &[
+        "pr", "view", &n, "--json",
+        "number,title,state,isDraft,headRefName,baseRefName,author,body,reviewDecision,statusCheckRollup,reviews,comments,files,url",
+    ], 5, fake).await?;
+    if pr["number"].as_u64() != Some(pr_number) {
+        return Err("GitHub returned a different pull request".into());
+    }
+    Ok(pr)
 }
 
 fn parse_branches_with_ab(out: &str, target: &str) -> Vec<Value> {
@@ -1242,8 +1238,8 @@ fn parse_branches_with_ab(out: &str, target: &str) -> Vec<Value> {
         .collect()
 }
 
-/// Complete local + remote + GitHub landscape for a repository.
-pub fn repo_landscape(ctx: &Ctx, repo_id: &str, include_prs: bool) -> Result<Value, String> {
+/// Local Git landscape. Network PR reads are added only by the callers that request them.
+pub fn repo_landscape(ctx: &Ctx, repo_id: &str) -> Result<Value, String> {
     let r = ctx.db.query("SELECT * FROM repos WHERE id=?1", [repo_id])?.into_iter().next().ok_or_else(|| crate::ctx::not_found("Unknown repository"))?;
     let p = repo_dir(&r)?;
     let target = r["integration_branch"]
@@ -1299,11 +1295,6 @@ pub fn repo_landscape(ctx: &Ctx, repo_id: &str, include_prs: bool) -> Result<Val
         }
         fallback
     };
-    let prs = if include_prs {
-        github_prs(&p)
-    } else {
-        json!({ "open": [], "recently_merged": [] })
-    };
     Ok(json!({
         "repo_id": repo_id,
         "name": r["name"],
@@ -1312,12 +1303,57 @@ pub fn repo_landscape(ctx: &Ctx, repo_id: &str, include_prs: bool) -> Result<Val
         "remote_url": r["remote_url"],
         "worktrees": wts,
         "branches": branches,
-        "prs": prs,
+        "prs": empty_prs(),
     }))
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn github_pr_reads_use_explicit_repo_and_credential_and_partition_cache() {
+        use std::os::unix::fs::PermissionsExt;
+        let ctx = Ctx::test();
+        std::fs::create_dir_all(&ctx.root).unwrap();
+        let fake = ctx.root.join("fake-gh");
+        std::fs::write(&fake, r#"#!/bin/sh
+set -eu
+[ "$PWD" = / ]
+[ "$GH_HOST" = github.com ]
+[ -z "${GH_REPO+x}${GITHUB_TOKEN+x}${GH_CONFIG_DIR+x}" ]
+[ "$1" = pr ]
+case "$GH_TOKEN" in
+  test-work-token) account=work ;;
+  test-personal-token) account=personal ;;
+  *) exit 1 ;;
+esac
+case "$2" in
+  list)
+    [ "$9" = --repo ] && [ "${10}" = github.com/test-org/test-project ] || exit 1
+    printf '[{"title":"%s-%s"}]' "$account" "$4"
+    ;;
+  view)
+    [ "$6" = --repo ] && [ "$7" = github.com/test-org/test-project ] || exit 1
+    printf '{"number":%s,"title":"%s"}' "$3" "$account"
+    ;;
+  *) exit 1 ;;
+esac
+"#).unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let fake = fake.to_str();
+        let origin = "test-org/test-project";
+        let work = github_prs_as(origin, "test-work-token", fake).await;
+        assert_eq!(work["open"][0]["title"], "work-open");
+        assert_eq!(work["recently_merged"][0]["title"], "work-merged");
+        let personal = github_prs_as(origin, "test-personal-token", fake).await;
+        assert_eq!(personal["open"][0]["title"], "personal-open");
+        assert_eq!(personal["recently_merged"][0]["title"], "personal-merged");
+        assert_eq!(github_prs_as(origin, "test-work-token", fake).await, work);
+        let pr = github_pr_view_as(origin, "test-personal-token", 17, fake).await.unwrap();
+        assert_eq!(pr["title"], "personal");
+        assert!(github_pr_view_as(origin, "", 17, fake).await.unwrap_err().contains("No GitHub credential"));
+        assert!(github_pr_view_as("other/project", "test-work-token", 17, fake).await.is_err());
+    }
+
     fn setup() -> (Arc<Ctx>, String) {
         let ctx = Ctx::test();
         init(&ctx).unwrap();
@@ -1602,7 +1638,7 @@ mod tests {
         std::fs::write(w.path.join("feat.txt"), "hello").unwrap();
         git(&w.path, &["add", "."]).unwrap();
         git(&w.path, &["commit", "-m", "feat commit"]).unwrap();
-        let land = repo_landscape(&ctx, &id, false).unwrap();
+        let land = repo_landscape(&ctx, &id).unwrap();
         let brs = land["branches"].as_array().unwrap();
         let feat = brs.iter().find(|b| b["name"] == w.branch).expect("worktree branch in landscape");
         assert_eq!((feat["ahead"].as_u64(), feat["behind"].as_u64()), (Some(1), Some(0)));

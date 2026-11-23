@@ -1,21 +1,20 @@
 // Headless render harness: serves ../../dist with a stubbed Tauri bridge and
 // screenshots every screen and modal in EMPTY and POPULATED fixture states.
 // usage: node render.mjs [outDir] [--only=agents,board] [--sets=empty,populated]
+// visible preview: node render.mjs --serve --port=PORT
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import puppeteer from "puppeteer-core";
 import { EMPTY, POPULATED, FAILING, SLOW, HUGE } from "./fixtures.js";
 import { checkAgentMessaging, checkChatMessaging } from "./robustness.mjs";
 import { checkStoppedHistory } from "./stopped-history.mjs";
-import { checkEffortProgress } from "./effort-progress.mjs";
+import { checkEffortProgress, checkLiveTps } from "./effort-progress.mjs";
 import { checkCodeGraph } from "./code-review.mjs";
 import { checkReviewPreview } from "./review-preview.mjs";
 const SETS = { empty: EMPTY, populated: POPULATED, failing: FAILING, slow: SLOW, huge: HUGE };
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const dist = process.env.PHILIUM_RENDER_DIST ?? path.resolve(here, "../../dist");
 const args = process.argv.slice(2);
 const out = path.resolve(args.find((a) => !a.startsWith("--")) ?? path.join(here, "out"));
 const opt = (k, d) => (args.find((a) => a.startsWith(`--${k}=`)) ?? `--${k}=${d}`).split("=")[1];
@@ -24,18 +23,48 @@ const sets = opt("sets", "empty,populated,failing,slow,huge").split(",");
 const CHROME = process.env.CHROME ?? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 const SIZES = [[1440, 900], [1280, 800]];
 const SCREENS = ["home", "agents", "board", "review", "environments", "chat", "terminals", "browser", "repos", "code", "activity", "stats", "providers", "settings"];
+const serveOnly = args.includes("--serve");
+const dist = serveOnly
+  ? path.resolve(here, "../../dist-fixture")
+  : path.resolve(process.env.PHILIUM_RENDER_DIST ?? path.join(here, "../../dist"));
 
 const mime = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".woff2": "font/woff2", ".png": "image/png", ".svg": "image/svg+xml" };
 const server = http.createServer((req, res) => {
-  let p = path.join(dist, decodeURIComponent(req.url.split("?")[0]));
+  const url = new URL(req.url, "http://localhost");
+  if (serveOnly && ["/", "/index.html", "/fixture.js"].includes(url.pathname)) {
+    const state = url.searchParams.get("set") || "populated";
+    const route = url.searchParams.get("screen") || "stats";
+    if (!Object.hasOwn(SETS, state) || !SCREENS.includes(route)) {
+      res.writeHead(400).end("Unknown fixture or screen");
+      return;
+    }
+    if (url.pathname === "/fixture.js") {
+      res.setHeader("content-type", mime[".js"]);
+      res.end(`(${stub.toString()})(${JSON.stringify(SETS[state])}, ${JSON.stringify(state)}, true);\nlocalStorage.setItem("route", ${JSON.stringify(route)});`);
+      return;
+    }
+    const query = new URLSearchParams({ set: state, screen: route });
+    res.setHeader("content-type", mime[".html"]);
+    res.end(fs.readFileSync(path.join(dist, "index.html"), "utf8").replace("<head>", `<head><script src="/fixture.js?${query.toString().replaceAll("&", "&amp;")}"></script>`));
+    return;
+  }
+  let p;
+  try {
+    p = path.resolve(dist, `.${decodeURIComponent(url.pathname)}`);
+  } catch {
+    res.writeHead(400).end("Invalid path");
+    return;
+  }
+  if (p !== dist && !p.startsWith(`${dist}${path.sep}`)) {
+    res.writeHead(404).end();
+    return;
+  }
   if (!fs.existsSync(p) || fs.statSync(p).isDirectory()) p = path.join(dist, "index.html");
   res.setHeader("content-type", mime[path.extname(p)] ?? "application/octet-stream");
   fs.createReadStream(p).pipe(res);
 });
-await new Promise((resolve,reject) => server.once('error',reject).listen(0, '127.0.0.1', resolve));
-const port = server.address().port;
 
-const stub = (fx, setName) => {
+const stub = (fx, setName, serveOnly = false) => {
   const fixtures = fx;
   window.__permissionCalls = [];
   const listeners = new Map();
@@ -61,8 +90,7 @@ const stub = (fx, setName) => {
   };
   let permissionSeq = 2000;
   let cb = 1;
-  window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener() {} };
-  window.__TAURI_INTERNALS__ = {
+  const bridge = {
     metadata: { currentWindow: { label: "main" }, currentWebview: { label: "main", windowLabel: "main" } },
     transformCallback(f) { const id = cb++; window[`_${id}`] = f; return id; },
     unregisterCallback() {},
@@ -98,6 +126,20 @@ const stub = (fx, setName) => {
         throw fixtures.__fail[window.__n % fixtures.__fail.length];
       }
       if (cmd === "rpc") {
+        if (a.method === "providers.oauth_start" && a.args.kind === "chatgpt_oauth") {
+          return { id: "chatgpt-test", user_code: "TEST-CODE", verify_url: "https://example.com/verify" };
+        }
+        if (a.method === "release_intake.origin_connection" || a.method === "release_intake.origin_accounts" || a.method === "release_intake.origin_connect") {
+          const id = a.args.repo_id;
+          const origin = id === "r2" ? "demo/hal" : "demo/philium";
+          const selections = window.__test.github ??= {};
+          if (a.method === "release_intake.origin_accounts") return { accounts: ["work-account", "personal-account"] };
+          if (a.method === "release_intake.origin_connect") {
+            if (!a.args.login) throw new Error("Expected an explicit login");
+            selections[origin] = a.args.login;
+          }
+          return { origin, login: selections[origin] ?? null, token_saved: false };
+        }
         if(a.method==='managed.list' && a.args.task_id==='t2' && a.args.repo_id==='r1')return {tasks:[{id:'t2',agent:'a1',owner:'lion',title:'Refactor worktree cleanup'}],jobs:[{id:'board-job',task:'t2',agent:'a1',cid:'c'.repeat(64),state:'active',expires:Date.now()+60000}]};
         if(a.method==='managed.logs' && a.args.id==='board-job') {if(a.args.task_id!=='t2'||a.args.repo_id!=='r1')throw Error('Unscoped task logs');return {text:'board task fixture output'};}
         if(a.method==='managed.list') return {tasks:[{id:'t1',agent:'a1',owner:'lion',title:'Offline check'}],jobs:window.__test.managed?[{...window.__test.managed}]:[]};
@@ -115,15 +157,18 @@ const stub = (fx, setName) => {
         }
         if (window.__test.historyMode) {
           const t = window.__test;
+          if (a.method === "agents.list") return structuredClone(Object.values(t.historyAgents));
           if (a.method === "agents.get") return structuredClone(t.historyAgents[a.args.id]);
           if (a.method === "agents.events") {
             const id = a.args.id;
             t.historyCalls.push(id);
             (t.historyPages ??= []).push({ id, after: a.args.after, limit: a.args.limit });
-            const response = structuredClone((t.historyEvents[id] ?? []).filter((e) => e.seq > (a.args.after ?? 0)).slice(0, a.args.limit ?? 5000));
+            const events = (t.historyEvents[id] ?? []).filter((e) => e.seq > (a.args.after ?? 0));
+            const limit = a.args.limit ?? 5000;
+            const response = structuredClone(events.slice(0, limit));
             if (t.holdHistory) await new Promise((resolve, reject) => t.historyPending.push({ id, response, resolve, reject }));
             if (t.failHistory) throw "Saved history unreadable";
-            return response;
+            return a.args.page ? { events: response, has_more: events.length > limit } : response;
           }
           if (["agents.resume", "agents.stop"].includes(a.method)) {
             t.historyActions.push(a.method);
@@ -159,6 +204,13 @@ const stub = (fx, setName) => {
           if (window.__test.mode === "reject") throw 'HAL 409 Conflict: {"type":"busy","message":"session is busy"}';
           return {};
         }
+        if (a.method === "agents.queue_list") return structuredClone(window.__test.queued ?? []);
+        if (a.method === "agents.queue_add") {
+          const t = window.__test;
+          if (t.rejectQueue) throw "Fixture queue unavailable";
+          (t.queued ??= []).push({ ...structuredClone(a.args), id: t.queued.length + 1 });
+          return {};
+        }
         if (a.method === "agents.permission") {
           window.__permissionCalls.push(a.args);
           queueMicrotask(() => {
@@ -167,6 +219,12 @@ const stub = (fx, setName) => {
               if (topic === "agents:events") window[`_${id}`]?.({ event: topic, id, payload: { id: a.args.id, events: [event] } });
             }
           });
+        }
+        if (a.method === "agents.pending_permissions") {
+          const resolved = new Set(window.__permissionCalls.map(({ request_id }) => request_id));
+          return { a1: (fixtures["agents.events"] ?? []).filter((event) =>
+            event.type === "permission.requested" && !resolved.has(event.request_id)
+          ) };
         }
         if (a.method === 'workspace.overview') {
           const id=a.args.repo_id;
@@ -202,8 +260,25 @@ const stub = (fx, setName) => {
       return null;
     },
   };
+  if (serveOnly) {
+    window.__philiumFixtureBridge = bridge;
+  } else {
+    window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener() {} };
+    window.__TAURI_INTERNALS__ = bridge;
+  }
 };
 
+if (!fs.existsSync(path.join(dist, "index.html"))) throw new Error(`Run npm run build${serveOnly ? " -- --mode fixture" : ""} first`);
+await new Promise((resolve, reject) => server.once("error", reject).listen(serveOnly ? Number(opt("port", 0)) : 0, "127.0.0.1", resolve));
+const port = server.address().port;
+if (serveOnly) {
+  console.log(`Fixture preview (no browser launched): http://127.0.0.1:${port}/?screen=stats&set=populated`);
+} else {
+  await renderScreens();
+}
+
+async function renderScreens() {
+const { default: puppeteer } = await import("puppeteer-core");
 const problems = [];
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const browser = await puppeteer.launch({ executablePath: CHROME, headless: "new", args: ["--no-sandbox"] });
@@ -244,6 +319,19 @@ for (const setName of sets) {
         return out;
       });
       for (const b of bad) problems.push(`${setName} ${w}x${h} ${s}: ${b}`);
+      if (s === "stats" && setName === "populated") {
+        try {
+          await page.waitForFunction(() => {
+            const table = document.querySelector('table[aria-label="Provider usage"]');
+            const row = (name) => [...(table?.tBodies[0]?.rows ?? [])]
+              .find((r) => r.cells[0]?.textContent.includes(name));
+            return row("ChatGPT")?.cells[1]?.textContent.includes("7d: 28% used · resets in")
+              && Number(row("ChatGPT")?.cells[2]?.textContent) > 0
+              && row("Claude")?.cells[1]?.textContent.includes("No quota reported")
+              && row("OpenRouter")?.textContent.includes("No requests in this range");
+          }, { timeout: 3000 });
+        } catch (e) { problems.push(`${w} Stats provider quota and traffic: ${e.message}`); }
+      }
       if(s==='environments' && setName==='populated') {
         try {
           await clickText(page,'button','Inspect local machine'); await page.waitForSelector('label select option[value="alpha"]');
@@ -271,14 +359,18 @@ for (const setName of sets) {
             await page.evaluate(() => { window.__test.holdShell = false; window.__test.releaseShell?.(); });
             const errors = await page.evaluate(async () => {
               const errors = [];
-              const cards = [...document.querySelectorAll(".perm")];
+              const cards = [...document.querySelectorAll(".agent-approvals .perm")];
               if (cards.length !== 3) return [`expected three browser permission cards, got ${cards.length}`];
               if (!cards[0].innerText.includes("https://example.com/permission-test")) errors.push("browser target URL missing");
               for (const [i, label] of ["Allow once", "Deny", "Allow for session"].entries()) {
                 if (!cards[i].innerText.includes("Browser permission")) errors.push("browser permission title missing");
-                const button = [...cards[i].querySelectorAll("button")].find((b) => b.textContent.trim() === label);
+                const card = [...document.querySelectorAll(".agent-approvals .perm")][0];
+                const button = [...(card?.querySelectorAll("button") ?? [])].find((b) => b.textContent.trim() === label);
                 if (!button) errors.push(`missing ${label}`);
                 else button.click();
+                for (let retry = 0; retry < 50 && document.querySelectorAll(".agent-approvals .perm").length > 2 - i; retry++) {
+                  await new Promise((resolve) => setTimeout(resolve, 20));
+                }
               }
               await new Promise((r) => setTimeout(r, 50));
               const calls = window.__permissionCalls;
@@ -294,6 +386,9 @@ for (const setName of sets) {
             });
             errors.forEach((e) => problems.push(`${w} browser approval: ${e}`));
             await shot(page, "agents-permissions-resolved");
+            const tpsErrors = await checkLiveTps(page);
+            for (const error of tpsErrors) problems.push(`${w} live TPS: ${error}`);
+            if (!tpsErrors.length) console.log(`pass ${w} live TPS`);
             for (const error of await checkEffortProgress(page, shot)) problems.push(`${w} effort/progress: ${error}`);
             for (const error of await checkAgentMessaging(page)) problems.push(`${w} messaging: ${error}`);
             await shot(page, "agents-messaging-checked");
@@ -305,7 +400,42 @@ for (const setName of sets) {
       if (s === "code" && setName === "populated") {
         for (const error of await checkCodeGraph(page, shot)) problems.push(`${w} code review: ${error}`);
       }
+      if (s === "repos" && setName === "populated") {
+        try {
+          const chooseRepo = async (i) => page.evaluate(index => document.querySelectorAll(".ws-repo")[index].click(), i);
+          const picker = 'select[aria-label="GitHub account"]';
+          const connect = async login => {
+            await page.waitForFunction(sel => !document.querySelector(sel)?.disabled && document.querySelector(sel)?.options.length === 3, { timeout: 4000 }, picker);
+            await page.select(picker, login);
+            if (!await clickText(page, "button", "Connect GitHub")) throw new Error("Account connect button not found");
+            await page.waitForFunction(name => document.querySelector('[aria-label="GitHub connection"] strong')?.textContent === name, { timeout: 4000 }, login);
+          };
+          await chooseRepo(0); await connect("work-account");
+          await chooseRepo(1); await connect("personal-account");
+          await chooseRepo(0);
+          await page.waitForFunction(() => document.querySelector('[aria-label="GitHub connection"] strong')?.textContent === "work-account", { timeout: 4000 });
+        } catch (e) { problems.push(`${w} GitHub repository accounts: ${e.message}`); }
+      }
       if (s === "providers") {
+        if (setName === "empty") {
+          try {
+            await page.evaluate(() => {
+              Object.defineProperty(navigator, "clipboard", { value: { writeText: async (text) => {
+                if (window.__test.denyCopy) throw new Error("Clipboard denied");
+                window.__test.copiedCode = text;
+              } } });
+            });
+            if (!await clickText(page, "button", "Sign in with ChatGPT")) throw new Error("ChatGPT sign-in is missing");
+            await page.waitForFunction(() => document.body.innerText.includes("TEST-CODE"), { timeout: 4000 });
+            if (!await clickText(page, "button", "Copy code")) throw new Error("Copy button is missing");
+            await page.waitForFunction(() => window.__test.copiedCode === "TEST-CODE" && document.body.innerText.includes("Code copied"), { timeout: 4000 });
+            await page.evaluate(() => { window.__test.denyCopy = true; });
+            await clickText(page, "button", "Copy code");
+            await page.waitForFunction(() => document.body.innerText.includes("Could not copy the code"), { timeout: 4000 });
+            await clickText(page, "button", "Cancel");
+            await page.waitForFunction(() => !document.body.innerText.includes("TEST-CODE"), { timeout: 4000 });
+          } catch (e) { problems.push(`${w} ChatGPT code copy: ${e.message}`); }
+        }
         if (await clickText(page, "button", "Add provider")) { await sleep(300); await shot(page, "modal-add-provider"); }
       }
       if (s === "chat" && setName === "populated") {
@@ -350,3 +480,4 @@ for (const setName of sets) {
 await browser.close();
 if (problems.length) { console.log("\nPROBLEMS (" + problems.length + ")"); for (const p of [...new Set(problems)]) console.log(" - " + p); process.exitCode = 1; } else console.log("\nno problems");
 server.close();
+}

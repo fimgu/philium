@@ -4,9 +4,15 @@ export async function checkStoppedHistory(page, shot) {
     const errors = [], t = window.__test;
     const wait = () => new Promise((r) => setTimeout(r, 250));
     const text = () => document.querySelector('.conv')?.innerText ?? '';
+    const messages = () => [...document.querySelectorAll('.conv .msg.user')].map((element) => {
+      const bubble = element.cloneNode(true);
+      bubble.querySelectorAll('button').forEach((button) => button.remove());
+      return bubble.textContent;
+    });
     const input = () => document.querySelector('.composer textarea');
     const click = (label) => [...document.querySelectorAll('button')].find((b) => b.textContent.trim() === label)?.click();
     const navigate = async (id) => { window.__philiumGo('agents', { id }); await wait(); };
+    const reopen = async (id) => { await navigate(id === 'a1' ? 'a2' : 'a1'); await navigate(id); };
     const event = (seq, content) => ({ seq, type: 'message.created', role: 'user', content });
     input().value = 'stopped draft kept'; input().dispatchEvent(new Event('input', { bubbles: true }));
     const clipboardData = new DataTransfer();
@@ -18,7 +24,8 @@ export async function checkStoppedHistory(page, shot) {
       a2: { id: 'a2', name: 'otter', live: false, state: 'stopped', model_ref: 'fixture/model' },
     };
     t.historyEvents = { a1: [event(1, 'saved A history'), { seq: 2, type: 'permission.requested', request_id: 'old', action: 'mcp', resource: 'philium/browser_open' }], a2: [event(1, 'saved B history')] };
-    window.__philiumGo('home', {}); await wait(); await navigate('a1');
+    window.__emit('agents:changed', { id: 'a1' }); await wait();
+    await reopen('a1');
     if (!text().includes('saved A history')) errors.push('stopped saved history missing');
     if (document.querySelector('.perm button')) errors.push('stopped permission actionable');
     if (document.body.innerText.includes('Some data could not load')) errors.push('stopped history global banner');
@@ -41,12 +48,11 @@ export async function checkStoppedHistory(page, shot) {
     if (!t.historyPending.length) errors.push('stop live transition did not reload history');
     window.__emit('agents:events', { id: 'a1', events: [event(3, 'stream during history fetch'), event(1, 'saved A history')] });
     t.historyPending.splice(0).forEach((p) => p.resolve()); t.holdHistory = false; await wait();
-    const messages = [...document.querySelectorAll('.conv .msg.user')].map((e) => e.textContent);
-    if (messages.join('|') !== 'saved A history|stream during history fetch') errors.push(`fetch/stream merge or dedupe failed: ${messages}`);
+    if (messages().join('|') !== 'saved A history|stream during history fetch') errors.push(`fetch/stream merge or dedupe failed: ${messages()}`);
     if (document.querySelector('.perm button')) errors.push('permission actionable after explicit stop');
     if (t.historyActions.join() !== 'agents.resume,agents.stop') errors.push('unexpected automatic resume/stop');
     // Hold A then B then A, release latest first and stale requests afterwards.
-    window.__philiumGo('home', {}); await wait();
+    await navigate('a2');
     t.holdHistory = true;
     await navigate('a1'); await navigate('a2'); await navigate('a1');
     const pending = t.historyPending.splice(0);
@@ -59,7 +65,7 @@ export async function checkStoppedHistory(page, shot) {
     if (!text().includes('saved B history') || text().includes('saved A')) errors.push('peer history isolation failed');
     window.__emit('agents:events', { id: 'a1', events: [event(10, 'wrong peer streamed')] }); await wait();
     if (text().includes('wrong peer')) errors.push('peer stream isolation failed');
-    t.historyEvents.a2 = []; window.__philiumGo('home', {}); await wait(); await navigate('a2');
+    t.historyEvents.a2 = []; await reopen('a2');
     if (!text().includes('No saved messages')) errors.push('empty stopped history not explicit');
     await navigate('a1');
     if (!document.querySelector('.composer img[alt="history-draft.png"]')) errors.push('switching agents lost draft attachment');
@@ -69,7 +75,7 @@ export async function checkStoppedHistory(page, shot) {
     t.historyEvents.a1 = Array.from({ length: 5000 }, (_, i) => ({ seq: i + 1, type: 'fixture.neutral' }));
     t.historyEvents.a1[0] = event(1, 'oldest paged history');
     t.historyEvents.a1.push(event(5001, 'later unique saved message'));
-    window.__philiumGo('home', {}); await wait(); await navigate('a1');
+    await reopen('a1');
     if (!document.querySelector('.history-more') || text().includes('later unique')) errors.push('full page lacked explicit more notice or auto-fetched');
     window.__emit('agents:events', { id: 'a1', events: [event(9000, 'newer SSE beyond cursor'), event(5001, 'later unique saved message')] }); await wait();
     t.failHistory = true; click('Load more history'); await wait();
@@ -77,10 +83,10 @@ export async function checkStoppedHistory(page, shot) {
     if (!document.querySelector('.history-error') || !text().includes('oldest paged')) errors.push('page failure discarded history or hid local error');
     t.failHistory = false; click('Retry history'); await wait();
     if (t.historyPages.at(-1)?.after !== 5000) errors.push('page retry lost fetched cursor');
-    if ([...document.querySelectorAll('.conv .msg.user')].filter((e) => e.textContent === 'later unique saved message').length !== 1) errors.push('paged SSE boundary duplicated or lost later message');
+    if (messages().filter((message) => message === 'later unique saved message').length !== 1) errors.push('paged SSE boundary duplicated or lost later message');
     if (document.querySelector('.history-more')) errors.push('short final page retained more notice');
     // A held page must not replace another agent or advance its cursor.
-    window.__philiumGo('home', {}); await wait(); await navigate('a1');
+    await reopen('a1');
     t.holdHistory = true; click('Load more history'); await wait();
     const heldPage = t.historyPending.splice(0);
     if (!heldPage.length) errors.push('stale paging request not exercised');

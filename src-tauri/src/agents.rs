@@ -452,6 +452,7 @@ async fn agent_session_context_async(
 /// Per-agent identity tail placed after the shared repo cache prefix.
 fn agent_identity_tail(name: &str, role: &str, parent_name: Option<&str>, worktree: Option<&Path>) -> String {
     let mut s = format!("## You\n- Your agent name is \"{name}\" (role: `{role}`).\n");
+    s.push_str("- Use `agent_spawn` when delegating work the person should be able to follow in the Agents sidebar. Create separate Board tasks for changes that can be reviewed independently.\n");
     if let Some(p) = parent_name {
         s.push_str(&format!(
             "- Your lead is \"{p}\". Send progress, questions and your final report to \"{p}\" with `mail_send {{to: \"{p}\", body: ...}}` rather than to the person.\n"
@@ -1611,13 +1612,16 @@ fn with_live_snapshot(snap: &LiveSnapshot, mut row: Value) -> Value {
     let kv = snap.stats.get(&name).cloned().unwrap_or_else(|| {
         json!({
             "requests": 0,
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "cached_tokens": 0,
-            "cache_hit_pct": 0,
-            "last_input_tokens": 0,
-            "last_cached_tokens": 0,
-            "last_cache_hit_pct": 0,
+            "pending_requests": 0,
+            "input_tokens": Value::Null,
+            "output_tokens": Value::Null,
+            "cache_requests": 0,
+            "cache_input_tokens": 0,
+            "cached_tokens": Value::Null,
+            "cache_hit_pct": Value::Null,
+            "last_input_tokens": Value::Null,
+            "last_cached_tokens": Value::Null,
+            "last_cache_hit_pct": Value::Null,
             "guard_alerts": 0,
             "rate_limits": 0,
             "errors": 0,
@@ -1637,7 +1641,7 @@ fn with_live_snapshot(snap: &LiveSnapshot, mut row: Value) -> Value {
     }
     for c in &clashes {
         let sev = c["severity"].as_str().unwrap_or("");
-        if !matches!(sev, "same_symbol" | "dependent") {
+        if sev != "same_symbol" {
             continue;
         }
         let peer = if c["a"].as_str() == Some(&name) {
@@ -1651,19 +1655,20 @@ fn with_live_snapshot(snap: &LiveSnapshot, mut row: Value) -> Value {
             .unwrap_or_default();
         warnings.push(json!({
             "kind": "clash",
-            "severity": if sev == "same_symbol" { "high" } else { "med" },
-            "text": format!("AST {sev} clash with {peer}: {detail}"),
+            "severity": "med",
+            "text": format!("Same symbol overlap with {peer}: {detail}"),
         }));
     }
-    let reqs = kv["requests"].as_u64().unwrap_or(0);
-    let inp = kv["input_tokens"].as_u64().unwrap_or(0);
-    let hit = kv["cache_hit_pct"].as_u64().unwrap_or(0);
-    if reqs >= 4 && inp >= 20_000 && hit < 15 {
-        warnings.push(json!({
-            "kind": "kv_cache",
-            "severity": "med",
-            "text": format!("Cold KV cache ({hit}% hit across {}k input tokens)", inp / 1000),
-        }));
+    let reqs = kv["cache_requests"].as_u64().unwrap_or(0);
+    let inp = kv["cache_input_tokens"].as_u64().unwrap_or(0);
+    if let Some(hit) = kv["cache_hit_pct"].as_u64() {
+        if reqs >= 4 && inp >= 20_000 && hit < 15 {
+            warnings.push(json!({
+                "kind": "kv_cache",
+                "severity": "med",
+                "text": format!("Cold KV cache ({hit}% hit across {}k input tokens)", inp / 1000),
+            }));
+        }
     }
     let guard_alerts = kv["guard_alerts"].as_u64().unwrap_or(0);
     if guard_alerts > 0 {
@@ -2024,7 +2029,11 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
             let limit = args["limit"].as_i64().unwrap_or(2000).clamp(1, 10000);
             let raw = ctx::arg_str(&args, "id")?;
             let c = ctx.clone();
-            tokio::task::spawn_blocking(move || history::events(&c, &raw, after, limit))
+            let page = args["page"].as_bool().unwrap_or(false);
+            tokio::task::spawn_blocking(move || {
+                if page { history::page(&c, &raw, after, limit) }
+                else { history::events(&c, &raw, after, limit) }
+            })
                 .await.map_err(|e| format!("saved agent history task failed: {e}"))?
         }
         "search_history" => {
@@ -2044,6 +2053,23 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
         }
         "messages" => hal_get(&id()?, "/messages").await,
         "permissions" => hal_get(&id()?, "/permissions").await,
+        "pending_permissions" => {
+            use futures_util::StreamExt;
+            let ids: Vec<_> = runtimes().lk().keys().cloned().collect();
+            let results: serde_json::Map<String, Value> = futures_util::stream::iter(ids)
+                .map(|id| async move {
+                    let requests = tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        hal_get(&id, "/permissions"),
+                    ).await.ok()?.ok()?;
+                    requests.is_array().then_some((id, requests))
+                })
+                .buffer_unordered(8)
+                .filter_map(std::future::ready)
+                .collect()
+                .await;
+            Ok(Value::Object(results))
+        }
         "permission" => {
             let r = rt(&id()?)?;
             let rid = ctx::arg_str(&args, "request_id")?;
@@ -2965,11 +2991,11 @@ mod tests {
         // plus benign same_file clash and high-signal same_symbol clash.
         snap.stats.insert(
             "lion".into(),
-            json!({ "requests": 3, "input_tokens": 15_000, "cache_hit_pct": 20, "guard_alerts": 0, "rate_limits": 0 }),
+            json!({ "cache_requests": 3, "cache_input_tokens": 15_000, "cache_hit_pct": 20, "guard_alerts": 0, "rate_limits": 0 }),
         );
         snap.stats.insert(
             "owl".into(),
-            json!({ "requests": 4, "input_tokens": 25_000, "cache_hit_pct": 10, "guard_alerts": 0, "rate_limits": 0 }),
+            json!({ "cache_requests": 4, "cache_input_tokens": 25_000, "cache_hit_pct": 10, "guard_alerts": 0, "rate_limits": 0 }),
         );
         snap.clashes = vec![
             json!({ "a": "lion", "b": "fox", "severity": "same_file", "detail": ["src/a.rs"] }),
@@ -2992,14 +3018,14 @@ mod tests {
         assert!(!std_w.iter().any(|w| w["kind"] == "kv_cache"), "{std_w:?}");
         assert_eq!(std_w.len(), 1, "{std_w:?}");
         assert_eq!(std_w[0]["kind"], "clash");
-        assert_eq!(std_w[0]["severity"], "high");
-        assert!(std_w[0]["text"].as_str().unwrap().contains("same_symbol"));
+        assert_eq!(std_w[0]["severity"], "med");
+        assert!(std_w[0]["text"].as_str().unwrap().contains("Same symbol overlap"));
 
         // Owl exceeds new Cold KV cache threshold (reqs>=4, inp>=20k, hit<15) and has dependent clash.
         let str_w = str_row["warnings"].as_array().unwrap();
         assert!(!str_w.iter().any(|w| w["kind"] == "waiting"), "{str_w:?}");
         assert!(str_w.iter().any(|w| w["kind"] == "kv_cache"), "{str_w:?}");
-        assert!(str_w.iter().any(|w| w["kind"] == "clash" && w["severity"] == "med"), "{str_w:?}");
+        assert!(!str_w.iter().any(|w| w["kind"] == "clash"), "{str_w:?}");
 
         let _ = std::fs::remove_dir_all(ctx.data_dir.parent().unwrap());
     }

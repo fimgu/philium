@@ -29,6 +29,7 @@ pub(crate) mod progress;
 pub(crate) mod quota;
 pub(crate) mod stale;
 pub(crate) mod translate;
+mod usage;
 
 use crate::guard::{self, GuardMode};
 use crate::providers::{Kind, Provider};
@@ -300,11 +301,14 @@ impl Gateway {
         #[derive(Default)]
         struct Acc {
             requests: u64,
-            input_tokens: u64,
-            output_tokens: u64,
+            pending_requests: u64,
+            input_tokens: Option<u64>,
+            output_tokens: Option<u64>,
+            cache_requests: u64,
+            cache_input_tokens: u64,
             cached_tokens: u64,
-            last_input_tokens: u64,
-            last_cached_tokens: u64,
+            last_input_tokens: Option<u64>,
+            last_cached_tokens: Option<u64>,
             guard_alerts: u64,
             rate_limits: u64,
             errors: u64,
@@ -317,15 +321,27 @@ impl Gateway {
             let Some(agent) = s.agent.as_deref() else { continue };
             let a = map.entry(agent.to_string()).or_default();
             a.requests += 1;
-            let inp = s.input_tokens.unwrap_or(0);
-            let out = s.output_tokens.unwrap_or(0);
-            let cac = s.cached_tokens.unwrap_or(0);
-            a.input_tokens += inp;
-            a.output_tokens += out;
-            a.cached_tokens += cac;
-            if inp > 0 {
-                a.last_input_tokens = inp;
-                a.last_cached_tokens = cac;
+            if s.state == "pending" {
+                a.pending_requests += 1;
+            }
+            if let Some(inp) = s.input_tokens {
+                a.input_tokens = Some(a.input_tokens.unwrap_or(0).saturating_add(inp));
+            }
+            if let Some(out) = s.output_tokens {
+                a.output_tokens = Some(a.output_tokens.unwrap_or(0).saturating_add(out));
+            }
+            // Compare only requests for which the provider reported both
+            // counters. Missing cache counts are not implicit misses.
+            if let (Some(inp), Some(cached)) = (s.input_tokens, s.cached_tokens) {
+                if inp > 0 {
+                    a.cache_requests += 1;
+                    a.cache_input_tokens = a.cache_input_tokens.saturating_add(inp);
+                    a.cached_tokens = a.cached_tokens.saturating_add(cached.min(inp));
+                }
+            }
+            if s.state != "pending" {
+                a.last_input_tokens = s.input_tokens;
+                a.last_cached_tokens = s.cached_tokens;
             }
             if s.guard != "pass" {
                 a.guard_alerts += 1;
@@ -343,24 +359,23 @@ impl Gateway {
         }
         map.into_iter()
             .map(|(k, a)| {
-                let hit_pct = if a.input_tokens > 0 {
-                    ((a.cached_tokens.min(a.input_tokens) * 100) / a.input_tokens) as u64
-                } else {
-                    0
+                let pct = |input: u64, cached: u64| {
+                    (input > 0).then(|| ((u128::from(cached.min(input)) * 100) / u128::from(input)) as u64)
                 };
-                let last_hit_pct = if a.last_input_tokens > 0 {
-                    ((a.last_cached_tokens.min(a.last_input_tokens) * 100) / a.last_input_tokens) as u64
-                } else {
-                    0
-                };
+                let hit_pct = pct(a.cache_input_tokens, a.cached_tokens);
+                let last_hit_pct = a.last_input_tokens.zip(a.last_cached_tokens)
+                    .and_then(|(inp, cached)| pct(inp, cached));
                 let avg_ttft_ms = if a.ttft_count > 0 { Some(a.ttft_sum / a.ttft_count) } else { None };
                 (
                     k,
                     json!({
                         "requests": a.requests,
+                        "pending_requests": a.pending_requests,
                         "input_tokens": a.input_tokens,
                         "output_tokens": a.output_tokens,
-                        "cached_tokens": a.cached_tokens,
+                        "cache_requests": a.cache_requests,
+                        "cache_input_tokens": a.cache_input_tokens,
+                        "cached_tokens": hit_pct.map(|_| a.cached_tokens),
                         "cache_hit_pct": hit_pct,
                         "last_input_tokens": a.last_input_tokens,
                         "last_cached_tokens": a.last_cached_tokens,
@@ -447,6 +462,12 @@ fn error_response(status: StatusCode, kind: &str, message: String) -> Response {
     (status, [("content-type", "application/json")], body.to_string()).into_response()
 }
 
+fn response_is_sse(content_type: Option<&HeaderValue>, fallback: bool) -> bool {
+    content_type.and_then(|v| v.to_str().ok()).map_or(fallback, |v| {
+        v.split(';').next().is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/event-stream"))
+    })
+}
+
 /// Accumulates the streamed response; finalizes the record on drop, so a
 /// client disconnect or upstream error still closes the log entry.
 struct Finalizer {
@@ -457,22 +478,28 @@ struct Finalizer {
     head: Vec<u8>,
     tail: VecDeque<u8>,
     total: usize,
+    usage: usage::Capture,
     error: Option<String>,
     _permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl Finalizer {
     fn feed(&mut self, chunk: &[u8]) {
+        self.usage.feed(chunk);
+        self.preview(chunk);
+    }
+
+    fn preview(&mut self, chunk: &[u8]) {
         if self.first.is_none() && !chunk.is_empty() {
             self.first = Some(self.started.elapsed().as_millis() as u64);
         }
         self.total += chunk.len();
         let room = HEAD_CAP.saturating_sub(self.head.len());
         self.head.extend_from_slice(&chunk[..room.min(chunk.len())]);
+        let chunk = &chunk[chunk.len().saturating_sub(TAIL_CAP)..];
+        let excess = (self.tail.len() + chunk.len()).saturating_sub(TAIL_CAP);
+        self.tail.drain(..excess);
         self.tail.extend(chunk);
-        while self.tail.len() > TAIL_CAP {
-            self.tail.pop_front();
-        }
     }
 }
 
@@ -481,7 +508,7 @@ impl Drop for Finalizer {
         let head = String::from_utf8_lossy(&self.head).into_owned();
         let tail_bytes: Vec<u8> = self.tail.iter().copied().collect();
         let tail = String::from_utf8_lossy(&tail_bytes).into_owned();
-        let (input, output, cached) = extract_usage(&head, &tail);
+        let usage::Usage { input, output, cached } = self.usage.finish();
         let total = self.total;
         let elapsed = self.started.elapsed().as_millis() as u64;
         let error = self.error.take();
@@ -503,73 +530,6 @@ impl Drop for Finalizer {
             r.response_tail = if total > HEAD_CAP { tail } else { String::new() };
         });
     }
-}
-
-/// Token usage from any of the wire formats, streamed (SSE) or whole.
-/// OpenAI: prompt/completion_tokens. Responses + Anthropic: input/output_tokens
-/// (Anthropic reports input in message_start and output in message_delta).
-fn extract_usage(head: &str, tail: &str) -> (Option<u64>, Option<u64>, Option<u64>) {
-    let mut input = None;
-    let mut output = None;
-    let mut cached = None;
-    let mut visit = |v: &Value| {
-        fn walk(v: &Value, f: &mut dyn FnMut(&Value)) {
-            match v {
-                Value::Object(o) => {
-                    if let Some(u) = o.get("usage") {
-                        f(u);
-                    }
-                    o.values().for_each(|x| walk(x, f));
-                }
-                Value::Array(a) => a.iter().for_each(|x| walk(x, f)),
-                _ => {}
-            }
-        }
-        walk(v, &mut |u| {
-            let get = |k: &str| u.get(k).and_then(Value::as_u64);
-            let cr = get("cache_read_input_tokens")
-                .or_else(|| u.pointer("/prompt_tokens_details/cached_tokens").and_then(Value::as_u64))
-                .or_else(|| u.pointer("/input_tokens_details/cached_tokens").and_then(Value::as_u64))
-                .or_else(|| get("cached_tokens"));
-            if let Some(c) = cr {
-                cached = Some(cached.unwrap_or(0).max(c));
-            }
-            if let Some(i) = get("prompt_tokens").or_else(|| {
-                get("input_tokens").map(|raw| {
-                    raw + get("cache_read_input_tokens").unwrap_or(0)
-                        + get("cache_creation_input_tokens").unwrap_or(0)
-                })
-            }) {
-                input = Some(input.unwrap_or(0).max(i));
-            }
-            if let Some(o) = get("completion_tokens").or(get("output_tokens")) {
-                output = Some(output.unwrap_or(0).max(o));
-            }
-        });
-    };
-    for text in [head, tail] {
-        if !text.contains("usage") {
-            continue;
-        }
-        let trimmed = text.trim();
-        if trimmed.starts_with('{') || trimmed.starts_with('[') {
-            if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
-                visit(&v);
-                continue;
-            }
-        }
-        for line in text.lines() {
-            if let Some(data) = line.strip_prefix("data:") {
-                let data = data.trim();
-                if data.contains("usage") {
-                    if let Ok(v) = serde_json::from_str::<Value>(data) {
-                        visit(&v);
-                    }
-                }
-            }
-        }
-    }
-    (input, output, cached)
 }
 
 fn is_concurrency_429(body: &str) -> bool {
@@ -969,6 +929,7 @@ async fn proxy(
             head: Vec::new(),
             tail: VecDeque::new(),
             total: 0,
+            usage: usage::Capture::new(response_is_sse(content_type.as_ref(), false)),
             error: None,
             _permit: permit,
         };
@@ -987,6 +948,8 @@ async fn proxy(
     gw.note_quota(&provider, resp.headers());
     gw.update(id, |r| r.summary.status = Some(status.as_u16()));
     let content_type = resp.headers().get("content-type").cloned();
+    let trace_stream = stream || content_type.as_ref().and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("text/event-stream"));
     let retry_after = resp.headers().get("retry-after").cloned();
     let mut upstream = byte_stream(resp);
     let mut pre: Option<Result<Bytes, String>> = None;
@@ -1010,7 +973,7 @@ async fn proxy(
     let mut last_emit: Option<Instant> = None;
     let gw_p = gw.clone();
     let mut track = move |chunk: &[u8], err: bool| {
-        if !stream {
+        if !trace_stream || !status.is_success() {
             return;
         }
         sniff.feed(chunk);
@@ -1031,6 +994,7 @@ async fn proxy(
         head: Vec::new(),
         tail: VecDeque::new(),
         total: 0,
+        usage: usage::Capture::new(response_is_sse(content_type.as_ref(), stream || p.kind == Kind::ChatgptOauth)),
         error: None,
         _permit: permit,
     };
@@ -1041,8 +1005,9 @@ async fn proxy(
         let body = upstream.map(move |item| {
             match item {
                 Ok(chunk) => {
+                    fin.usage.feed(&chunk);
                     let s = tr.lk().feed(&chunk);
-                    fin.feed(s.as_bytes());
+                    fin.preview(s.as_bytes());
                     track(s.as_bytes(), false);
                     Ok(Bytes::from(s))
                 }
@@ -1062,10 +1027,13 @@ async fn proxy(
             bytes.extend_from_slice(&c);
         }
         let outb = match serde_json::from_slice::<Value>(&bytes) {
-            Ok(v) => translate::response(&v).to_string().into_bytes(),
+            Ok(v) => {
+                fin.usage.observe(&v);
+                translate::response(&v).to_string().into_bytes()
+            }
             Err(_) => bytes.to_vec(),
         };
-        fin.feed(&outb);
+        fin.preview(&outb);
         Response::new(Body::from(outb))
     } else {
         let body = upstream.map(move |item| {
@@ -1199,7 +1167,7 @@ async fn antigravity(
                 _ => {}
             }
             gw.update(id, |r| r.summary.status = Some(status.as_u16()));
-            let mut fin = Finalizer { gw: gw.clone(), id, started, first: None, head: Vec::new(), tail: VecDeque::new(), total: 0, error: None, _permit: permit.take() };
+            let mut fin = Finalizer { gw: gw.clone(), id, started, first: None, head: Vec::new(), tail: VecDeque::new(), total: 0, usage: usage::Capture::new(false), error: None, _permit: permit.take() };
             fin.feed(text.as_bytes());
             let msg = serde_json::from_str::<Value>(&text).ok().and_then(|v| v.pointer("/error/message").and_then(Value::as_str).map(str::to_string)).unwrap_or_else(|| cap(&text, 500));
             let stale_msg = stale::outdated(status.as_u16(), &text).then(|| stale::warning("Antigravity", "client version", gemini::VERSION));
@@ -1250,8 +1218,9 @@ async fn antigravity(
     }
     gw.update(id, |r| r.summary.status = Some(200));
     let bytes = if stream { gemini::to_sse(&answer.completion) } else { answer.completion.to_string() };
-    let mut fin = Finalizer { gw: gw.clone(), id, started, first: None, head: Vec::new(), tail: VecDeque::new(), total: 0, error: None, _permit: permit.take() };
-    fin.feed(bytes.as_bytes());
+    let mut fin = Finalizer { gw: gw.clone(), id, started, first: None, head: Vec::new(), tail: VecDeque::new(), total: 0, usage: usage::Capture::new(false), error: None, _permit: permit.take() };
+    fin.usage.observe(&answer.completion);
+    fin.preview(bytes.as_bytes());
     drop(fin);
     let mut out = Response::new(Body::from(bytes));
     out.headers_mut().insert("content-type", HeaderValue::from_static(if stream { "text/event-stream" } else { "application/json" }));
@@ -1332,6 +1301,66 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         panic!("activity never finished");
+    }
+
+    #[tokio::test]
+    async fn responses_usage_survives_truncated_previews() {
+        let final_event = format!(
+            "event: response.completed\r\ndata: {}\r\n\r\n",
+            json!({"type":"response.completed","response":{
+                "output":[{"type":"message","text":"x".repeat(HEAD_CAP + TAIL_CAP)}],
+                "usage":{"input_tokens":25,"output_tokens":31,"input_tokens_details":{"cached_tokens":0}}
+            }})
+        );
+        let chunks: Vec<_> = final_event.as_bytes().chunks(8001)
+            .map(|c| Ok::<_, std::convert::Infallible>(Bytes::copy_from_slice(c)))
+            .collect();
+        let app = Router::new().route("/v1/responses", any(move || {
+            let chunks = chunks.clone();
+            async move { ([("content-type", "text/event-stream; charset=utf-8")], Body::from_stream(futures_util::stream::iter(chunks))) }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (gw, url) = gateway(&base, Kind::ChatgptOauth, GuardMode::Off).await;
+        gw.tokens.set(Arc::new(|_, _| {
+            Box::pin(async { Ok(crate::oauth::Creds { access: "synthetic".into(), ..Default::default() }) })
+        }));
+        let response = reqwest::Client::new().post(format!("{url}/responses"))
+            .bearer_auth(gw.issue_token("agent", None)).json(&json!({"model":"m","input":"hi"}))
+            .send().await.unwrap();
+        assert_eq!(response.text().await.unwrap(), final_event);
+        let a = settle(&gw).await;
+        assert_eq!((a.input_tokens, a.output_tokens, a.cached_tokens), (Some(25), Some(31), Some(0)));
+        let detail = gw.detail(a.id).unwrap();
+        assert_eq!(detail["response_head"].as_str().unwrap().len(), HEAD_CAP);
+        assert_eq!(detail["response_tail"].as_str().unwrap().len(), TAIL_CAP);
+        assert_eq!(gw.agent_stats()["agent"]["cache_hit_pct"], 0);
+
+        // Unknown data neither becomes a known 0% nor dilutes the aggregate.
+        let mut next = gw.log.lk().back().unwrap().summary.clone();
+        next.id += 1;
+        next.state = "pending";
+        next.agent = Some("other".into());
+        next.input_tokens = None;
+        next.output_tokens = None;
+        next.cached_tokens = None;
+        gw.push(Record { summary: next.clone(), request: String::new(), response_head: String::new(), response_tail: String::new() });
+        let stats = gw.agent_stats();
+        assert_eq!(stats["other"]["pending_requests"], 1);
+        assert!(stats["other"]["cache_hit_pct"].is_null());
+        gw.update(next.id, |r| {
+            r.summary.state = "done";
+            r.summary.input_tokens = Some(100);
+        });
+        let stats = gw.agent_stats();
+        assert_eq!(stats["other"]["pending_requests"], 0);
+        assert!(stats["other"]["cache_hit_pct"].is_null());
+        gw.update(next.id, |r| r.summary.agent = Some("agent".into()));
+        let stats = gw.agent_stats();
+        assert_eq!(stats["agent"]["input_tokens"], 125);
+        assert_eq!(stats["agent"]["cache_input_tokens"], 25);
+        assert!(stats["agent"]["last_cache_hit_pct"].is_null());
     }
 
     /// Raw TCP upstream: answers every connection with `reply`, then either
@@ -1651,6 +1680,24 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn emits_progress_for_chatgpt_when_oauth_enables_streaming() {
+        let (base, _) = upstream().await;
+        let (gw, url) = gateway(&base, Kind::ChatgptOauth, GuardMode::Off).await;
+        gw.tokens.set(Arc::new(|_, _| {
+            Box::pin(async { Ok(crate::oauth::Creds { access: "test".into(), ..Default::default() }) })
+        }));
+        let mut progress = gw.progress.subscribe();
+        let token = gw.issue_token("fixture-agent", None);
+        let response = reqwest::Client::new().post(format!("{url}/responses"))
+            .bearer_auth(token).json(&json!({"model":"fixture"})).send().await.unwrap();
+        assert_eq!(response.status(), 200);
+        assert!(response.text().await.unwrap().contains("[DONE]"));
+        let p = progress.try_recv().expect("streaming progress for forced SSE");
+        assert_eq!(p.agent.as_deref(), Some("fixture-agent"));
+        assert_eq!(p.phase, "text");
+    }
+
     /// The effort a person chose reaches each Claude model in the form that model takes: a named
     /// level for current models, a thinking budget for the 4.5 generation.
     #[tokio::test]
@@ -1687,17 +1734,6 @@ mod tests {
         assert_eq!(r.status(), 401);
         assert!(r.text().await.unwrap().contains("Sign in again"));
         assert!(seen.lk().is_empty());
-    }
-
-    #[test]
-    fn usage_from_each_wire_format() {
-        let anthropic = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":40,\"cache_read_input_tokens\":10,\"output_tokens\":1}}}\n\n\
-                         data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":9}}\n";
-        assert_eq!(extract_usage(anthropic, ""), (Some(50), Some(9), Some(10)));
-        let responses = "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":6,\"input_tokens_details\":{\"cached_tokens\":2}}}}\n";
-        assert_eq!(extract_usage("", responses), (Some(5), Some(6), Some(2)));
-        let whole = "{\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":8}}";
-        assert_eq!(extract_usage(whole, ""), (Some(7), Some(8), None));
     }
 
     #[tokio::test]

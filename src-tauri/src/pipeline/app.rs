@@ -132,7 +132,7 @@ pub async fn ensure_commits(dir: &Path, origin: &str, pr: i64, shas: &[&str]) ->
         return Ok(());
     }
     let mut env = vec![];
-    if let Some(token) = crate::release_intake::origin_bearer(origin).await {
+    if let Some(token) = crate::release_intake::origin_bearer(origin).await? {
         use base64::Engine;
         let basic = base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}"));
         env = vec![("GIT_CONFIG_COUNT", "1".to_string()), ("GIT_CONFIG_KEY_0", "http.extraHeader".to_string()), ("GIT_CONFIG_VALUE_0", format!("Authorization: Basic {basic}"))];

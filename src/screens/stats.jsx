@@ -2,6 +2,7 @@ import {
   For,
   Show,
   createSignal,
+  createResource,
   createMemo,
   createEffect,
   on,
@@ -20,9 +21,104 @@ import {
 import { KvTelemetryBar } from "../ui/kv-bar.jsx";
 import { rpc, fmt } from "../lib/rpc.js";
 import { go } from "../lib/nav.js";
-import { activeRepoId } from "../lib/store.js";
-import { useVisibleEvent } from "../lib/visibility.js";
+import { activeRepoId, useStore } from "../lib/store.js";
+import { useScreenVisible, useVisibleEvent } from "../lib/visibility.js";
+import { providerUsageRows } from "../lib/provider-usage.js";
+import { quotaView } from "../lib/quota.js";
 import "../styles/terminals.css";
+
+const usageColumns = ["Requests", "Input", "Output", "TTFT avg / p50", "TPS", "Known cost", "Errors", "Guard actions"];
+
+function usageValues(r) {
+  return [
+    fmt.int(r.requests),
+    fmt.compact(r.tokens_in),
+    fmt.compact(r.tokens_out),
+    `${fmt.ms(r.avg_ttft_ms)} / ${fmt.ms(r.p50_ttft_ms)}`,
+    r.avg_tps?.toFixed(1) ?? "N/A",
+    `${fmt.money(r.cost)}${r.unpriced_requests ? " + unknown" : ""}`,
+    fmt.pct(r.error_rate),
+    Object.entries(r.guard_actions || {})
+      .filter(([k]) => k !== "pass")
+      .map(([k, v]) => `${k}: ${v}`)
+      .join(", ") || "None",
+  ];
+}
+
+function ProviderQuota(props) {
+  // Refreshing the snapshot also recomputes the reset countdown.
+  const windows = createMemo(() => quotaView(props.usage).rows);
+  return (
+    <Show when={windows().length} fallback={<span class="dim">{props.empty}</span>}>
+      <For each={windows()}>
+        {(w) => (
+          <div class="row" style={{ gap: "6px" }}>
+            <meter min="0" max="100" value={w.pct} aria-label={`${w.label} quota used`} style={{ width: "50px" }} />
+            <span>{w.label}: {w.pct}% used{w.reset ? ` · ${w.reset}` : ""}</span>
+          </div>
+        )}
+      </For>
+      <Show when={props.usage?.observed_at}>
+        <span class="faint xs">
+          Last reported {new Date(props.usage.observed_at * 1000).toLocaleString()}
+        </span>
+      </Show>
+    </Show>
+  );
+}
+
+function ProviderUsage(props) {
+  return (
+    <section class="lane-section">
+      <h2>Provider usage</h2>
+      <p>
+        Quota meters show the last usage reported by each provider. The date range
+        and repository filters only apply to requests recorded by Philium and
+        their token and cost totals.
+      </p>
+      <Show when={props.rows.length} fallback={
+        <p>{props.pending ? "Loading providers…" : "No configured providers or recorded usage to show."}</p>
+      }>
+        <div class="lane-table-wrap">
+          <table class="lane-table" aria-label="Provider usage">
+            <thead><tr>
+              <th scope="col">Provider</th>
+              <th scope="col">Reported quota</th>
+              <For each={usageColumns}>{(label) => <th scope="col">{label}</th>}</For>
+            </tr></thead>
+            <tbody>
+              <For each={props.rows}>
+                {(row) => (
+                  <tr>
+                    <th scope="row">
+                      {row.provider?.name || row.id}
+                      <Show when={row.provider?.name && row.provider.name !== row.id}>
+                        {" "}<span class="faint mono">{row.id}</span>
+                      </Show>
+                      <Show when={row.provider?.enabled === false}> · Disabled</Show>
+                    </th>
+                    <td>
+                      <ProviderQuota
+                        usage={row.provider ? props.quotas?.[row.id] : undefined}
+                        empty={row.provider
+                          ? props.quotaStatus
+                          : props.pending ? "Loading…" : "Not configured"}
+                      />
+                    </td>
+                    <Show when={row.stats} fallback={<td colspan={usageColumns.length} class="dim">{props.statsStatus}</td>}>
+                      <For each={usageValues(row.stats)}>{(value) => <td>{value}</td>}</For>
+                    </Show>
+                  </tr>
+                )}
+              </For>
+            </tbody>
+          </table>
+        </div>
+      </Show>
+    </section>
+  );
+}
+
 function UsageTable(props) {
   return (
     <section class="lane-section">
@@ -35,19 +131,7 @@ function UsageTable(props) {
           aria-rowcount={props.rows.length + 1}
         >
           <div class="lane-usage-row lane-usage-head" role="row">
-            <For
-              each={[
-                props.label,
-                "Requests",
-                "Input",
-                "Output",
-                "TTFT avg / p50",
-                "TPS",
-                "Known cost",
-                "Errors",
-                "Guard actions",
-              ]}
-            >
+            <For each={[props.label, ...usageColumns]}>
               {(s) => <span role="columnheader">{s}</span>}
             </For>
           </div>
@@ -63,24 +147,9 @@ function UsageTable(props) {
                     {r[props.field]}
                     {props.field === "model" ? ` (${r.provider_id})` : ""}
                   </span>
-                  <span role="cell">{fmt.int(r.requests)}</span>
-                  <span role="cell">{fmt.compact(r.tokens_in)}</span>
-                  <span role="cell">{fmt.compact(r.tokens_out)}</span>
-                  <span role="cell">
-                    {fmt.ms(r.avg_ttft_ms)} / {fmt.ms(r.p50_ttft_ms)}
-                  </span>
-                  <span role="cell">{r.avg_tps?.toFixed(1) ?? "N/A"}</span>
-                  <span role="cell">
-                    {fmt.money(r.cost)}
-                    {r.unpriced_requests ? " + unknown" : ""}
-                  </span>
-                  <span role="cell">{fmt.pct(r.error_rate)}</span>
-                  <span role="cell">
-                    {Object.entries(r.guard_actions || {})
-                      .filter(([k]) => k !== "pass")
-                      .map(([k, v]) => `${k}: ${v}`)
-                      .join(", ") || "None"}
-                  </span>
+                  <For each={usageValues(r)}>
+                    {(value) => <span role="cell">{value}</span>}
+                  </For>
                 </div>
               )}
             </VirtualList>
@@ -91,12 +160,24 @@ function UsageTable(props) {
   );
 }
 export default function Stats() {
+  const store = useStore();
+  const visible = useScreenVisible();
+  const [quotaResult, { refetch: refreshQuotas }] = createResource(async () => {
+    try {
+      return { data: await rpc("activity.quotas") };
+    } catch {
+      return { error: true };
+    }
+  });
   const [range, setRange] = createSignal("24h"),
     [summary, setSummary] = createSignal(null),
     [series, setSeries] = createSignal([]),
     [efficiency, setEfficiency] = createSignal([]),
     [loading, setLoading] = createSignal(false),
     [error, setError] = createSignal("");
+  const providerRows = createMemo(() =>
+    providerUsageRows(store.providers() ?? [], summary()?.by_provider ?? []),
+  );
   let generation = 0;
   const clampPct = (ratio) =>
     Math.min(100, Math.max(0, Math.round((Number(ratio) || 0) * 100)));
@@ -127,14 +208,21 @@ export default function Stats() {
     }
   };
   onMount(load);
+  const quotaTimer = setInterval(() => {
+    if (visible()) refreshQuotas();
+  }, 30000);
   createEffect(on(activeRepoId, () => load(), { defer: true }));
   onCleanup(() => {
     generation++;
+    clearInterval(quotaTimer);
   });
   useVisibleEvent(
     "activity",
     (a) => {
-      if (a?.state !== "pending") load();
+      if (a?.state !== "pending") {
+        load();
+        refreshQuotas();
+      }
     },
     { debounceMs: 1500 },
   );
@@ -147,7 +235,7 @@ export default function Stats() {
   return (
     <Page
       title="Stats"
-      sub="All providers, token efficiency and generation speed"
+      sub="Provider usage, token efficiency and generation speed"
       actions={
         <>
           <Show when={loading()}>
@@ -163,7 +251,14 @@ export default function Stats() {
               load();
             }}
           />
-          <Button busy={loading()} onClick={load}>
+          <Button
+            busy={loading()}
+            onClick={() => {
+              load();
+              refreshQuotas();
+              store.refetchProviders();
+            }}
+          >
             Refresh
           </Button>
         </>
@@ -215,6 +310,13 @@ export default function Stats() {
           />
           <Stat label="TTFT p50" value={fmt.ms(totals().p50_ttft_ms)} />
         </div>
+        <ProviderUsage
+          rows={providerRows()}
+          pending={store.providers.loading || (!summary() && !error())}
+          quotas={quotaResult()?.data}
+          quotaStatus={quotaResult()?.error ? "Quota unavailable" : quotaResult.loading ? "Loading quota…" : "No quota reported"}
+          statsStatus={error() ? "Usage unavailable" : loading() || !summary() ? "Loading usage…" : "No requests in this range"}
+        />
         <Show
           when={summary()?.totals.requests}
           fallback={
@@ -229,12 +331,6 @@ export default function Stats() {
             </Empty>
           }
         >
-          <UsageTable
-            title="Providers"
-            label="Provider"
-            field="provider_id"
-            rows={summary()?.by_provider || []}
-          />
           <UsageTable
             title="Models"
             label="Model"

@@ -153,6 +153,36 @@ async fn hal(app: State<'_, App>, method: String, path: String, body: Option<Val
     h.call(hal::parse_method(&method)?, &path, body).await
 }
 
+fn markdown_link(url: &str) -> Result<tauri::Url, String> {
+    let invalid = || "Only HTTP, HTTPS and email links can be opened".to_string();
+    let url = tauri::Url::parse(url).map_err(|_| invalid())?;
+    if !matches!(url.scheme(), "http" | "https" | "mailto")
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err(invalid());
+    }
+    Ok(url)
+}
+
+/// Open a validated link in the system handler, not inside the privileged webview.
+#[tauri::command]
+async fn open_markdown_link(url: String) -> Result<(), String> {
+    let url = markdown_link(&url)?;
+    open::that_detached(url.as_str()).map_err(|_| "The system couldn’t open this link".to_string())
+}
+
+#[cfg(test)]
+#[test]
+fn markdown_links_only_use_web_and_mail_handlers() {
+    for url in ["https://example.com/a", "http://example.com", "mailto:hello@example.com"] {
+        assert!(markdown_link(url).is_ok());
+    }
+    for url in ["file:///example", "javascript:void(0)", "data:text/plain,x", "//example.com", "https://person:secret@example.com"] {
+        assert!(markdown_link(url).is_err());
+    }
+}
+
 /// One entry point for every feature module: `rpc("terminals.open", {...})`.
 #[tauri::command]
 async fn rpc(app: State<'_, App>, method: String, args: Option<Value>) -> Result<Value, Value> {
@@ -501,7 +531,7 @@ fn main() {
             });
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![hal, rpc, drafts::drafts_load, drafts::drafts_save, drafts::drafts_put_blob, drafts::drafts_blob, capture::capture_screenshot, capture::open_screen_settings, capture::agent_attachment])
+        .invoke_handler(tauri::generate_handler![hal, rpc, open_markdown_link, drafts::drafts_load, drafts::drafts_save, drafts::drafts_put_blob, drafts::drafts_blob, capture::capture_screenshot, capture::open_screen_settings, capture::agent_attachment])
         .build(config)
         .expect("error while building Philium");
     #[cfg(target_os="macos")] if offscreen{tauri_app.set_activation_policy(tauri::ActivationPolicy::Prohibited);}

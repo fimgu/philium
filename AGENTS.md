@@ -1,5 +1,11 @@
 # Philium agent guide
 
+## UI verification and screenshots
+
+- Use the visible Philium browser tab for UI walkthroughs and PR screenshots. Prefer a local preview with sample data so the user can follow along without exposing account details.
+- For a fixture preview, run `npm run build -- --mode fixture`, then `node scripts/render/render.mjs --serve --port="$PHILIUM_PORT_BASE"`. Open the printed URL in the Philium browser and use its screenshot tool. Stop the server when finished.
+- Headless runs are useful for automated regression checks. Say when a run uses a separate headless browser, and never use one to bypass a browser permission denial.
+
 ## Engineering rules
 
 - **Always latest, never stale pins.** Philium must always use the latest versions, client fingerprints and model IDs. Resolve them at runtime (registry, live catalog, server response). Never hardcode a value that goes stale: a hardcoded `claude-cli/2.1.280` user agent once broke every Claude request.

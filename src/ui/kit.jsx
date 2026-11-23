@@ -154,7 +154,7 @@ export function Shield(props) {
 export function Page(props) {
   return (
     <>
-      <header class="page-head">
+      <header class={`page-head${props.headerClass ? ` ${props.headerClass}` : ""}`}>
         <h1>{props.title}</h1>
         <Show when={props.sub}><span class="sub">{props.sub}</span></Show>
         <div class="actions">{props.actions}</div>
@@ -275,7 +275,9 @@ export function VirtualList(props) {
       <div class="vlist-inner" style={{ height: `${(props.items?.length ?? 0) * props.rowHeight}px` }}>
         <For each={visible()}>
           {(item, i) => {
-            const idx = () => range().start + i();
+            // A height change can alter the visible range without moving this
+            // row. Preserve its DOM and focus when its absolute index is stable.
+            const idx = createMemo(() => range().start + i());
             return (
               <div style={{ position: "absolute", top: `${idx() * props.rowHeight}px`, left: 0, right: 0, height: `${props.rowHeight}px` }}>
                 {props.children(item, idx())}

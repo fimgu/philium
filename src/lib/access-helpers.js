@@ -288,8 +288,13 @@ export function pendingAccessByAgent(pendingList) {
   return counts;
 }
 
-export function agentNeedsUser(agent, pendingByAgent) {
+export function agentNeedsToolApproval(agent, approvals) {
+  if (!agent || agent.live === false) return false;
+  const requests = approvals?.[agent.id];
+  return Array.isArray(requests) ? requests.length > 0 : agent.state === "waiting";
+}
+
+export function agentNeedsUser(agent, pendingByAgent, approvals) {
   if (!agent) return false;
-  if (agent.state === "waiting") return true;
-  return (pendingByAgent?.get?.(agent.id) ?? 0) > 0;
+  return agentNeedsToolApproval(agent, approvals) || (pendingByAgent?.get?.(agent.id) ?? 0) > 0;
 }

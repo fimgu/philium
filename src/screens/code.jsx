@@ -12,8 +12,9 @@ import { useStore, activeRepoId } from "../lib/store.js";
 import { useVisibleEvent } from "../lib/visibility.js";
 import "../styles/code.css";
 
-const SEV = { same_symbol: ["danger", "same symbol"], dependent: ["strict", "dependent code"], same_file: ["strict", "same file"] };
+const SEV = { same_symbol: ["strict", "Same symbol"], dependent: ["", "Possible dependency"], same_file: ["", "Same file"] };
 const sevOf = (s) => SEV[s] ?? ["strict", String(s ?? "overlap").replace(/_/g, " ")];
+const changeLabel = { A: "Added", D: "Deleted", R: "Renamed", C: "Copied", M: "Modified", U: "Merge conflict", "?": "Untracked" };
 const basename = (p) => p.split("/").pop();
 const dirname = (p) => (p.includes("/") ? p.slice(0, p.lastIndexOf("/") + 1) : "");
 
@@ -319,6 +320,7 @@ export default function Code() {
   const [sel, setSel] = createSignal(null); // {id, symbol, label}
   const [busy, setBusy] = createSignal(false);
   const [tab, setTab] = createSignal("source");
+  const [comparison, setComparison] = createSignal("working");
   const [showChanges, setShowChanges] = createSignal(Boolean(params()?.worktree_id));
   const [changesOnly, setChangesOnly] = createSignal(false);
   const [expanded, setExpanded] = createSignal(false);
@@ -346,12 +348,14 @@ export default function Code() {
   const [tree] = createResource(key, () => rpc("codeindex.tree", target()).catch(() => ({ files: [] })));
   const gkey = () => { const k = key(); return viewMode() === "graph" && k ? k + level() : null; };
   const [graph] = createResource(gkey, () => rpc("codeindex.graph", { ...target(), level: level(), worktrees: true }).catch(() => ({ nodes: [], edges: [] })));
-  const [changes] = createResource(key, () => rpc("codeindex.changes", target()).catch((e) => ({ files: [], error: String(e) })));
+  const [changes] = createResource(() => key() && [target(), comparison(), tick()], ([t, mode]) =>
+    rpc("codeindex.changes", { ...t, comparison: mode }).catch((e) => ({ files: [], error: String(e) })));
   const changedPaths = createMemo(() => new Set((changes()?.files ?? []).flatMap((f) => [f.path, f.old_path].filter(Boolean))));
   const targetLabel = () => viewId() === "main" ? "Indexed base (fixed commit)" : viewId() === "local" ? "Local checkout (working snapshot)" : `${agentName((wts() ?? []).find((w) => w.id === viewId()) ?? {})} worktree (working snapshot)`;
   const [clashes, clr] = createResource(repo, (r) => (r ? rpc("codeindex.clashes", { repo_id: r }).catch(() => ({ clashes: [] })) : { clashes: [] }));
   const [refs] = createResource(() => (sel()?.symbol ? JSON.stringify([target(), sel().symbol, tick()]) : null), () => rpc("codeindex.refs", { ...target(), symbol: sel().symbol }).catch((e) => ({ error: String(e), defs: [], refs: [] })));
   useVisibleEvent("codeindex:clashes", () => clr.refetch(), { debounceMs: 250 });
+  useVisibleEvent("workspace:changed", () => setTick((t) => t + 1), { debounceMs: 500 });
   createEffect(
     on(
       activeRepoId,
@@ -380,7 +384,13 @@ export default function Code() {
       setSel(null);
     }
   });
-  createEffect(on(viewId, () => { setSel(null); setExpanded(false); setTab("source"); }, { defer: true }));
+  createEffect(on(viewId, (id) => {
+    setSel(null);
+    setExpanded(false);
+    setTab("source");
+    setComparison("working");
+    setShowChanges(id !== "main");
+  }, { defer: true }));
 
   const agentName = (w) => w.agent_name || w.branch;
   const rows = createMemo(() => {
@@ -438,7 +448,7 @@ export default function Code() {
             <For each={clashes().clashes}>{(c) => (
               <div class="code-clash">
                 <Badge tone={sevOf(c.severity)[0]}>{sevOf(c.severity)[1]}</Badge>
-                <AgentChip name={c.a ?? "?"} /> and <AgentChip name={c.b ?? "?"} /> both change code that overlaps
+                <AgentChip name={c.a ?? "?"} /> and <AgentChip name={c.b ?? "?"} />
                 <span class="detail" title={(c.detail ?? []).join("\n")}>{(c.detail ?? []).slice(0, 2).join(", ")}</span>
               </div>
             )}</For>
@@ -448,7 +458,35 @@ export default function Code() {
           <div class={mainClass()} style={{ "--inspector-size": `${inspectorSize()}px` }}>
             <div class="code-side">
               <div class="search"><Input placeholder="Search files and symbols" value={q()} onValue={setQ} /></div>
-              <Show when={showChanges()}><section class="changed-files"><div class="dsec">Changes against base {(changes()?.base_commit ?? "").slice(0, 8)}</div><Show when={changes.loading}><div class="inspector-note">Loading changes…</div></Show><Show when={changes()?.error}><div class="inspector-note err">{changes().error}</div></Show><Show when={changes()?.note}><div class="inspector-note">{changes().note}</div></Show><Show when={changes()?.truncated}><div class="inspector-note">Changed file list truncated.</div></Show><For each={changes()?.files ?? []}>{(f) => <button class="changed-file" title={f.old_path ? `${f.old_path} → ${f.path}` : f.path} onClick={() => { setSel({ id: f.path, file: f.path, label: basename(f.path) }); setTab("diff"); }}><b>{f.status}</b><span>{f.old_path ? `${f.old_path} → ` : ""}{f.path}</span><small>+{f.added ?? 0} −{f.removed ?? 0}</small></button>}</For><Show when={!changes.loading && !changes()?.files?.length && !changes()?.note}><div class="inspector-note">No changes in this target.</div></Show></section></Show>
+              <Show when={showChanges()}>
+                <section class="changed-files">
+                  <div class="dsec">Changed files</div>
+                  <Show when={viewId() !== "main"}>
+                    <Segmented value={comparison()} onChange={setComparison} options={[
+                      { value: "working", label: "Uncommitted" },
+                      { value: "base", label: "Against base" },
+                    ]} />
+                    <div class="inspector-note">{comparison() === "working" ? "Against HEAD" : "Branch and working changes against the indexed base"} {(changes()?.base_commit ?? "").slice(0, 8)}</div>
+                  </Show>
+                  <Show when={changes.loading}><div class="inspector-note">Loading changes…</div></Show>
+                  <Show when={changes()?.error}><div class="inspector-note err">{changes().error}</div></Show>
+                  <Show when={changes()?.note}><div class="inspector-note">{changes().note}</div></Show>
+                  <Show when={changes()?.truncated}><div class="inspector-note">Changed file list truncated.</div></Show>
+                  <For each={changes()?.files ?? []}>{(f) => (
+                    <button class="changed-file" classList={{ on: sel()?.file === f.path, "merge-conflict": f.status === "U" }}
+                      aria-current={sel()?.file === f.path ? "true" : undefined}
+                      title={f.old_path ? `${f.old_path} → ${f.path}` : f.path}
+                      onClick={() => { setSel({ id: f.path, file: f.path, label: basename(f.path) }); setTab("diff"); }}>
+                      <b>{changeLabel[f.status] ?? f.status}</b>
+                      <span>{f.old_path ? `${f.old_path} → ` : ""}{f.path}</span>
+                      <small>{f.added == null ? "—" : `+${f.added}`} {f.removed == null ? "—" : `−${f.removed}`}</small>
+                    </button>
+                  )}</For>
+                  <Show when={!changes.loading && !changes()?.files?.length && !changes()?.note && !changes()?.error}>
+                    <div class="inspector-note">{comparison() === "working" && viewId() !== "main" ? "No uncommitted changes. Choose Against base to see the branch diff." : "No changes in this target."}</div>
+                  </Show>
+                </section>
+              </Show>
               <Show when={rows().length} fallback={<div class="code-empty">{tree.loading ? "Loading index" : q() ? "No matches." : "No indexed files in this view."}</div>}>
                 <VirtualList items={rows()} rowHeight={24}>
                   {(r) => r.t === "file" ? (
@@ -492,7 +530,7 @@ export default function Code() {
                 <Show when={viewMode() === "graph"}>
                   <div class="inspector-resize" role="separator" tabindex="0" aria-label="Resize code inspector" onPointerDown={resize} onKeyDown={(e) => { if (["ArrowLeft", "ArrowUp", "ArrowRight", "ArrowDown"].includes(e.key)) { e.preventDefault(); setInspectorSize((s) => Math.max(180, s + (["ArrowLeft", "ArrowUp"].includes(e.key) ? 30 : -30))); } }} />
                 </Show>
-                <CodeInspector selected={sel()} target={target()} targetAgentId={(wts() ?? []).find((w) => w.id === viewId())?.agent_id} targetLabel={targetLabel()} repoId={repo()} baseCommit={status()?.base_commit} tab={tab()} onTab={setTab} expanded={viewMode() === "inspector" ? true : expanded()} onExpand={() => { if (viewMode() === "inspector") { setViewMode("graph"); setExpanded(false); } else { setExpanded(!expanded()); } }} onClose={() => { setSel(null); setExpanded(false); }} tick={tick()}>
+                <CodeInspector selected={sel()} target={target()} targetAgentId={(wts() ?? []).find((w) => w.id === viewId())?.agent_id} targetLabel={targetLabel()} repoId={repo()} baseCommit={status()?.base_commit} comparison={comparison()} tab={tab()} onTab={setTab} expanded={viewMode() === "inspector" ? true : expanded()} onExpand={() => { if (viewMode() === "inspector") { setViewMode("graph"); setExpanded(false); } else { setExpanded(!expanded()); } }} onClose={() => { setSel(null); setExpanded(false); }} tick={tick()}>
                   <Show when={sel()?.symbol} fallback={<div class="code-empty">Select a symbol to inspect its references. File contents are in Source.</div>}>
                     <Show when={!refs.loading} fallback={<div class="code-empty">Loading references…</div>}>
                       <Show when={!refs()?.error} fallback={<div class="code-empty err">{refs().error}</div>}><RefList data={refs()} onJump={(r) => { setSel({ id: r.path, file: r.path, label: basename(r.path), line: r.line }); setTab("source"); }} /></Show>

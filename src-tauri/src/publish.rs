@@ -6,8 +6,8 @@
 //!   commits only those paths. Rejects when HEAD moved since the panel was loaded.
 //! - `push {}`: pushes the current branch to its upstream remote, or the only remote,
 //!   with normal fast-forward rules. Never forces.
-//! - `pr {base, title, body}`: returns the existing PR for this head if there is one,
-//!   otherwise runs `gh pr create`.
+//! - `pr`: returns the existing PR for this head if there is one, otherwise creates it
+//!   through the GitHub API using the repository's selected account. Never pushes.
 use serde_json::{json, Value};
 use std::{
     path::Path,
@@ -118,26 +118,42 @@ pub(crate) fn push(dir: &Path) -> Result<Value, String> {
     Ok(json!({"remote": remote, "branch": branch}))
 }
 
-/// `gh pr create` argv for a head branch. Separate so it can be checked without `gh`.
-pub(crate) fn pr_create_args<'a>(base: &'a str, head: &'a str, title: &'a str, body: &'a str) -> Vec<&'a str> {
-    vec!["pr", "create", "--base", base, "--head", head, "--title", title, "--body", body]
-}
-
-pub(crate) fn pr(dir: &Path, base: &str, title: &str, body: &str) -> Result<Value, String> {
+pub(crate) async fn pr(dir: &Path, base: &str, title: &str, body: &str, expected_login: &str, expected_origin: &str) -> Result<Value, String> {
     if title.trim().is_empty() || base.trim().is_empty() {
         return Err("A pull request needs a title and a base branch.".into());
     }
+    let path = dir.to_path_buf();
+    let (head, origin) = tokio::task::spawn_blocking(move || pr_target(&path)).await.map_err(|e| e.to_string())??;
+    if origin != expected_origin {
+        return Err("The branch remote does not match the GitHub repository selected for this PR.".into());
+    }
+    let token = crate::release_intake::github_write_token(&origin, expected_login).await?;
+    let endpoint = format!("repos/{origin}/pulls");
+    let owner = origin.split('/').next().ok_or("Invalid GitHub repository")?;
+    let filter = format!("head={owner}:{head}");
+    use crate::release_intake::run_github;
+    let existing = run_github(&["api", "--method", "GET", &endpoint, "-f", "state=open", "-f", &filter], None, Some(&token), TIMEOUT.as_secs()).await?;
+    let existing: Vec<Value> = serde_json::from_str(&existing).map_err(|_| "Invalid GitHub response")?;
+    if let Some(pr) = existing.first() {
+        return Ok(json!({"url": pr["html_url"], "existing": true}));
+    }
+    let payload = json!({"base": base, "head": head, "title": title.trim(), "body": body}).to_string();
+    let response = run_github(&["api", "--method", "POST", &endpoint, "--input", "-"], Some(&payload), Some(&token), TIMEOUT.as_secs()).await?;
+    let pr: Value = serde_json::from_str(&response).map_err(|_| "Invalid GitHub response")?;
+    Ok(json!({"url": pr["html_url"], "existing": false}))
+}
+
+pub(crate) fn pr_target(dir: &Path) -> Result<(String, String), String> {
+    use crate::release_intake::origin_of;
     let head = git(dir, &["symbolic-ref", "--quiet", "--short", "HEAD"])
         .map_err(|_| "Not on a branch.".to_string())?;
-    if let Ok(existing) = run("gh", dir, &["pr", "view", &head, "--json", "url,state"]) {
-        if let Ok(v) = serde_json::from_str::<Value>(&existing) {
-            if v["state"] == "OPEN" {
-                return Ok(json!({"url": v["url"], "existing": true}));
-            }
-        }
+    let remote = remote_for(dir, &head)?;
+    let origin = origin_of(&git(dir, &["remote", "get-url", "--", &remote])?)?;
+    let push_origin = origin_of(&git(dir, &["remote", "get-url", "--push", "--", &remote])?)?;
+    if origin != push_origin {
+        return Err("The branch remote does not match the GitHub repository selected for this PR.".into());
     }
-    let url = run("gh", dir, &pr_create_args(base, &head, title.trim(), body))?;
-    Ok(json!({"url": url.lines().last().unwrap_or(""), "existing": false}))
+    Ok((head, origin))
 }
 
 #[cfg(test)]
@@ -196,10 +212,13 @@ mod tests {
         assert_eq!(state(p).unwrap()["ahead"], "0");
     }
 
-    #[test]
-    fn pr_args_are_argv_separated() {
-        let a = pr_create_args("main", "feature", "Title; rm -rf", "body");
-        assert_eq!(a[5], "feature");
-        assert_eq!(a[7], "Title; rm -rf");
+    #[tokio::test]
+    async fn pr_rejects_a_different_push_repository_before_authentication() {
+        let w = tmp("pr-remote");
+        git(&w.0, &["init", "-q", "-b", "feature"]).unwrap();
+        git(&w.0, &["remote", "add", "origin", "https://github.com/org/work.git"]).unwrap();
+        git(&w.0, &["remote", "set-url", "--push", "origin", "https://github.com/me/personal.git"]).unwrap();
+        let error = pr(&w.0, "main", "Change", "", "work-account", "org/work").await.unwrap_err();
+        assert!(error.contains("branch remote does not match"), "{error}");
     }
 }
