@@ -38,6 +38,7 @@ const ACTIONS: &[(&str, &str)] = &[
     ("board.submit", "Submitted a task for review"),
     ("board.release", "Released a task"),
     ("board.delete", "Deleted a task"),
+    ("board.reset", "Reset task board"),
     ("board.mail_send", "Sent mail"),
     ("terminals.open", "Opened a terminal"),
     ("terminals.kill", "Stopped a terminal"),

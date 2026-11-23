@@ -56,7 +56,8 @@ CREATE TABLE IF NOT EXISTS tasks (
   status TEXT NOT NULL DEFAULT 'todo', priority TEXT NOT NULL DEFAULT 'normal',
   owner_agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
   lease_expires_at INTEGER, repo_id TEXT REFERENCES repos(id) ON DELETE SET NULL,
-  pr_url TEXT, playbook TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+  pr_url TEXT, playbook TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+  board_cleared INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS task_deps (
   task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
   depends_on TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,

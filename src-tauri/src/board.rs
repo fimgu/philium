@@ -1,4 +1,4 @@
-//! Board RPC: list, get, create, update, claim, release, delete, deps_set,
+//! Board RPC: list, get, create, update, claim, release, delete, reset, deps_set,
 //! mail_send, mail_inbox, mail_threads, playbooks, playbook_get/set/reset.
 //! Events: board:changed and mail:new. Agent-facing functions below use names or IDs.
 use crate::{
@@ -28,6 +28,7 @@ pub fn init(ctx: &Arc<Ctx>) -> Result<(), String> {
         "ALTER TABLE tasks ADD COLUMN owner TEXT",
         "ALTER TABLE tasks ADD COLUMN step INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE tasks ADD COLUMN check_results TEXT NOT NULL DEFAULT '[]'",
+        "ALTER TABLE tasks ADD COLUMN board_cleared INTEGER NOT NULL DEFAULT 0",
         // Who the work was handed to. Unlike the lease, this survives a stop, a quit and a crash.
         "ALTER TABLE tasks ADD COLUMN assigned TEXT",
         "ALTER TABLE tasks ADD COLUMN assigned_agent_id TEXT",
@@ -219,13 +220,15 @@ pub fn list(ctx: &Arc<Ctx>, filter: &Value) -> Result<Value, String> {
     let status = filter.get("status").and_then(Value::as_str);
     let owner = filter.get("owner").and_then(Value::as_str);
     let repo_id = filter.get("repo_id").and_then(Value::as_str);
+    let visible_only = filter["visible_only"].as_bool().unwrap_or(false);
     let rows = ctx.db.query(
         "SELECT * FROM tasks
          WHERE (?1 IS NULL OR status = ?1)
            AND (?2 IS NULL OR owner = ?2)
            AND (?3 IS NULL OR repo_id = ?3)
+           AND (NOT ?4 OR board_cleared = 0)
          ORDER BY created_at DESC, id",
-        rusqlite::params![status, owner, repo_id],
+        rusqlite::params![status, owner, repo_id, visible_only],
     )?;
     if rows.is_empty() {
         return Ok(json!([]));
@@ -909,6 +912,24 @@ fn s<'a>(v: &'a Value, k: &str) -> Result<&'a str, String> {
 pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, String> {
     match method {
         "list" => list(ctx, &args),
+        "reset" => {
+            let repo_id = match args.get("repo_id") {
+                Some(Value::Null) => None,
+                Some(Value::String(id)) if !id.trim().is_empty() => Some(id.as_str()),
+                _ => return Err("Choose a workspace or All Workspaces before resetting the board".into()),
+            };
+            let _lock = WRITE.lk();
+            // Other screens use task records for review evidence and active work.
+            // Resetting the board only clears its cards.
+            let cleared = ctx.db.exec(
+                "UPDATE tasks SET board_cleared=1 WHERE board_cleared=0 AND (?1 IS NULL OR repo_id=?1)",
+                [repo_id],
+            )?;
+            if cleared > 0 {
+                changed(ctx);
+            }
+            Ok(json!({ "cleared": cleared }))
+        }
         // A missing task is an optional record (deleted while a drawer was open), not a load failure.
         "get" => {
             let id = s(&args, "task_id").or_else(|_| s(&args, "id"))?;
@@ -1047,6 +1068,38 @@ mod tests {
         assert!(get(&c, &id).is_err());
         let r = tauri::async_runtime::block_on(call(&c, "get", json!({"task_id": id})));
         assert_eq!(r.unwrap(), Value::Null);
+    }
+    #[tokio::test]
+    async fn reset_clears_all_statuses_in_scope_and_preserves_records() {
+        let c = ctx();
+        for (id, path) in [("local", "/fixture/local"), ("peer", "/fixture/peer")] {
+            c.db.exec("INSERT INTO repos(id,name,path,added_at) VALUES(?1,?1,?2,0)", [id, path]).unwrap();
+        }
+        let mut scoped_ids = Vec::new();
+        for status in ["open", "claimed", "in_review", "done", "cancelled"] {
+            let id = create(&c, "you", status, "", None, Some("local"), &[], None).unwrap()["id"]
+                .as_str().unwrap().to_owned();
+            c.db.exec("UPDATE tasks SET status=?2 WHERE id=?1", [id.as_str(), status]).unwrap();
+            scoped_ids.push((id, status));
+        }
+        let unscoped = task(&c, &[], None);
+        create(&c, "you", "Peer task", "", None, Some("peer"), &[], None).unwrap();
+        assert!(call(&c, "reset", json!({})).await.is_err());
+        let reset = call(&c, "reset", json!({"repo_id": "local"})).await.unwrap();
+        assert_eq!(reset["cleared"], 5);
+        assert_eq!(list(&c, &json!({"visible_only":true,"repo_id":"local"})).unwrap(), json!([]));
+        for (id, status) in &scoped_ids {
+            let saved = get(&c, id).unwrap();
+            assert_eq!(saved["status"], *status);
+            assert!(!saved["history"].as_array().unwrap().is_empty());
+        }
+        assert_eq!(list(&c, &json!({"visible_only":true})).unwrap().as_array().unwrap().len(), 2);
+        assert_eq!(call(&c, "reset", json!({"repo_id":null})).await.unwrap()["cleared"], 2);
+        assert!(get(&c, &unscoped).is_ok());
+        let fresh = task(&c, &[], None);
+        let remaining = list(&c, &json!({"visible_only":true})).unwrap();
+        assert_eq!(remaining.as_array().unwrap().len(), 1);
+        assert_eq!(remaining[0]["id"], fresh);
     }
     #[test]
     fn handover_survives_stop_and_restart() {

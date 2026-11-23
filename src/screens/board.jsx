@@ -1,10 +1,11 @@
 import { createSignal, createMemo, createEffect, on, onMount, For, Show } from "solid-js";
-import { Page, Button, Empty, VirtualList } from "../ui/kit.jsx";
+import { Page, Button, Empty, VirtualList, confirm, toast } from "../ui/kit.jsx";
 import { rpc, fmt } from "../lib/rpc.js";
 import { activeRepoId, useStore } from "../lib/store.js";
 import { go, params } from "../lib/nav.js";
 import { useVisibleEvent, useClock } from "../lib/visibility.js";
 import { ManagedJobs } from "./managed-jobs.jsx";
+import { repoLabels } from "../lib/repo-labels.js";
 import "../styles/board.css";
 
 const statuses = [["open", "Open"], ["claimed", "Claimed"], ["in_review", "In review"], ["done", "Done"]];
@@ -15,6 +16,7 @@ const holder = (t) => t.owner || (t.assigned ? `Handed to ${t.assigned} · ${STA
 const color = (name) => `hsl(${[...(name || "you")].reduce((n, c) => n + c.charCodeAt(0) * 13, 0) % 360} 55% 65%)`;
 export default function Board() {
   const store = useStore();
+  const labels = createMemo(() => repoLabels(store.repos() ?? []));
   const clock = useClock(1000);
   const [handTo, setHandTo] = createSignal("");
   const [rawTasks, setTasks] = createSignal([]), [tab, setTab] = createSignal("board"), [cancelled, setCancelled] = createSignal(false);
@@ -32,11 +34,44 @@ export default function Board() {
   const [title, setTitle] = createSignal(""), [priority, setPriority] = createSignal("normal"), [job, setJob] = createSignal("commit"), [books, setBooks] = createSignal([]);
   const [selected, setSelected] = createSignal(null), [detail, setDetail] = createSignal(""), [editTitle, setEditTitle] = createSignal(""), [depText, setDepText] = createSignal(""), [note, setNote] = createSignal("");
   const [error, setError] = createSignal(""), [busy, setBusy] = createSignal(false);
+  const [resetting, setResetting] = createSignal(false);
   const [taskMail, setTaskMail] = createSignal([]);
   const [mail, setMail] = createSignal([]), [messages, setMessages] = createSignal([]), [a, setA] = createSignal("you"), [b, setB] = createSignal("all"), [body, setBody] = createSignal("");
   const columns = createMemo(() => cancelled() ? [...statuses, ["cancelled", "Cancelled"]] : statuses);
   async function attempt(fn) { setError(""); setBusy(true); try { return await fn(); } catch (e) { setError(String(e)); } finally { setBusy(false); } }
-  async function refresh() { setTasks(await rpc("board.list", {})); if (selected()) { const id=selected().id; const updated=await rpc("board.get", { task_id:id }); if(selected()?.id===id)setSelected(updated ?? null); } }
+  let refreshGeneration = 0;
+  async function refresh() {
+    const generation = ++refreshGeneration;
+    const rows = await rpc("board.list", { visible_only: true }, { fresh: true });
+    if (generation !== refreshGeneration) return;
+    setTasks(rows);
+    const id = selected()?.id;
+    if (!id) return;
+    const updated = await rpc("board.get", { task_id: id });
+    if (generation === refreshGeneration && selected()?.id === id) setSelected(updated ?? null);
+  }
+  async function resetBoard() {
+    if (resetting() || !tasks().length) return;
+    const repoId = activeRepoId() || null;
+    const scope = repoId ? labels().get(repoId) || "this workspace" : "All Workspaces";
+    setResetting(true);
+    try {
+      const confirmed = await confirm(
+        "Reset board?",
+        `Clear all task cards in ${scope}, including cancelled and completed tasks? Task records and their history are kept.`,
+        { danger: true, ok: "Reset board" },
+      );
+      if (!confirmed) return;
+      await attempt(async () => {
+        const { cleared } = await rpc("board.reset", { repo_id: repoId }, { action: true });
+        if (!repoId || selected()?.repo_id === repoId) setSelected(null);
+        await refresh();
+        toast(cleared ? `Cleared ${cleared} ${cleared === 1 ? "task" : "tasks"} from the board.` : "The board is already clear.");
+      });
+    } finally {
+      setResetting(false);
+    }
+  }
   async function readMail() { setMail(await rpc("board.mail_inbox", { agent: a(), mark_read: true })); await readThread(); }
   async function readTaskMail(t) { const rows = await rpc("board.mail_threads", { a: "you", b: t.owner || "all", limit: 1000 }); setTaskMail(rows.filter(m => m.body.includes(t.id))); }
   async function readThread() { setMessages(await rpc("board.mail_threads", { a: a(), b: b(), limit: 1000 })); }
@@ -70,7 +105,15 @@ export default function Board() {
   async function patch(patch) { await rpc("board.update", { task_id: selected().id, patch }); await refresh(); }
   async function sendBack(t) { await attempt(async () => { if (t.status === "in_review") await rpc("board.update", { task_id: t.id, patch: { status: "claimed", note: "Changes requested: resolve failed checks and resubmit." } }); await rpc("board.mail_send", { to: t.owner || "all", body: `Task ${t.id}: please resolve failed checks and resubmit.` }); await refresh(); }); }
   const failures = (t) => (t.check_results || []).filter(c => c.passed === false);
-  return <Page title="Board" actions={<><Button size="sm" variant={tab() === "board" ? "primary" : "ghost"} onClick={() => setTab("board")}>Board</Button><Button size="sm" variant={tab() === "mail" ? "primary" : "ghost"} onClick={() => { setTab("mail"); attempt(readMail); }}>Mail</Button></>}>
+  return <Page title="Board" actions={
+    <>
+      <Show when={tab() === "board"}>
+        <Button size="sm" variant="ghost" disabled={busy() || !tasks().length} busy={resetting()} onClick={resetBoard}>Reset board</Button>
+      </Show>
+      <Button size="sm" variant={tab() === "board" ? "primary" : "ghost"} onClick={() => setTab("board")}>Board</Button>
+      <Button size="sm" variant={tab() === "mail" ? "primary" : "ghost"} onClick={() => { setTab("mail"); attempt(readMail); }}>Mail</Button>
+    </>
+  }>
     <Show when={error()}><div class="board-error" role="alert">{error()} <button onClick={() => setError("")}>Dismiss</button></div></Show>
     <Show when={tab() === "board"} fallback={<section class="board-mail">
       <div class="board-mail-controls"><label>Conversation participant<input value={a()} onInput={e => setA(e.currentTarget.value)} /></label><label>With<input list="board-recipients" value={b()} onInput={e => setB(e.currentTarget.value)} /></label><Button disabled={busy()} onClick={() => attempt(readMail)}>Load conversation</Button></div>
