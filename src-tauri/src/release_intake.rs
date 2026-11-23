@@ -111,6 +111,53 @@ async fn gh(args: &[&str]) -> Option<(bool, String, String)> {
     let out = tokio::time::timeout(Duration::from_secs(8), c.output()).await.ok()?.ok()?;
     Some((out.status.success(), String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned()))
 }
+/// The GitHub CLI as the person, for `origin`. Reads use the token or account connected for it;
+/// writes (`write`) use only the connected CLI account, never a saved read-only token, and fall
+/// back to the CLI's active account. `input` goes to stdin, for `gh api --input -`.
+pub(crate) async fn gh_as(origin: &str, args: &[&str], input: Option<&str>, write: bool, secs: u64) -> Result<String, String> {
+    use tokio::io::AsyncWriteExt;
+    if fixture_origin().is_some() {
+        return Err("The GitHub CLI is not used with a stand-in origin".into());
+    }
+    let exe = gh_exe().ok_or("The GitHub CLI is not installed. Install it and sign in with `gh auth login`.")?;
+    let mut c = tokio::process::Command::new(exe);
+    c.args(args).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    c.stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() });
+    if let Some(home) = crate::pilot::real_home() {
+        c.env("HOME", home);
+    }
+    for k in ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "GH_CONFIG_DIR", "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN"] {
+        c.env_remove(k);
+    }
+    c.env("GH_PROMPT_DISABLED", "1").env("GH_HOST", "github.com").env("NO_COLOR", "1");
+    let slug = origin.to_ascii_lowercase();
+    let token = if write {
+        match gh_logins().get(&slug).and_then(Value::as_str).map(str::to_owned) {
+            Some(login) => gh_token(&login).await,
+            None => None,
+        }
+    } else {
+        bearer_for(&slug).await
+    };
+    if let Some(t) = token {
+        c.env("GH_TOKEN", t);
+    }
+    let mut child = c.spawn().map_err(|_| "Could not start the GitHub CLI")?;
+    if let (Some(text), Some(mut w)) = (input, child.stdin.take()) {
+        w.write_all(text.as_bytes()).await.map_err(|_| "Could not send the request to the GitHub CLI")?;
+        drop(w);
+    }
+    let out = tokio::time::timeout(Duration::from_secs(secs), child.wait_with_output())
+        .await
+        .map_err(|_| "The GitHub CLI timed out")?
+        .map_err(|_| "The GitHub CLI failed")?;
+    if !out.status.success() {
+        let why: String = String::from_utf8_lossy(&out.stderr).trim().chars().take(400).collect();
+        let body: String = String::from_utf8_lossy(&out.stdout).trim().chars().take(400).collect();
+        return Err(format!("GitHub CLI: {} {}", why, body).trim().to_owned());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
 /// The accounts the CLI is signed in to on github.com, the active one first as the CLI lists them.
 fn gh_accounts(status: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
