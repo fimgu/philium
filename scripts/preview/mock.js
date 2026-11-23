@@ -17,13 +17,13 @@
     checks_confirmed_ms: now - 3600e3, release_decision: 'observed', artifact: full ? 'sha256:9f2c41d0aa7b' : null,
   };
   const decision = { pr: 5542, generation: 2, head: H, base: B, artifact: receipt.artifact, checked_ms: now - 120e3, origin_current: true,
-    mergeable: state === 'bad' ? { state: 'conflicts', count: 4, files: ['example-repo-app/cli/cmd/main.go', 'example-repo-app/cli/cmd/cli/connect.go', 'example-repo-app/cli/cmd/plugins_test.go', 'example-repo-app/internal/entrypoint/background.go'] } : { state: 'clean' },
+    mergeable: state === 'bad' ? { state: 'conflicts', count: 4, files: ['example-app/cli/cmd/main.go', 'example-app/cli/cmd/cli/connect.go', 'example-app/cli/cmd/plugins_test.go', 'example-app/internal/entrypoint/background.go'] } : { state: 'clean' },
     decision: { ready: 'ready_for_reviewed_scope', bad: 'not_ready', incomplete: 'incomplete' }[state], contract_decision: state === 'bad' ? 'regression_in_release' : 'no_regression', receipt,
     why: state === 'ready' ? [] : state === 'bad'
       ? ['github-app-permissions fails on this head and passes on the target: a regression inside this release. Landed #5531 fails the same way on its own.']
       : ['No independent artifact record for this exact head.', 'No running-product checks are pinned, so nothing was observed on a deployment.', 'No recorded review for this exact head.'] };
   const data = {
-    'workspace.repos_list': [{ id: 'r1', name: 'example-repo', path: '/Users/you/Developer/example-repo', remote_url: 'https://github.com/acme/example-repo.git', default_branch: 'release/v1.1.x' }],
+    'workspace.repos_list': [{ id: 'r1', name: 'example-repo', path: '/Users/you/Developer/example-repo', remote_url: 'https://github.com/example-org/example-repo.git', default_branch: 'release/v1.1.x' }],
     'app.settings_get': 'r1', 'app.status': { version: '0.1.0', pilot: true }, 'providers.list': [], 'providers.models': [], 'providers.default': null, 'agents.list': [],
     'workday.summary': { started: now - 5 * 3600e3, completed: 37, tools: ['Jcode', 'Herdr', 'Manual database edit', 'Assistant intervention', 'Other'],
       fallbacks: [{ tool: 'Jcode', ts: now - 2 * 3600e3, note: 'Needed the old review gate for a hotfix' }, { tool: 'Manual database edit', ts: now - 40 * 60e3, note: 'Reset a stuck task' }],
@@ -55,7 +55,7 @@
       tiers: ['can lose data, break security or stop the release from installing', 'the main behaviour each pull request changes', 'neighbouring behaviour that could regress', 'error handling and edge cases', 'configuration, deployment files and documentation', 'polish'].map((means, i) => ({ tier: 'P' + i, means })),
       items: [
         [0, 'Migrations 59 to 64 apply in order on an empty database', 'done', 'pass', 'heron: Ran make test-integration on a798d73 against a fresh Postgres: 9 migrations applied, 0 errors.'],
-        [0, 'Conflicts with release/v1.1.x', 'done', 'fail', 'lead: Introduced by #5501: git merge-tree on a798d73 onto 1bc788d: conflicts in 4 files under example-repo-app/cli and internal/entrypoint.', null, 'introduced'],
+        [0, 'Conflicts with release/v1.1.x', 'done', 'fail', 'lead: Introduced by #5501: git merge-tree on a798d73 onto 1bc788d: conflicts in 4 files under example-app/cli and internal/entrypoint.', null, 'introduced'],
         [2, 'Audit log export keeps its column order', 'done', 'fail', 'heron: go test ./internal/audit/... fails TestExportOrder on a798d73 and the same way on the target 1bc788d.', null, 'pre_existing'],
         [1, '#5501 git access: key rotation and CLI signing endpoints', 'done', 'pass', 'finch: Ran go test ./internal/gitaccess/... on a798d73: 212 passed. Both endpoints are in swagger.json.'],
         [1, '#5546 image overrides file is read by the chart', 'claimed', null, null, 'wren'],
@@ -111,7 +111,7 @@
     await sleep(900);
     if (screen === 'Review' && q.get('verify') === '0' && q.get('open')) document.querySelectorAll(q.get('open')).forEach((d) => { d.open = true; });
     if (screen === 'Review' && q.get('verify') !== '0') {
-      const url = document.querySelector('form input[type="url"]'); if (url) { type(url, 'https://github.com/acme/example-repo/pull/5542'); url.closest('form').querySelector('button').click(); }
+      const url = document.querySelector('form input[type="url"]'); if (url) { type(url, 'https://github.com/example-org/example-repo/pull/5542'); url.closest('form').querySelector('button').click(); }
       await sleep(900);
       if (q.get('open')) document.querySelectorAll(q.get('open')).forEach((d) => { d.open = true; });
     }

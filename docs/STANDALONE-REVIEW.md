@@ -63,7 +63,9 @@ A verifier can observe an environment through a client program instead of a loop
 ```
 
 * Each target is one environment with its own identity command. Its checks count only when its own revision and artifact match the head's independent record before and after. A target without an identity command is observed and shown, and never counted. A wrong value on a matching deployment gives **Do not ship**.
-* Philium runs only programs named `mycli` or `kubectl`, at the absolute path you enter in the form. For `mycli` only `whoami`, `version`, `context list` and `exec ENDPOINT (-c BODY | -- WORDS)`; for `kubectl` only `get` with `--context kind-...`. A remote command containing a word that changes something, a redirect or a command substitution is refused when you pin. These are guards, not proof; your confirmation is the control.
+* Philium runs only `kubectl` and the clients you declare read-only in `<data dir>/read-only-clients.json`, at the absolute path you enter in the form. A declared client lists its exact read commands and, optionally, one verb that runs a remote command:
+  `{"clients":{"mycli":{"reads":["whoami","version","context list"],"exec":{"verb":"exec","value_options":["-x","--timeout"]}}}}`.
+  For that verb only `VERB [OPTION VALUE]... ENDPOINT (-c BODY | -- WORDS)` is accepted; for `kubectl` only `get` with `--context kind-...`. A remote command containing a word that changes something, a redirect or a command substitution is refused when you pin. These are guards, not proof; your confirmation is the control.
 * The program runs with your own home, so it uses your own login, and with no other part of your environment. Sign in yourself before you verify. An `exec` is recorded by the product as a normal session.
 * Output is compared after removing colour codes and collapsing whitespace. Only hashes of the output are stored.
 

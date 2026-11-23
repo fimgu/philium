@@ -33,48 +33,89 @@ fn looks_like_a_change(body: &str) -> Option<&'static str> {
         .find_map(|w| WORDS.iter().find(|x| **x == w).copied())
 }
 
+/// A client the person declared read-only in `<data dir>/read-only-clients.json`:
+///
+/// ```json
+/// {"clients":{"mycli":{"reads":["whoami","version","context list"],
+///                      "exec":{"verb":"exec","value_options":["-x","--timeout"]}}}}
+/// ```
+///
+/// `reads` are exact argument lists that only read. `exec` names a verb that runs one remote
+/// command on one endpoint: `VERB [OPTION VALUE]... ENDPOINT (-c BODY | -- WORDS...)`, with the
+/// body screened for words that change something. `kubectl` is built in and needs no entry.
+#[derive(Debug, Default, Clone, serde::Deserialize)]
+pub struct Client {
+    #[serde(default)]
+    reads: Vec<String>,
+    #[serde(default)]
+    exec: Option<Exec>,
+}
+#[derive(Debug, Default, Clone, serde::Deserialize)]
+struct Exec {
+    verb: String,
+    #[serde(default)]
+    value_options: Vec<String>,
+}
+pub type Clients = std::collections::BTreeMap<String, Client>;
+
+pub const CLIENTS_FILE: &str = "read-only-clients.json";
+
+/// The person's configured clients. Missing or unreadable config means only built-ins.
+pub fn clients() -> Clients {
+    let dir = crate::pilot::data_dir().or_else(|| std::env::var_os("PHILIUM_DATA_DIR").map(std::path::PathBuf::from));
+    let Some(raw) = dir.and_then(|d| std::fs::read_to_string(d.join(CLIENTS_FILE)).ok()) else { return Clients::new() };
+    #[derive(serde::Deserialize)]
+    struct File {
+        #[serde(default)]
+        clients: Clients,
+    }
+    serde_json::from_str::<File>(&raw).map(|f| f.clients).unwrap_or_default().into_iter().filter(|(k, _)| name_ok(k) && k != "kubectl").collect()
+}
+
+fn configured(name: &str, client: &Client, args: &[String]) -> Result<(), String> {
+    if client.reads.iter().any(|r| r.split_whitespace().eq(args.iter().map(String::as_str))) {
+        return Ok(());
+    }
+    let Some(exec) = client.exec.as_ref().filter(|e| !e.verb.is_empty() && args[0] == e.verb) else {
+        return Err(format!("{name} {} is not a read Philium runs", args[0]));
+    };
+    let verb = &exec.verb;
+    let mut i = 1;
+    let mut body: Option<String> = None;
+    let mut endpoint = false;
+    while i < args.len() {
+        match args[i].as_str() {
+            a if exec.value_options.iter().any(|o| o == a) => i += 1,
+            "-c" | "--command" => {
+                body = args.get(i + 1).cloned();
+                i += 1;
+            }
+            "--" => {
+                body = Some(args[i + 1..].join(" "));
+                break;
+            }
+            a if a.starts_with('-') => return Err(format!("{verb} option {a} is not allowed for observation")),
+            _ if !endpoint => endpoint = true,
+            _ => return Err(format!("{verb} takes one endpoint; put the command after -c or --")),
+        }
+        i += 1;
+    }
+    let body = body.filter(|b| !b.trim().is_empty()).ok_or_else(|| format!("{verb} needs a command after -c or --"))?;
+    if !endpoint {
+        return Err(format!("{verb} needs an endpoint"));
+    }
+    match looks_like_a_change(&body) {
+        Some(word) => Err(format!("the remote command contains {word}, which is not a read")),
+        None => Ok(()),
+    }
+}
+
 /// The read verbs Philium accepts, per client program. Returns the reason for a refusal.
-fn read_only(program: &str, args: &[String]) -> Result<(), String> {
+fn read_only(program: &str, args: &[String], clients: &Clients) -> Result<(), String> {
     if args.is_empty() || args.len() > MAX_ARGS || args.iter().any(|a| a.len() > MAX_ARG || a.contains('\0')) {
         return Err("A command needs 1 to 48 plain arguments".into());
     }
     match program {
-        "mycli" => match args[0].as_str() {
-            "whoami" | "version" => Ok(()),
-            "context" if args.get(1).map(String::as_str) == Some("list") && args.len() == 2 => Ok(()),
-            "exec" => {
-                // exec [-x CONTEXT] ENDPOINT (-c BODY | -- WORDS...)
-                let mut i = 1;
-                let mut body: Option<String> = None;
-                let mut endpoint = false;
-                while i < args.len() {
-                    match args[i].as_str() {
-                        "-x" | "--context-name" | "--timeout" => i += 1,
-                        "-c" | "--command" => {
-                            body = args.get(i + 1).cloned();
-                            i += 1;
-                        }
-                        "--" => {
-                            body = Some(args[i + 1..].join(" "));
-                            break;
-                        }
-                        a if a.starts_with('-') => return Err(format!("exec option {a} is not allowed for observation")),
-                        _ if !endpoint => endpoint = true,
-                        _ => return Err("exec takes one endpoint; put the command after -c or --".into()),
-                    }
-                    i += 1;
-                }
-                let body = body.filter(|b| !b.trim().is_empty()).ok_or("exec needs a command after -c or --")?;
-                if !endpoint {
-                    return Err("exec needs an endpoint".into());
-                }
-                match looks_like_a_change(&body) {
-                    Some(word) => Err(format!("the remote command contains {word}, which is not a read")),
-                    None => Ok(()),
-                }
-            }
-            other => Err(format!("mycli {other} is not a read Philium runs")),
-        },
         "kubectl" => {
             // Only `get` against a local kind cluster named on the command line.
             let mut i = 0;
@@ -105,7 +146,10 @@ fn read_only(program: &str, args: &[String]) -> Result<(), String> {
             }
             Ok(())
         }
-        other => Err(format!("{other} is not a client Philium knows how to keep read-only (mycli, kubectl)")),
+        other => match clients.get(other) {
+            Some(c) => configured(other, c, args),
+            None => Err(format!("{other} is not a client Philium knows how to keep read-only (kubectl, or one declared in {CLIENTS_FILE})")),
+        },
     }
 }
 
@@ -117,6 +161,10 @@ fn args_of(v: &Value) -> Option<Vec<String>> {
 /// running. Each target is one environment: its own identity command and its own checks, so an
 /// observation of one environment is never credited with another environment's identity.
 pub fn validate(spec: &Value, seen: &mut std::collections::BTreeSet<String>) -> Result<(), String> {
+    validate_with(spec, seen, &clients())
+}
+
+fn validate_with(spec: &Value, seen: &mut std::collections::BTreeSet<String>, clients: &Clients) -> Result<(), String> {
     let Some(targets) = spec.get("targets") else { return Ok(()) };
     let targets = targets.as_array().filter(|t| (1..=3).contains(&t.len())).ok_or("Choose 1 to 3 targets")?;
     let mut names = std::collections::BTreeSet::new();
@@ -129,7 +177,7 @@ pub fn validate(spec: &Value, seen: &mut std::collections::BTreeSet<String>) -> 
                 return Err(format!("{name}: invalid or duplicate check id"));
             }
             let program = c["program"].as_str().filter(|p| name_ok(p)).ok_or_else(|| format!("{id}: name the client program"))?;
-            read_only(program, &args_of(&c["args"]).ok_or_else(|| format!("{id}: list the arguments"))?).map_err(|e| format!("{id}: {e}"))?;
+            read_only(program, &args_of(&c["args"]).ok_or_else(|| format!("{id}: list the arguments"))?, clients).map_err(|e| format!("{id}: {e}"))?;
             let text = c["expect_text"].is_string() || c["expect_contains"].as_array().is_some_and(|a| !a.is_empty() && a.len() <= 8 && a.iter().all(|x| x.as_str().is_some_and(|s| !s.is_empty())));
             let json = c["pointer"].is_string() && c.get("expect").is_some();
             if text == json {
@@ -139,7 +187,7 @@ pub fn validate(spec: &Value, seen: &mut std::collections::BTreeSet<String>) -> 
         let ident = &t["identity"];
         if !ident.is_null() {
             let program = ident["program"].as_str().filter(|p| name_ok(p)).ok_or_else(|| format!("{name}: the identity command names its client program"))?;
-            read_only(program, &args_of(&ident["args"]).ok_or_else(|| format!("{name}: the identity command lists its arguments"))?).map_err(|e| format!("{name} identity: {e}"))?;
+            read_only(program, &args_of(&ident["args"]).ok_or_else(|| format!("{name}: the identity command lists its arguments"))?, clients).map_err(|e| format!("{name} identity: {e}"))?;
             for k in ["revision", "digest"] {
                 if !ident[k].is_string() {
                     return Err(format!("{name}: the identity command needs a {k} pointer"));
@@ -310,6 +358,9 @@ pub fn identity_report(output: &[u8], ident: &Value, now_ms: i64) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn cfg() -> Clients {
+        serde_json::from_value(json!({"mycli":{"reads":["whoami","version","context list"],"exec":{"verb":"exec","value_options":["-x","--context-name","--timeout"]}}})).unwrap()
+    }
     fn a(xs: &[&str]) -> Vec<String> {
         xs.iter().map(|s| s.to_string()).collect()
     }
@@ -321,7 +372,7 @@ mod tests {
             a(&["exec", "-x", "staging", "postgres:abc", "-c", "SELECT count(*) FROM employees"]),
             a(&["exec", "ssh-1", "--", "uptime"]),
         ] {
-            assert_eq!(read_only("mycli", &ok), Ok(()), "{ok:?}");
+            assert_eq!(read_only("mycli", &ok, &cfg()), Ok(()), "{ok:?}");
         }
         for bad in [
             a(&["admin", "create"]),
@@ -343,10 +394,10 @@ mod tests {
             a(&["exec", "-c", "select 1"]),
             a(&["exec", "pg"]),
         ] {
-            assert!(read_only("mycli", &bad).is_err(), "{bad:?}");
+            assert!(read_only("mycli", &bad, &cfg()).is_err(), "{bad:?}");
         }
-        assert_eq!(read_only("kubectl", &a(&["--context", "kind-review", "-n", "mycli", "get", "pods", "-l", "app=example", "-o", "json"])), Ok(()));
-        assert_eq!(read_only("kubectl", &a(&["--context=kind-review", "get", "--raw", "/api/v1/namespaces/example/services/app:8080/proxy/api/health"])), Ok(()));
+        assert_eq!(read_only("kubectl", &a(&["--context", "kind-review", "-n", "app", "get", "pods", "-l", "app=web", "-o", "json"]), &cfg()), Ok(()));
+        assert_eq!(read_only("kubectl", &a(&["--context=kind-review", "get", "--raw", "/api/v1/namespaces/app/services/app:8080/proxy/api/health"]), &cfg()), Ok(()));
         for bad in [
             a(&["get", "pods"]),
             a(&["--context", "staging", "get", "pods"]),
@@ -357,9 +408,10 @@ mod tests {
             a(&["--context", "kind-review", "get", "pods", "-w"]),
             a(&["--server", "https://x", "--context", "kind-review", "get", "pods"]),
         ] {
-            assert!(read_only("kubectl", &bad).is_err(), "{bad:?}");
+            assert!(read_only("kubectl", &bad, &cfg()).is_err(), "{bad:?}");
         }
-        assert!(read_only("psql", &a(&["-c", "select 1"])).is_err());
+        assert!(read_only("mycli", &a(&["whoami"]), &Clients::new()).is_err(), "unconfigured clients are refused");
+        assert!(read_only("psql", &a(&["-c", "select 1"]), &cfg()).is_err());
     }
     #[test]
     fn contract_shape_and_text_judgement() {
@@ -370,22 +422,22 @@ mod tests {
                 {"id":"count","program":"mycli","args":["exec","pg","-c","select count(*) from t"],"expect_text":"count ------- 5 (1 row)"}]},
             {"name":"local","identity":{"program":"kubectl","args":["--context","kind-r","get","pods","-o","json"],"replicas":"/items","revision":"/metadata/annotations/rev","digest":"/status/containerStatuses/0/imageID","ready":"/status/containerStatuses/0/ready"},
              "cases":[{"id":"health","program":"kubectl","args":["--context","kind-r","get","--raw","/x"],"pointer":"/status","expect":"ok"}]}]});
-        validate(&good, &mut seen).unwrap();
-        assert_eq!(programs(&good), ["mycli", "kubectl"]);
-        assert!(validate(&good, &mut seen).is_err(), "duplicate ids across lanes are refused");
+        validate_with(&good, &mut seen, &cfg()).unwrap();
+        assert_eq!(programs(&good), ["kubectl", "mycli"]);
+        assert!(validate_with(&good, &mut seen, &cfg()).is_err(), "duplicate ids across lanes are refused");
         let mut bad = good.clone();
         bad["targets"][0]["cases"][0]["args"] = json!(["stop", "x"]);
-        assert!(validate(&bad, &mut Default::default()).unwrap_err().starts_with("who:"));
+        assert!(validate_with(&bad, &mut Default::default(), &cfg()).unwrap_err().starts_with("who:"));
         let mut both = good.clone();
         both["targets"][0]["cases"][0]["pointer"] = json!("/x");
         both["targets"][0]["cases"][0]["expect"] = json!(1);
-        assert!(validate(&both, &mut Default::default()).is_err());
+        assert!(validate_with(&both, &mut Default::default(), &cfg()).is_err());
         let mut twice = good.clone();
         twice["targets"][1]["name"] = json!("env01");
-        assert!(validate(&twice, &mut Default::default()).is_err());
+        assert!(validate_with(&twice, &mut Default::default(), &cfg()).is_err());
         let mut changing = good.clone();
         changing["targets"][1]["identity"]["args"] = json!(["--context", "kind-r", "delete", "pods", "--all"]);
-        assert!(validate(&changing, &mut Default::default()).unwrap_err().starts_with("local identity:"));
+        assert!(validate_with(&changing, &mut Default::default(), &cfg()).unwrap_err().starts_with("local identity:"));
         let cases: Vec<Value> = good["targets"].as_array().unwrap().iter().flat_map(|t| t["cases"].as_array().unwrap().clone()).collect();
         assert!(judge(b"Logged in as x\n\x1b[0;33mContext: staging\x1b[0m\n", &cases[0]).unwrap().starts_with("pass:"));
         assert!(judge(b"Context: production\n", &cases[0]).unwrap().starts_with("mismatch:"));

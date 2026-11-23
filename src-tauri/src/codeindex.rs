@@ -3339,7 +3339,7 @@ mod tests {
         for s in ["b:r:c", "w:live", "w:done", "w:gone", "w:ext:r:mine", "w:local:r"] {
             fill(s);
         }
-        let detail: Vec<String> = (0..500).map(|i| format!("example-repo-app/internal/service/file{i}.go: Symbol{i}")).collect();
+        let detail: Vec<String> = (0..500).map(|i| format!("example-app/internal/service/file{i}.go: Symbol{i}")).collect();
         ctx.log_event("code_clash", None, &json!({ "a": "x", "b": "y", "severity": "same_file", "detail": detail }));
         assert_eq!(tidy(&ctx).unwrap(), None, "nothing worth giving back to the disk");
         let scopes: Vec<String> = ctx.db.query("SELECT DISTINCT scope FROM ci_refs ORDER BY scope", []).unwrap().iter().map(|r| r["scope"].as_str().unwrap().to_string()).collect();

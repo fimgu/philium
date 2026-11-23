@@ -124,7 +124,7 @@ The dashboard shows queue depth, time to land, red time, reverts, catch rate on 
 ## Rollout
 
 1. Branch protection requiring `philium/gate` (human decision, done outside Philium).
-2. Generic runner + config parser + base comparison. First repo: example-repo. Second: exo, with no code changes, only a config file. **That's the test of "not hardcoded".**
+2. Generic runner + config parser + base comparison. First repo: one real product repo. Second: another, with no code changes, only a config file. **That's the test of "not hardcoded".**
 3. Requirement intake + matrix.
 4. Queue + land, single-PR batches first.
 5. Replay set from known escaped bugs, then batching, then the dashboard.

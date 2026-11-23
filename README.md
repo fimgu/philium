@@ -1,6 +1,6 @@
 # Philium
 
-A lightweight, cross-platform agent workspace (Tauri 2) with [HAL](HAL) as its harness.
+A lightweight, cross-platform agent workspace (Tauri 2) with HAL, a separate agent runtime, as its harness.
 
 - Bundles `hal-desktop-server` as a sidecar on a random loopback port with a per-launch token.
 - The token stays in the Rust process; the web UI can only reach HAL through a path-checked `hal` command.

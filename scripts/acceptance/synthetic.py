@@ -414,6 +414,10 @@ def pods(revision, digest, ready=True, count=2):
     return json.dumps({'items': [pod] * count})
 
 
+# Declares the stand-in CLI read-only, the way a person would in their data dir.
+MYCLI_CLIENTS = {'clients': {'mycli': {'reads': ['whoami'], 'exec': {'verb': 'exec', 'value_options': ['-x']}}}}
+
+
 def target_contract():
     ident = {'replicas': '/items', 'revision': '/metadata/annotations/philium.dev~1revision', 'digest': '/status/containerStatuses/0/imageID', 'ready': '/status/containerStatuses/0/ready'}
     return {'release_records': True,
