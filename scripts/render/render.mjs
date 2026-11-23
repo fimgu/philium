@@ -6,13 +6,13 @@ import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { EMPTY, POPULATED, FAILING, SLOW, HUGE } from "./fixtures.js";
+import { EMPTY, POPULATED, FAILING, SLOW, HUGE, STALE } from "./fixtures.js";
 import { checkAgentMessaging, checkChatMessaging } from "./robustness.mjs";
 import { checkStoppedHistory } from "./stopped-history.mjs";
 import { checkEffortProgress, checkLiveTps } from "./effort-progress.mjs";
 import { checkCodeGraph } from "./code-review.mjs";
 import { checkReviewPreview } from "./review-preview.mjs";
-const SETS = { empty: EMPTY, populated: POPULATED, failing: FAILING, slow: SLOW, huge: HUGE };
+const SETS = { empty: EMPTY, populated: POPULATED, failing: FAILING, slow: SLOW, huge: HUGE, stale: STALE };
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
@@ -322,15 +322,15 @@ for (const setName of sets) {
       if (s === "stats" && setName === "populated") {
         try {
           await page.waitForFunction(() => {
-            const table = document.querySelector('table[aria-label="Provider usage"]');
-            const row = (name) => [...(table?.tBodies[0]?.rows ?? [])]
-              .find((r) => r.cells[0]?.textContent.includes(name));
-            return row("ChatGPT")?.cells[1]?.textContent.includes("7d: 28% used · resets in")
-              && Number(row("ChatGPT")?.cells[2]?.textContent) > 0
-              && row("Claude")?.cells[1]?.textContent.includes("No quota reported")
-              && row("OpenRouter")?.textContent.includes("No requests in this range");
+            const card = (name) => document.querySelector(`article[aria-label="${name} usage"]`)?.textContent ?? "";
+            const models = document.querySelector('table[aria-label="Models"]')?.textContent ?? "";
+            return card("Claude").includes("5-hour window") && /Resets in \d/.test(card("Claude"))
+              && card("ChatGPT").includes("35% used") && card("ChatGPT").includes("Banked resets")
+              && !document.querySelector('table[aria-label="Provider usage"]')
+              && models.includes("On plan") && !models.includes("$0.000")
+              && document.querySelector('.st-activity .segmented');
           }, { timeout: 3000 });
-        } catch (e) { problems.push(`${w} Stats provider quota and traffic: ${e.message}`); }
+        } catch (e) { problems.push(`${w} Stats live account usage and activity: ${e.message}`); }
       }
       if(s==='environments' && setName==='populated') {
         try {

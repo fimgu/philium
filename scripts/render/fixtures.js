@@ -88,12 +88,13 @@ const usageAccounts = {
 };
 const insights = {
   range: "24h",
-  totals: { requests: 342, errors: 4, tokens_in: 1.2e6, tokens_out: 3.4e5, tokens_cached: 7.1e5, cost: 12.8 },
+  totals: { requests: 382, errors: 4, tokens_in: 1.2e6, tokens_out: 3.4e5, tokens_cached: 7.1e5, cost: 0.84 },
   spend: { today: { cost: 3.42, requests: 88, unpriced: 2, included: 61 }, week: { cost: 12.8, requests: 342, unpriced: 12, included: 230 }, month: { cost: 41.06, requests: 1310, unpriced: 30, included: 902 } },
   models: [
-    { provider_id: "claude", model: "claude-opus-5-5", requests: 140, p50_ttft_ms: 820, p95_ttft_ms: 2400, avg_tps: 61.2, cache_hit: 0.71, error_rate: 0.007, cost: 0 },
-    { provider_id: "chatgpt", model: "gpt-6.1", requests: 120, p50_ttft_ms: 540, p95_ttft_ms: 1900, avg_tps: 74.5, cache_hit: 0.48, error_rate: 0.017, cost: 0 },
-    { provider_id: "local", model: "qwen3-coder", requests: 82, p50_ttft_ms: 190, p95_ttft_ms: 600, avg_tps: 38.1, cache_hit: null, error_rate: 0.061, cost: null },
+    { provider_id: "claude", model: "claude-opus-5-5", requests: 140, p50_ttft_ms: 820, p95_ttft_ms: 2400, avg_tps: 61.2, cache_hit: 0.71, error_rate: 0.007, cost: 0, included: 140, priced: 0, tokens_in: 6.1e5, tokens_out: 1.6e5 },
+    { provider_id: "chatgpt", model: "gpt-6.1", requests: 120, p50_ttft_ms: 540, p95_ttft_ms: 1900, avg_tps: 74.5, cache_hit: 0.48, error_rate: 0.017, cost: 0, included: 120, priced: 0, tokens_in: 4.4e5, tokens_out: 1.2e5 },
+    { provider_id: "local", model: "qwen3-coder", requests: 82, p50_ttft_ms: 190, p95_ttft_ms: 600, avg_tps: 38.1, cache_hit: null, error_rate: 0.061, cost: 0, included: 0, priced: 0, tokens_in: 1.5e5, tokens_out: 0.6e5 },
+    { provider_id: "openrouter", model: "deepseek-v4", requests: 40, p50_ttft_ms: 610, p95_ttft_ms: 1500, avg_tps: 52.0, cache_hit: 0.2, error_rate: 0, cost: 0.84, included: 0, priced: 40, tokens_in: 1.1e5, tokens_out: 0.3e5 },
   ],
   heatmap: Array.from({ length: 7 }, (_, d) => Array.from({ length: 24 }, (_, h) => (h >= 9 && h <= 18 && d !== 2 && d !== 3 ? ((h * 7 + d * 3) % 11) + 2 : h > 20 ? (h + d) % 3 : 0))),
   repos: [{ id: "r1", name: "philium", requests: 220, tokens: 9.1e5, cost: 8.2 }, { id: "r2", name: "jcode", requests: 90, tokens: 4.4e5, cost: 3.9 }, { id: null, name: null, requests: 32, tokens: 1.1e5, cost: 0.7 }],
@@ -234,6 +235,21 @@ export const FAILING = {
   ],
 };
 // SLOW: populated data, every call delayed.
+// STALE: accounts in error or stale states; activity loads normally.
+export const STALE = {
+  ...POPULATED,
+  "usage.accounts": {
+    checked_at: now,
+    accounts: [
+      { ...usageAccounts.accounts[0], stale: true, error: "Anthropic usage request timed out", fetched_at: now - 9 * min },
+      { ...usageAccounts.accounts[1], windows: [], banked_resets: null, plan: null, account: null, error: "Signed out. Sign in again on the Providers screen", fetched_at: null, last_used_ms: now - 26 * 3600000 },
+      { provider_id: "google", provider_name: "Antigravity", kind: "antigravity_oauth", account: "d***@philium.dev", plan: null, enabled: true, stale: false, limit_reached: true, error: null, key_status: null,
+        windows: [win("Gemini 3 Pro", 100, 2 * 3600 + 14 * 60, { scope: "model", models: ["gemini-3-pro"] }), win("Gemini Flash", 64, 2 * 3600 + 14 * 60, { scope: "model", models: ["gemini-flash"] })],
+        banked_resets: null, details: [], last_used_ms: now - 3 * min, fetched_at: now - 15000 },
+      ...usageAccounts.accounts.slice(2),
+    ],
+  },
+};
 export const SLOW = { ...POPULATED, __delay: 4000 };
 
 const long = (n, w = "very-long-segment") => Array.from({ length: n }, () => w).join("-");

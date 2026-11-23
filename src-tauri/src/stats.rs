@@ -425,7 +425,8 @@ fn insights(c: &rusqlite::Connection, start: i64, repo_id: Option<&str>, today: 
     {
         let mut st = c.prepare(
             "SELECT r.provider_id, r.model, r.ttft_ms, r.tps, r.tokens_in, r.tokens_out, r.tokens_cached, r.cost,
-                    CASE WHEN COALESCE(r.status,0) >= 400 OR o.state IN ('error','blocked') THEN 1 ELSE 0 END
+                    CASE WHEN COALESCE(r.status,0) >= 400 OR o.state IN ('error','blocked') THEN 1 ELSE 0 END,
+                    CASE WHEN r.billing = 'included' THEN 1 ELSE 0 END
              FROM requests r LEFT JOIN stats_outcomes o ON o.request_id = r.id
              WHERE r.ts >= ?1 AND (?2 IS NULL OR r.repo_id = ?2)",
         )?;
@@ -444,6 +445,10 @@ fn insights(c: &rusqlite::Connection, start: i64, repo_id: Option<&str>, today: 
             add(v, "tokens_cached", r.get::<_, f64>(6)?);
             add(v, "cost", r.get::<_, Option<f64>>(7)?.unwrap_or(0.0));
             add(v, "errors", r.get::<_, i64>(8)? as f64);
+            // Separate on-plan and priced requests so the UI never shows a fake $0.
+            let included = r.get::<_, i64>(9)? == 1;
+            add(v, "included", if included { 1.0 } else { 0.0 });
+            add(v, "priced", if !included && r.get::<_, Option<f64>>(7)?.is_some() { 1.0 } else { 0.0 });
             if let Some(t) = r.get::<_, Option<f64>>(3)? {
                 add(v, "tps_sum", t);
                 add(v, "tps_n", 1.0);

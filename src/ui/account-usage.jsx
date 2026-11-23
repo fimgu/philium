@@ -3,6 +3,7 @@ import { useClock } from "../lib/visibility.js";
 import { fmt } from "../lib/rpc.js";
 import { countdown, resetClock, tone, tightest, planLabel } from "../lib/account-usage.js";
 import { AccountUsageLink } from "./account-usage-link.jsx";
+import { go } from "../lib/nav.js";
 import "../styles/account-usage.css";
 
 function WindowRow(props) {
@@ -40,7 +41,7 @@ export function AccountUsageCard(props) {
   const a = () => props.account;
   const now = useClock(1000);
   return (
-    <article class={`au-card ${a().limit_reached ? "limited" : ""}`} aria-label={`${a().provider_name} usage`}>
+    <article class={`au-card ${a().limit_reached ? "limited" : ""} ${a().stale ? "stale" : ""}`} aria-label={`${a().provider_name} usage`}>
       <header class="au-card-head">
         <div>
           <h3>{a().provider_name}</h3>
@@ -55,13 +56,20 @@ export function AccountUsageCard(props) {
         </div>
       </header>
       <Show when={a().error && !a().windows?.length}>
-        <p class="small au-err" role="alert">{a().error}</p>
+        <div class="au-card-error" role="alert">
+          <p class="small au-err">{a().error}</p>
+          <Show when={/sign/i.test(a().error)}>
+            <a class="xs" href="#" onClick={(e) => { e.preventDefault(); go("providers"); }}>Open Providers</a>
+          </Show>
+        </div>
       </Show>
       <Show when={a().error && a().windows?.length}>
-        <p class="xs au-warn">Last refresh failed: {a().error}. Showing the last good reading.</p>
+        <p class="xs au-warn">Refresh failed: {a().error}. Showing the last reading.</p>
       </Show>
       <Show when={a().limit_reached}><p class="small au-err">Limit reached</p></Show>
-      <For each={a().windows}>{(w) => <WindowRow w={w} />}</For>
+      <div class="au-windows">
+        <For each={a().windows}>{(w) => <WindowRow w={w} />}</For>
+      </div>
       <Show when={a().key_status}>
         <p class="small">API key: <b>{a().key_status}</b> <span class="faint">(pay as you go, no usage windows)</span></p>
       </Show>
@@ -86,6 +94,23 @@ export function AccountUsageCard(props) {
         <AccountUsageLink kind={a().kind} />
       </footer>
     </article>
+  );
+}
+
+/** One line for a pay-as-you-go provider: key health, or why it failed. */
+export function KeyAccountRow(props) {
+  const a = () => props.account;
+  return (
+    <div class="au-key">
+      <span class={`dot ${a().error ? "bad" : a().key_status === "valid" ? "live" : ""}`} />
+      <span class="au-key-name">{a().provider_name}</span>
+      <span class={`xs ${a().error ? "au-err" : "dim"}`}>
+        {a().error ? a().error : a().key_status ? `Key ${a().key_status}` : "No key check"}
+      </span>
+      <span class="xs faint au-key-used">
+        {a().last_used_ms ? `used ${fmt.ago(a().last_used_ms)}` : "not used yet"}
+      </span>
+    </div>
   );
 }
 
