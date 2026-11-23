@@ -147,7 +147,7 @@ function Worktree(props) {
         <Show when={st().error} fallback={<>
           <Show when={num(st().ahead)}><Pill title="Commits ahead of base">{"\u2191"}{st().ahead}</Pill></Show>
           <Show when={num(st().behind)}><Pill title="Commits behind base">{"\u2193"}{st().behind}</Pill></Show>
-          <Show when={st().dirty_files?.length}><Pill tone="warn" title="Uncommitted entries">{st().dirty_files.length} dirty</Pill></Show>
+          <Show when={st().dirty_files?.length}><Pill tone="warn" title={`Uncommitted changes in this worktree:\n${st().dirty_files.join("\n")}`}>{st().dirty_files.length} changed</Pill></Show>
           <Show when={num(st().unpushed_commits)}><Pill tone="warn" title="Commits not pushed">{st().unpushed_commits} unpushed</Pill></Show>
           <Show when={!st().unsaved}><Pill tone="ok">Clean and landed</Pill></Show>
         </>}><Pill tone="bad" title={st().error}>Status unavailable</Pill></Show>
@@ -239,6 +239,18 @@ export default function Repos() {
     const [w, b] = await Promise.all([rpc("workspace.worktrees", { repo_id: id }), rpc("workspace.branches", { repo_id: id })]);
     if (request === detailRequest && selected() === id) { setTrees(w ?? []); setBranches(b ?? []); }
   }
+  const [fetching, setFetching] = createSignal(false);
+  async function refreshRemote() {
+    const id = selected();
+    if (!id || fetching()) return;
+    setFetching(true);
+    setError("");
+    try {
+      const res = await rpc("workspace.branches_refresh", { repo_id: id });
+      await details(id);
+      toast(`Refreshed ${res?.remote ?? "remote"} branches`, "good");
+    } catch (e) { setError(cleanErr(e)); toast(cleanErr(e), "danger"); } finally { setFetching(false); }
+  }
   async function refresh() {
     try {
       const list = (await store.refetchRepos()) ?? [];
@@ -302,13 +314,14 @@ export default function Repos() {
           <aside class="ws-repos"><VirtualList items={repos()} rowHeight={84}>{r => <button class={`ws-repo ${selected() === r.id ? "selected" : ""}`} onClick={() => choose(r.id)}>
             <strong class="ellipsis" title={r.path}>{labels().get(r.id)}</strong>
             <span class="ws-mono xs faint"><Icon name="branch" size={11} /> {r.branch || "Detached HEAD"}</span>
-            <span class="rp-line"><Pill tone={r.error ? "bad" : r.dirty ? "warn" : "ok"}>{r.error ? "Unavailable" : r.dirty ? "Dirty" : "Clean"}</Pill><Show when={activeRepoId() === r.id}><Pill tone="ok" title="Active workspace">Active</Pill></Show><span class="xs faint">{r.worktree_count ?? 0} worktree{r.worktree_count === 1 ? "" : "s"}</span></span>
+            <span class="rp-line"><Pill tone={r.error ? "bad" : r.dirty ? "warn" : "ok"} title={r.dirty && !r.error ? `Uncommitted changes in the main checkout (not in worktrees):\n${(r.dirty_files || []).join("\n")}` : undefined}>{r.error ? "Unavailable" : r.dirty ? r.dirty_count ? `Main checkout: ${r.dirty_count} changed` : "Main checkout changed" : "Clean"}</Pill><Show when={activeRepoId() === r.id}><Pill tone="ok" title="Active workspace">Active</Pill></Show><span class="xs faint">{r.worktree_count ?? 0} worktree{r.worktree_count === 1 ? "" : "s"}</span></span>
           </button>}</VirtualList></aside>
           <Show when={current()} fallback={<Empty title="Select a repository">Pick one on the left to see its worktrees and branches.</Empty>}>{r => <section class="ws-detail">
             <header class="rp-head">
               <div class="rp-title">
                 <h2 class="ellipsis" title={r().name}>{r().name}</h2>
-                <Pill tone={r().error ? "bad" : r().dirty ? "warn" : "ok"}>{r().error ? "Unavailable" : r().dirty ? "Uncommitted changes" : "Clean"}</Pill>
+                <Pill tone={r().error ? "bad" : r().dirty ? "warn" : "ok"} title={r().dirty && !r().error ? `Uncommitted changes in the main checkout:\n${(r().dirty_files || []).join("\n")}` : undefined}>{r().error ? "Unavailable" : r().dirty ? `${r().dirty_count ?? ""} uncommitted file${r().dirty_count === 1 ? "" : "s"} in main checkout`.trim() : "Clean"}</Pill>
+                <Button size="sm" busy={fetching()} disabled={fetching()} title="Fetch and prune remote-tracking branches. Local branches and worktrees are never deleted." onClick={refreshRemote}><Icon name="refresh" size={12} /> Refresh remote branches</Button>
                 <Show when={activeRepoId() === r().id}><Pill tone="ok">Active workspace</Pill></Show>
                 <div class="grow" />
                 <Button

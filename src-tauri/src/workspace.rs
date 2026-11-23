@@ -162,6 +162,70 @@ pub(crate) fn git(path: &Path, args: &[&str]) -> Result<String, String> {
         .trim_end_matches('\n')
         .to_string())
 }
+fn refresh_branches(path: &Path, timeout: Duration) -> Result<String, String> {
+    let branch = git(path, &["symbolic-ref", "--quiet", "--short", "HEAD"]).unwrap_or_default();
+    let configured = git(path, &["config", "--get", &format!("branch.{branch}.remote")]).ok();
+    let remotes = git(path, &["remote"])?;
+    let names: Vec<_> = remotes.lines().collect();
+    let remote = configured.as_deref().filter(|r| *r != ".")
+        .or_else(|| names.iter().copied().find(|r| *r == "origin"))
+        .or_else(|| if names.len() == 1 { Some(names[0]) } else { None })
+        .ok_or("This repository has no remote or no unambiguous configured remote to refresh")?;
+    if !names.contains(&remote) || remote.starts_with('-') {
+        return Err("Configured remote is not a named repository remote".into());
+    }
+    // Explicit refspec and empty refmap override mirror/local mappings. Never
+    // prune tags, even when fetch.pruneTags is configured by the user.
+    let refspec = format!("+refs/heads/*:refs/remotes/{remote}/*");
+    let mut command = Command::new("git");
+    command.arg("-C").arg(path)
+        .args(["-c", "credential.interactive=false", "fetch", "--prune", "--no-prune-tags", "--no-tags", "--no-recurse-submodules", "--refmap=", "--", remote, &refspec])
+        .env("GIT_TERMINAL_PROMPT", "0").env("GCM_INTERACTIVE", "never")
+        .env("GIT_SSH_COMMAND", "ssh -oBatchMode=yes")
+        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command.spawn().map_err(|e| format!("git fetch: {e}"))?;
+    let mut stderr = child.stderr.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut message = Vec::new();
+        let mut buf = [0; 4096];
+        while let Ok(n) = stderr.read(&mut buf) {
+            if n == 0 { break; }
+            let remaining = 65536usize.saturating_sub(message.len());
+            message.extend_from_slice(&buf[..n.min(remaining)]);
+        }
+        let _ = tx.send(message);
+    });
+    let start = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) if start.elapsed() < timeout => std::thread::sleep(Duration::from_millis(20)),
+            result => {
+                #[cfg(unix)]
+                unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL); }
+                let _ = child.kill();
+                let _ = child.wait();
+                break Err(match result {
+                    Err(e) => format!("git fetch: {e}"),
+                    _ => "git fetch timed out".into(),
+                });
+            }
+        }
+    }?;
+    let message = rx.recv_timeout(timeout.saturating_sub(start.elapsed())).unwrap_or_default();
+    if !status.success() {
+        return Err(format!("git fetch failed: {}", String::from_utf8_lossy(&message).trim()));
+    }
+    Ok(remote.to_string())
+}
+
 fn changed(ctx: &Arc<Ctx>) {
     invalidate_status_cache();
     ctx.emit("workspace:changed", json!({}));
@@ -739,12 +803,13 @@ fn dispatch(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, String> 
                         let _ = ctx.db.exec("UPDATE repos SET root_commits=?2 WHERE id=?1", params![text(r, "id")?, roots]);
                     }
                 }
-                // -uno: skip the untracked-file walk; cheap even on big repos.
-                match git(p, &["status", "--porcelain=v2", "--branch", "-uno"]) {
+                match git(p, &["status", "--porcelain=v2", "--branch", "--untracked-files=all"]) {
                     Ok(out) => {
                         let st = parse_porcelain_v2(&out);
                         r["branch"] = json!(st.branch);
                         r["dirty"] = json!(!st.dirty_files.is_empty());
+                        r["dirty_count"] = json!(st.dirty_files.len());
+                        r["dirty_files"] = json!(st.dirty_files);
                     }
                     Err(e) => {
                         r["branch"] = json!("");
@@ -831,6 +896,15 @@ fn dispatch(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, String> 
             }
             changed(ctx);
             Ok(repo(ctx, &id).unwrap())
+        }
+        "refresh_branches" | "branches_refresh" => {
+            let id = arg_str(&args, "repo_id")?;
+            let r = repo(ctx, &id).ok_or_else(|| crate::ctx::not_found("Unknown repository"))?;
+            let lock = repo_lock(&id);
+            let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+            let remote = refresh_branches(&repo_dir(&r)?, Duration::from_secs(30))?;
+            changed(ctx);
+            Ok(json!({"remote": remote}))
         }
         "branches" => {
             let r = repo(ctx, &arg_str(&args, "repo_id")?).ok_or_else(|| crate::ctx::not_found("Unknown repository"))?;
@@ -1354,6 +1428,55 @@ esac
         assert!(github_pr_view_as("other/project", "test-work-token", 17, fake).await.is_err());
     }
 
+    #[test]
+    fn refresh_prunes_only_remote_branches() {
+        let (ctx, id) = setup();
+        let path = ctx.root.join("fixture");
+        let remote = ctx.root.join("remote.git");
+        std::fs::create_dir_all(&remote).unwrap();
+        git(&remote, &["init", "--bare"]).unwrap();
+        git(&path, &["remote", "add", "origin", remote.to_str().unwrap()]).unwrap();
+        git(&path, &["branch", "topic"]).unwrap();
+        git(&path, &["push", "origin", "main", "topic"]).unwrap();
+        let tree = ctx.root.join("topic-worktree");
+        git(&path, &["worktree", "add", tree.to_str().unwrap(), "topic"]).unwrap();
+        git(&path, &["tag", "keep"]).unwrap();
+        git(&path, &["config", "remote.origin.fetch", "+refs/heads/*:refs/heads/*"]).unwrap();
+        git(&path, &["config", "fetch.pruneTags", "true"]).unwrap();
+        git(&remote, &["update-ref", "-d", "refs/heads/topic"]).unwrap();
+        assert!(git(&path, &["rev-parse", "--verify", "refs/remotes/origin/topic"]).is_ok());
+        dispatch(&ctx, "refresh_branches", json!({"repo_id": id})).unwrap();
+        assert!(git(&path, &["rev-parse", "--verify", "refs/remotes/origin/topic"]).is_err());
+        assert!(git(&path, &["rev-parse", "--verify", "refs/heads/topic"]).is_ok());
+        assert!(git(&path, &["rev-parse", "--verify", "refs/tags/keep"]).is_ok());
+        assert!(tree.join("file").is_file());
+        assert_eq!(git(&tree, &["branch", "--show-current"]).unwrap(), "topic");
+        assert!(git(&path, &["worktree", "list", "--porcelain"]).unwrap().contains(tree.to_str().unwrap()));
+    }
+
+    #[test]
+    fn refresh_error_preserves_branch_list() {
+        let (ctx, id) = setup();
+        let path = ctx.root.join("fixture");
+        let before = dispatch(&ctx, "branches", json!({"repo_id": id})).unwrap();
+        assert!(dispatch(&ctx, "refresh_branches", json!({"repo_id": id})).is_err());
+        git(&path, &["remote", "add", "origin", ctx.root.join("absent.git").to_str().unwrap()]).unwrap();
+        assert!(dispatch(&ctx, "refresh_branches", json!({"repo_id": id})).unwrap_err().contains("git fetch failed"));
+        assert_eq!(dispatch(&ctx, "branches", json!({"repo_id": id})).unwrap(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refresh_timeout_is_bounded() {
+        let (ctx, _) = setup();
+        let path = ctx.root.join("fixture");
+        git(&path, &["remote", "add", "origin", "ext::sleep 30"]).unwrap();
+        git(&path, &["config", "protocol.ext.allow", "always"]).unwrap();
+        let start = Instant::now();
+        assert!(refresh_branches(&path, Duration::from_millis(50)).unwrap_err().contains("timed out"));
+        assert!(start.elapsed() < Duration::from_secs(3));
+    }
+
     fn setup() -> (Arc<Ctx>, String) {
         let ctx = Ctx::test();
         init(&ctx).unwrap();
@@ -1367,6 +1490,45 @@ esac
         git(&p, &["commit", "-m", "initial"]).unwrap();
         let r = add_repo(&ctx, &p.to_string_lossy()).unwrap();
         (ctx, r["id"].as_str().unwrap().into())
+    }
+    #[test]
+    fn refresh_prunes_stale_remote_ref_but_keeps_local_branch_and_worktree() {
+        let (ctx, id) = setup();
+        let p = ctx.root.join("fixture");
+        let bare = ctx.root.join("remote.git");
+        git(&ctx.root, &["init", "--bare", "-b", "main", bare.to_str().unwrap()]).unwrap();
+        git(&p, &["remote", "add", "origin", bare.to_str().unwrap()]).unwrap();
+        git(&p, &["branch", "feat", "main"]).unwrap();
+        git(&p, &["push", "-q", "origin", "main", "feat"]).unwrap();
+        git(&p, &["fetch", "-q", "origin"]).unwrap();
+        let wt = ctx.root.join("feat-wt");
+        git(&p, &["worktree", "add", "-q", wt.to_str().unwrap(), "feat"]).unwrap();
+        let names = |ctx: &Arc<Ctx>| -> Vec<String> {
+            dispatch(ctx, "branches", json!({"repo_id":id})).unwrap().as_array().unwrap().iter().map(|b| b["name"].as_str().unwrap().to_string()).collect()
+        };
+        assert!(names(&ctx).contains(&"origin/feat".to_string()));
+        git(&bare, &["branch", "-D", "feat"]).unwrap();
+        assert_eq!(dispatch(&ctx, "branches_refresh", json!({"repo_id":id})).unwrap()["remote"], "origin");
+        let n = names(&ctx);
+        assert!(!n.contains(&"origin/feat".to_string()), "{n:?}");
+        assert!(n.contains(&"feat".to_string()) && n.contains(&"origin/main".to_string()), "{n:?}");
+        assert!(wt.join("file").exists());
+        assert!(git(&p, &["worktree", "list"]).unwrap().contains("feat-wt"));
+        std::fs::remove_dir_all(ctx.root.parent().unwrap()).unwrap();
+    }
+    #[test]
+    fn refresh_errors_keep_the_existing_branch_list() {
+        let (ctx, id) = setup();
+        let p = ctx.root.join("fixture");
+        let e = dispatch(&ctx, "branches_refresh", json!({"repo_id":id})).unwrap_err();
+        assert!(e.contains("no remote"), "{e}");
+        git(&p, &["remote", "add", "origin", ctx.root.join("missing.git").to_str().unwrap()]).unwrap();
+        git(&p, &["update-ref", "refs/remotes/origin/keep", "HEAD"]).unwrap();
+        let e = dispatch(&ctx, "branches_refresh", json!({"repo_id":id})).unwrap_err();
+        assert!(e.contains("git fetch failed"), "{e}");
+        let b = dispatch(&ctx, "branches", json!({"repo_id":id})).unwrap();
+        assert!(b.as_array().unwrap().iter().any(|b| b["name"] == "origin/keep"));
+        std::fs::remove_dir_all(ctx.root.parent().unwrap()).unwrap();
     }
     #[test]
     fn branch_rows_and_origin_head_skipped() {
