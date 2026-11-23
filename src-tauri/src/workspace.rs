@@ -226,11 +226,6 @@ fn refresh_branches(path: &Path, timeout: Duration) -> Result<String, String> {
     Ok(remote.to_string())
 }
 
-/// Fetch and prune remote-tracking refs only (`refs/remotes/<remote>/*`). Never touches local
-/// branches, worktrees or the remote. Non-interactive, bounded by `secs`.
-pub(crate) fn refresh_remote_branches(path: &Path, secs: u64) -> Result<String, String> {
-    refresh_branches(path, Duration::from_secs(secs))
-}
 fn changed(ctx: &Arc<Ctx>) {
     invalidate_status_cache();
     ctx.emit("workspace:changed", json!({}));
@@ -902,14 +897,14 @@ fn dispatch(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, String> 
             changed(ctx);
             Ok(repo(ctx, &id).unwrap())
         }
-        "refresh_branches" => {
+        "refresh_branches" | "branches_refresh" => {
             let id = arg_str(&args, "repo_id")?;
             let r = repo(ctx, &id).ok_or_else(|| crate::ctx::not_found("Unknown repository"))?;
             let lock = repo_lock(&id);
             let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-            refresh_branches(&repo_dir(&r)?, Duration::from_secs(30))?;
+            let remote = refresh_branches(&repo_dir(&r)?, Duration::from_secs(30))?;
             changed(ctx);
-            Ok(json!({"ok": true}))
+            Ok(json!({"remote": remote}))
         }
         "branches" => {
             let r = repo(ctx, &arg_str(&args, "repo_id")?).ok_or_else(|| crate::ctx::not_found("Unknown repository"))?;
@@ -924,12 +919,6 @@ fn dispatch(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, String> 
                 ],
             )?;
             Ok(json!(parse_branches(&s)))
-        }
-        "branches_refresh" => {
-            let r = repo(ctx, &arg_str(&args, "repo_id")?).ok_or_else(|| crate::ctx::not_found("Unknown repository"))?;
-            let remote = refresh_remote_branches(&repo_dir(&r)?, 60)?;
-            changed(ctx);
-            Ok(json!({"remote": remote}))
         }
         "relocate" => relocate(ctx, &arg_str(&args, "repo_id")?, &arg_str(&args, "path")?),
         "worktrees" => list_worktrees(ctx, args["repo_id"].as_str()),

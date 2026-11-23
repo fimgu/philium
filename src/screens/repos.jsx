@@ -244,6 +244,7 @@ export default function Repos() {
     const id = selected();
     if (!id || fetching()) return;
     setFetching(true);
+    setError("");
     try {
       const res = await rpc("workspace.branches_refresh", { repo_id: id });
       await details(id);
