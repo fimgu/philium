@@ -497,3 +497,5 @@ details.msg summary { cursor: pointer; display: flex; align-items: center; gap: 
 .fork-here { display: block; margin-top: 4px; font-size: var(--fs-xs); opacity: 0; transition: opacity .15s; }
 .msg:hover .fork-here, .fork-here:focus-visible { opacity: .7; }
 .msg.search-hit { outline: 2px solid var(--accent, #6aa1ff); outline-offset: 2px; }
+.agents-page-head { height: auto; min-height: 56px; flex-wrap: wrap; gap: 6px 12px; padding-block: 8px; }
+.agents-page-head .actions { flex: 0 1 auto; min-width: 0; }

@@ -157,15 +157,18 @@ const stub = (fx, setName, serveOnly = false) => {
         }
         if (window.__test.historyMode) {
           const t = window.__test;
+          if (a.method === "agents.list") return structuredClone(Object.values(t.historyAgents));
           if (a.method === "agents.get") return structuredClone(t.historyAgents[a.args.id]);
           if (a.method === "agents.events") {
             const id = a.args.id;
             t.historyCalls.push(id);
             (t.historyPages ??= []).push({ id, after: a.args.after, limit: a.args.limit });
-            const response = structuredClone((t.historyEvents[id] ?? []).filter((e) => e.seq > (a.args.after ?? 0)).slice(0, a.args.limit ?? 5000));
+            const events = (t.historyEvents[id] ?? []).filter((e) => e.seq > (a.args.after ?? 0));
+            const limit = a.args.limit ?? 5000;
+            const response = structuredClone(events.slice(0, limit));
             if (t.holdHistory) await new Promise((resolve, reject) => t.historyPending.push({ id, response, resolve, reject }));
             if (t.failHistory) throw "Saved history unreadable";
-            return response;
+            return a.args.page ? { events: response, has_more: events.length > limit } : response;
           }
           if (["agents.resume", "agents.stop"].includes(a.method)) {
             t.historyActions.push(a.method);
@@ -199,6 +202,13 @@ const stub = (fx, setName, serveOnly = false) => {
           window.__test.sends.push(a.args);
           await new Promise((resolve) => { window.__test.releaseSend = resolve; });
           if (window.__test.mode === "reject") throw 'HAL 409 Conflict: {"type":"busy","message":"session is busy"}';
+          return {};
+        }
+        if (a.method === "agents.queue_list") return structuredClone(window.__test.queued ?? []);
+        if (a.method === "agents.queue_add") {
+          const t = window.__test;
+          if (t.rejectQueue) throw "Fixture queue unavailable";
+          (t.queued ??= []).push({ ...structuredClone(a.args), id: t.queued.length + 1 });
           return {};
         }
         if (a.method === "agents.permission") {

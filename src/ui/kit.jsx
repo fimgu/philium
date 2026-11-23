@@ -154,7 +154,7 @@ export function Shield(props) {
 export function Page(props) {
   return (
     <>
-      <header class="page-head">
+      <header class={`page-head${props.headerClass ? ` ${props.headerClass}` : ""}`}>
         <h1>{props.title}</h1>
         <Show when={props.sub}><span class="sub">{props.sub}</span></Show>
         <div class="actions">{props.actions}</div>

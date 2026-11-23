@@ -440,10 +440,12 @@ function AgentView(props) {
   const [historyCursor, setHistoryCursor] = createSignal(0);
   const [historyMore, setHistoryMore] = createSignal(false);
   let retryAfter = 0;
-  let generation = 0, historyId;
+  let generation = 0, historyId, pendingHistory;
   const merge = mergeEvents;
   const load = async (id, after = 0) => {
     const request = ++generation;
+    const liveDuringLoad = [];
+    pendingHistory = { id, liveDuringLoad };
     if (historyId !== id) {
       historyId = id;
       setEvents(agentEventsCache.get(id) ?? []);
@@ -454,12 +456,12 @@ function AgentView(props) {
     setHistoryLoading(true);
     setHistoryError("");
     try {
-      const result = await rpc("agents.events", { id, after, limit: 5000, page: true }, { local: true });
+      const result = await rpc("agents.events", { id, after, limit: 5000, page: true }, { local: true, fresh: true });
       if (request !== generation || props.id !== id) return;
       const evs = Array.isArray(result) ? result : result?.events;
       if (!Array.isArray(evs)) throw new Error("Invalid history response");
       setEvents((current) => {
-        const next = merge(current, evs);
+        const next = after === 0 ? merge(evs, liveDuringLoad) : merge(current, evs);
         agentEventsCache.set(id, next);
         return next;
       });
@@ -469,13 +471,17 @@ function AgentView(props) {
     } catch (e) {
       if (request === generation && props.id === id) setHistoryError(String(e));
     } finally {
-      if (request === generation && props.id === id) setHistoryLoading(false);
+      if (request === generation && props.id === id) {
+        pendingHistory = undefined;
+        setHistoryLoading(false);
+      }
     }
   };
   onCleanup(() => generation++);
   createEffect(on(() => props.id, (id) => load(id)));
   useVisibleEvent("agents:events", (p) => {
     if (p.id !== props.id || historyId !== props.id) return;
+    if (pendingHistory?.id === p.id) pendingHistory.liveDuringLoad.push(...(p.events ?? []));
     setEvents((current) => {
       const next = merge(current, p.events ?? []);
       agentEventsCache.set(props.id, next);
@@ -1285,7 +1291,11 @@ export default function Agents() {
     return out;
   });
 
-  const selected = createMemo(() => selectedAgentId(tree().map(({ a }) => a), params().id));
+  const selected = createMemo(() => {
+    const requested = params().id;
+    if (requested && list() && !list().some((a) => a.id === requested)) return requested;
+    return selectedAgentId(tree().map(({ a }) => a), requested);
+  });
 
   const telemetry = createMemo(() => {
     const l = scoped();
@@ -1348,7 +1358,7 @@ export default function Agents() {
   };
 
   return (
-    <Page title="Agents" flush
+    <Page title="Agents" headerClass="agents-page-head" flush
       sub={
         <Show when={scoped().length}>
           <span class="fleet-sub-telemetry">
