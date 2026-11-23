@@ -207,7 +207,7 @@ pub const PRIVATE: &[&str] = &[
     "Library/Application Support/Firefox", "Library/Application Support/BraveSoftware",
     "Library/Application Support/Arc", "Library/Application Support/Microsoft Edge",
     "Library/Application Support/Slack", "Library/Application Support/discord",
-    "Library/Application Support/dev.gunnarsson.philium",
+    crate::app_id::MAC_DATA_REL,
     // personal folders (share parts of them with repo grants)
     "Documents", "Desktop", "Downloads", "Developer", "Pictures", "Movies", "Music", "Philium",
 ];
@@ -971,7 +971,7 @@ mod toolchain_probe {
             assert!(o.status.success(), "kicad-cli: {}", String::from_utf8_lossy(&o.stderr));
         }
         let home = home();
-        for secret in [".ssh", "Documents", "Library/Keychains", "Library/Messages", ".zsh_history", "Library/Application Support/dev.gunnarsson.philium"] {
+        for secret in [".ssh", "Documents", "Library/Keychains", "Library/Messages", ".zsh_history", crate::app_id::MAC_DATA_REL] {
             let path = home.join(secret);
             let cmd = if path.is_dir() { format!("ls '{}'", path.display()) } else { format!("cat '{}' >/dev/null", path.display()) };
             let o = run(&cmd);

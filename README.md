@@ -180,10 +180,10 @@ Once the required rows are done, the card goes away on its own.
 
 ## Where data lives
 
-- **App data**: Philium's own database, settings and stored secrets live in the standard app data folder for the id `dev.gunnarsson.philium`.
-  - macOS: `~/Library/Application Support/dev.gunnarsson.philium`
-  - Windows: `%APPDATA%\dev.gunnarsson.philium`
-  - Linux: `~/.local/share/dev.gunnarsson.philium`
+- **App data**: Philium's own database, settings and stored secrets live in the standard app data folder for the id `app.philium`.
+  - macOS: `~/Library/Application Support/app.philium`
+  - Windows: `%APPDATA%\app.philium`
+  - Linux: `~/.local/share/app.philium`
 - **HAL configuration**: `~/.hal/hal.yaml`, or the file named by `HAL_CONFIG`.
 - **Per repository**: an optional `.philium/` folder in the repo, for example `.philium/pipeline.yaml`. This belongs to the repo and is yours to commit or ignore.
 

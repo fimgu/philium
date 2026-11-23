@@ -1,9 +1,11 @@
 """Read-only public origin, real packaged form, controlled local deployment. No remote writes."""
 import hashlib, http.server, json, os, plistlib, socket, subprocess, sys, tempfile, threading, time
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import app_id  # noqa: E402
 
 def run(app):
-    info=plistlib.loads((app/'Contents/Info.plist').read_bytes()); assert info['CFBundleIdentifier']=='dev.gunnarsson.philium.pilot'
+    info=plistlib.loads((app/'Contents/Info.plist').read_bytes()); assert info['CFBundleIdentifier']==app_id.PILOT
     subprocess.run(['codesign','--verify','--deep','--strict',app],check=True)
     exe=app/'Contents/MacOS'/info['CFBundleExecutable']; url='https://github.com/typicode/demo/pull/1090'
     head='610dcdf4f371d2e47f15c4edcad6837b4b8c862b'; base='f0b44972443d306e32eed093910687d26cd9f3f1'

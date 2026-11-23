@@ -27,7 +27,7 @@ pub const EVENT_MAX: usize = 64 * 1024;
 
 pub struct Ctx {
     pub db: Db,
-    /// Platform app data dir, e.g. ~/Library/Application Support/dev.gunnarsson.philium
+    /// Platform app data dir, e.g. ~/Library/Application Support/<app_id::ID>
     pub data_dir: PathBuf,
     /// User-visible Philium folder, default ~/Philium (SPEC 11.1).
     pub root: PathBuf,

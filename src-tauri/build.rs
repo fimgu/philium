@@ -1,6 +1,7 @@
 fn main() {
     println!("cargo:rustc-env=PHILIUM_TARGET_TRIPLE={}", std::env::var("TARGET").expect("Cargo target triple"));
     link_clang_rt();
+    export_app_id();
     tauri_build::build()
 }
 
@@ -17,4 +18,16 @@ fn link_clang_rt() {
         println!("cargo:rustc-link-search=native={}", dir.display());
         println!("cargo:rustc-link-lib=static=clang_rt.osx");
     }
+}
+
+/// `src/app_id.rs` reads the bundle identifier from here, so it is defined once.
+fn export_app_id() {
+    println!("cargo:rerun-if-changed=tauri.conf.json");
+    let conf = std::fs::read_to_string("tauri.conf.json").expect("tauri.conf.json");
+    let id = conf
+        .split("\"identifier\"")
+        .nth(1)
+        .and_then(|r| r.split('"').nth(1))
+        .expect("identifier in tauri.conf.json");
+    println!("cargo:rustc-env=PHILIUM_APP_ID={id}");
 }

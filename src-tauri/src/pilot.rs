@@ -7,7 +7,7 @@ use std::{
     sync::OnceLock,
 };
 
-pub const ID: &str = "dev.gunnarsson.philium.pilot";
+pub const ID: &str = crate::app_id::PILOT;
 static BASE: OnceLock<PathBuf> = OnceLock::new();
 pub fn active() -> bool {
     BASE.get().is_some()

@@ -570,7 +570,8 @@ fn preview(ctx: &Arc<Ctx>, id: &str) -> Result<Value, String> {
         ("CLAUDE_CONFIG_DIR".into(), base.join("empty-claude").to_string_lossy().into()),
     ]);
     let cmd = format!(
-        "npm install --no-audit --no-fund && npx tauri dev --config '{{\"identifier\":\"dev.gunnarsson.philium.preview\",\"build\":{{\"devUrl\":\"http://localhost:{port}\",\"beforeDevCommand\":\"npx vite --port {port} --strictPort\"}},\"app\":{{\"windows\":[{{\"title\":\"Philium preview\",\"width\":1200,\"height\":800}}]}}}}'"
+        "npm install --no-audit --no-fund && npx tauri dev --config '{{\"identifier\":\"{preview_id}\",\"build\":{{\"devUrl\":\"http://localhost:{port}\",\"beforeDevCommand\":\"npx vite --port {port} --strictPort\"}},\"app\":{{\"windows\":[{{\"title\":\"Philium preview\",\"width\":1200,\"height\":800}}]}}}}'",
+        preview_id = crate::app_id::PREVIEW
     );
     let t = sh(ctx, "Improve: preview", &wt, &cmd, env, r["agent_id"].as_str())?;
     set(ctx, id, "preview_terminal", &t)?;

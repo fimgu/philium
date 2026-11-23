@@ -536,7 +536,7 @@ mod tests {
             ctx.db.kv_set("library.imported_at", "fixture").unwrap();
             crate::library::init(&ctx).unwrap();
             if on {
-                let real = std::env::var("HOME").unwrap() + "/Library/Application Support/dev.gunnarsson.philium/models";
+                let real = format!("{}/{}/models", std::env::var("HOME").unwrap(), crate::app_id::MAC_DATA_REL);
                 std::fs::create_dir_all(ctx.data_dir.clone()).unwrap();
                 let _ = std::os::unix::fs::symlink(&real, ctx.data_dir.join("models"));
                 assert!(installed(&ctx.data_dir, &EMBED) && installed(&ctx.data_dir, &RERANK), "run the app once to download models");
@@ -581,7 +581,7 @@ mod tests {
             ("The main branch is called master.", "We renamed master to main last sprint.", "The main branch is called main.", "what is the default branch called?"),
         ];
         let r = rig("stale-eval").await;
-        let real = std::env::var("HOME").unwrap() + "/Library/Application Support/dev.gunnarsson.philium/models";
+        let real = format!("{}/{}/models", std::env::var("HOME").unwrap(), crate::app_id::MAC_DATA_REL);
         let models = installed(std::path::Path::new(&real).parent().unwrap(), &EMBED);
         if models {
             let _ = std::os::unix::fs::symlink(&real, r.ctx.data_dir.join("models"));

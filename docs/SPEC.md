@@ -605,7 +605,7 @@ Tools inside the sandbox get `HTTPS_PROXY` pointing at the egress proxy. A tool 
 ## 11. Storage layout
 
 ```
-<app data dir>/            macOS: ~/Library/Application Support/dev.gunnarsson.philium
+<app data dir>/            macOS: ~/Library/Application Support/app.philium
   philium.db                SQLite: agents, tasks, messages, leases, ledger, stats
   hal.yaml                 generated, 0600
   activity/                request metadata, rotated

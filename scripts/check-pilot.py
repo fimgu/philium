@@ -7,12 +7,15 @@ import subprocess
 import sys
 import tempfile
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import app_id  # noqa: E402
+
 
 def main():
     app = Path(sys.argv[1]).resolve(strict=True)
     with (app / 'Contents/Info.plist').open('rb') as stream:
         info = plistlib.load(stream)
-    if info['CFBundleIdentifier'] != 'dev.gunnarsson.philium.pilot':
+    if info['CFBundleIdentifier'] != app_id.PILOT:
         raise SystemExit('Refusing to invoke a non-pilot bundle')
     subprocess.run(['codesign', '--verify', '--deep', '--strict', str(app)], check=True)
     exe = app / 'Contents/MacOS' / info['CFBundleExecutable']

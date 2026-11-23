@@ -1,6 +1,6 @@
 # macOS side-by-side pilot
 
-Build from the repository root with `npm run pilot:build` after dependencies are cached locally. This produces an optimized release binary with thin link-time optimization and two Cargo jobs. It does not change the regular Philium release profile. The local ad-hoc signed artifact is `src-tauri/target/release/bundle/macos/Philium Pilot.app`. Do not replace the installed Philium. The separate bundle identifier is `dev.gunnarsson.philium.pilot`.
+Build from the repository root with `npm run pilot:build` after dependencies are cached locally. This produces an optimized release binary with thin link-time optimization and two Cargo jobs. It does not change the regular Philium release profile. The local ad-hoc signed artifact is `src-tauri/target/release/bundle/macos/Philium Pilot.app`. Do not replace the installed Philium. The separate bundle identifier is `app.philium.pilot`.
 
 Normal pilot startup uses `~/Philium Pilot/{data,workspace,home}`. This is profile separation, not an OS security boundary. The pilot skips automatic personal-library import, host reconciliation, ledger-driven shutdown cleanup, and self-update. In-memory agent, terminal and desk handles retain their normal shutdown paths. Keeping a pilot checkout does not grant access to a remote runner or recipient.
 

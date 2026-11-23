@@ -1960,7 +1960,7 @@ mod tests {
         assert!(is_blocked_root(Path::new("~/.aws/credentials")).is_some());
         assert!(is_blocked_root(Path::new("~/Documents")).is_some());
         assert!(is_blocked_root(Path::new("~/Library/Keychains")).is_some());
-        assert!(is_blocked_root(Path::new("~/Library/Application Support/dev.gunnarsson.philium")).is_some());
+        assert!(is_blocked_root(Path::new(&format!("~/{}", crate::app_id::MAC_DATA_REL))).is_some());
         assert!(is_blocked_root(&home.join("Documents/..")).is_some());
 
         // Secret vault must be blocked

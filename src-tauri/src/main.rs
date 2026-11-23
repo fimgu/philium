@@ -11,6 +11,7 @@
 //! The web UI never sees a token or key.
 
 mod access;
+mod app_id;
 mod access_fs;
 mod agents;
 mod attention;
@@ -345,6 +346,8 @@ fn main() {
             return;
         }
     } else if !offscreen {
+        // One-time move of data, caches and Keychain items from the previous identifier.
+        if config.config().identifier == app_id::ID && std::env::var_os("PHILIUM_DATA_DIR").is_none() { app_id::migrate_legacy(); }
         // Dock launches get a bare PATH; Improve Philium needs cargo/npm from the login shell.
         if let Some(home) = std::env::var_os("HOME") { pilot::adopt_login_path(std::path::Path::new(&home)); }
     }

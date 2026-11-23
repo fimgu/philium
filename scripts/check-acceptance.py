@@ -21,6 +21,8 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE / 'acceptance'))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import app_id  # noqa: E402
 import synthetic as syn  # noqa: E402
 
 LIB = (HERE / 'acceptance/ui-lib.js').read_text()
@@ -31,7 +33,7 @@ class Run:
     def __init__(self, app, root, out):
         self.app, self.root, self.out = Path(app), Path(root), out
         info = plistlib.loads((self.app / 'Contents/Info.plist').read_bytes())
-        assert info['CFBundleIdentifier'] == 'dev.gunnarsson.philium.pilot', 'Not a Pilot bundle'
+        assert info['CFBundleIdentifier'] == app_id.PILOT, 'Not a Pilot bundle'
         subprocess.run(['/usr/bin/codesign', '--verify', '--deep', '--strict', str(self.app)], check=True)
         self.exe = self.app / 'Contents/MacOS' / info['CFBundleExecutable']
         self.home = self.root / 'home'; self.tmp = self.root / 'tmp'
