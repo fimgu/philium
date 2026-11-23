@@ -987,6 +987,8 @@ async fn proxy(
     gw.note_quota(&provider, resp.headers());
     gw.update(id, |r| r.summary.status = Some(status.as_u16()));
     let content_type = resp.headers().get("content-type").cloned();
+    let trace_stream = stream || content_type.as_ref().and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("text/event-stream"));
     let retry_after = resp.headers().get("retry-after").cloned();
     let mut upstream = byte_stream(resp);
     let mut pre: Option<Result<Bytes, String>> = None;
@@ -1010,7 +1012,7 @@ async fn proxy(
     let mut last_emit: Option<Instant> = None;
     let gw_p = gw.clone();
     let mut track = move |chunk: &[u8], err: bool| {
-        if !stream {
+        if !trace_stream || !status.is_success() {
             return;
         }
         sniff.feed(chunk);
@@ -1649,6 +1651,24 @@ mod tests {
             assert_eq!((a.state, a.input_tokens), ("done", Some(12)));
             assert!(!gw.detail(a.id).unwrap().to_string().contains("OAUTH-ACCESS"));
         }
+    }
+
+    #[tokio::test]
+    async fn emits_progress_for_chatgpt_when_oauth_enables_streaming() {
+        let (base, _) = upstream().await;
+        let (gw, url) = gateway(&base, Kind::ChatgptOauth, GuardMode::Off).await;
+        gw.tokens.set(Arc::new(|_, _| {
+            Box::pin(async { Ok(crate::oauth::Creds { access: "test".into(), ..Default::default() }) })
+        }));
+        let mut progress = gw.progress.subscribe();
+        let token = gw.issue_token("fixture-agent", None);
+        let response = reqwest::Client::new().post(format!("{url}/responses"))
+            .bearer_auth(token).json(&json!({"model":"fixture"})).send().await.unwrap();
+        assert_eq!(response.status(), 200);
+        assert!(response.text().await.unwrap().contains("[DONE]"));
+        let p = progress.try_recv().expect("streaming progress for forced SSE");
+        assert_eq!(p.agent.as_deref(), Some("fixture-agent"));
+        assert_eq!(p.phase, "text");
     }
 
     /// The effort a person chose reaches each Claude model in the form that model takes: a named

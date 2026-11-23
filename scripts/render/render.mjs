@@ -9,7 +9,7 @@ import puppeteer from "puppeteer-core";
 import { EMPTY, POPULATED, FAILING, SLOW, HUGE } from "./fixtures.js";
 import { checkAgentMessaging, checkChatMessaging } from "./robustness.mjs";
 import { checkStoppedHistory } from "./stopped-history.mjs";
-import { checkEffortProgress } from "./effort-progress.mjs";
+import { checkEffortProgress, checkLiveTps } from "./effort-progress.mjs";
 import { checkCodeGraph } from "./code-review.mjs";
 import { checkReviewPreview } from "./review-preview.mjs";
 const SETS = { empty: EMPTY, populated: POPULATED, failing: FAILING, slow: SLOW, huge: HUGE };
@@ -294,6 +294,9 @@ for (const setName of sets) {
             });
             errors.forEach((e) => problems.push(`${w} browser approval: ${e}`));
             await shot(page, "agents-permissions-resolved");
+            const tpsErrors = await checkLiveTps(page);
+            for (const error of tpsErrors) problems.push(`${w} live TPS: ${error}`);
+            if (!tpsErrors.length) console.log(`pass ${w} live TPS`);
             for (const error of await checkEffortProgress(page, shot)) problems.push(`${w} effort/progress: ${error}`);
             for (const error of await checkAgentMessaging(page)) problems.push(`${w} messaging: ${error}`);
             await shot(page, "agents-messaging-checked");

@@ -12,13 +12,14 @@ import { SpawnModal } from "../ui/spawn-modal.jsx";
 import { AgentProgressLine, AgentProgressPanel } from "../ui/agent-progress.jsx";
 import { AccessApprovalBar } from "../ui/access-requests.jsx";
 import { pendingAccessByAgent, agentNeedsUser } from "../lib/access-helpers.js";
-import { rpc, fmt, sendError } from "../lib/rpc.js";
+import { rpc, fmt, sendError, useEvent } from "../lib/rpc.js";
 import { route, go, params, registerCommands } from "../lib/nav.js";
 import HunkReview from "../ui/hunk-review.jsx";
 import { steerKey } from "../lib/steer.js";
 import { matchShortcut, shortcutLabel, cycle } from "../lib/shortcuts.js";
 import { useStore, activeRepoId, agentEventsCache } from "../lib/store.js";
-import { useScreenVisible, useVisibleEvent } from "../lib/visibility.js";
+import { useScreenVisible, useVisibleEvent, useClock } from "../lib/visibility.js";
+import { liveTps, sampleLiveTps } from "../lib/live-tps.js";
 import "../styles/agents.css";
 import "../styles/code.css";
 
@@ -532,6 +533,21 @@ function AgentView(props) {
     observedId = id; observedLive = value;
   });
   const busy = () => ["running", "waiting"].includes(a()?.state);
+  const clock = useClock(500);
+  const [rate, setRate] = createSignal(null);
+  useEvent("gateway:progress", (p) => {
+    if (!p.agent || p.agent !== a()?.name) return;
+    const id = props.id;
+    setRate((prev) => ({ id, sample: sampleLiveTps(prev?.id === id ? prev.sample : null, p, Date.now()) }));
+  });
+  useEvent("activity", (p) => {
+    if (!p.agent || p.agent !== a()?.name || p.state === "pending") return;
+    setRate((prev) => prev?.id === props.id && prev.sample.id === p.id
+      ? { ...prev, sample: sampleLiveTps(prev.sample, { id: p.id, done: true }, Date.now()) } : prev);
+  });
+  const tps = () => screenVisible() && live() && a()?.state === "running" && rate()?.id === props.id
+    ? liveTps(rate().sample, clock()) : null;
+
   let agentMain;
 
   // What is typed while the agent works waits here, survives a quit, and is sent when the step ends.
@@ -672,6 +688,9 @@ function AgentView(props) {
         <AgentChip name={a()?.name} />
         <RoleBadge role={a()?.role} />
         <span class="small dim">{stateLabel(a()?.state)}</span>
+        <Show when={tps()}>{(speed) => (
+          <span class="mono xs dim" title="Estimated tokens per second from streamed output. Hidden reasoning is not counted.">~{speed().toFixed(1)} TPS</span>
+        )}</Show>
         <ModelPicker
           compact
           value={a()?.model_ref || ""}
