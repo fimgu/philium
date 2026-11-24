@@ -20,6 +20,7 @@ export function nativeView(box, want, onCovered, onError, active = () => true) {
   let shown = null;
   let last = "";
   let raf = 0;
+  let poll = 0;
   let alive = true;
   let covered = false;
   let ro = null;
@@ -29,7 +30,35 @@ export function nativeView(box, want, onCovered, onError, active = () => true) {
   let observedParent = null;
   let disposeRoot = null;
 
-  const hide = (id) => rpc("browser.hide", { tab: id }).catch(() => {});
+  // Tauri runs async commands concurrently, so independent set_bounds/show/hide calls
+  // can land out of order and leave the webview at stale coordinates (drawn over the
+  // page). Send them strictly one at a time and always send the latest desired state.
+  let queue = Promise.resolve();
+  const send = (method, args) => {
+    const p = queue.then(() => rpc(method, args));
+    queue = p.catch(() => {});
+    return p;
+  };
+  let boundsInFlight = false;
+  let pendingBounds = null;
+  const pushBounds = (args) => {
+    pendingBounds = args;
+    if (boundsInFlight) return;
+    boundsInFlight = true;
+    const next = () => {
+      const a = pendingBounds;
+      pendingBounds = null;
+      if (!a) { boundsInFlight = false; return; }
+      send("browser.set_bounds", a)
+        .catch((e) => { last = ""; onError?.(String(e), a.tab); })
+        .finally(next);
+    };
+    next();
+  };
+  const hide = (id) => {
+    if (pendingBounds?.tab === id) pendingBounds = null;
+    return send("browser.hide", { tab: id }).catch(() => {});
+  };
 
   const isDocHidden = () => typeof document !== "undefined" && Boolean(document.hidden);
   const isActive = () => {
@@ -91,6 +120,7 @@ export function nativeView(box, want, onCovered, onError, active = () => true) {
         mo.observe(document.body, {
           childList: true,
           subtree: true,
+          characterData: true,
           attributes: true,
           attributeFilter: ["class", "style", "hidden", "open", "role"],
         });
@@ -99,7 +129,13 @@ export function nativeView(box, want, onCovered, onError, active = () => true) {
     if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
       window.addEventListener("resize", scheduleCheck, { passive: true });
       window.addEventListener("scroll", scheduleCheck, { capture: true, passive: true });
+      window.addEventListener("focus", scheduleCheck);
+      window.addEventListener("transitionend", scheduleCheck, { capture: true, passive: true });
+      window.addEventListener("animationend", scheduleCheck, { capture: true, passive: true });
     }
+    // Safety net: a box can move without resizing (e.g. a transition above it), which
+    // no observer reports. A 1 Hz recheck is cheap and only sends IPC on change.
+    if (typeof setInterval === "function") poll = setInterval(scheduleCheck, 1000);
   };
 
   const disconnectObservers = () => {
@@ -119,6 +155,13 @@ export function nativeView(box, want, onCovered, onError, active = () => true) {
     if (typeof window !== "undefined" && typeof window.removeEventListener === "function") {
       window.removeEventListener("resize", scheduleCheck);
       window.removeEventListener("scroll", scheduleCheck, { capture: true });
+      window.removeEventListener("focus", scheduleCheck);
+      window.removeEventListener("transitionend", scheduleCheck, { capture: true });
+      window.removeEventListener("animationend", scheduleCheck, { capture: true });
+    }
+    if (poll) {
+      clearInterval(poll);
+      poll = 0;
     }
   };
 
@@ -174,17 +217,18 @@ export function nativeView(box, want, onCovered, onError, active = () => true) {
       const b = `${id}:${r.left}:${r.top}:${r.width}:${r.height}`;
       if (b !== last) {
         last = b;
-        rpc("browser.set_bounds", {
+        pushBounds({
           tab: id,
           x: r.left + 1,
           y: r.top + 1,
           w: r.width - 2,
           h: r.height - 2,
-        }).catch((e) => onError?.(String(e), id));
+        });
       }
       if (shown !== id) {
         shown = id;
-        rpc("browser.show", { tab: id }).catch((e) => onError?.(String(e), id));
+        // Queued after the bounds above, so the page never flashes at old coordinates.
+        send("browser.show", { tab: id }).catch((e) => onError?.(String(e), id));
       }
     }
   }
