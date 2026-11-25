@@ -228,7 +228,7 @@ export const POPULATED = {
     },
   },
   "stats.summary": {
-    totals: { requests: 342, tokens_in: 1.2e6, tokens_out: 3.4e5, cost: 12.8, error_rate: 0.012, avg_tps: 58, avg_ttft_ms: 410, guard_actions: 7, unpriced_requests: 12 },
+    totals: { requests: 342, tokens_in: 1.2e6, tokens_out: 3.4e5, cost: 12.8, priced: 100, included: 230, error_rate: 0.012, avg_tps: 58, avg_ttft_ms: 410, guard_actions: 7, unpriced_requests: 12 },
     by_agent: ["lion", "otter", "heron"].map(statRow), by_provider: ["claude", "chatgpt", "local"].map(statRow), by_model: ["claude-opus-5-5", "gpt-6.1", "qwen3-coder"].map(statRow),
   },
   "stats.timeseries": points,

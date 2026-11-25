@@ -163,7 +163,7 @@ pub fn register(
         }
     }
     // Signature cannot return an error: fail closed rather than create an untracked resource.
-    if let Err(e) = ctx.db.exec("INSERT INTO resources(id,agent_id,kind,handle,meta,created_at) VALUES(?1,?2,?3,?4,?5,?6)",params![id,agent_id,kind,handle,meta.to_string(),now()]) {
+    if let Err(e) = ctx.db.exec("INSERT INTO resources(id,agent_id,kind,handle,meta,created_at,repo_id) VALUES(?1,?2,?3,?4,?5,?6,COALESCE(?7,(SELECT repo_id FROM agents WHERE id=?2)))",params![id,agent_id,kind,handle,meta.to_string(),now(),meta["repo_id"].as_str()]) {
         // Never panic in a request path. The row is missing, so the orphan
         // scan (worktrees/containers) or startup reconcile picks it up later.
         eprintln!("philium: resource registration failed: {e}");
@@ -274,7 +274,7 @@ fn strval<'a>(v: &'a Value, key: &str) -> Result<&'a str, String> {
         .ok_or_else(|| format!("Missing resource {key}"))
 }
 fn rows(ctx: &Arc<Ctx>, agent: Option<&str>, state: Option<&str>) -> Result<Vec<Value>, String> {
-    ctx.db.query("SELECT r.*,a.name AS agent_name,a.state AS agent_state,a.last_active_at,a.repo_id AS repo_id FROM resources r LEFT JOIN agents a ON a.id=r.agent_id WHERE (?1 IS NULL OR r.agent_id=?1) AND (?2 IS NULL OR r.state=?2) ORDER BY CASE r.kind WHEN 'process' THEN 0 WHEN 'terminal' THEN 0 WHEN 'port' THEN 9 WHEN 'colima' THEN 10 ELSE 1 END,r.created_at",params![agent,state])
+    ctx.db.query("SELECT r.*,COALESCE(a.name,json_extract(r.meta,'$.agent_name')) AS agent_name,a.state AS agent_state,a.last_active_at,COALESCE(r.repo_id,a.repo_id) AS repo_id FROM resources r LEFT JOIN agents a ON a.id=r.agent_id WHERE (?1 IS NULL OR r.agent_id=?1) AND (?2 IS NULL OR r.state=?2) ORDER BY CASE r.kind WHEN 'process' THEN 0 WHEN 'terminal' THEN 0 WHEN 'port' THEN 9 WHEN 'colima' THEN 10 ELSE 1 END,r.created_at",params![agent,state])
 }
 fn unsaved(ctx: &Arc<Ctx>, r: &Value) -> bool {
     if r["kind"] != "worktree" {
@@ -919,7 +919,7 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
 fn dispatch(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, String> {
     match method {
         "ledger"=>{let mut r=rows(ctx,args["agent_id"].as_str(),args["state"].as_str())?;for item in &mut r{item["meta"]=meta(item);}Ok(json!(r))}
-        "proposals"=>Ok(json!(ctx.db.query("SELECT p.*,r.kind,r.handle,r.agent_id,a.name AS agent_name FROM teardown_proposals p JOIN resources r ON r.id=p.resource_id LEFT JOIN agents a ON a.id=r.agent_id WHERE p.state='pending' AND r.state!='released' ORDER BY p.created_at",[])?)),
+        "proposals"=>Ok(json!(ctx.db.query("SELECT p.*,r.kind,r.handle,r.agent_id,COALESCE(r.repo_id,a.repo_id) AS repo_id,COALESCE(a.name,json_extract(r.meta,'$.agent_name')) AS agent_name FROM teardown_proposals p JOIN resources r ON r.id=p.resource_id LEFT JOIN agents a ON a.id=r.agent_id WHERE p.state='pending' AND r.state!='released' ORDER BY p.created_at",[])?)),
         "approve"|"dismiss"=>{
             let _q=REAP_QUEUE.lock().map_err(|e|e.to_string())?;
             let ids=args["ids"].as_array().ok_or("ids must be an array")?;let mut results=Vec::new();

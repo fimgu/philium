@@ -1712,6 +1712,13 @@ fn with_live(ctx: &Ctx, row: Value) -> Value {
     with_live_snapshot(&snap, row)
 }
 
+/// Same live projection as `agents.list` (state, error, warnings incl. clashes) for any rows,
+/// so summaries elsewhere (workspace overview) cannot disagree with the Agents screen.
+pub fn enrich_rows(ctx: &Ctx, rows: Vec<Value>) -> Vec<Value> {
+    let snap = LiveSnapshot::capture(ctx);
+    rows.into_iter().map(|r| with_live_snapshot(&snap, r)).collect()
+}
+
 pub fn list(ctx: &Ctx) -> Result<Value, String> {
     let rows = ctx.db.query(
         "SELECT a.*, t.title AS task_title, r.name AS repo_name, w.path AS worktree, w.branch AS branch
@@ -1783,8 +1790,8 @@ fn reserve_local_kind(ctx: &Ctx, aid: &str, name: &str, meta: Value) -> Result<S
     let rid = new_id();
     let limit = local_kind_limit(ctx);
     let inserted = ctx.db.exec(
-        "INSERT INTO resources(id,agent_id,kind,handle,meta,created_at)
-         SELECT ?1,?2,'kind_cluster',?3,?4,?5
+        "INSERT INTO resources(id,agent_id,kind,handle,meta,created_at,repo_id)
+         SELECT ?1,?2,'kind_cluster',?3,?4,?5,(SELECT repo_id FROM agents WHERE id=?2)
          WHERE (SELECT count(*) FROM resources WHERE kind='kind_cluster' AND state!='released') < ?6
            AND NOT EXISTS (SELECT 1 FROM resources WHERE kind='kind_cluster' AND state!='released' AND (agent_id=?2 OR handle=?3))",
         rusqlite::params![rid, aid, name, meta.to_string(), now(), limit],

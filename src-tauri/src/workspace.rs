@@ -764,10 +764,16 @@ fn dispatch(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, String> 
             let r = repo(ctx, &id).ok_or_else(|| crate::ctx::not_found("Unknown repository"))?;
             // IDs only. No host scan, kubeconfig access, Git invocation, or legacy name inference.
             let tasks = ctx.db.query("SELECT id,title,status,owner,assigned FROM tasks WHERE repo_id=?1 AND status NOT IN ('done','cancelled') AND board_cleared=0 ORDER BY updated_at DESC,id LIMIT 21", [&id])?;
-            let agents = ctx.db.query("SELECT id,name,state,role FROM agents WHERE repo_id=?1 ORDER BY CASE state WHEN 'waiting' THEN 0 WHEN 'failed' THEN 1 ELSE 2 END,last_active_at DESC,id LIMIT 21", [&id])?;
+            // Attention (waiting, failed, clashes) and coordinators are judged over every agent with the
+            // same live projection as the Agents screen. Only the displayed preview list is capped.
+            let all_agents = crate::agents::enrich_rows(ctx, ctx.db.query("SELECT * FROM agents WHERE repo_id=?1 ORDER BY CASE state WHEN 'waiting' THEN 0 WHEN 'failed' THEN 1 ELSE 2 END,last_active_at DESC,id", [&id])?);
+            let slim = |a: &Value| json!({"id":a["id"],"name":a["name"],"state":a["state"],"role":a["role"],"error":a["error"],"warnings":a["warnings"]});
+            let needs: Vec<Value> = all_agents.iter().filter(|a| matches!(a["state"].as_str(), Some("waiting" | "failed")) || a["warnings"].as_array().is_some_and(|w| w.iter().any(|w| w["kind"] == "clash"))).map(slim).collect();
+            let coordinators: Vec<Value> = all_agents.iter().filter(|a| matches!(a["role"].as_str(), Some("orchestrator" | "coordinator"))).map(slim).collect();
+            let agents: Vec<Value> = all_agents.iter().take(21).map(slim).collect();
             let worktrees = ctx.db.query("SELECT id,branch,path,state FROM worktrees WHERE repo_id=?1 ORDER BY created_at DESC,id LIMIT 21", [&id])?;
-            let resources = ctx.db.query("SELECT r.id,r.kind,r.handle,r.state,a.name AS owner FROM resources r JOIN agents a ON a.id=r.agent_id WHERE a.repo_id=?1 AND r.state!='released' ORDER BY CASE r.state WHEN 'leaked' THEN 0 ELSE 1 END,r.created_at DESC,r.id LIMIT 21", [&id])?;
-            Ok(json!({"repo_id":id,"path":r["path"],"tasks":tasks,"agents":agents,"worktrees":worktrees,"resources":resources,"pilot":crate::pilot::active()}))
+            let resources = ctx.db.query("SELECT r.id,r.kind,r.handle,r.state,COALESCE(a.name,json_extract(r.meta,'$.agent_name'),'Removed agent') AS owner FROM resources r LEFT JOIN agents a ON a.id=r.agent_id WHERE COALESCE(r.repo_id,a.repo_id)=?1 AND r.state!='released' ORDER BY CASE r.state WHEN 'leaked' THEN 0 ELSE 1 END,r.created_at DESC,r.id LIMIT 21", [&id])?;
+            Ok(json!({"repo_id":id,"path":r["path"],"tasks":tasks,"agents":agents,"agent_total":all_agents.len(),"attention":needs,"coordinators":coordinators,"worktrees":worktrees,"resources":resources,"pilot":crate::pilot::active()}))
         }
         "repos_list" => {
             let mut rows = ctx.db.query("SELECT r.*,(SELECT count(*) FROM worktrees w WHERE w.repo_id=r.id) AS worktree_count FROM repos r ORDER BY name", [])?;
@@ -1806,5 +1812,28 @@ esac
         assert_eq!((feat["ahead"].as_u64(), feat["behind"].as_u64()), (Some(1), Some(0)));
         remove_worktree(&ctx, &w.id, true).unwrap();
         std::fs::remove_dir_all(ctx.root.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn overview_counts_every_agent_and_keeps_leaks_of_removed_agents() {
+        let ctx = Ctx::test();
+        crate::board::init(&ctx).unwrap();
+        ctx.db.exec("INSERT INTO repos(id,name,path,added_at) VALUES('r1','r1','/tmp/philium-overview-r1',0)", []).unwrap();
+        for i in 0..25 {
+            let state = if i == 24 { "waiting" } else { "done" };
+            let role = if i == 23 { "orchestrator" } else { "worker" };
+            ctx.db.exec("INSERT INTO agents(id,name,role,model_ref,state,repo_id,created_at,last_active_at) VALUES(?1,?1,?2,'m',?3,'r1',?4,?4)", params![format!("a{i}"), role, state, i]).unwrap();
+        }
+        crate::reaper::register(&ctx, Some("a0"), "process", "4242", json!({}));
+        ctx.db.exec("UPDATE resources SET state='leaked'", []).unwrap();
+        ctx.db.exec("DELETE FROM agents WHERE id='a0'", []).unwrap();
+        let o = dispatch(&ctx, "overview", json!({"repo_id":"r1"})).unwrap();
+        assert_eq!(o["agents"].as_array().unwrap().len(), 21, "preview stays capped");
+        assert_eq!(o["agent_total"], 24);
+        assert_eq!(o["attention"].as_array().unwrap().len(), 1, "the waiting agent counts even outside the preview");
+        assert_eq!(o["coordinators"].as_array().unwrap().len(), 1);
+        let res = o["resources"].as_array().unwrap();
+        assert_eq!(res.len(), 1, "leak survives its agent: {res:?}");
+        assert_eq!(res[0]["owner"], "a0");
     }
 }

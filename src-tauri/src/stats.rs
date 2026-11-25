@@ -109,6 +109,8 @@ fn empty_agg() -> Value {
         "avg_tps": Value::Null,
         "cost": 0.0,
         "unpriced_requests": 0usize,
+        "priced": 0,
+        "included": 0,
         "error_rate": 0.0,
         "guard_actions": BTreeMap::<String, usize>::new(),
     })
@@ -153,7 +155,9 @@ const AGG_COLS: &str = "
     AVG(r.tps),
     COALESCE(SUM(r.cost), 0.0),
     COALESCE(SUM(CASE WHEN r.cost IS NULL AND COALESCE(r.billing, '') != 'included' THEN 1 ELSE 0 END), 0),
-    COALESCE(SUM(CASE WHEN COALESCE(r.status, 0) >= 400 OR o.state IN ('error', 'blocked') THEN 1 ELSE 0 END), 0)
+    COALESCE(SUM(CASE WHEN COALESCE(r.status, 0) >= 400 OR o.state IN ('error', 'blocked') THEN 1 ELSE 0 END), 0),
+    COALESCE(SUM(CASE WHEN r.cost IS NOT NULL AND COALESCE(r.billing, '') != 'included' THEN 1 ELSE 0 END), 0),
+    COALESCE(SUM(CASE WHEN r.billing = 'included' THEN 1 ELSE 0 END), 0)
 ";
 
 fn read_agg_row(row: &rusqlite::Row<'_>, offset: usize, guards: BTreeMap<String, usize>) -> rusqlite::Result<Value> {
@@ -171,7 +175,9 @@ fn read_agg_row(row: &rusqlite::Row<'_>, offset: usize, guards: BTreeMap<String,
     let cost = row.get::<_, f64>(offset + 7)?;
     let unpriced = row.get::<_, i64>(offset + 8)?.max(0) as usize;
     let errors = row.get::<_, i64>(offset + 9)?.max(0) as usize;
-    Ok(agg_json(
+    let priced = row.get::<_, i64>(offset + 10)?.max(0);
+    let included = row.get::<_, i64>(offset + 11)?.max(0);
+    let mut v = agg_json(
         n,
         tokens_in,
         tokens_out,
@@ -183,7 +189,11 @@ fn read_agg_row(row: &rusqlite::Row<'_>, offset: usize, guards: BTreeMap<String,
         unpriced,
         errors,
         guards,
-    ))
+    );
+    // Lets every screen use one honest cost label: dollars only when something was priced.
+    v["priced"] = json!(priced);
+    v["included"] = json!(included);
+    Ok(v)
 }
 
 fn sql_totals(c: &rusqlite::Connection, start: i64, repo_id: Option<&str>) -> rusqlite::Result<Value> {

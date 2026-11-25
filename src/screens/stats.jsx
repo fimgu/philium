@@ -15,15 +15,8 @@ import "../styles/account-usage.css";
 const RANGE_LABEL = { "24h": "last 24 hours", "7d": "last 7 days", "30d": "last 30 days" };
 const DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 
-/** Honest cost: a dollar figure only when something was actually priced. */
-export function costLabel(row) {
-  const priced = row?.priced ?? 0;
-  const included = row?.included ?? 0;
-  if (priced > 0 && row.cost > 0) return fmt.money(row.cost);
-  if (included > 0 && included >= (row.requests ?? 0)) return "On plan";
-  if (included > 0) return "Mostly on plan";
-  return "–";
-}
+export { costLabel } from "../lib/cost.js";
+import { costLabel } from "../lib/cost.js";
 
 function Heatmap(props) {
   // Backend rows are Thursday-first (epoch day 0); rotate to Monday-first.
@@ -275,7 +268,7 @@ export default function Stats() {
             <div class="st-sub">
               <h3>Where it went</h3>
               <div class="st-two">
-                <Breakdown title="Repos" rows={insights()?.repos} />
+                <Breakdown title="Workspaces" rows={insights()?.repos} />
                 <Breakdown title="Agents" rows={insights()?.agents} />
               </div>
             </div>

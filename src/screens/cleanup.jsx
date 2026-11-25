@@ -34,7 +34,7 @@ function Row(props) {
       <Dot state={props.dot} />
       <div class="cleanup-main">
         <div class="cleanup-title">
-          <strong>{props.owner || "Workspace"}</strong>
+          <strong title={props.owner || props.scoped ? "" : "Not tied to a workspace, so it shows in every workspace"}>{props.owner || (props.scoped ? "Removed agent" : "Machine-wide")}</strong>
           <span class="ws-muted">· {kind(props.kind)}</span>
           <Show when={props.badge}><Badge tone={props.tone}>{props.badge}</Badge></Show>
         </div>
@@ -88,7 +88,7 @@ export function Cleanup(props) {
       <Show when={pending().length}>
         <Group title="Ready to clean up" sub="Philium found these idle. Nothing is removed until you say so." rows={pending()}>
           {(p) => (
-            <Row dot={p.unsaved ? "warn" : ""} owner={p.agent_name} kind={p.kind} handle={p.handle} note={p.reason} badge={p.unsaved ? "Unsaved work" : null} tone="strict">
+            <Row dot={p.unsaved ? "warn" : ""} owner={p.agent_name} scoped={!!p.repo_id} kind={p.kind} handle={p.handle} note={p.reason} badge={p.unsaved ? "Unsaved work" : null} tone="strict">
               <Button size="sm" disabled={busy()} onClick={() => decide(p, false)}>Keep</Button>
               <Button size="sm" variant="primary" disabled={busy()} onClick={() => decide(p, true)}>{p.unsaved ? "Review and discard" : "Clean up"}</Button>
             </Row>
@@ -103,7 +103,7 @@ export function Cleanup(props) {
           action={<Show when={leaked().length > 1}><Button size="sm" disabled={busy()} onClick={() => forget(leaked().map((r) => r.id))}>Forget all</Button></Show>}
         >
           {(r) => (
-            <Row dot="bad" owner={r.agent_name} kind={r.kind} handle={r.handle} note={r.meta?.note}>
+            <Row dot="bad" owner={r.agent_name} scoped={!!r.repo_id} kind={r.kind} handle={r.handle} note={r.meta?.note}>
               <Button size="sm" disabled={busy()} title="Nothing is stopped or deleted. Philium just stops tracking it." onClick={() => forget([r.id])}>Forget</Button>
             </Row>
           )}
@@ -115,7 +115,7 @@ export function Cleanup(props) {
         rows={live()}
         empty={ledger.loading ? "Loading…" : "Nothing. Agents have not left anything running."}
       >
-        {(r) => <Row dot="live" owner={r.agent_name} kind={r.kind} handle={r.handle} note={`Since ${fmt.ago(r.created_at)}`} />}
+        {(r) => <Row dot="live" owner={r.agent_name} scoped={!!r.repo_id} kind={r.kind} handle={r.handle} note={`Since ${fmt.ago(r.created_at)}`} />}
       </Group>
       <Show when={!props.pilot}>
         <Group

@@ -31,10 +31,11 @@ export default function CheckoutHome(props) {
     rpc('pr_review.list', {repo_id: props.id}, {local: true}).catch(() => []));
   useVisibleEvent('pr_review:changed', () => refetchPrReviews(), { debounceMs: 300 });
   const [spawnPreset, setSpawnPreset] = createSignal(null);
-  const coordinators = () => (result()?.data?.agents || []).filter(a => a.role === 'orchestrator' || a.role === 'coordinator');
-  const waitingAgents = () => (result()?.data?.agents || []).filter(a => a.state === 'waiting');
-  const failedAgents = () => (result()?.data?.agents || []).filter(a => a.state === 'failed');
-  const repoClashes = () => (result()?.data?.agents || []).flatMap(a => (a.warnings || []).filter(w => w.kind === 'clash').map(w => ({ agent: a, text: w.text })));
+  const allOf = (key) => result()?.data?.[key] ?? result()?.data?.agents ?? [];
+  const coordinators = () => allOf('coordinators').filter(a => a.role === 'orchestrator' || a.role === 'coordinator');
+  const waitingAgents = () => allOf('attention').filter(a => a.state === 'waiting');
+  const failedAgents = () => allOf('attention').filter(a => a.state === 'failed');
+  const repoClashes = () => allOf('attention').flatMap(a => (a.warnings || []).filter(w => w.kind === 'clash').map(w => ({ agent: a, text: w.text })));
   const needsYouPrReviews = () => (prReviews() || []).filter(r => r.verdict === 'needs_you');
   const blockedTitles = (r) => (r.items || []).filter(it => it.status === 'blocked').map(it => it.title).join(', ');
   const needsYouCount = () => waitingAgents().length + failedAgents().length + repoClashes().length + needsYouPrReviews().length;

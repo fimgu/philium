@@ -79,7 +79,7 @@ CREATE TABLE IF NOT EXISTS leases (
 CREATE TABLE IF NOT EXISTS resources (
   id TEXT PRIMARY KEY, agent_id TEXT, kind TEXT NOT NULL, handle TEXT NOT NULL,
   meta TEXT, state TEXT NOT NULL DEFAULT 'live', created_at INTEGER NOT NULL,
-  released_at INTEGER);
+  released_at INTEGER, repo_id TEXT);
 CREATE TABLE IF NOT EXISTS teardown_proposals (
   id TEXT PRIMARY KEY, resource_id TEXT NOT NULL, reason TEXT NOT NULL,
   unsaved INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL DEFAULT 'pending',
@@ -156,6 +156,11 @@ impl Db {
         // review starts on the pull request's head, and its helpers with it.
         if !c.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('agents') WHERE name='base_ref')", [], |r| r.get::<_, bool>(0)).map_err(|e| e.to_string())? {
             c.execute_batch("ALTER TABLE agents ADD COLUMN base_ref TEXT").map_err(|e|e.to_string())?;
+        }
+        // A resource keeps its checkout after its agent row is deleted, so every screen that
+        // scopes leftovers by checkout (overview, cleanup) agrees about who owns a leak.
+        if !c.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('resources') WHERE name='repo_id')", [], |r| r.get::<_, bool>(0)).map_err(|e| e.to_string())? {
+            c.execute_batch("ALTER TABLE resources ADD COLUMN repo_id TEXT; UPDATE resources SET repo_id=(SELECT a.repo_id FROM agents a WHERE a.id=resources.agent_id) WHERE repo_id IS NULL;").map_err(|e|e.to_string())?;
         }
         let mut readers = Vec::with_capacity(READ_POOL_SIZE);
         let ro_flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;

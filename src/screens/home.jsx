@@ -5,6 +5,7 @@ import { Icon } from "../ui/icons.jsx";
 import { AgentChip } from "../ui/agent-chip.jsx";
 import { SpawnModal } from "../ui/spawn-modal.jsx";
 import { rpc, fmt } from "../lib/rpc.js";
+import { costLabel } from "../lib/cost.js";
 import { go } from "../lib/nav.js";
 import { useStore, activeRepoId } from "../lib/store.js";
 import { useVisibleEvent } from "../lib/visibility.js";
@@ -132,7 +133,7 @@ function GlobalHome() {
         <Stat label="Needs you" value={attention()} sub={attention() ? "see below" : "all clear"} />
         <Stat label="Requests (24h)" value={n(totals().requests)} sub={totals().error_rate ? `${(totals().error_rate * 100).toFixed(1)}% errors` : "no errors"} />
         <Stat label="Tokens (24h)" value={n((totals().tokens_in ?? 0) + (totals().tokens_out ?? 0))} sub={totals().avg_tps ? `${totals().avg_tps.toFixed(0)} tok/s avg` : ""} />
-        <Stat label="Cost (24h)" value={totals().cost != null ? `$${totals().cost.toFixed(2)}` : "n/a"} sub={totals().unpriced_requests ? `${totals().unpriced_requests} unpriced` : ""} />
+        <Stat label="Cost (24h)" value={costLabel(totals())} sub={totals().unpriced_requests ? `${totals().unpriced_requests} unpriced` : ""} />
         <Stat label="Secrets removed" value={n(guardCount(totals().guard_actions))} sub="24h · gateway" />
       </div>
 
