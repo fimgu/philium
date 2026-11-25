@@ -47,6 +47,29 @@ export async function checkHomeSetupLive(page) {
   await until(page, (w) => document.querySelector(".home-setup")?.innerText.includes(w), want, "Home setup MCP count after mcp:changed");
 }
 
+// A change that lands while the window is in the background must show as soon as the window is back.
+export async function checkHomeSetupBackground(page) {
+  const want = "1 skills, 1 MCP servers.";
+  const setVisible = (on) => page.evaluate((on) => {
+    Object.defineProperty(document, "hidden", { configurable: true, get: () => !on });
+    Object.defineProperty(document, "visibilityState", { configurable: true, get: () => (on ? "visible" : "hidden") });
+    document.dispatchEvent(new Event("visibilitychange"));
+  }, on);
+  await setVisible(false);
+  try {
+    await page.evaluate(() => {
+      window.__fixtures["skills.list"] = { ...(window.__fixtures["skills.list"] ?? {}), skills: [{ name: "bg-skill", description: "Added in the background", scope: "global", enabled: true }] };
+      window.__emit("library", {});
+    });
+    await new Promise((r) => setTimeout(r, 800));
+    const early = await page.evaluate(() => document.querySelector(".home-setup")?.innerText ?? "");
+    assert.ok(!early.includes(want), "refreshed while hidden");
+  } finally {
+    await setVisible(true);
+  }
+  await until(page, (w) => document.querySelector(".home-setup")?.innerText.includes(w), want, "Home setup after the window became visible again");
+}
+
 export async function checkSkillsLive(page) {
   const name = "live-skill-marker";
   const before = await page.evaluate(() => document.querySelector(".main")?.innerText ?? "");
