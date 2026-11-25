@@ -129,8 +129,23 @@ pub fn init(ctx: &Arc<Ctx>) -> Result<(), String> {
         "UPDATE terminals SET state='exited', ended_at=?1 WHERE state='running'",
         [db::now()],
     )?;
+    // Terminals of agents that no longer exist can never be opened from anywhere: drop them.
+    ctx.db.exec("DELETE FROM terminals WHERE agent_id IS NOT NULL AND agent_id NOT IN (SELECT id FROM agents)", [])?;
     manager(ctx);
     Ok(())
+}
+/// Called when an agent is removed: its shells are already stopped, so forget them.
+pub fn forget_agent(ctx: &Arc<Ctx>, agent_id: &str) {
+    kill_agent(ctx, agent_id);
+    let ids: Vec<String> = ctx.db.query("SELECT id FROM terminals WHERE agent_id=?1 AND state='exited'", [agent_id]).unwrap_or_default()
+        .iter().filter_map(|r| r["id"].as_str().map(str::to_owned)).collect();
+    if ids.is_empty() { return; }
+    let _ = ctx.db.exec("DELETE FROM terminals WHERE agent_id=?1 AND state='exited'", [agent_id]);
+    let m = manager(ctx);
+    let mut entries = m.entries.lk();
+    for id in &ids { entries.remove(id); }
+    drop(entries);
+    ctx.emit("terminals:changed", json!({"agent_id":agent_id}));
 }
 pub fn open(ctx: &Arc<Ctx>, o: Opts) -> Result<String, String> {
     open_in_repo(ctx, o, None)
@@ -424,6 +439,18 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
             }, repo_id
         )?));
     }
+    if method == "clear_exited" {
+        // Only finished shells; anything still running is left alone.
+        let ids: Vec<String> = ctx.db.query("SELECT id FROM terminals WHERE state='exited'", [])?
+            .iter().filter_map(|r| r["id"].as_str().map(str::to_owned)).collect();
+        ctx.db.exec("DELETE FROM terminals WHERE state='exited'", [])?;
+        let m = manager(ctx);
+        let mut entries = m.entries.lk();
+        for id in &ids { entries.remove(id); }
+        drop(entries);
+        ctx.emit("terminals:changed", json!({"cleared":ids.len()}));
+        return Ok(json!({"cleared":ids.len()}));
+    }
     let id = arg_str(&args, "id")?;
     match method {
         "write" => {
@@ -656,6 +683,45 @@ mod tests {
             assert!(terminal.process.lk().is_none());
             assert_eq!(snapshot(&ctx, &id, CAP).as_deref(), Some("finished"));
         }
+    }
+
+    fn count(ctx: &Arc<Ctx>, sql: &str) -> i64 {
+        ctx.db.query(sql, []).unwrap()[0]["n"].as_i64().unwrap()
+    }
+
+    #[tokio::test]
+    async fn clear_exited_keeps_running_shells() {
+        let ctx = Ctx::test();
+        init(&ctx).unwrap();
+        let done = open(&ctx, options("exit 0", None)).unwrap();
+        wait(&ctx, &done);
+        let live = open(&ctx, options("sleep 30", None)).unwrap();
+        let r = call(&ctx, "clear_exited", json!({})).await.unwrap();
+        assert_eq!(r["cleared"], 1);
+        assert!(get(&ctx, &done).is_err());
+        assert!(get(&ctx, &live).is_ok());
+        assert_eq!(count(&ctx, "SELECT COUNT(*) n FROM terminals"), 1);
+        shutdown(&ctx);
+    }
+
+    #[test]
+    fn removed_agents_lose_their_terminals() {
+        let ctx = Ctx::test();
+        for id in ["gone", "kept"] {
+            ctx.db.exec("INSERT INTO agents(id,name,model_ref,created_at,last_active_at) VALUES(?1,?1,'test',0,0)", [id]).unwrap();
+        }
+        init(&ctx).unwrap();
+        let a = open(&ctx, options("exit 0", Some("gone"))).unwrap();
+        let b = open(&ctx, options("exit 0", Some("kept"))).unwrap();
+        wait(&ctx, &a);
+        wait(&ctx, &b);
+        forget_agent(&ctx, "gone");
+        assert!(get(&ctx, &a).is_err());
+        assert!(get(&ctx, &b).is_ok());
+        // A restart also drops rows whose agent row has disappeared.
+        ctx.db.exec("DELETE FROM agents WHERE id='kept'", []).unwrap();
+        init(&ctx).unwrap();
+        assert_eq!(count(&ctx, "SELECT COUNT(*) n FROM terminals"), 0);
     }
 }
 

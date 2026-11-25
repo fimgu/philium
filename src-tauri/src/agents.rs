@@ -2444,6 +2444,7 @@ async fn remove_one(ctx: &Arc<Ctx>, id: &str, force: bool) -> Result<Value, Stri
     }
     crate::browser::forget_agent(ctx, &id);
     crate::surfaces::forget_agent(ctx, &id);
+    crate::terminals::forget_agent(ctx, &id);
     ctx.db.exec("DELETE FROM agents WHERE id=?1", [&id])?;
     let _ = ctx.db.exec("DELETE FROM agent_queue WHERE agent_id=?1", [&id]);
     for k in ["agent_error", "agent_seq", "agent.retry"] {

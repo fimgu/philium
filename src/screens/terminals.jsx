@@ -188,6 +188,7 @@ export default function Terminals() {
   const [selected, setSelected] = createSignal(params()?.id ?? null),
     [panes, setPanes] = createSignal("1"),
     [showAll, setShowAll] = createSignal(false),
+    [showExited, setShowExited] = createSignal(false),
     [renaming, setRenaming] = createSignal(null),
     [renameTitle, setRenameTitle] = createSignal(""),
     [error, setError] = createSignal("");
@@ -234,9 +235,29 @@ export default function Terminals() {
 
   const scopedItems = createMemo(() => {
     const rid = activeRepoId();
-    if (!rid || showAll()) return items();
-    return items().filter((t) => t.workspace_id === rid);
+    const all = !rid || showAll() ? items() : items().filter((t) => t.workspace_id === rid);
+    // Finished shells stay out of the way unless asked for (or the one you are looking at).
+    return showExited() ? all : all.filter((t) => t.state === "running" || t.id === params()?.id);
   });
+  const exitedCount = createMemo(() => items().filter((t) => t.state !== "running").length);
+  const groups = createMemo(() => {
+    const m = new Map();
+    for (const t of scopedItems()) {
+      const key = t.agent_id ? t.agent_name || "Removed agent" : "";
+      if (!m.has(key)) m.set(key, []);
+      m.get(key).push(t);
+    }
+    return [...m].sort(([a], [b]) => (a === "" ? -1 : b === "" ? 1 : a.localeCompare(b)));
+  });
+  const clearExited = async () => {
+    try {
+      await rpc("terminals.clear_exited", {});
+      setShowExited(false);
+      await reload();
+    } catch (e) {
+      setError(String(e));
+    }
+  };
 
   createEffect(() => {
     const list = scopedItems();
@@ -297,7 +318,7 @@ export default function Terminals() {
   return (
     <Page
       title="Terminals"
-      sub="Persistent shells stay running when you leave this screen"
+      sub="Your shells and the commands agents run"
       flush
       actions={
         <>
@@ -311,6 +332,12 @@ export default function Terminals() {
                 ? `All terminals (${items().length})`
                 : `View all terminals (${items().length})`}
             </Button>
+          </Show>
+          <Show when={exitedCount() > 0}>
+            <Button size="sm" variant={showExited() ? "primary" : "ghost"} onClick={() => setShowExited(!showExited())}>
+              {showExited() ? "Hide finished" : `Show finished (${exitedCount()})`}
+            </Button>
+            <Button size="sm" variant="ghost" title="Forget every finished shell. Running ones are left alone." onClick={clearExited}>Clear finished</Button>
           </Show>
           <Segmented
             value={panes()}
@@ -329,10 +356,13 @@ export default function Terminals() {
           when={scopedItems().length}
           fallback={
             <Empty
-              title="Your persistent workspace"
+              title={exitedCount() > 0 && !showExited() ? "Nothing running" : "No terminals yet"}
               action={
                 <div class="row" style={{ gap: "8px", "justify-content": "center" }}>
                   <Button variant="primary" onClick={open}>Open a terminal</Button>
+                  <Show when={exitedCount() > 0 && !showExited()}>
+                    <Button onClick={() => setShowExited(true)}>Show finished ({exitedCount()})</Button>
+                  </Show>
                   <Show when={hiddenCount() > 0 && !showAll()}>
                     <Button onClick={() => setShowAll(true)}>
                       All terminals ({items().length})
@@ -341,8 +371,7 @@ export default function Terminals() {
                 </div>
               }
             >
-              Run a shell here, or watch an agent's commands. Return at any time
-              to see recent output.
+              Open a shell here. Commands agents run show up too, grouped by agent, while they run.
               <Show when={hiddenCount() > 0 && !showAll()}>
                 {` (${hiddenCount()} terminal${hiddenCount() === 1 ? "" : "s"} in other workspaces or personal shells hidden by workspace filter.)`}
               </Show>
@@ -350,16 +379,23 @@ export default function Terminals() {
           }
         >
           <nav class="terminal-tabs" aria-label="Terminal tabs">
-            <For each={scopedItems()}>
-              {(t) => (
-                <button
-                  class={selected() === t.id ? "on" : ""}
-                  onClick={() => setSelected(t.id)}
-                >
-                  {t.title}
-                  {t.agent_name ? ` · ${t.agent_name}` : ""}
-                  {t.state !== "running" ? " · exited" : ""}
-                </button>
+            <For each={groups()}>
+              {([owner, list]) => (
+                <div class="terminal-group">
+                  <span class="terminal-group-label">{owner || "You"}</span>
+                  <For each={list}>
+                    {(t) => (
+                      <button
+                        class={selected() === t.id ? "on" : ""}
+                        title={t.title}
+                        onClick={() => setSelected(t.id)}
+                      >
+                        <span class={`dot ${t.state === "running" ? "live" : ""}`} />
+                        <span class="ellipsis">{t.agent_name && t.title.startsWith(`${t.agent_name}: `) ? t.title.slice(t.agent_name.length + 2) : t.title}</span>
+                      </button>
+                    )}
+                  </For>
+                </div>
               )}
             </For>
             <Show when={activeRepoId() && hiddenCount() > 0 && !showAll()}>
