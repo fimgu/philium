@@ -47,9 +47,9 @@ function GlobalHome() {
   const agents = store.agents;
   const providers = store.providers;
   const repos = store.repos;
-  const [tasks, tk] = createResource(() => rpc("board.list", {}).catch(() => []));
+  const [tasks, tk] = createResource(() => rpc("board.list", { visible_only: true }).catch(() => []));
   const [proposals, pr] = createResource(() => rpc("reaper.proposals").catch(() => []));
-  const [leaked] = createResource(() => rpc("reaper.ledger", { state: "leaked" }).catch(() => []));
+  const [leaked, lk] = createResource(() => rpc("reaper.ledger", { state: "leaked" }).catch(() => []));
   const [stats, st] = createResource(() => rpc("stats.summary", { range: "24h" }).catch(() => null));
   const [events, ev] = createResource(() => rpc("app.events", { limit: 30 }).catch(() => []));
   const [disk] = createResource(() => rpc("app.disk").catch(() => null));
@@ -63,7 +63,8 @@ function GlobalHome() {
   useVisibleEvent("event", () => { ev.refetch(); st.refetch(); }, { debounceMs: 300 });
   useVisibleEvent("codeindex:clashes", () => cl.refetch(), { debounceMs: 300 });
   useVisibleEvent("reaper:proposals", () => pr.refetch(), { debounceMs: 200 });
-  useVisibleEvent("reaper:changed", () => pr.refetch(), { debounceMs: 200 });
+  useVisibleEvent("reaper:changed", () => { pr.refetch(); lk.refetch(); }, { debounceMs: 200 });
+  useVisibleEvent("agents:changed", () => lk.refetch(), { debounceMs: 300 });
   useVisibleEvent("library", () => libSt.refetch(), { debounceMs: 300 });
 
   const live = createMemo(() => (agents() ?? []).filter((a) => a.live));
@@ -184,10 +185,10 @@ function GlobalHome() {
             </Show>
             <For each={leaked()}>
               {(r) => (
-                <div class="list-item" onClick={() => go("settings")}>
+                <div class="list-item">
                   <Dot state="bad" />
-                  <span class="grow small ellipsis">Leaked {r.kind}: <span class="mono xs">{r.handle}</span></span>
-                  <Badge tone="danger">leaked</Badge>
+                  <span class="grow small ellipsis" title={r.meta?.note || ""}>{r.agent_name ? `${r.agent_name} · ` : ""}{r.kind} Philium could not stop: <span class="mono xs">{r.handle}</span></span>
+                  <Button size="sm" title="You checked it is gone or will handle it yourself. Nothing is stopped or deleted." onClick={() => rpc("reaper.forget", { ids: [r.id] }, { action: true }).catch((e) => toast(String(e), "danger"))}>Forget</Button>
                 </div>
               )}
             </For>

@@ -1,7 +1,7 @@
 import { For, Show, createResource, createSignal } from 'solid-js';
 import { SpawnModal } from '../ui/spawn-modal.jsx';
 import { AgentChip } from '../ui/agent-chip.jsx';
-import { Page, Button, Dot } from '../ui/kit.jsx';
+import { Page, Button, Dot, toast } from '../ui/kit.jsx';
 import { Icon } from '../ui/icons.jsx';
 import { go } from '../lib/nav.js';
 import { rpc } from '../lib/rpc.js';
@@ -91,7 +91,11 @@ export default function CheckoutHome(props) {
         {w => <div class="checkout-row"><span title={w.path}>{w.branch}</span><small>{w.state}</small></div>}
       </Records>
       <Records title="Resources" rows={d().resources} empty="None active.">
-        {r => <div class="checkout-row"><span><strong>{r.owner}</strong> · {r.kind} <code>{r.handle}</code></span><small>{r.state}</small></div>}
+        {r => <div class="checkout-row"><span><strong>{r.owner}</strong> · {r.kind} <code>{r.handle}</code></span>
+          <Show when={r.state === 'leaked'} fallback={<small>{r.state}</small>}>
+            <span class="row"><small title="Philium could not stop this safely. Check it yourself.">could not stop</small>
+              <Button size="sm" title="You checked it is gone or will handle it yourself. Nothing is stopped or deleted." onClick={() => rpc('reaper.forget', {ids:[r.id]}, {action:true}).catch(e => toast(String(e), 'danger'))}>Forget</Button></span>
+          </Show></div>}
       </Records>
     </div>}</Show>
     <Show when={spawnPreset()}><SpawnModal preset={spawnPreset()} onClose={(a) => { setSpawnPreset(null); if (a) go('agents', { id: a.id }); }} /></Show>

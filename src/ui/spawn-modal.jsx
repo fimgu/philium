@@ -6,6 +6,7 @@ import { go } from "../lib/nav.js";
 import { useStore, activeRepoId } from "../lib/store.js";
 import { spawnRepoDefault } from "../lib/agent-workspace.js";
 import { repoLabels } from "../lib/repo-labels.js";
+import { useVisibleEvent } from "../lib/visibility.js";
 
 /** Spawn dialog: name, role, model (live list), repo, task, brief, Strict. */
 export function SpawnModal(props) {
@@ -15,7 +16,8 @@ export function SpawnModal(props) {
   const providers = store.providers;
   const repos = store.repos;
   const labels = createMemo(() => repoLabels(repos() ?? []));
-  const [tasks] = createResource(() => rpc("board.list", { status: "open" }).catch(() => []));
+  const [tasks, { refetch: refetchTasks }] = createResource(() => rpc("board.list", { status: "open", visible_only: true }).catch(() => []));
+  useVisibleEvent("board:changed", () => refetchTasks(), { debounceMs: 200 });
   const def = store.defaultModel;
   const [name, setName] = createSignal(props.preset?.name ?? "");
   const [role, setRole] = createSignal(props.preset?.role ?? "worker");

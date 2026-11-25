@@ -514,6 +514,7 @@ fn remove(ctx: &Arc<Ctx>, r: &Value, force: bool) -> Result<Value, String> {
         Err(e) => {
             ctx.db
                 .exec("UPDATE resources SET state='leaked' WHERE id=?1", [id])?;
+            ctx.emit("reaper:changed", json!({"id":id}));
             ctx.log_event(
                 "reaper:leaked",
                 r["agent_id"].as_str(),
@@ -930,7 +931,21 @@ fn dispatch(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, String> 
                 match remove(ctx,&r,true){Ok(v)=>{ctx.db.exec("UPDATE teardown_proposals SET state='approved' WHERE id=?1",[id])?;results.push(v)},Err(e)=>results.push(json!({"id":id,"error":e}))}
             }ctx.emit("reaper:proposals",json!({"changed":true}));Ok(json!(results))
         }
-        "sweep_now"=>{ let scan=reconcile(ctx)?; let mut result=sweep(ctx)?; result["reconciliation"]=scan; Ok(result) },"orphans"=>orphans(ctx),_=>Err(format!("reaper.{method}: unknown method"))
+        "sweep_now"=>{ let scan=reconcile(ctx)?; let mut result=sweep(ctx)?; result["reconciliation"]=scan; Ok(result) },"orphans"=>orphans(ctx),
+        // The person checked a leaked resource by hand (it is gone, or they will deal with it):
+        // stop tracking it. Only leaked records qualify; nothing is signalled or deleted.
+        "forget"=>{
+            let _q=REAP_QUEUE.lock().map_err(|e|e.to_string())?;
+            let ids=args["ids"].as_array().ok_or("ids must be an array")?;let mut forgot=Vec::new();
+            for id in ids.iter().filter_map(Value::as_str){
+                if ctx.db.exec("UPDATE resources SET state='released',released_at=?1 WHERE id=?2 AND state='leaked'",params![now(),id])?>0{
+                    ctx.log_event("reaper:forget",None,&json!({"id":id}));forgot.push(id.to_string());
+                }
+            }
+            if !forgot.is_empty(){ctx.emit("reaper:changed",json!({"ids":forgot}));}
+            Ok(json!({"forgot":forgot}))
+        },
+        _=>Err(format!("reaper.{method}: unknown method"))
     }
 }
 #[cfg(test)]
@@ -1102,6 +1117,20 @@ mod tests {
         ctx.db.exec("DELETE FROM resources WHERE id=?1", [own.as_str()]).unwrap();
         let again = teardown_agent(&ctx, "a", true).unwrap();
         assert_eq!(again["needs_confirmation"], false, "nothing is left blocking removal: {again}");
+        std::fs::remove_dir_all(ctx.root.parent().unwrap()).unwrap();
+    }
+    #[test]
+    fn forget_only_drops_leaked_records() {
+        let ctx = Ctx::test();
+        schema(&ctx).unwrap();
+        let leaked = register(&ctx, None, "process", "vite on :42103", json!({}));
+        let live = register(&ctx, None, "process", "still running", json!({}));
+        ctx.db.exec("UPDATE resources SET state='leaked' WHERE id=?1", [leaked.as_str()]).unwrap();
+        let r = dispatch(&ctx, "forget", json!({"ids":[leaked, live]})).unwrap();
+        assert_eq!(r["forgot"], json!([leaked]));
+        let state = |id: &str| ctx.db.query("SELECT state FROM resources WHERE id=?1", [id]).unwrap()[0]["state"].clone();
+        assert_eq!(state(&leaked), "released");
+        assert_eq!(state(&live), "live", "a live resource is never forgotten");
         std::fs::remove_dir_all(ctx.root.parent().unwrap()).unwrap();
     }
     #[test]

@@ -4,6 +4,7 @@ import { go } from '../lib/nav.js';
 import { Page, Button } from '../ui/kit.jsx';
 import { ManagedJobs } from './managed-jobs.jsx';
 import { rpc } from '../lib/rpc.js';
+import { useVisibleEvent } from '../lib/visibility.js';
 
 const read = (m, args) => rpc(`environments.${m}`, args, { local: true });
 
@@ -152,13 +153,14 @@ function Inventory(props) {
 }
 
 function Recorded(props) {
-  const [r] = createResource(async () => {
+  const [r, { refetch }] = createResource(async () => {
     try {
       return { rows: (await rpc('workspace.overview', { repo_id: props.id }, { local: true })).resources };
     } catch (e) {
       return { error: String(e) };
     }
   });
+  for (const topic of ['reaper:changed', 'agents:changed']) useVisibleEvent(topic, () => refetch(), { debounceMs: 300 });
   return (
     <section>
       <h3 title="From this workspace's agent resource ledger.">{props.name} · recorded resources</h3>
