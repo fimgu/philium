@@ -289,7 +289,7 @@ async function open(fx, setName, w, h, route) {
   const page = await browser.newPage();
   await page.setViewport({ width: w, height: h, deviceScaleFactor: 1 });
   await page.evaluateOnNewDocument(`(${stub.toString()})(${JSON.stringify(fx)}, ${JSON.stringify(setName)})`);
-  await page.evaluateOnNewDocument((r) => {localStorage.setItem("route", r);if(r==='board')localStorage.setItem('agents.viewMode','grid');if(r==='environments')localStorage.setItem('philium.activeRepo','r1');}, route);
+  await page.evaluateOnNewDocument((r) => {localStorage.setItem("route", r);if(r==='board')localStorage.setItem('agents.viewMode','grid');if(r==='environments')localStorage.setItem('philium.activeRepo','r1');else localStorage.removeItem('philium.activeRepo');}, route);
   page.on("pageerror", (e) => { problems.push(`${setName} ${route} pageerror: ${e.message}`); });
   page.on("console", (m) => { if (m.type() === "error") problems.push(`${setName} ${route} console.error: ${m.text().slice(0, 200)}`); });
   await page.goto(`http://127.0.0.1:${port}/`);
