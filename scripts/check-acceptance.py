@@ -625,7 +625,8 @@ await workspace(P.checkout);
 const box = await releaseCheck();
 const setup = await until(() => box.querySelector('details[aria-label="Release verification setup"]'), 'setup');
 const pinned = () => txt(setup.querySelector('[aria-label="Pinned verifier"]'));
-const access = () => txt(setup.querySelector('[aria-label="Origin read access"]'));
+const tokenBox = () => box.querySelector('details[aria-label="GitHub token"]');
+const access = () => txt(box.querySelector('[aria-label="Origin read access"]'));
 const summary = () => txt(box.querySelector('[aria-label="Verification setup summary"]'));
 const status_ = () => txt(all('p[role="status"]', box)[0]);
 const out = { summaryAtOpen: await until(() => (summary().includes('pinned at') ? summary() : null), 'saved setup shown', 6000).catch(() => summary()) };
@@ -644,10 +645,10 @@ if (P.pin) {
   out.pinResult = await until(() => (pinned().includes(out.proposed.length ? 'You confirmed its checks' : 'pinned at') && !all('button', setup).find((b) => txt(b) === 'Confirm and pin').disabled ? 'pinned' : (status_().startsWith('Checks confirmed') ? 'pinned' : (status_() && !status_().startsWith('Checks') ? status_() : null))), 'verifier pinned', 25000).catch((e) => String(e));
 }
 if (P.token) {
-  if (!setup.open) setup.querySelector('summary').click();
-  type(setup.querySelector('input[aria-label="GitHub read-only token"]'), P.token);
-  await click('Save token', setup);
-  await until(() => access().includes('A read-only token is saved'), 'token saved', 15000);
+  if (!tokenBox().open) tokenBox().querySelector('summary').click();
+  type(tokenBox().querySelector('input[aria-label="GitHub read-only token"]'), P.token);
+  await click('Save token', tokenBox());
+  await until(() => access().includes('Read-only token saved'), 'token saved', 15000);
 }
 out.pinned = pinned(); out.access = access();
 const status = () => txt(all('p[role="status"]', box)[0]);

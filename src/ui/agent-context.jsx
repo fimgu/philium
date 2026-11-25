@@ -219,7 +219,7 @@ export function AgentContext(props) {
                 <div class="mem-card proposed">
                   <div class="mem-body">{m.content}</div>
                   <div class="row" style={{ "justify-content": "flex-end" }}>
-                    <Button size="sm" variant="ghost" onClick={() => forget(m.id)}>Dismiss</Button>
+                    <Button size="sm" variant="ghost" title="Turn down this suggested memory. It is not saved." onClick={() => forget(m.id)}>Reject</Button>
                     <Button size="sm" variant="primary" onClick={() => promote(m.id)}><Icon name="check" size={11} /> Approve</Button>
                   </div>
                 </div>

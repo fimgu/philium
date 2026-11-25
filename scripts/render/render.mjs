@@ -20,6 +20,8 @@ const out = path.resolve(args.find((a) => !a.startsWith("--")) ?? path.join(here
 const opt = (k, d) => (args.find((a) => a.startsWith(`--${k}=`)) ?? `--${k}=${d}`).split("=")[1];
 const only = opt("only", "").split(",").filter(Boolean);
 const sets = opt("sets", "empty,populated,failing,slow,huge").split(",");
+// --overlap: also flag visible controls and text runs whose boxes collide.
+const overlap = args.includes("--overlap");
 const CHROME = process.env.CHROME ?? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 const SIZES = [[1440, 900], [1280, 800]];
 const SCREENS = ["home", "agents", "board", "review", "environments", "chat", "terminals", "browser", "repos", "code", "activity", "stats", "providers", "settings"];
@@ -151,6 +153,7 @@ const stub = (fx, setName, serveOnly = false) => {
         if(a.method==='environments.containers') return [{id:'a'.repeat(64),name:`${a.args.profile}-node`,cluster:'sandbox',image:'fixture:local',status:'Up'}];
         if(a.method==='environments.logs') {if(window.__test.holdLogs)await new Promise(resolve=>window.__test.releaseLogs=resolve);return {text:`${a.args.profile} fixture log`,truncated:false};}
         if (a.method === "agents.get_effort") return window.__test.efforts?.[a.args.id] ?? "default";
+        if (a.method === "app.settings_get" && localStorage.getItem("route") === "review") return { ...(fx["app.settings_get"] ?? {}), release_engineering_tools: "true" };
         if (a.method === "agents.set_effort") {
           if (window.__test.holdEffort) await new Promise((resolve) => { window.__test.releaseEffort = resolve; });
           (window.__test.efforts ??= {})[a.args.id] = a.args.effort;
@@ -289,7 +292,7 @@ async function open(fx, setName, w, h, route) {
   const page = await browser.newPage();
   await page.setViewport({ width: w, height: h, deviceScaleFactor: 1 });
   await page.evaluateOnNewDocument(`(${stub.toString()})(${JSON.stringify(fx)}, ${JSON.stringify(setName)})`);
-  await page.evaluateOnNewDocument((r) => {localStorage.setItem("route", r);if(r==='board')localStorage.setItem('agents.viewMode','grid');if(r==='environments')localStorage.setItem('philium.activeRepo','r1');else localStorage.removeItem('philium.activeRepo');}, route);
+  await page.evaluateOnNewDocument((r) => {localStorage.setItem("route", r);if(r==='board')localStorage.setItem('agents.viewMode','grid');else localStorage.removeItem('agents.viewMode');if(r==='environments')localStorage.setItem('philium.activeRepo','r1');else localStorage.removeItem('philium.activeRepo');}, route);
   page.on("pageerror", (e) => { problems.push(`${setName} ${route} pageerror: ${e.message}`); });
   page.on("console", (m) => { if (m.type() === "error") problems.push(`${setName} ${route} console.error: ${m.text().slice(0, 200)}`); });
   await page.goto(`http://127.0.0.1:${port}/`);
@@ -321,6 +324,53 @@ for (const setName of sets) {
         return out;
       });
       for (const b of bad) problems.push(`${setName} ${w}x${h} ${s}: ${b}`);
+      if (overlap) {
+        const hits = await page.evaluate(() => {
+          const main = document.querySelector(".main");
+          if (!main) return [];
+          // Leaf-ish things a person reads or clicks.
+          const els = [...main.querySelectorAll("button, a, input, select, textarea, .badge, h1, h2, h3, label, summary, code, strong, .dot")]
+            .filter((e) => {
+              const r = e.getBoundingClientRect();
+              if (r.width < 2 || r.height < 2) return false;
+              const cs = getComputedStyle(e);
+              if (cs.visibility === "hidden" || cs.opacity === "0" || cs.position === "fixed") return false;
+              // A label that wraps its control is a container, not a leaf.
+              if (e.tagName === "LABEL" && e.querySelector("input, select, textarea, button, details")) return false;
+              return !e.closest("[aria-hidden='true'], .toast, .modal, dialog, .tooltip, canvas, svg, .xterm, .board-drawer, .ws-diff, pre");
+            });
+          const label = (e) => `${e.tagName.toLowerCase()}${e.className && typeof e.className === "string" ? "." + e.className.trim().split(/\s+/)[0] : ""} "${(e.innerText || e.value || e.getAttribute("aria-label") || "").trim().slice(0, 24)}"`;
+          const out = [];
+          for (let i = 0; i < els.length && out.length < 6; i++) {
+            const a = els[i], ra = a.getBoundingClientRect();
+            for (let j = i + 1; j < els.length; j++) {
+              const b = els[j];
+              if (a.contains(b) || b.contains(a)) continue;
+              const rb = b.getBoundingClientRect();
+              const x = Math.min(ra.right, rb.right) - Math.max(ra.left, rb.left);
+              const y = Math.min(ra.bottom, rb.bottom) - Math.max(ra.top, rb.top);
+              // Tolerate shared borders and sub-pixel touches.
+              if (x <= 3 || y <= 3) continue;
+              // Content scrolling under a sticky header is intended, not a layout collision.
+              const sticky = (el) => { for (let n = el; n && n !== main; n = n.parentElement) if (getComputedStyle(n).position === "sticky") return n; return null; };
+              if (sticky(a) !== sticky(b)) continue;
+              // Only count it when both are actually painted at the shared spot (not clipped or scrolled away).
+              let cx = Math.max(ra.left, rb.left) + x / 2, cy = Math.max(ra.top, rb.top) + y / 2;
+              if (cx < 0 || cy < 0 || cx > innerWidth || cy > innerHeight) {
+                b.scrollIntoView({ block: "center", inline: "center" });
+                const r1 = a.getBoundingClientRect(), r2 = b.getBoundingClientRect();
+                cx = (Math.max(r1.left, r2.left) + Math.min(r1.right, r2.right)) / 2;
+                cy = (Math.max(r1.top, r2.top) + Math.min(r1.bottom, r2.bottom)) / 2;
+              }
+              const stack = document.elementsFromPoint(cx, cy);
+              const painted = (el) => stack.some((n) => n === el || el.contains(n));
+              if (painted(a) && painted(b)) { out.push(`overlap ${label(a)} × ${label(b)} (${Math.round(x)}x${Math.round(y)}px)`); break; }
+            }
+          }
+          return out;
+        });
+        for (const b of hits) problems.push(`${setName} ${w}x${h} ${s}: ${b}`);
+      }
       if (s === "stats" && setName === "populated") {
         try {
           await page.waitForFunction(() => {
@@ -344,7 +394,7 @@ for (const setName of sets) {
           await page.select(sel,'beta');await page.evaluate(()=>window.__test.releaseLogs());await page.waitForFunction(()=>document.querySelector('[aria-label="Runtime inventory"]')?.innerText.includes('beta'));
           if(await page.$('aside[aria-label="Container logs"]'))throw Error('Stale peer logs remained visible');
           await clickText(page,'button','Task sandboxes');if(await page.$('[aria-label="Runtime inventory"]')) throw Error('Machine inventory leaked into checkout');
-          await clickText(page,'button','New task sandbox');await page.waitForSelector('fieldset select option[value="t1"]');await page.select('fieldset select:has(option[value="t1"])','t1');await page.select('fieldset select:has(option:not([value]))','alpha');await page.type('fieldset textarea','echo marker');
+          await clickText(page,'button','New task sandbox');await page.waitForSelector('fieldset select option[value="t1"]');await page.select('fieldset select:has(option[value="t1"])','t1');await page.evaluate(()=>{const s=[...document.querySelectorAll('fieldset select')].find(x=>[...x.options].some(o=>o.value==='alpha'));s.value='alpha';s.dispatchEvent(new Event('change',{bubbles:true}));});await page.type('fieldset textarea','echo marker');
           await clickText(page,'button','Preview sandbox');await page.waitForFunction(()=>document.body.innerText.includes('Start offline sandbox')&&!window.__test.managed);await clickText(page,'button','Start offline sandbox');await page.waitForSelector('[aria-label="Managed task sandboxes"] summary');await page.click('[aria-label="Managed task sandboxes"] summary');await clickText(page,'button','Sandbox logs');await page.waitForFunction(()=>document.body.innerText.includes('fixture marker'));
           await page.click('[aria-label="Managed task sandboxes"] .ws-actions button:nth-child(2)');await clickText(page,'button','Release sandbox');await clickText(page,'button','Keep sandbox');if(await page.evaluate(()=>window.__test.managed.state)!=='active')throw Error('Dismissed release removed sandbox');await clickText(page,'button','Release sandbox');await clickText(page,'button','Confirm release');await page.waitForFunction(()=>document.body.innerText.includes('removal verified'));
         } catch(e){problems.push(`${w} environments: ${e.message}`);}

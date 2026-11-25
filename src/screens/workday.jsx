@@ -24,7 +24,7 @@ export default function Workday() {
         <For each={data().fallbacks} fallback={<p class="small faint">None recorded in this window.</p>}>{(f) => <p data-fallback={f.tool}><strong>{f.tool}</strong> · {new Date(f.ts).toLocaleString()} · {f.note || "No note"}</p>}</For>
       </section>
       <section aria-label="Completed actions"><h2>Completed in Philium: {data().completed}</h2>
-        <table><thead><tr><th>Action</th><th>Checkout</th><th>Completed</th><th>Failed</th><th>Last</th></tr></thead><tbody>
+        <table><thead><tr><th>Action</th><th>Workspace</th><th>Completed</th><th>Failed</th><th>Last</th></tr></thead><tbody>
           <For each={data().actions} fallback={<tr><td colspan="5">Nothing recorded in this window yet.</td></tr>}>{(a) => <tr data-action={a.method}><td>{a.action}</td><td>{a.checkout || "All workspaces"}</td><td>{a.completed}</td><td>{a.failed}</td><td>{fmt.ago(a.last)}</td></tr>}</For>
         </tbody></table>
       </section>

@@ -46,7 +46,7 @@ export function SpawnModal(props) {
   const submit = async (e) => {
     e?.preventDefault?.();
     if (busy()) return;
-    if (role() === "orchestrator" && !repo()) { setErr("Choose a repo so the coordinator can create tasks and helpers."); return; }
+    if (role() === "orchestrator" && !repo()) { setErr("Choose a workspace so the coordinator can create tasks and helpers."); return; }
     setBusy(true); setErr("");
     try {
       const a = await rpc("agents.spawn", {

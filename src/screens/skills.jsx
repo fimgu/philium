@@ -164,7 +164,7 @@ export default function Skills() {
                 <Input mono placeholder="name" value={s().name} disabled={!s().isNew} onValue={(v) => setSel({ ...s(), name: v, body: s().isNew ? s().body.replace(/^name: .*$/m, `name: ${v}`) : s().body })} />
                 <Show when={s().isNew && repo()}>
                   <Select value={s().scope} onValue={(v) => setSel({ ...s(), scope: v })}
-                    options={[{ value: "global", label: "Global" }, { value: `repo:${repo()}`, label: "This repo" }]} />
+                    options={[{ value: "global", label: "Global" }, { value: `repo:${repo()}`, label: "This workspace" }]} />
                 </Show>
                 <Show when={writable(s().scope)} fallback={<span class="xs dim">Shared skill, read-only here</span>}>
                   <Button onClick={save}>Save</Button>

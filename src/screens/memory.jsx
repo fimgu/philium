@@ -325,8 +325,8 @@ export default function Memory() {
     } catch (e) { toast(String(e), "danger"); }
   };
 
-  const forget = async (id) => {
-    try { await rpc("library.forget", { id }); toast("Deleted"); refreshAll(); }
+  const forget = async (id, done = "Deleted") => {
+    try { await rpc("library.forget", { id }); toast(done); refreshAll(); }
     catch (e) { toast(String(e), "danger"); }
   };
 
@@ -755,15 +755,18 @@ export default function Memory() {
                             <span class="grow" />
                             <div class="row card-actions" style={{ gap: "4px" }}>
                               <Show when={m.status === "proposed" || m.status === "quarantined"}>
+                                <Button size="sm" variant="ghost" title="Turn down this memory. It is not saved." onClick={() => forget(m.id, "Rejected")}>Reject</Button>
                                 <Button size="sm" variant="primary" onClick={() => promote(m.id)}><Icon name="check" size={11} /> Approve</Button>
                               </Show>
                               <Show when={m.status === "active"}>
                                 <Button size="sm" variant="ghost" onClick={() => beginSupersede(m)}>Update</Button>
                                 <Button size="sm" variant="ghost" onClick={() => quarantine(m.id)}>Block</Button>
                               </Show>
-                              <Button size="sm" variant="ghost" title="Delete" onClick={() => forget(m.id)}>
-                                <Icon name="trash" size={11} />
-                              </Button>
+                              <Show when={m.status !== "proposed" && m.status !== "quarantined"}>
+                                <Button size="sm" variant="ghost" title="Delete" aria-label="Delete" onClick={() => forget(m.id)}>
+                                  <Icon name="trash" size={11} />
+                                </Button>
+                              </Show>
                             </div>
                           </div>
                         </div>
