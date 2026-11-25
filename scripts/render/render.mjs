@@ -400,7 +400,7 @@ for (const setName of sets) {
         } catch(e){problems.push(`${w} environments: ${e.message}`);}
       }
       if (s === 'review' && setName === 'populated') {
-        try { await checkReviewPreview(page); } catch (e) { problems.push(`${w} review: ${e.message}`); }
+        try { await checkReviewPreview(page); await page.$eval('details[aria-label="More review tools"]', d => d.scrollIntoView()); await shot(page, 'review-tools'); } catch (e) { problems.push(`${w} review: ${e.message}`); }
       }
       if (s === "agents") {
         if (setName === "populated") await page.evaluate(() => { window.__test.holdShell = true; });

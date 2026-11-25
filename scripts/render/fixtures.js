@@ -161,6 +161,8 @@ const codeGraph = (() => {
 export const POPULATED = {
   ...EMPTY,
   "app.settings_get": { theme: "dark", sweep_hours: "24" },
+  // The backend returns null until contract checks are pinned.
+  "release_intake.sql_profile": null,
   "app.disk": { worktrees: { bytes: 1.4e9 }, repos: { bytes: 6.2e8 }, data: { bytes: 2.1e8 } },
   "app.events": [
     { id: 1, kind: "agent.spawned", ts: now - 20 * min, summary: "lion started", agent: "lion" },
