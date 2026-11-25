@@ -2001,7 +2001,7 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
                 picked.retain(|id| only.contains(&id.as_str()));
             }
             let name = |id: &str| rows.iter().find(|r| r["id"].as_str() == Some(id)).and_then(|r| r["name"].as_str()).unwrap_or(id).to_string();
-            let (mut removed, mut unsaved, mut kept) = (vec![], vec![], vec![]);
+            let (mut removed, mut unsaved, mut kept, mut left) = (vec![], vec![], vec![], vec![]);
             // Leaves first: an agent goes once none of its helpers remain.
             loop {
                 let remaining: Vec<String> = picked.iter().filter(|id| !removed.contains(*id) && !unsaved.iter().any(|u: &Value| u["id"].as_str() == Some(id.as_str())) && !kept.contains(*id)).cloned().collect();
@@ -2013,7 +2013,12 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
                 for id in ready {
                     match remove_one(ctx, &id, force).await {
                         Ok(r) if r["needs_confirmation"].as_bool() == Some(true) => unsaved.push(json!({ "id": id, "name": name(&id), "reason": r["reason"] })),
-                        Ok(_) => removed.push(id),
+                        Ok(r) => {
+                            for l in r["left"].as_array().into_iter().flatten() {
+                                left.push(json!({ "agent": name(&id), "handle": l["handle"], "note": l["note"] }));
+                            }
+                            removed.push(id)
+                        }
                         Err(_) => kept.push(id),
                     }
                 }
@@ -2022,6 +2027,7 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
                 "removed": removed.iter().map(|i| name(i)).collect::<Vec<_>>(),
                 "unsaved": unsaved,
                 "kept": kept.iter().map(|i| name(i)).collect::<Vec<_>>(),
+                "left": left,
             }))
         }
         "events" => {

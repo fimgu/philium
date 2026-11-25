@@ -536,6 +536,7 @@ fn process_rows(
     let mut proposals = Vec::new();
     let mut kept = Vec::new();
     let mut errors = Vec::new();
+    let mut left = Vec::new();
     for r in resources {
         if !explicit && !ctx.db.query("SELECT id FROM teardown_proposals WHERE resource_id=?1 AND state='dismissed' AND created_at>?2",params![strval(&r,"id")?,now()-24*HOUR])?.is_empty() {
             kept.push(r["id"].clone()); continue;
@@ -589,12 +590,39 @@ fn process_rows(
             Decision::Ask(reason) => proposals.push(propose(ctx, &r, reason, dirty)?),
             Decision::Remove(_) => match remove(ctx, &r, force && explicit) {
                 Ok(v) => removed.push(v),
-                Err(e) => errors.push(json!({"id":r["id"],"error":e})),
+                // What an agent noted down itself (often free text, no PID) may be impossible to
+                // tear down safely. Once the person confirms, stop tracking it instead of blocking
+                // the agent's removal forever. Nothing is signalled; it is reported as left behind.
+                Err(e) if force && explicit && m["by"] == "agent" => {
+                    if let Some(id) = r["id"].as_str() {
+                        release(ctx, id);
+                    }
+                    left.push(json!({"id":r["id"],"handle":r["handle"],"note":m["note"],"error":e}));
+                }
+                Err(e) => errors.push(json!({"id":r["id"],"handle":r["handle"],"error":e})),
             },
         }
     }
+    let reason = if !errors.is_empty() {
+        format!(
+            "Philium could not clean up: {}.",
+            errors.iter().map(|e| format!("{} ({})", e["handle"].as_str().unwrap_or("?"), e["error"].as_str().unwrap_or(""))).collect::<Vec<_>>().join("; ")
+        )
+    } else if !proposals.is_empty() {
+        let dirty = proposals.iter().any(|p| p["unsaved"] == true || p["unsaved"] == 1);
+        let what: Vec<String> = proposals.iter().filter_map(|p| p["handle"].as_str().map(str::to_string)).collect();
+        format!(
+            "{}It left behind: {}.",
+            if dirty { "Its folder has changes that were never committed. " } else { "" },
+            if what.is_empty() { "files and processes Philium tracks".to_string() } else { what.join("; ") }
+        )
+    } else if !kept.is_empty() {
+        "Some of what it created is still in use.".to_string()
+    } else {
+        String::new()
+    };
     Ok(
-        json!({"needs_confirmation":!proposals.is_empty() || !kept.is_empty() || !errors.is_empty(),"removed":removed,"proposals":proposals,"kept":kept,"errors":errors}),
+        json!({"needs_confirmation":!proposals.is_empty() || !kept.is_empty() || !errors.is_empty(),"reason":reason,"removed":removed,"proposals":proposals,"kept":kept,"errors":errors,"left":left}),
     )
 }
 pub fn teardown_agent(ctx: &Arc<Ctx>, agent_id: &str, force: bool) -> Result<Value, String> {
@@ -1051,6 +1079,29 @@ mod tests {
         assert_eq!(approved[0]["state"], "released");
         assert!(rows(&ctx, None, Some("live")).unwrap().is_empty());
         release(&ctx, &id);
+        std::fs::remove_dir_all(ctx.root.parent().unwrap()).unwrap();
+    }
+    #[test]
+    fn confirmed_removal_lets_go_of_agent_notes_it_cannot_tear_down() {
+        let ctx = Ctx::test();
+        schema(&ctx).unwrap();
+        ctx.db.exec("INSERT INTO agents(id,name,model_ref,state,created_at,last_active_at) VALUES('a','e2e','m','stopped',0,0)", []).unwrap();
+        // What agents really record: a free-text process with no PID and an `other` kind.
+        let note = |n: &str| json!({ "agent_name": "e2e", "by": "agent", "note": n });
+        register(&ctx, Some("a"), "process", "colima (default profile)", note("stop with colima stop"));
+        register(&ctx, Some("a"), "other", "e2e-kind-5592", note("make deploy-down"));
+        // Something Philium itself tracks stays protected even when forced.
+        let own = register(&ctx, Some("a"), "other", "philium-owned", json!({ "agent_name": "e2e" }));
+        let first = teardown_agent(&ctx, "a", false).unwrap();
+        assert_eq!(first["needs_confirmation"], true);
+        assert!(first["reason"].as_str().unwrap().contains("colima (default profile)"), "{}", first["reason"]);
+        let forced = teardown_agent(&ctx, "a", true).unwrap();
+        assert_eq!(forced["left"].as_array().unwrap().len(), 2, "the agent's own notes are let go and reported");
+        assert_eq!(forced["errors"].as_array().unwrap().len(), 1, "{forced}");
+        assert_eq!(forced["errors"][0]["id"], own.as_str());
+        ctx.db.exec("DELETE FROM resources WHERE id=?1", [own.as_str()]).unwrap();
+        let again = teardown_agent(&ctx, "a", true).unwrap();
+        assert_eq!(again["needs_confirmation"], false, "nothing is left blocking removal: {again}");
         std::fs::remove_dir_all(ctx.root.parent().unwrap()).unwrap();
     }
     #[test]

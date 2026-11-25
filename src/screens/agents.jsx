@@ -628,10 +628,12 @@ function AgentView(props) {
     const r = await rpc("agents.remove", { id: props.id }).catch((e) => ({ error: String(e) }));
     if (r?.error) return toast(r.error, "danger");
     if (r?.needs_confirmation) {
-      const ok = await confirm(`Remove ${a().name}?`, `${r.reason ?? "This agent has unsaved work."} ${(r.items ?? []).map((i) => i.handle ?? i).join(", ")}`, { danger: true, ok: "Delete anyway" });
+      const ok = await confirm(`Remove ${a().name}?`, `${r.reason || "This agent has unsaved work."} Remove it anyway? Anything Philium cannot stop safely is left running and listed afterwards.`, { danger: true, ok: "Remove anyway" });
       if (!ok) return;
       const r2 = await rpc("agents.remove", { id: props.id, force: true }).catch((e) => ({ error: String(e) }));
       if (r2?.error) return toast(r2.error, "danger");
+      if (r2?.needs_confirmation) return toast(r2.reason || `${a().name} could not be removed`, "danger");
+      if (r2?.left?.length) toast(`Philium stopped tracking these but could not stop them safely, so check them yourself: ${r2.left.map((l) => l.handle).join("; ")}`, "danger");
     }
     toast(`${a().name} removed`);
     go("agents", {});
@@ -1109,24 +1111,40 @@ export default function Agents() {
   const scoped = createMemo(() => workspaceAgents(list() ?? [], activeRepoId(), store.repos() ?? []));
   // Stopped or failed agents in the active workspace scope: what they found stays in Review and Board after they go.
   const finished = createMemo(() => scoped().filter((a) => a.state === "stopped" || a.state === "failed"));
+  // One bulk removal, shared by "Remove finished" and a picked selection. Agents the backend
+  // could not clean up are explained with the real reason, and a confirmed retry also takes
+  // the leads their helpers were blocking.
+  async function removeAgents(scope, ids) {
+    const r = await rpc("agents.remove_many", { scope, ids }, { action: true }).catch((e) => ({ error: String(e) }));
+    if (r.error) { toast(r.error, "bad"); return null; }
+    const removed = [...(r.removed ?? [])];
+    const left = [...(r.left ?? [])];
+    let kept = r.kept ?? [];
+    if (r.unsaved?.length) {
+      const why = r.unsaved.map((u) => `${u.name}: ${u.reason || "it has changes that were never committed."}`).join("\n");
+      const ok = await confirm(`${r.unsaved.length} of them could not be cleaned up`, `${why}\n\nRemove them anyway? Anything Philium cannot stop safely is left running and listed afterwards.`, { danger: true, ok: "Remove anyway" });
+      if (ok) {
+        const byName = new Map((list() || []).map((a) => [a.name, a.id]));
+        const retry = [...r.unsaved.map((u) => u.id), ...kept.map((n) => byName.get(n)).filter(Boolean)];
+        const r2 = await rpc("agents.remove_many", { scope: "selected", force: true, ids: retry }, { action: true }).catch((e) => ({ error: String(e) }));
+        if (r2.error) toast(r2.error, "bad");
+        removed.push(...(r2.removed ?? []));
+        left.push(...(r2.left ?? []));
+        kept = [...(r2.kept ?? []), ...(r2.unsaved ?? []).map((u) => u.name)];
+      }
+    }
+    toast(`Removed ${removed.length} agent${removed.length === 1 ? "" : "s"}${kept.length ? `; kept ${kept.join(", ")}` : ""}`, removed.length ? "good" : "bad");
+    if (left.length) toast(`Philium stopped tracking these but could not stop them safely, so check them yourself: ${left.map((l) => `${l.handle} (${l.agent})`).join("; ")}`, "danger");
+    refetch?.();
+    return r;
+  }
   async function removeFinished() {
     const targets = finished();
     const ids = targets.map((a) => a.id);
     const names = targets.map((a) => a.name);
     if (!ids.length) return;
     if (!(await confirm(`Remove ${names.length} finished agent${names.length === 1 ? "" : "s"}?`, `${names.join(", ")}. Their folders and saved history go; what they found stays in Review and Board. Agents that are working or waiting for you stay.`, { danger: true, ok: "Remove" }))) return;
-    const r = await rpc("agents.remove_many", { scope: "finished", ids }, { action: true }).catch((e) => ({ error: String(e) }));
-    if (r.error) return toast(r.error, "bad");
-    let removed = r.removed?.length || 0;
-    if (r.unsaved?.length) {
-      const ok = await confirm(`${r.unsaved.length} of them have unsaved files`, `${r.unsaved.map((u) => u.name).join(", ")} still have changes in their folders that were never committed. Delete them anyway?`, { danger: true, ok: "Delete anyway" });
-      if (ok) {
-        const r2 = await rpc("agents.remove_many", { scope: "finished", force: true, ids: r.unsaved.map((u) => u.id) }, { action: true }).catch(() => ({}));
-        removed += r2.removed?.length || 0;
-      }
-    }
-    toast(`Removed ${removed} agent${removed === 1 ? "" : "s"}${r.kept?.length ? `; kept ${r.kept.join(", ")} (a helper is still working)` : ""}`, "good");
-    refetch?.();
+    await removeAgents("finished", ids);
   }
   // Picked in the list with ⌘-click (or Ctrl), a range with Shift: removed together.
   const [picked, setPicked] = createSignal([]);
@@ -1161,20 +1179,9 @@ export default function Agents() {
     const helpers = agents.length - ids.length;
     const what = `${agents.map((a) => a.name).join(", ")}.${helpers ? ` That includes ${helpers} helper${helpers === 1 ? "" : "s"} of the ones you picked.` : ""}${working.length ? ` ${working.map((a) => a.name).join(", ")} ${working.length === 1 ? "is" : "are"} working and will be stopped.` : ""} Their folders and saved history go; what they found stays in Review and Board.`;
     if (!(await confirm(`Remove ${agents.length} agent${agents.length === 1 ? "" : "s"}?`, what, { danger: true, ok: "Remove" }))) return;
-    const r = await rpc("agents.remove_many", { scope: "selected", ids }, { action: true }).catch((e) => ({ error: String(e) }));
-    if (r.error) return toast(r.error, "bad");
-    let removed = r.removed?.length || 0;
-    if (r.unsaved?.length) {
-      const ok = await confirm(`${r.unsaved.length} of them have unsaved files`, `${r.unsaved.map((u) => u.name).join(", ")} still have changes in their folders that were never committed. Delete them anyway?`, { danger: true, ok: "Delete anyway" });
-      if (ok) {
-        const r2 = await rpc("agents.remove_many", { scope: "selected", force: true, ids: r.unsaved.map((u) => u.id) }, { action: true }).catch(() => ({}));
-        removed += r2.removed?.length || 0;
-      }
-    }
-    toast(`Removed ${removed} agent${removed === 1 ? "" : "s"}${r.kept?.length ? `; kept ${r.kept.join(", ")}` : ""}`, "good");
+    if (!(await removeAgents("selected", ids))) return;
     setPicked([]);
     if (selected() && !(list() || []).some((a) => a.id === selected())) go("agents", {});
-    refetch?.();
   }
   const onKey = (e) => {
     if (!screenVisible() || (typeof route === "function" && route() !== "agents")) return;
