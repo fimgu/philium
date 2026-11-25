@@ -37,7 +37,7 @@ export function UpdateControls(props) {
           downloading: `Downloading Philium ${s().version}${pct(s()) != null ? ` (${pct(s())}%)` : "…"}`,
           ready: `Philium ${s().version} is installed. Restart to use it.`,
           error: s().error || "Update failed",
-        }[s().phase] ?? (s().latest ? `Philium ${s().current} is up to date.` : `Philium ${s().current || ""}`)}
+        }[s().phase] ?? (s().latest ? `Philium ${s().current} is up to date.` : `Philium ${s().current || props.version || ""}`)}
       </span>
       <Show when={s().phase === "available"}><button class="btn primary sm" onClick={u.install}>Update now</button></Show>
       <Show when={s().phase === "ready"}><button class="btn primary sm" onClick={u.restart}>Restart</button></Show>

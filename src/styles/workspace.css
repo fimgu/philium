@@ -68,3 +68,52 @@
 .br-row code { color: var(--text); }
 .br-meta { min-width: 52px; text-align: right; }
 @media (max-width: 1100px) { .rp-settings { grid-template-columns: 1fr; } }
+
+/* Environments / cleanup: one row style for everything agents leave behind. */
+.cleanup-group { gap: 12px; }
+.cleanup-group h2 { font-size: var(--fs-m); }
+.cleanup-group .ws-row > div > p { margin: 4px 0 0; }
+.cleanup-list { display: flex; flex-direction: column; border: 1px solid var(--line); border-radius: var(--radius-s); overflow: hidden; }
+.cleanup-row { display: flex; align-items: center; gap: 12px; padding: 10px 12px; min-width: 0; }
+.cleanup-row + .cleanup-row { border-top: 1px solid var(--line); }
+.cleanup-main { display: flex; flex-direction: column; gap: 3px; min-width: 0; flex: 1; }
+.cleanup-title { display: flex; align-items: center; gap: 6px; min-width: 0; font-size: var(--fs-s); }
+.cleanup-main code.ws-path { font-size: var(--fs-xs); color: var(--text-dim); background: none; border: 0; padding: 0; }
+.cleanup-main small { font-size: var(--fs-xs); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cleanup-row .ws-actions { flex: none; }
+.cleanup-details summary { cursor: pointer; padding: 6px 0; font-size: var(--fs-s); }
+.cleanup-details .cleanup-list { margin-top: 6px; }
+.cleanup-logs { display: flex; flex-direction: column; gap: 8px; border-top: 1px solid var(--line); padding-top: 14px; }
+.cleanup-logs h3 { font-size: var(--fs); }
+.ws-row .ws-actions .input { width: 180px; }
+
+/* Task sandboxes use plain controls; make them match the kit. */
+.managed-wrap section { display: flex; flex-direction: column; gap: 12px; align-items: flex-start; }
+.managed-wrap h2 { font-size: var(--fs-m); }
+.managed-wrap button { display: inline-flex; align-items: center; height: 28px; padding: 0 10px; border-radius: var(--radius-s); border: 1px solid var(--line-strong); background: var(--surface); color: var(--text); font-size: var(--fs-s); cursor: pointer; }
+.managed-wrap button:hover:not(:disabled) { background: var(--surface-hover); }
+.managed-wrap button:disabled { opacity: .45; cursor: default; }
+.managed-wrap select, .managed-wrap input, .managed-wrap textarea { height: 30px; padding: 0 8px; border-radius: var(--radius-s); background: var(--bg-sunken); border: 1px solid var(--line-strong); color: var(--text); }
+.managed-wrap textarea { height: auto; min-height: 70px; padding: 6px 8px; width: 100%; }
+.managed-wrap fieldset { border: 1px solid var(--line); border-radius: var(--radius-s); padding: 12px; display: flex; flex-direction: column; gap: 10px; width: 100%; }
+.managed-wrap label { display: flex; flex-direction: column; gap: 4px; font-size: var(--fs-s); color: var(--text-dim); }
+.managed-wrap details { width: 100%; border: 1px solid var(--line); border-radius: var(--radius-s); padding: 8px 12px; }
+.managed-wrap p { margin: 0; color: var(--text-dim); font-size: var(--fs-s); }
+.managed-wrap pre { width: 100%; background: var(--bg-sunken); border: 1px solid var(--line); border-radius: var(--radius-s); padding: 10px; font-size: var(--fs-xs); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 320px; overflow: auto; }
+
+/* Settings key/value rows */
+.ws-kv { display: grid; grid-template-columns: 160px minmax(0, 1fr); align-items: center; gap: 12px; padding: 6px 0; border-bottom: 1px solid var(--border, rgba(255,255,255,.06)); font-size: 13px; }
+.ws-kv:last-child { border-bottom: 0; }
+.ws-kv > span:first-child { color: var(--muted, #8a8f98); }
+.ws-kv .ws-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Settings > Storage */
+.storage-table { width: 100%; border-collapse: collapse; margin: 4px 0 16px; font-size: 13px; }
+.storage-table th, .storage-table td { text-align: left; padding: 7px 0; border-bottom: 1px solid var(--border, rgba(255,255,255,.06)); font-weight: 400; }
+.storage-table th { width: 40%; }
+.storage-table td.mono { width: 20%; }
+.storage-table tr:last-child th, .storage-table tr:last-child td { border-bottom: 0; font-weight: 600; }
+.storage-budget { display: flex; gap: 8px; align-items: center; }
+.storage-budget .input { width: 120px; }
+.ws-kv > :last-child { justify-self: start; max-width: 100%; }
+.ws-kv .update-row { justify-self: stretch; }

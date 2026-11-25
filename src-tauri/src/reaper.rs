@@ -274,7 +274,7 @@ fn strval<'a>(v: &'a Value, key: &str) -> Result<&'a str, String> {
         .ok_or_else(|| format!("Missing resource {key}"))
 }
 fn rows(ctx: &Arc<Ctx>, agent: Option<&str>, state: Option<&str>) -> Result<Vec<Value>, String> {
-    ctx.db.query("SELECT r.*,a.name AS agent_name,a.state AS agent_state,a.last_active_at FROM resources r LEFT JOIN agents a ON a.id=r.agent_id WHERE (?1 IS NULL OR r.agent_id=?1) AND (?2 IS NULL OR r.state=?2) ORDER BY CASE r.kind WHEN 'process' THEN 0 WHEN 'terminal' THEN 0 WHEN 'port' THEN 9 WHEN 'colima' THEN 10 ELSE 1 END,r.created_at",params![agent,state])
+    ctx.db.query("SELECT r.*,a.name AS agent_name,a.state AS agent_state,a.last_active_at,a.repo_id AS repo_id FROM resources r LEFT JOIN agents a ON a.id=r.agent_id WHERE (?1 IS NULL OR r.agent_id=?1) AND (?2 IS NULL OR r.state=?2) ORDER BY CASE r.kind WHEN 'process' THEN 0 WHEN 'terminal' THEN 0 WHEN 'port' THEN 9 WHEN 'colima' THEN 10 ELSE 1 END,r.created_at",params![agent,state])
 }
 fn unsaved(ctx: &Arc<Ctx>, r: &Value) -> bool {
     if r["kind"] != "worktree" {

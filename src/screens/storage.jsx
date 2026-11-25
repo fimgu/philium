@@ -75,7 +75,7 @@ export function Storage(props = {}) {
             {low() ? ` Checks do not start below ${fmt.bytes(st().disk.min_free_for_checks)} free, so a full disk is never read as a failing check. Clean up here, or free space elsewhere.` : ""}
           </p>
         </Show>
-        <table class="ready plan" aria-label="What Philium keeps">
+        <table class="storage-table" aria-label="What Philium keeps">
           <tbody>
             <For each={st().parts || []}>
               {p => (
@@ -93,8 +93,8 @@ export function Storage(props = {}) {
             </tr>
           </tbody>
         </table>
-        <Field label={`Build cache budget (now ${st().budget_gb} GB)`} hint="Go build caches shared by agents and checks are trimmed to this, oldest files first, once a day and only while nothing builds.">
-          <div class="ws-row">
+        <Field label={st().budget_gb ? `Build cache budget (now ${st().budget_gb} GB)` : "Build cache budget"} hint="Go build caches shared by agents and checks are trimmed to this, oldest files first, once a day and only while nothing builds.">
+          <div class="storage-budget">
             <Input type="number" min="1" max="1000" placeholder={String(st().budget_gb ?? "")} value={budget()} onValue={setBudget} aria-label="Build cache budget in GB" />
             <Button disabled={!budget().trim()} onClick={saveBudget}>Save</Button>
           </div>

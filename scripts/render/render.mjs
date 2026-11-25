@@ -146,6 +146,7 @@ const stub = (fx, setName, serveOnly = false) => {
         if(a.method==='managed.launch') {if(a.args.repo_id!=='r1'||a.args.task_id!=='t1'||a.args.agent_id!=='a1'||a.args.profile!=='alpha'||a.args.command!=='echo marker')throw Error('Incorrect preview binding');return window.__test.managed={id:'j1',task_name:'Offline check',agent_name:'lion',profile:'alpha',cid:'b'.repeat(64),expires:Date.now()+60000,state:'active'};}
         if(a.method==='managed.logs') return {text:'fixture marker',truncated:false};
         if(a.method==='managed.release') {if(a.args.id!=='j1'||a.args.repo_id!=='r1')throw Error('Wrong release');Object.assign(window.__test.managed,{state:'released',receipt:'removal verified'});return window.__test.managed;}
+        if(a.method==='environments.runtimes') return ['alpha','beta'].map(id=>({id,runtime:'docker',profile:id,label:id}));
         if(a.method==='environments.profiles') return ['alpha','beta'];
         if(a.method==='environments.containers') return [{id:'a'.repeat(64),name:`${a.args.profile}-node`,cluster:'sandbox',image:'fixture:local',status:'Up'}];
         if(a.method==='environments.logs') {if(window.__test.holdLogs)await new Promise(resolve=>window.__test.releaseLogs=resolve);return {text:`${a.args.profile} fixture log`,truncated:false};}
@@ -335,17 +336,17 @@ for (const setName of sets) {
       }
       if(s==='environments' && setName==='populated') {
         try {
-          await clickText(page,'button','Inspect local machine'); await page.waitForSelector('label select option[value="alpha"]');
-          const sel='label select:has(option[value="alpha"])'; await page.select(sel,'alpha');
+          await clickText(page,'button','Containers'); await page.waitForSelector('select option[value="alpha"]');
+          const sel='select:has(option[value="alpha"])'; await page.select(sel,'alpha');
           await page.waitForSelector('[aria-label="Runtime inventory"] summary'); await page.click('[aria-label="Runtime inventory"] summary');
-          await clickText(page,'button','View logs'); await page.waitForFunction(()=>document.querySelector('aside pre')?.textContent==='alpha fixture log');
-          await page.evaluate(()=>window.__test.holdLogs=true);await clickText(page,'button','Refresh logs');await page.waitForFunction(()=>!!window.__test.releaseLogs);
+          await clickText(page,'button','Logs'); await page.waitForFunction(()=>document.querySelector('aside pre')?.textContent==='alpha fixture log');
+          await page.evaluate(()=>window.__test.holdLogs=true);await page.click('aside[aria-label="Container logs"] .btn');await page.waitForFunction(()=>!!window.__test.releaseLogs);
           await page.select(sel,'beta');await page.evaluate(()=>window.__test.releaseLogs());await page.waitForFunction(()=>document.querySelector('[aria-label="Runtime inventory"]')?.innerText.includes('beta'));
           if(await page.$('aside[aria-label="Container logs"]'))throw Error('Stale peer logs remained visible');
-          await clickText(page,'button','This checkout');if(await page.$('[aria-label="Runtime inventory"]')) throw Error('Machine inventory leaked into checkout');
+          await clickText(page,'button','Task sandboxes');if(await page.$('[aria-label="Runtime inventory"]')) throw Error('Machine inventory leaked into checkout');
           await clickText(page,'button','New task sandbox');await page.waitForSelector('fieldset select option[value="t1"]');await page.select('fieldset select:has(option[value="t1"])','t1');await page.select('fieldset select:has(option:not([value]))','alpha');await page.type('fieldset textarea','echo marker');
           await clickText(page,'button','Preview sandbox');await page.waitForFunction(()=>document.body.innerText.includes('Start offline sandbox')&&!window.__test.managed);await clickText(page,'button','Start offline sandbox');await page.waitForSelector('[aria-label="Managed task sandboxes"] summary');await page.click('[aria-label="Managed task sandboxes"] summary');await clickText(page,'button','Sandbox logs');await page.waitForFunction(()=>document.body.innerText.includes('fixture marker'));
-          await clickText(page,'button','Refresh sandboxes');await clickText(page,'button','Release sandbox');await clickText(page,'button','Keep sandbox');if(await page.evaluate(()=>window.__test.managed.state)!=='active')throw Error('Dismissed release removed sandbox');await clickText(page,'button','Release sandbox');await clickText(page,'button','Confirm release');await page.waitForFunction(()=>document.body.innerText.includes('removal verified'));
+          await page.click('[aria-label="Managed task sandboxes"] .ws-actions button:nth-child(2)');await clickText(page,'button','Release sandbox');await clickText(page,'button','Keep sandbox');if(await page.evaluate(()=>window.__test.managed.state)!=='active')throw Error('Dismissed release removed sandbox');await clickText(page,'button','Release sandbox');await clickText(page,'button','Confirm release');await page.waitForFunction(()=>document.body.innerText.includes('removal verified'));
         } catch(e){problems.push(`${w} environments: ${e.message}`);}
       }
       if (s === 'review' && setName === 'populated') {
@@ -462,7 +463,7 @@ for (const setName of sets) {
           await page.select(picker,'r3'); await page.waitForFunction(()=>document.querySelector('.checkout-home')?.innerText.includes('cluster-r3'));
           await page.evaluate(()=>window.__resumeOverview()); await sleep(80);
           const info=await page.$eval('.checkout-home',el=>el.innerText);
-          if (info.includes('cluster-r1') || !info.includes('task-r3') || !info.includes('not a live Docker')) problems.push(`home ${w}: checkout scope or resource attribution`);
+          if (info.includes('cluster-r1') || !info.includes('task-r3') || !info.includes('agent-r3')) problems.push(`home ${w}: checkout scope or resource attribution`);
           await page.evaluate(()=>window.__failOverview=true); await clickText(page,'button','Refresh');
           await page.waitForSelector('[role="alert"]');
           if (await page.$('.checkout-home')) problems.push(`home ${w}: stale records after error`);

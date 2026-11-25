@@ -199,7 +199,27 @@ export const POPULATED = {
   "sandbox.grants_get": { grants: [{ path: "/Users/demo/Documents/Parts", write: false }], private: [] },
   "agents.get_effort": "default",
   "reaper.proposals": [{ id: "p1", kind: "worktree", handle: "/Users/demo/Philium/worktrees/old", reason: "Agent removed", state: "proposed" }],
-  "reaper.ledger": [{ id: "l1", kind: "worktree", handle: "/Users/demo/Philium/worktrees/lion", state: "live", created_at: now - 3600000 }],
+  "reaper.ledger": [
+    { id: "l1", kind: "worktree", handle: "/Users/demo/Philium/worktrees/lion", agent_name: "lion", state: "live", created_at: now - 3600000 },
+    { id: "l2", kind: "process", handle: "vite on :42103", agent_name: "otter", state: "leaked", meta: { note: "stop with kill on port 42103" }, created_at: now - 7200000 },
+    { id: "l3", kind: "other", handle: "e2e-kind-5592", agent_name: "otter", state: "leaked", created_at: now - 7300000 },
+  ],
+  "storage.status": {
+    parts: [
+      { key: "worktrees", label: "Agent worktrees", bytes: 1.4e9, rule: "Removed with their agent" },
+      { key: "cache", label: "Check & build caches", bytes: 3.2e9, rule: "Trimmed to the 10 GB budget" },
+      { key: "data", label: "Conversations & memory", bytes: 2.1e8, rule: "Kept" },
+    ],
+    disk: { free: 1.2e11, total: 5e11 }, budget_gb: 10, last: null,
+  },
+  "workspace.overview": {
+    repo_id: "r1", path: "/Users/demo/Philium", tasks: [], agents: [], worktrees: [],
+    resources: [
+      { id: "l2", kind: "process", handle: "vite on :42103", owner: "otter", state: "leaked" },
+      { id: "l3", kind: "other", handle: "e2e-kind-5592", owner: "otter", state: "leaked" },
+      { id: "l1", kind: "worktree", handle: "/Users/demo/Philium/worktrees/lion", owner: "lion", state: "live" },
+    ],
+  },
   "activity.list": rows,
   "activity.quotas": {
     chatgpt: {

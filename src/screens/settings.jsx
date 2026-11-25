@@ -2,6 +2,7 @@ import { createSignal, createMemo, onMount, onCleanup, Show, For } from "solid-j
 import { Page, Button, Field, Input, TextArea, Select, Toggle, Segmented, Badge, VirtualList, confirm, toast } from "../ui/kit.jsx";
 import { rpc, fmt } from "../lib/rpc.js";
 import { useStore } from "../lib/store.js";
+import { go } from "../lib/nav.js";
 import { useVisibleEvent } from "../lib/visibility.js";
 import "../styles/workspace.css";
 import { Storage } from "./storage.jsx";
@@ -584,38 +585,12 @@ export default function Settings() {
   const model = () => store.defaultModel() || "";
   const [settings, setSettings] = createSignal({});
   const [storageTick, setStorageTick] = createSignal(0);
-  const [ledger, setLedger] = createSignal([]), [proposals, setProposals] = createSignal([]), [orphans, setOrphans] = createSignal(null);
-  const [filter, setFilter] = createSignal("live"), [agent, setAgent] = createSignal("");
+  const [proposals, setProposals] = createSignal([]);
   const [busy, setBusy] = createSignal(false), [error, setError] = createSignal(""), [loaded, setLoaded] = createSignal(false);
   const value = (key, fallback) => settings()[key] ?? fallback;
 
-  const agentOptions = createMemo(() => {
-    const seen = new Map();
-    for (const a of store.agents() ?? []) {
-      if (a?.id) seen.set(a.id, a.name ? `${a.name} (${a.id})` : a.id);
-    }
-    for (const r of ledger() ?? []) {
-      if (r?.agent_id && !seen.has(r.agent_id)) {
-        seen.set(r.agent_id, r.agent_name ? `${r.agent_name} (${r.agent_id})` : r.agent_id);
-      }
-    }
-    return [
-      { value: "", label: "All agents" },
-      ...[...seen.entries()].map(([val, label]) => ({ value: val, label })),
-    ];
-  });
-
-  let ledgerRequest = 0;
-  async function loadLedger() {
-    const request = ++ledgerRequest;
-    const rows = await rpc("reaper.ledger", {
-      ...(filter() ? { state: filter() } : {}),
-      ...(agent().trim() ? { agent_id: agent().trim() } : {}),
-    });
-    if (request === ledgerRequest) setLedger(rows ?? []);
-  }
   async function loadCleanup() {
-    await Promise.all([loadLedger(), rpc("reaper.proposals").then((p) => setProposals(p ?? []))]);
+    setProposals((await rpc("reaper.proposals")) ?? []);
   }
   async function refresh(manual = false) {
     if (manual) setStorageTick((t) => t + 1);
@@ -662,36 +637,6 @@ export default function Settings() {
       return;
     }
     save(key, n);
-  }
-  async function proposal(p, approve) {
-    await act(async () => {
-      if (
-        approve &&
-        !(await confirm(
-          p.unsaved ? "Permanently discard unsaved work?" : "Approve cleanup?",
-          `${p.kind}: ${p.handle}\n${p.reason}\n${
-            p.unsaved
-              ? "This can delete dirty files and unpushed or unmerged commits. There is no archive or undo."
-              : "This resource will be permanently removed."
-          }`,
-          { danger: true, ok: p.unsaved ? "Discard and delete" : "Remove resource" },
-        ))
-      )
-        return;
-      const results = await rpc(approve ? "reaper.approve" : "reaper.dismiss", { ids: [p.id] });
-      await loadCleanup();
-      const failed = results.filter((r) => r.error || r.needs_confirmation);
-      if (failed.length)
-        setError(
-          failed
-            .map(
-              (r) =>
-                r.error ||
-                "Work changed since this proposal. Review the updated unsaved-work warning and approve again.",
-            )
-            .join("\n"),
-        );
-    });
   }
   onMount(() => refresh(false));
   useVisibleEvent(
@@ -770,12 +715,14 @@ export default function Settings() {
           Containers survive app quit; cleanup removes resources permanently.
         </p>
       </section>
-      <section class="ws-section"><div class="ws-row"><h2>Cleanup</h2><Show when={!status().pilot}><Button busy={busy()} onClick={() => act(async () => { const result = await rpc("reaper.sweep_now"); await loadCleanup(); if (result.errors?.length) setError(result.errors.map(e => e.error).join("\n")); else toast(`${result.removed.length} removed, ${result.proposals.length} pending confirmation`); })}>Sweep now</Button></Show></div>
-        <h3>Pending cleanup proposals ({proposals().length})</h3><Show when={proposals().length} fallback={<p class="ws-muted">No pending cleanup proposals.</p>}><div class="ws-proposal-list"><VirtualList items={proposals()} rowHeight={150}>{p => <article class="ws-proposal"><div class="ws-row"><strong>{p.kind} · {p.agent_name || p.agent_id || "No owner"}</strong><Badge tone={p.unsaved ? "strict" : "secure"}>{p.unsaved ? "Unsaved work" : "Ready"}</Badge></div><code class="ws-path">{p.handle}</code><p>{p.reason}</p><div class="ws-actions"><Button disabled={busy()} onClick={() => proposal(p, true)}>{p.unsaved ? "Review and discard" : "Approve removal"}</Button><Button disabled={busy()} onClick={() => proposal(p, false)}>Dismiss</Button></div></article>}</VirtualList></div></Show>
-        <h3>Resource ledger</h3><div class="ws-actions"><Select value={filter()} options={[{ value: "live", label: "Live" }, { value: "leaked", label: "Leaked" }, { value: "released", label: "Released" }, { value: "", label: "All states" }]} onValue={v => { setFilter(v); act(loadLedger); }} /><Select value={agent()} options={agentOptions()} onValue={v => { setAgent(v); act(loadLedger); }} /><Button onClick={() => act(loadLedger)}>Filter</Button></div><Show when={ledger().length} fallback={<p class="ws-muted">No matching resources.</p>}><div class="ws-ledger-list"><VirtualList items={ledger()} rowHeight={88}>{r => <article class="ws-ledger"><div class="ws-row"><strong>{r.kind} · {r.agent_name || r.agent_id || "Workspace"}</strong><Badge tone={r.state === "leaked" ? "danger" : r.state === "released" ? "secure" : "strict"}>{r.state}</Badge></div><code class="ws-path" title={r.handle}>{r.handle}</code><small>Registered {fmt.ago(r.created_at)} · {r.id}</small></article>}</VirtualList></div></Show>
-        <div class="ws-row"><h3>Untracked resources</h3><Show when={!status().pilot}><Button busy={busy()} onClick={() => act(async () => setOrphans(await rpc("reaper.orphans")))}>Scan disk &amp; runtimes</Button></Show></div><p class="ws-muted" title="Lists Philium worktree folders, containers labelled philium.agent, and clusters named philium-*. Inspect ownership before deleting.">Scans Philium worktrees, labelled containers, and clusters.</p><Show when={orphans()}>{o => <><Show when={o().errors?.length}><div class="ws-alert">Some checks could not run:<For each={o().errors}>{e => <p>{e}</p>}</For></div></Show><Show when={o().resources?.length} fallback={<p>No untracked resources found.</p>}><div class="ws-ledger-list"><VirtualList items={o().resources} rowHeight={72}>{r => <article class="ws-ledger"><strong>{r.kind}</strong><code class="ws-path">{r.handle}</code><small>{r.action || r.agent || "Inspect before cleanup"}</small></article>}</VirtualList></div></Show></>}</Show>
+      <section class="ws-section"><div class="ws-row"><div><h2>Cleanup</h2><p class="ws-muted small">{proposals().length ? `${proposals().length} ready to clean up. ` : ""}What agents left running, and what Philium could not stop, lives in Environments.</p></div><div class="ws-actions"><Show when={!status().pilot}><Button busy={busy()} onClick={() => act(async () => { const result = await rpc("reaper.sweep_now"); await loadCleanup(); if (result.errors?.length) setError(result.errors.map(e => e.error).join("\n")); else toast(`${result.removed.length} removed, ${result.proposals.length} pending confirmation`); })}>Sweep now</Button></Show><Button variant="primary" onClick={() => go("environments")}>Open Environments</Button></div></div></section>
+      <section class="ws-section"><h2>About</h2>
+        <div class="ws-kv"><span>Version</span><div class="ws-row update-row"><UpdateControls update={useUpdate()} version={status().version} showCheck /></div></div>
+        <div class="ws-kv"><span>Desk runtime</span><Badge tone={status().desk?.ok ? "secure" : "strict"}>{status().desk?.ok ? "Running" : "Unavailable"}</Badge></div>
+        <Show when={status().desk?.error}><p class="ws-alert">{status().desk.error}</p></Show>
+        <div class="ws-kv"><span>Gateway</span><code class="ws-path">{status().gateway || "Not running"}</code></div>
+        <div class="ws-kv"><span>Application data</span><code class="ws-path" title={status().data_dir}>{status().data_dir || "Unavailable"}</code></div>
       </section>
-      <section class="ws-section"><h2>About</h2><p>Philium {status().version || "unknown version"}</p><div class="ws-row update-row"><UpdateControls update={useUpdate()} showCheck /></div><div class="ws-row"><span>Desk runtime</span><Badge tone={status().desk?.ok ? "secure" : "strict"}>{status().desk?.ok ? "Running" : "Unavailable"}</Badge></div><Show when={status().desk?.error}><p class="ws-alert">{status().desk.error}</p></Show><Field label="Gateway"><code>{status().gateway}</code></Field><Field label="Application data"><code class="ws-path">{status().data_dir}</code></Field></section>
     </div></Show>
   </Page>;
 }

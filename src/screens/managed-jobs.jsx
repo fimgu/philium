@@ -37,7 +37,7 @@ export function ManagedJobs(props){
   async function logs(j){const n=++lseq;setError('');setTail({id:j.id,text:'Reading logs…'});try{const r=await invoke('logs',{id:j.id});if(live&&n===lseq)setTail({id:j.id,text:r.text||'No output yet.',cut:r.truncated});}catch(e){if(live&&n===lseq)setTail({id:j.id,text:String(e)});}}
   const usable=()=>data()?.tasks.find(t=>t.id===task());
   return <section aria-label="Managed task sandboxes"><h2 title="One offline container per claimed task. Philium verifies its identity before cleanup. Shared clusters are never removed here.">Task sandboxes</h2>
-    <button disabled={busy()} onClick={()=>act(openForm)}>New task sandbox</button> <button disabled={busy()} onClick={()=>act(refresh)}>Refresh sandboxes</button>
+    <div class="ws-actions"><button disabled={busy()} onClick={()=>act(openForm)}>New task sandbox</button><button disabled={busy()} onClick={()=>act(refresh)}>Refresh</button></div>
     <Show when={error()}><p role="alert">{error()}</p></Show>
     <Show when={form()}><fieldset disabled={busy()||!!plan()}><legend>Run a local command</legend>
       <label>Claimed task <select disabled={!!props.taskId} value={task()} onChange={e=>setTask(e.currentTarget.value)}><option value="">Choose task and agent</option><For each={data()?.tasks||[]}>{t=><option selected={task()===t.id} value={t.id}>{t.title} · {t.owner}</option>}</For></select></label>
