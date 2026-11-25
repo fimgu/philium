@@ -1,6 +1,7 @@
 import { createSignal, Show, For } from "solid-js";
 import { Button, Field, Input, Select, Toggle, Badge, confirm, toast } from "../ui/kit.jsx";
 import { rpc } from "../lib/rpc.js";
+import { useVisibleEvent } from "../lib/visibility.js";
 
 // Lines "KEY=value" <-> object. Secret lines are "KEY" only, values entered separately.
 const toPairs = (o) => Object.entries(o ?? {}).map(([k, v]) => `${k}=${v}`).join("\n");
@@ -69,7 +70,7 @@ function Editor(props) {
         <Select value={f().approval} onValue={(v) => set("approval", v)} options={[{ value: "ask", label: "Ask me each time" }, { value: "allow", label: "Allow without asking" }, { value: "deny", label: "Deny" }]} />
       </Field>
       <div class="ws-row"><span>Enabled</span><Toggle on={f().enabled} onChange={(v) => set("enabled", v)} /></div>
-      <div class="ws-row"><span>All repositories</span><Toggle on={f().all_repos} onChange={(v) => set("all_repos", v)} /></div>
+      <div class="ws-row"><span>All workspaces</span><Toggle on={f().all_repos} onChange={(v) => set("all_repos", v)} /></div>
       <Show when={!f().all_repos}>
         <Field label="Enabled for repositories">
           <For each={props.repos}>{(r) => (
@@ -99,7 +100,9 @@ export function McpServersSection(props) {
     if (!(await confirm(`Remove MCP server '${s.name}' and its stored secrets?`))) return;
     try { await rpc("mcp.servers_delete", { name: s.name }, { local: true }); await load(); } catch (e) { setErr(String(e)); }
   }
-  const scope = (s) => (s.all_repos ? "all repos" : `${(s.repos ?? []).length} repo(s)`);
+  load();
+  useVisibleEvent("mcp:changed", load, { debounceMs: 200 });
+  const scope = (s) => (s.all_repos ? "all workspaces" : `${(s.repos ?? []).length} workspace${(s.repos ?? []).length === 1 ? "" : "s"}`);
   return (
     <section class="ws-section">
       <details onToggle={(e) => e.currentTarget.open && load()}>

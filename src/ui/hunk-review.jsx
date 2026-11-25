@@ -2,6 +2,7 @@
 // hunk ids and rejects any id whose content changed since it was listed.
 import { createResource, createSignal, For, Show } from "solid-js";
 import { rpc } from "../lib/rpc.js";
+import { useVisibleEvent } from "../lib/visibility.js";
 import { Button, confirm } from "./kit.jsx";
 import { hunkActions } from "../lib/hunk-actions.js";
 
@@ -12,6 +13,8 @@ export default function HunkReview(props) {
     () => props.worktreeId && [props.worktreeId, layer()],
     ([id, l]) => rpc("workspace.hunks", { worktree_id: id, layer: l }).catch((e) => ({ error: String(e) })),
   );
+  // The agent may keep editing while you review; re-list when its turn settles.
+  useVisibleEvent("agents:changed", () => refetch(), { debounceMs: 1000 });
   const act = async (op, id, label) => {
     if (op === "revert" && !(await confirm(`Discard ${label}?`, "This removes the change from the file on disk.", { danger: true, ok: "Discard" }))) return;
     setNote("");

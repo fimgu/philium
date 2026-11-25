@@ -1,6 +1,7 @@
 import { createResource, createSignal, For, Show } from "solid-js";
 import { Button, Field, Input, confirm } from "../ui/kit.jsx";
 import { rpc, fmt } from "../lib/rpc.js";
+import { useVisibleEvent } from "../lib/visibility.js";
 
 const CLEANABLE_KEYS = new Set(["check_runs", "agents", "check_caches", "agent_caches", "database"]);
 
@@ -11,6 +12,9 @@ export function Storage(props = {}) {
     () => props.refreshTick ?? 0,
     () => rpc("storage.status", {}, { local: true }).catch((e) => ({ error: String(e) })),
   );
+  // Sizes change when agents, checkouts or leftovers go away. Measuring walks
+  // the disk, so wait for things to settle before re-reading.
+  for (const t of ["agents:changed", "reaper:changed", "workspace:changed"]) useVisibleEvent(t, () => refetch(), { debounceMs: 4000 });
   const [busy, setBusy] = createSignal(false);
   const [error, setError] = createSignal("");
   const [budget, setBudget] = createSignal("");

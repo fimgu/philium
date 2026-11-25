@@ -1,7 +1,8 @@
 import {createSignal,createEffect,For,Show,onMount,onCleanup} from 'solid-js';
 import {createStore,reconcile} from 'solid-js/store';
 import {rpc} from '../lib/rpc.js';
-import {useScreenVisible} from '../lib/visibility.js';
+import {Button,Field,Select,TextArea,Empty} from '../ui/kit.jsx';
+import {useScreenVisible,useVisibleEvent} from '../lib/visibility.js';
 
 // Mounted with a stable checkout key; switching checkout destroys the inspector and draft.
 export function ManagedJobs(props){
@@ -32,26 +33,81 @@ export function ManagedJobs(props){
     }
   });
   onMount(refresh);onCleanup(()=>{live=false;seq++;lseq++;clearTimeout(timer);});
+  useVisibleEvent('managed:changed',p=>{if(!p?.repo_id||p.repo_id===props.id)refresh();},{debounceMs:200});
+  useVisibleEvent('board:changed',()=>refresh(),{debounceMs:500});
   async function act(fn){if(busy())return;setError('');setBusy(true);try{await fn();}catch(e){if(live)setError(String(e));}finally{if(live)setBusy(false);}}
   async function openForm(){await refresh();if(!live)return;const p=await rpc('environments.profiles',{},{local:true});if(!live)return;setProfiles(p);setProfile(p.length===1?p[0]:'');setForm(true);}
   async function logs(j){const n=++lseq;setError('');setTail({id:j.id,text:'Reading logs…'});try{const r=await invoke('logs',{id:j.id});if(live&&n===lseq)setTail({id:j.id,text:r.text||'No output yet.',cut:r.truncated});}catch(e){if(live&&n===lseq)setTail({id:j.id,text:String(e)});}}
   const usable=()=>data()?.tasks.find(t=>t.id===task());
-  return <section aria-label="Managed task sandboxes"><h2 title="One offline container per claimed task. Philium verifies its identity before cleanup. Shared clusters are never removed here.">Task sandboxes</h2>
-    <div class="ws-actions"><button disabled={busy()} onClick={()=>act(openForm)}>New task sandbox</button><button disabled={busy()} onClick={()=>act(refresh)}>Refresh</button></div>
-    <Show when={error()}><p role="alert">{error()}</p></Show>
-    <Show when={form()}><fieldset disabled={busy()||!!plan()}><legend>Run a local command</legend>
-      <label>Claimed task <select disabled={!!props.taskId} value={task()} onChange={e=>setTask(e.currentTarget.value)}><option value="">Choose task and agent</option><For each={data()?.tasks||[]}>{t=><option selected={task()===t.id} value={t.id}>{t.title} · {t.owner}</option>}</For></select></label>
-      <Show when={!data()?.tasks.length}><p>Claim a task with an agent in this checkout first.</p></Show>
-      <label>Colima profile <select value={profile()} onChange={e=>setProfile(e.currentTarget.value)}><option value="">Choose runtime</option><For each={profiles()}>{p=><option>{p}</option>}</For></select></label>
-      <label>Maximum minutes <input type="number" min="1" max="60" value={minutes()} onInput={e=>setMinutes(e.currentTarget.valueAsNumber)}/></label>
-      <label>Container command <textarea maxlength="4096" placeholder="printf 'ready\\n'" value={cmd()} onInput={e=>setCmd(e.currentTarget.value)}/></label>
-      <button disabled={!usable()||!profile()||!cmd().trim()||!Number.isInteger(minutes())||minutes()<1||minutes()>60} onClick={()=>setPlan({task_id:task(),agent_id:usable().agent,profile:profile(),command:cmd(),minutes:minutes(),label:`${usable().title} · ${usable().owner}`})}>Preview sandbox</button></fieldset>
-      <Show when={plan()}>{p=><div><p>{p().label} on <b>{p().profile}</b> · {p().minutes} min. Local Alpine 3.20, no checkout mount, network or credentials. Files in /tmp disappear on release.</p><pre>{p().command}</pre><button disabled={busy()} onClick={()=>act(async()=>{const {label,...args}=p();await invoke('launch',args);if(live){setCmd('');setPlan(null);setForm(false);await refresh();}})}>Start offline sandbox</button></div>}</Show>
-      <button disabled={busy()} onClick={()=>{setPlan(null);setForm(false);}}>Dismiss</button></Show>
-    <Show when={data()}>{d=><For each={d().jobs} fallback={<p>No managed sandboxes for this checkout.</p>}>{j=><details><summary>{j.task_name||j.task} · {j.agent_name||j.agent} · {j.state==='active'?'leased':j.state}</summary>
-      <p>{j.profile} · container <code>{j.cid?.slice(0,12)||'pending'}</code> · expires {new Date(j.expires).toLocaleTimeString()} · {j.receipt||'Cleanup pending'}</p>
-      <Show when={j.state==='active'}><button onClick={()=>logs(j)}>Sandbox logs</button></Show> <Show when={j.state!=='released'&&j.cid}><button disabled={busy()} onClick={()=>setRelease(j.id)}>Release sandbox</button></Show>
-      <Show when={release()===j.id}><p>Remove only this task’s container and its temporary files?</p><button disabled={busy()} onClick={()=>act(async()=>{await invoke('release',{id:j.id});if(live){setRelease('');if(tail()?.id===j.id){lseq++;setTail(null);}await refresh();}})}>Confirm release</button> <button onClick={()=>setRelease('')}>Keep sandbox</button></Show>
-      <Show when={tail()?.id===j.id}><pre style={{'white-space':'pre-wrap','overflow-wrap':'anywhere'}}>{tail().text}</pre>{tail().cut&&'Log output truncated.'}</Show>
-    </details>}</For>}</Show></section>;
+  const stateLabel=(s)=>s==='active'?'Running':s==='released'?'Released':s==='retiring'?'Removing':s==='issuing'?'Starting':s;
+  const ready=()=>usable()&&profile()&&cmd().trim()&&Number.isInteger(minutes())&&minutes()>=1&&minutes()<=60;
+  const close=()=>{setPlan(null);setForm(false);};
+  return <section class="managed" aria-label="Managed task sandboxes">
+    <div class="ws-row">
+      <div>
+        <h2>Task sandboxes</h2>
+        <p class="ws-muted small">One offline container per claimed task. Philium checks it is the same container before removing it. Shared clusters are never removed here.</p>
+      </div>
+      <div class="ws-actions">
+        <Button size="sm" variant="primary" disabled={busy()||form()} onClick={()=>act(openForm)}>New task sandbox</Button>
+        <Button size="sm" disabled={busy()} onClick={()=>act(refresh)}>Refresh</Button>
+      </div>
+    </div>
+    <Show when={error()}><p class="ws-alert" role="alert">{error()}</p></Show>
+    <Show when={form()}>
+      <fieldset class="managed-form" disabled={busy()||!!plan()}>
+        <legend>Run a local command</legend>
+        <Field label="Claimed task" hint={!data()?.tasks.length ? 'Claim a task with an agent in this workspace first.' : ''}>
+          <Select disabled={!!props.taskId} value={task()} placeholder="Choose task and agent" options={(data()?.tasks||[]).map(t=>({value:t.id,label:`${t.title} · ${t.owner}`}))} onValue={setTask}/>
+        </Field>
+        <Field label="Colima profile">
+          <Select value={profile()} placeholder="Choose runtime" options={profiles()} onValue={setProfile}/>
+        </Field>
+        <Field label="Maximum minutes">
+          <input class="input" type="number" min="1" max="60" value={minutes()} onInput={e=>setMinutes(e.currentTarget.valueAsNumber)}/>
+        </Field>
+        <Field label="Container command">
+          <TextArea class="mono" maxlength="4096" placeholder="printf 'ready\\n'" value={cmd()} onValue={setCmd}/>
+        </Field>
+        <div class="ws-actions">
+          <Button size="sm" variant="primary" disabled={!ready()} onClick={()=>setPlan({task_id:task(),agent_id:usable().agent,profile:profile(),command:cmd(),minutes:minutes(),label:`${usable().title} · ${usable().owner}`})}>Preview sandbox</Button>
+          <Button size="sm" variant="ghost" disabled={busy()} onClick={close}>Cancel</Button>
+        </div>
+      </fieldset>
+      <Show when={plan()}>{p=><div class="managed-plan">
+        <p>{p().label} on <b>{p().profile}</b> · {p().minutes} min. Local Alpine 3.20, no checkout mount, network or credentials. Files in /tmp disappear on release.</p>
+        <pre class="ws-diff">{p().command}</pre>
+        <div class="ws-actions">
+          <Button size="sm" variant="primary" disabled={busy()} onClick={()=>act(async()=>{const {label,...args}=p();await invoke('launch',args);if(live){setCmd('');close();await refresh();}})}>Start offline sandbox</Button>
+          <Button size="sm" variant="ghost" disabled={busy()} onClick={()=>setPlan(null)}>Back</Button>
+        </div>
+      </div>}</Show>
+    </Show>
+    <Show when={data()} fallback={<p class="ws-muted small" role="status">Reading sandboxes…</p>}>{d=>
+      <Show when={d().jobs.length} fallback={<Empty title="No task sandboxes">Sandboxes started for this workspace's tasks show up here.</Empty>}>
+        <div class="cleanup-list">
+          <For each={d().jobs}>{j=><details class="cleanup-details managed-job">
+            <summary class="cleanup-title"><span class={`dot ${j.state==='active'?'live':''}`}/><strong>{j.task_name||j.task}</strong><span class="ws-muted">· {j.agent_name||j.agent} · {stateLabel(j.state)}</span></summary>
+            <div class="cleanup-main">
+              <small class="ws-muted">{j.profile} · container <code>{j.cid?.slice(0,12)||'pending'}</code> · expires {new Date(j.expires).toLocaleTimeString()} · {j.receipt||'Cleanup pending'}</small>
+              <div class="ws-actions">
+                <Show when={j.state==='active'}><Button size="sm" onClick={()=>logs(j)}>Sandbox logs</Button></Show>
+                <Show when={j.state!=='released'&&j.cid&&release()!==j.id}><Button size="sm" variant="danger" disabled={busy()} onClick={()=>setRelease(j.id)}>Release sandbox</Button></Show>
+              </div>
+              <Show when={release()===j.id}>
+                <div class="ws-row managed-confirm">
+                  <span class="small">Remove only this task’s container and its temporary files?</span>
+                  <div class="ws-actions">
+                    <Button size="sm" variant="danger" disabled={busy()} onClick={()=>act(async()=>{await invoke('release',{id:j.id});if(live){setRelease('');if(tail()?.id===j.id){lseq++;setTail(null);}await refresh();}})}>Confirm release</Button>
+                    <Button size="sm" variant="ghost" onClick={()=>setRelease('')}>Keep sandbox</Button>
+                  </div>
+                </div>
+              </Show>
+              <Show when={tail()?.id===j.id}><pre class="ws-diff">{tail().text}</pre><Show when={tail().cut}><small class="ws-muted">Log output truncated.</small></Show></Show>
+            </div>
+          </details>}</For>
+        </div>
+      </Show>
+    }</Show>
+  </section>;
 }

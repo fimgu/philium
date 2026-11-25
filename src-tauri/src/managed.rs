@@ -107,6 +107,7 @@ fn issued(j: &Value, v: &Value) -> bool {
 }
 fn released(ctx: &Ctx, j: &Value, note: &str, exit: Option<i64>) -> Result<(), String> {
     ctx.db.exec("UPDATE managed_jobs SET state='released',receipt=?,finished=?,exit_code=COALESCE(?,exit_code) WHERE id=?",params![note,now(),exit,key(j,"id")?])?;
+    ctx.emit("managed:changed", json!({"repo_id":j["repo"]}));
     Ok(())
 }
 async fn cleanup(ctx: &Ctx, j: &Value, reason: &str) -> Result<(), String> {
@@ -250,8 +251,10 @@ async fn launch(ctx: &Ctx, a: &Value) -> Result<Value, String> {
     if let Err(e) = result {
         ctx.db
             .exec("UPDATE managed_jobs SET receipt=? WHERE id=?", [&e, &id])?;
+        ctx.emit("managed:changed", json!({"repo_id":repo}));
         return Err(format!("{e}. Issuance recorded for reconciliation."));
     }
+    ctx.emit("managed:changed", json!({"repo_id":repo}));
     row(ctx, repo, &id)
 }
 async fn reconcile(ctx: &Ctx) -> Result<(), String> {

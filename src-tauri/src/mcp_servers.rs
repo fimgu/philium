@@ -197,6 +197,7 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
             list.sort_by(|a, b| a.name.cmp(&b.name));
             store(ctx, &list)?;
             ctx.notify("settings");
+            ctx.emit("mcp:changed", json!({}));
             Ok(view(&s))
         }
         "servers_delete" => {
@@ -208,6 +209,7 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
             list.retain(|x| x.name != name);
             store(ctx, &list)?;
             ctx.notify("settings");
+            ctx.emit("mcp:changed", json!({}));
             Ok(Value::Null)
         }
         _ => Err(format!("unknown mcp.{method}")),

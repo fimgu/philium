@@ -57,11 +57,11 @@ function DreamingRow() {
     <div class="ws-row">
       <div class="col" style={{ gap: "2px" }}>
         <strong style={{ "font-size": "12px" }}>Dreaming</strong>
-        <span class="xs faint">When a repo is idle, re-read recent sessions to fix, merge and re-rank its memories.</span>
+        <span class="xs faint">When a workspace is idle, re-read recent sessions to fix, merge and re-rank its memories.</span>
       </div>
       <div class="ws-actions">
         <Show when={cfg()}>
-          <Input type="number" min="0" step="10000" style={{ width: "96px" }} title="Daily token budget per repo" value={String(cfg().daily_tokens)} onChange={(e) => save({ daily_tokens: Math.max(0, parseInt(e.currentTarget.value, 10) || 0) })} />
+          <Input type="number" min="0" step="10000" style={{ width: "96px" }} title="Daily token budget per workspace" value={String(cfg().daily_tokens)} onChange={(e) => save({ daily_tokens: Math.max(0, parseInt(e.currentTarget.value, 10) || 0) })} />
           <span class="xs faint">tokens/day</span>
           <Toggle on={!!cfg().enabled} label="" onChange={(v) => save({ enabled: v })} />
         </Show>
@@ -107,6 +107,8 @@ function StrictSandboxSection(props) {
       setSbBusy(false);
     }
   }
+  // Keep an open egress log current as agents connect out.
+  useVisibleEvent("sandbox:egress", () => showEgress() && !sbBusy() && rpc("sandbox.egress", { limit: 100 }, { local: true }).then((r) => setEgress(r ?? [])).catch(() => {}), { debounceMs: 1000 });
 
   async function saveAllowlist() {
     setSbBusy(true);

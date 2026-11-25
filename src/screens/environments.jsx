@@ -4,6 +4,7 @@ import { Page, Button, Segmented, Select, Input, Empty } from '../ui/kit.jsx';
 import { ManagedJobs } from './managed-jobs.jsx';
 import { Cleanup } from './cleanup.jsx';
 import { rpc } from '../lib/rpc.js';
+import { useVisibleEvent } from '../lib/visibility.js';
 import '../styles/workspace.css';
 
 // Environments: everything agents run outside the editor, in one place.
@@ -47,8 +48,16 @@ function Inventory(props) {
   let generation = 0;
   let logRequest = 0;
 
-  async function refresh() {
+  async function refresh(quiet = false) {
     const n = ++generation;
+    if (quiet) {
+      // Background re-read after cleanup: keep the list and open logs in place.
+      try {
+        const r = await read('containers', { profile: props.runtime.id });
+        if (n === generation) setRows(r);
+      } catch {}
+      return;
+    }
     ++logRequest;
     select(null);
     setTail(null);
@@ -65,6 +74,7 @@ function Inventory(props) {
     }
   }
   refresh();
+  for (const t of ['reaper:changed', 'managed:changed', 'agents:changed']) useVisibleEvent(t, () => !busy() && refresh(true), { debounceMs: 1500 });
   onCleanup(() => {
     generation++;
     logRequest++;
@@ -91,7 +101,11 @@ function Inventory(props) {
       if (!m.has(label)) m.set(label, []);
       m.get(label).push(c);
     }
-    return [...m].sort(([a], [b]) => a.localeCompare(b));
+    return m;
+  });
+  // Key groups by label so a background refresh keeps open groups open.
+  const labels = createMemo(() => [...groups().keys()].sort((a, b) => a.localeCompare(b)), undefined, {
+    equals: (a, b) => a.length === b.length && a.every((x, i) => x === b[i]),
   });
 
   return (
@@ -107,18 +121,20 @@ function Inventory(props) {
         </div>
         <div class="ws-actions">
           <Input aria-label="Filter containers" placeholder="Filter" value={filter()} onValue={setFilter} />
-          <Button size="sm" busy={busy()} onClick={refresh}>Refresh</Button>
+          <Button size="sm" busy={busy()} onClick={() => refresh()}>Refresh</Button>
         </div>
       </div>
       <Show when={busy()}><p class="ws-muted small" role="status">Reading runtime…</p></Show>
       <Show when={issue()}><p class="ws-alert" role="alert">{issue()}</p></Show>
       <Show when={rows()}>
-        <For each={groups()} fallback={<p class="ws-muted small">No matching containers.</p>}>
-          {([label, cs]) => (
+        <For each={labels()} fallback={<p class="ws-muted small">No matching containers.</p>}>
+          {(label) => {
+            const cs = () => groups().get(label) || [];
+            return (
             <details class="cleanup-details">
-              <summary>{label} <span class="ws-muted">({cs.length})</span></summary>
+              <summary>{label} <span class="ws-muted">({cs().length})</span></summary>
               <div class="cleanup-list">
-                <For each={cs}>
+                <For each={cs()}>
                   {(c) => (
                     <div class="cleanup-row">
                       <span class={`dot ${/^up/i.test(c.status) ? 'live' : ''}`} />
@@ -132,7 +148,8 @@ function Inventory(props) {
                 </For>
               </div>
             </details>
-          )}
+            );
+          }}
         </For>
       </Show>
       <Show when={selected()}>
@@ -226,7 +243,7 @@ export default function Environments() {
         >
           {(id) => (
             <div class="ws-settings">
-              <section class="ws-section managed-wrap" aria-label={`${repoName() || 'Workspace'} sandboxes`}>
+              <section class="ws-section" aria-label={`${repoName() || 'Workspace'} sandboxes`}>
                 <ManagedJobs id={id} />
               </section>
             </div>

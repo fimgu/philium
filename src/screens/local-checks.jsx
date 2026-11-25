@@ -1,6 +1,6 @@
 import { createSignal, createEffect, For, Show, onCleanup, onMount } from 'solid-js';
 import { rpc } from '../lib/rpc.js';
-import { useScreenVisible, useClock } from '../lib/visibility.js';
+import { useScreenVisible, useClock, useVisibleEvent } from '../lib/visibility.js';
 
 export function LocalChecks(props) {
   const visible = useScreenVisible();
@@ -32,7 +32,9 @@ export function LocalChecks(props) {
       if ((rows()??[]).some(x=>x.state==='running')) pollPending=true;
     }
   });
-  onMount(()=>{refresh(); rpc('board.list',{repo_id:props.repo},{local:true}).then(r=>{if(alive) setTasks((r??[]).filter(t=>t.repo_id===props.repo));}).catch(e=>{if(alive)setError(String(e));});});
+  const loadTasks=()=>rpc('board.list',{repo_id:props.repo,visible_only:true},{local:true}).then(r=>{if(alive) setTasks((r??[]).filter(t=>t.repo_id===props.repo));}).catch(e=>{if(alive)setError(String(e));});
+  onMount(()=>{refresh(); loadTasks();});
+  useVisibleEvent('board:changed',loadTasks,{debounceMs:500});
   onCleanup(()=>{alive=false; clearTimeout(timer);});
   async function act(fn) { if(busy())return; setBusy(true); setError(''); try {await fn();} catch(e){if(alive)setError(String(e));} finally{if(alive)setBusy(false);} }
   return <section aria-label="Local check runs"><h2>Local checks</h2>

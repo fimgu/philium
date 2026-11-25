@@ -87,19 +87,23 @@
 .cleanup-logs h3 { font-size: var(--fs); }
 .ws-row .ws-actions .input { width: 180px; }
 
-/* Task sandboxes use plain controls; make them match the kit. */
-.managed-wrap section { display: flex; flex-direction: column; gap: 12px; align-items: flex-start; }
-.managed-wrap h2 { font-size: var(--fs-m); }
-.managed-wrap button { display: inline-flex; align-items: center; height: 28px; padding: 0 10px; border-radius: var(--radius-s); border: 1px solid var(--line-strong); background: var(--surface); color: var(--text); font-size: var(--fs-s); cursor: pointer; }
-.managed-wrap button:hover:not(:disabled) { background: var(--surface-hover); }
-.managed-wrap button:disabled { opacity: .45; cursor: default; }
-.managed-wrap select, .managed-wrap input, .managed-wrap textarea { height: 30px; padding: 0 8px; border-radius: var(--radius-s); background: var(--bg-sunken); border: 1px solid var(--line-strong); color: var(--text); }
-.managed-wrap textarea { height: auto; min-height: 70px; padding: 6px 8px; width: 100%; }
-.managed-wrap fieldset { border: 1px solid var(--line); border-radius: var(--radius-s); padding: 12px; display: flex; flex-direction: column; gap: 10px; width: 100%; }
-.managed-wrap label { display: flex; flex-direction: column; gap: 4px; font-size: var(--fs-s); color: var(--text-dim); }
-.managed-wrap details { width: 100%; border: 1px solid var(--line); border-radius: var(--radius-s); padding: 8px 12px; }
-.managed-wrap p { margin: 0; color: var(--text-dim); font-size: var(--fs-s); }
-.managed-wrap pre { width: 100%; background: var(--bg-sunken); border: 1px solid var(--line); border-radius: var(--radius-s); padding: 10px; font-size: var(--fs-xs); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 320px; overflow: auto; }
+/* Task sandboxes */
+.managed { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+.managed h2 { font-size: var(--fs-m); }
+.managed-form { border: 1px solid var(--line); border-radius: var(--radius-s); padding: 14px; margin: 0; display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.managed-form legend { padding: 0 6px; font-size: var(--fs-s); color: var(--text-dim); }
+.managed-form .select, .managed-form .input, .managed-form .textarea { width: 100%; max-width: 420px; }
+.managed-form .textarea { max-width: none; min-height: 72px; }
+.managed-plan { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.managed-plan p { margin: 0; font-size: var(--fs-s); color: var(--text-dim); }
+.managed .cleanup-list { border: 1px solid var(--line); border-radius: var(--radius-s); }
+.managed-job { padding: 4px 12px; }
+.managed-job + .managed-job { border-top: 1px solid var(--line); }
+.managed-job summary { list-style-position: inside; }
+.managed-job .cleanup-main { gap: 8px; padding: 4px 0 10px; }
+.managed-job small { white-space: normal; }
+.managed-confirm { flex-wrap: wrap; }
+.managed .ws-diff { max-height: 320px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; }
 
 /* Settings key/value rows */
 .ws-kv { display: grid; grid-template-columns: 160px minmax(0, 1fr); align-items: center; gap: 12px; padding: 6px 0; border-bottom: 1px solid var(--border, rgba(255,255,255,.06)); font-size: 13px; }
