@@ -13,7 +13,8 @@ import { AgentProgressLine, AgentProgressPanel } from "../ui/agent-progress.jsx"
 import { AccessApprovalBar } from "../ui/access-requests.jsx";
 import { pendingAccessByAgent, agentNeedsUser, agentNeedsToolApproval } from "../lib/access-helpers.js";
 import { rpc, fmt, sendError, useEvent } from "../lib/rpc.js";
-import { route, go, params, registerCommands } from "../lib/nav.js";
+import { route, go, paramsFor, registerCommands } from "../lib/nav.js";
+const params = paramsFor("agents");
 import HunkReview from "../ui/hunk-review.jsx";
 import { steerKey } from "../lib/steer.js";
 import { matchShortcut, shortcutLabel, cycle } from "../lib/shortcuts.js";
@@ -1081,7 +1082,7 @@ function MissionDispatchBar(props) {
         <option value="reviewer">Reviewer (Audits diffs &amp; PRs)</option>
       </select>
       <select class="select mission-select" value={repo()} onChange={(e) => setRepo(e.currentTarget.value)} aria-label="Target repository">
-        <option value="">Any / Scratch Repo</option>
+        <option value="">No workspace (scratch folder)</option>
         <For each={repos() ?? []}>{(r) => <option value={r.id} selected={repo() === r.id}>{labels().get(r.id)}</option>}</For>
       </select>
       <input
