@@ -94,6 +94,7 @@ function GlobalHome() {
     return { models: models ?? { embed: { state: "missing" } }, github, runtimes: runtimes ?? [], notifications: settings?.notifications === "true", skills, mcp };
   });
   useVisibleEvent("library", () => su.refetch(), { debounceMs: 500 });
+  useVisibleEvent("mcp:changed", () => su.refetch(), { debounceMs: 500 });
   const setupRows = createMemo(() => setupSteps({
     ...(setupRaw() ?? {}),
     providers: providers.state === "ready" ? providers() ?? [] : undefined,

@@ -12,7 +12,7 @@ import { checkStoppedHistory } from "./stopped-history.mjs";
 import { checkEffortProgress, checkLiveTps } from "./effort-progress.mjs";
 import { checkCodeGraph } from "./code-review.mjs";
 import { checkReviewPreview } from "./review-preview.mjs";
-import { checkMemoryLive, checkMcpLive, checkSkillsLive } from "./live-refresh.mjs";
+import { checkMemoryLive, checkMcpLive, checkSkillsLive, checkSurfacesLive, checkHomeSetupLive } from "./live-refresh.mjs";
 const SETS = { empty: EMPTY, populated: POPULATED, failing: FAILING, slow: SLOW, huge: HUGE, stale: STALE };
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -403,8 +403,12 @@ for (const setName of sets) {
         } catch(e){problems.push(`${w} environments: ${e.message}`);}
       }
       if (setName === 'populated') {
-        const live = { memory: checkMemoryLive, settings: checkMcpLive, skills: checkSkillsLive }[s];
+        const live = { memory: checkMemoryLive, settings: checkMcpLive, skills: checkSkillsLive, surfaces: checkSurfacesLive }[s];
         if (live) { try { await live(page); } catch (e) { problems.push(`${w} ${s} live: ${e.message}`); } }
+      }
+      // The setup card only shows while setup is incomplete, which is the empty set.
+      if (setName === 'empty' && s === 'home') {
+        try { await checkHomeSetupLive(page); } catch (e) { problems.push(`${w} home live: ${e.message}`); }
       }
       if (s === 'review' && setName === 'populated') {
         try { await checkReviewPreview(page); await page.$eval('details[aria-label="More review tools"]', d => d.scrollIntoView()); await shot(page, 'review-tools'); } catch (e) { problems.push(`${w} review: ${e.message}`); }

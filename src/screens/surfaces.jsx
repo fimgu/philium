@@ -31,7 +31,7 @@ export default function Surfaces() {
   const [cport, setCport] = createSignal("3000");
   const [adding, setAdding] = createSignal(false);
 
-  useVisibleEvent("surfaces:changed", () => { refetchSurfaces(); refetchStatus(); }, { debounceMs: 200 });
+  useVisibleEvent("surfaces:changed", () => { refetchSurfaces(); refetchStatus(); refetchCatalog(); }, { debounceMs: 200 });
 
   const running = createMemo(() => (surfaces() ?? []).filter((s) => s.state === "running"));
   const active = createMemo(() => running().find((s) => s.id === activeId()) || null);

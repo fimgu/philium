@@ -1235,6 +1235,7 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
                 params![id, name, category, description, image, command, port, proto, cli, now()],
             )?;
             ctx.notify("surfaces");
+            ctx.emit("surfaces:changed", json!({ "recipe": id }));
             Ok(json!({ "id": id, "name": name, "image": image }))
         }
         "remove_recipe" => {
@@ -1245,6 +1246,7 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
             }
             ctx.db.exec("DELETE FROM app_surface_recipes WHERE id=?1", [&id])?;
             ctx.notify("surfaces");
+            ctx.emit("surfaces:changed", json!({ "recipe": id }));
             Ok(Value::Null)
         }
         "launch" => {

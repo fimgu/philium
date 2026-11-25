@@ -532,9 +532,8 @@ fn main() {
             let c3 = ctx.clone();
             tauri::async_runtime::spawn(async move {
                 while let Ok(what) = changes.recv().await {
-                    // The UI subscribes to these two by their bare names
-                    // (memory, skills, agent context, shell settings).
-                    if what == "library" || what == "settings" {
+                    // Some UI listeners subscribe to bare notify topics.
+                    if ctx::forwards_to_ui(&what) {
                         c3.emit(&what, serde_json::json!({}));
                     }
                     if what == "providers" {

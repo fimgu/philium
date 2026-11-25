@@ -27,6 +27,26 @@ export async function checkMcpLive(page) {
   await until(page, (b) => { const t = [...document.querySelectorAll("summary")].find((s) => s.textContent.includes("MCP servers"))?.querySelector(".badge")?.textContent.trim(); return t && t !== b && /^1 custom$/.test(t); }, before, "Settings MCP count after mcp:changed");
 }
 
+export async function checkSurfacesLive(page) {
+  const name = "Live app marker";
+  await page.evaluate((name) => {
+    const row = { id: "live-app", name, category: "custom", description: "Added elsewhere", image: "example/app" };
+    window.__fixtures["surfaces.catalog"] = [...(window.__fixtures["surfaces.catalog"] ?? []), row];
+    window.__emit("surfaces:changed", { recipe: "live-app" });
+  }, name);
+  await until(page, (n) => document.querySelector(".main")?.innerText.includes(n), name, "Apps catalog after surfaces:changed");
+}
+
+export async function checkHomeSetupLive(page) {
+  const want = "0 skills, 1 MCP servers.";
+  if (!(await page.evaluate(() => !!document.querySelector(".home-setup")))) throw new Error("setup card not shown");
+  await page.evaluate(() => {
+    window.__fixtures["mcp.servers_list"] = [{ name: "live-mcp", command: "true", transport: "stdio", enabled: true }];
+    window.__emit("mcp:changed", {});
+  });
+  await until(page, (w) => document.querySelector(".home-setup")?.innerText.includes(w), want, "Home setup MCP count after mcp:changed");
+}
+
 export async function checkSkillsLive(page) {
   const name = "live-skill-marker";
   const before = await page.evaluate(() => document.querySelector(".main")?.innerText ?? "");

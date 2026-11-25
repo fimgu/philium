@@ -98,7 +98,15 @@ impl Ctx {
     pub fn notify(&self, what: &str) {
         let _ = self.changes.send(what.to_string());
     }
+}
 
+/// `notify` topics the UI listens to by their bare name (Memory, Skills, agent context, shell
+/// settings). Other notify topics already have a matching `<topic>:changed` emit at the call site.
+pub fn forwards_to_ui(what: &str) -> bool {
+    matches!(what, "library" | "settings")
+}
+
+impl Ctx {
     /// Append to the audit/event log shown on Home and in Activity.
     /// An entry is a record, not a dump: one larger than `EVENT_MAX` keeps its start and size.
     pub fn log_event(&self, kind: &str, agent_id: Option<&str>, body: &Value) {
@@ -285,5 +293,47 @@ mod rpc_error_tests {
         assert_eq!(super::rpc_error(super::not_found("Task not found"))["kind"], "not_found");
         assert_eq!(super::rpc_error(super::not_found("Task not found"))["message"], "Task not found");
         assert_eq!(super::rpc_error("boom".into())["kind"], "failed");
+    }
+}
+
+#[cfg(test)]
+mod live_topic_tests {
+    use std::collections::BTreeSet;
+    use std::path::Path;
+
+    fn walk(dir: &Path, exts: &[&str], out: &mut Vec<String>) {
+        for e in std::fs::read_dir(dir).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() { walk(&p, exts, out); continue; }
+            let name = p.to_string_lossy().to_string();
+            if exts.iter().any(|x| name.ends_with(x)) && !name.contains(".test.") {
+                out.push(std::fs::read_to_string(&p).unwrap_or_default());
+            }
+        }
+    }
+
+    /// Quoted names after `marker` up to the closing quote, e.g. `notify("library")` -> library.
+    fn names(src: &str, marker: &str) -> BTreeSet<String> {
+        src.match_indices(marker)
+            .filter_map(|(i, _)| src[i + marker.len()..].split('"').next().map(str::to_string))
+            .filter(|s| !s.is_empty())
+            .collect()
+    }
+
+    /// A screen that listens for a bare notify topic only updates if the change loop forwards it.
+    #[test]
+    fn every_ui_listened_notify_topic_reaches_the_ui() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let (mut rs, mut ui) = (Vec::new(), Vec::new());
+        walk(&root.join("src"), &[".rs"], &mut rs);
+        walk(&root.join("../src"), &[".js", ".jsx"], &mut ui);
+        let notified: BTreeSet<String> = rs.iter().flat_map(|s| names(s, "notify(\"")).collect();
+        let heard: BTreeSet<String> = ui.iter()
+            .flat_map(|s| names(s, "useEvent(\"").into_iter().chain(names(s, "useVisibleEvent(\"")))
+            .collect();
+        assert!(notified.contains("library") && heard.contains("library"), "scan found nothing");
+        for t in notified.intersection(&heard) {
+            assert!(super::forwards_to_ui(t), "UI listens for `{t}` but notify(\"{t}\") never reaches it");
+        }
     }
 }
