@@ -349,8 +349,10 @@ export function Menu(props) {
   });
   return (
     <>
-      <button ref={btn} type="button" class="btn ghost sm menu-btn" title={props.title ?? "More actions"} aria-haspopup="menu" aria-expanded={!!pos()} onClick={open}>
-        <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><circle cx="3" cy="8" r="1.4" /><circle cx="8" cy="8" r="1.4" /><circle cx="13" cy="8" r="1.4" /></svg>
+      <button ref={btn} type="button" class={props.label ? "btn sm" : "btn ghost sm menu-btn"} title={props.title ?? "More actions"} aria-haspopup="menu" aria-expanded={!!pos()} onClick={open}>
+        <Show when={props.label} fallback={<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><circle cx="3" cy="8" r="1.4" /><circle cx="8" cy="8" r="1.4" /><circle cx="13" cy="8" r="1.4" /></svg>}>
+          {props.label}
+        </Show>
       </button>
       <Show when={pos()}>
         <Portal>

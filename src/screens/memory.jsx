@@ -605,7 +605,7 @@ export default function Memory() {
         <Show when={models() && modelsInfo().state !== "ready"}>
           <div class="mem-models-banner">
             <span class="grow">
-              <span class="dim">Local search models</span> <span class="dim" title={models()?.embed?.error || models()?.rerank?.error || ""}>{modelsInfo().text}</span>
+              <span class="dim">Local search models:</span> <span class="dim" title={models()?.embed?.error || models()?.rerank?.error || ""}>{modelsInfo().text}</span>
             </span>
             <Show when={modelsInfo().action}>
               <Button size="sm" variant="ghost" busy={modelsBusy()} onClick={downloadModels}>{modelsInfo().action}</Button>

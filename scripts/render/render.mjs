@@ -12,6 +12,7 @@ import { checkStoppedHistory } from "./stopped-history.mjs";
 import { checkEffortProgress, checkLiveTps } from "./effort-progress.mjs";
 import { checkCodeGraph } from "./code-review.mjs";
 import { checkReviewPreview } from "./review-preview.mjs";
+import { checkMemoryLive, checkMcpLive, checkSkillsLive } from "./live-refresh.mjs";
 const SETS = { empty: EMPTY, populated: POPULATED, failing: FAILING, slow: SLOW, huge: HUGE, stale: STALE };
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -24,7 +25,7 @@ const sets = opt("sets", "empty,populated,failing,slow,huge").split(",");
 const overlap = args.includes("--overlap");
 const CHROME = process.env.CHROME ?? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 const SIZES = [[1440, 900], [1280, 800]];
-const SCREENS = ["home", "agents", "board", "review", "environments", "chat", "terminals", "browser", "repos", "code", "activity", "stats", "providers", "settings"];
+const SCREENS = ["home", "agents", "board", "review", "environments", "chat", "terminals", "browser", "surfaces", "skills", "memory", "repos", "code", "activity", "stats", "providers", "settings"];
 const serveOnly = args.includes("--serve");
 const dist = serveOnly
   ? path.resolve(here, "../../dist-fixture")
@@ -80,6 +81,7 @@ const stub = (fx, setName, serveOnly = false) => {
   }
   const nativeScale = CanvasRenderingContext2D.prototype.scale;
   CanvasRenderingContext2D.prototype.scale = function(x, y) { this.canvas.__graphScale = x; return nativeScale.call(this, x, y); };
+  window.__fixtures = fixtures;
   window.__emit = (topic, payload) => {
     for (const [id, subscribed] of listeners) {
       if (subscribed === topic) window[`_${id}`]?.({ event: topic, id, payload });
@@ -122,6 +124,7 @@ const stub = (fx, setName, serveOnly = false) => {
       if (cmd === "agent_attachment") { (window.__test.attachmentCalls ??= []).push(a); const b = window.__test.blobs?.get(a.sha256); if (!b) throw "attachment not found in this conversation"; return b; }
       if (cmd === "capture_screenshot") { window.__test.captures = (window.__test.captures ?? 0) + 1; if (window.__test.screenshot === "denied") throw "screen-permission"; return window.__test.screenshot ?? new Uint8Array(); }
       if (cmd === "open_screen_settings") { window.__test.settingsOpened = (window.__test.settingsOpened ?? 0) + 1; return null; }
+      if (cmd === "rpc") (window.__rpcLog ??= []).push(a.method);
       if (fixtures.__delay) await new Promise((r) => setTimeout(r, fixtures.__delay));
       if (fixtures.__fail && (cmd === "rpc" || cmd === "hal")) {
         window.__n = (window.__n ?? 0) + 1;
@@ -398,6 +401,10 @@ for (const setName of sets) {
           await clickText(page,'button','Preview sandbox');await page.waitForFunction(()=>document.body.innerText.includes('Start offline sandbox')&&!window.__test.managed);await clickText(page,'button','Start offline sandbox');await page.waitForSelector('[aria-label="Managed task sandboxes"] summary');await page.click('[aria-label="Managed task sandboxes"] summary');await clickText(page,'button','Sandbox logs');await page.waitForFunction(()=>document.body.innerText.includes('fixture marker'));
           await page.click('[aria-label="Managed task sandboxes"] .ws-actions button:nth-child(2)');await clickText(page,'button','Release sandbox');await clickText(page,'button','Keep sandbox');if(await page.evaluate(()=>window.__test.managed.state)!=='active')throw Error('Dismissed release removed sandbox');await clickText(page,'button','Release sandbox');await clickText(page,'button','Confirm release');await page.waitForFunction(()=>document.body.innerText.includes('removal verified'));
         } catch(e){problems.push(`${w} environments: ${e.message}`);}
+      }
+      if (setName === 'populated') {
+        const live = { memory: checkMemoryLive, settings: checkMcpLive, skills: checkSkillsLive }[s];
+        if (live) { try { await live(page); } catch (e) { problems.push(`${w} ${s} live: ${e.message}`); } }
       }
       if (s === 'review' && setName === 'populated') {
         try { await checkReviewPreview(page); await page.$eval('details[aria-label="More review tools"]', d => d.scrollIntoView()); await shot(page, 'review-tools'); } catch (e) { problems.push(`${w} review: ${e.message}`); }

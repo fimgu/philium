@@ -14,7 +14,10 @@ export const MEMORY_CATEGORIES = [
 ];
 
 export function categoryLabel(c) {
-  return MEMORY_CATEGORIES.find((x) => x.value === c)?.label ?? (c || "");
+  const known = MEMORY_CATEGORIES.find((x) => x.value === c)?.label;
+  if (known) return known;
+  const s = String(c || "").replace(/_/g, " ");
+  return s ? s[0].toUpperCase() + s.slice(1) : "";
 }
 
 export function memoryTitle(m) {

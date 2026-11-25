@@ -30,6 +30,8 @@ test("modelsSummary states", () => {
   assert.equal(f.action, "Retry");
   assert.equal(modelsSummary({ embed: r("missing"), rerank: r("missing") }).action, "Download");
   assert.equal(categoryLabel("gotcha"), "Gotcha");
+  assert.equal(categoryLabel("open_question"), "Open question");
+  assert.equal(categoryLabel(""), "");
 });
 
 test("dreamSummary reads SQLite UTC timestamps and budget", async () => {

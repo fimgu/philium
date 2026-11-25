@@ -3,6 +3,7 @@
 // and <repo>/.agents/skills. Agents see enabled skills via skill_list / skill_get.
 import { For, Show, createSignal, createResource } from "solid-js";
 import { Page, Button, Badge, Empty, Input, TextArea, Select, Toggle, Modal, Field, Menu, confirm, toast, cleanError } from "../ui/kit.jsx";
+import { Icon } from "../ui/icons.jsx";
 import { rpc } from "../lib/rpc.js";
 import { activeRepoId } from "../lib/store.js";
 import { useVisibleEvent } from "../lib/visibility.js";
@@ -139,7 +140,7 @@ export default function Skills() {
 
   return (
     <Page title="Skills" sub={data()?.global_dir}
-      actions={<div class="row gap-4"><Show when={busy()}><span class="xs dim">Working…</span></Show><span class="xs">Add skill</span><Menu title="Add skill" items={addMenu} /></div>}>
+      actions={<div class="row gap-4"><Show when={busy()}><span class="xs dim">Working…</span></Show><Menu title="Add skill" label={<><Icon name="plus" size={12} /> Add skill</>} items={addMenu} /></div>}>
       <div class="row gap-12" style={{ "align-items": "flex-start", height: "100%", outline: over() ? "2px dashed var(--accent, #888)" : "none" }}
         onDragOver={(e) => { e.preventDefault(); setOver(true); }} onDragLeave={() => setOver(false)} onDrop={onDrop}>
         <div class="col gap-8" style={{ width: "320px", "flex-shrink": 0 }}>

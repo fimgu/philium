@@ -163,6 +163,20 @@ export const POPULATED = {
   "app.settings_get": { theme: "dark", sweep_hours: "24" },
   // The backend returns null until contract checks are pinned.
   "release_intake.sql_profile": null,
+  "mcp.servers_list": [],
+  "library.status": { memories: 3, proposed: 1 },
+  "library.list": [
+    { id: "m1", content: "Run cargo test with --locked in CI.", scope: "global", status: "active", category: "preference", created_at: now / 1000 - 86400, updated_at: now / 1000 - 3600 },
+    { id: "m2", content: "The board drawer reads its own route params.", scope: "global", status: "active", category: "fact", created_at: now / 1000 - 7200, updated_at: now / 1000 - 7200 },
+    { id: "m3", content: "Prefer kit components over raw buttons.", scope: "global", status: "active", category: "correction", created_at: now / 1000 - 600, updated_at: now / 1000 - 600 },
+  ],
+  "skills.list": {
+    global_dir: "~/.agents/skills",
+    skills: [
+      { name: "release-notes", description: "Draft release notes from merged pull requests.", scope: "global", enabled: true },
+      { name: "flaky-test", description: "Find and quarantine flaky tests.", scope: "repo", enabled: false },
+    ],
+  },
   "app.disk": { worktrees: { bytes: 1.4e9 }, repos: { bytes: 6.2e8 }, data: { bytes: 2.1e8 } },
   "app.events": [
     { id: 1, kind: "agent.spawned", ts: now - 20 * min, summary: "lion started", agent: "lion" },
