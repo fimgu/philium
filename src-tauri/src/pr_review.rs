@@ -1511,8 +1511,20 @@ mod tests {
         ctx.db.exec("INSERT INTO agents(id,name,role,model_ref,repo_id,created_at,last_active_at) VALUES('oldlead','oldlead','orchestrator','m','r1',0,0),('mine','mine','worker','m','r1',0,0)", []).unwrap();
         ctx.db.exec("INSERT INTO pr_reviews(id,repo,origin,pr,base,head,state,lead,started,coverage,errors) VALUES('rv0','r1','o/inv',7,'b','h0','superseded','oldlead',1,'{}','[]')", []).unwrap();
         ctx.db.exec("UPDATE pr_reviews SET state='observed' WHERE id='rv'", []).unwrap();
+        // Real folders on disk: each agent's own dir and a registered scratch dir.
+        crate::reaper::init(&ctx).ok();
+        for n in ["lead", "helper", "oldlead", "mine"] {
+            std::fs::create_dir_all(ctx.agent_dir(n).join("scratch")).unwrap();
+            std::fs::write(ctx.agent_dir(n).join("scratch/notes.txt"), "x").unwrap();
+        }
         let out = super::call(&ctx, "done", json!({"id":"rv"})).await.unwrap();
         assert_eq!(out["review"]["state"], "done");
+        for n in ["lead", "helper", "oldlead"] {
+            assert!(!ctx.agent_dir(n).exists(), "{n}'s folder is gone");
+        }
+        assert!(ctx.agent_dir("mine").join("scratch/notes.txt").exists(), "an unrelated agent's files stay");
+        let leaked = ctx.db.query("SELECT handle FROM resources WHERE state='leaked'", []).unwrap();
+        assert!(leaked.is_empty(), "nothing left behind: {leaked:?}");
         let left: Vec<String> = ctx.db.query("SELECT id FROM agents ORDER BY id", []).unwrap().iter().map(|r| r["id"].as_str().unwrap().to_string()).collect();
         assert_eq!(left, vec!["mine"], "lead, helper and the earlier run's lead are gone");
         assert_eq!(items_of(&ctx, "rv").unwrap().len(), 1, "the checklist stays");
