@@ -1639,6 +1639,34 @@ mod tests {
         assert!(policy_items(&crate::pr_policy::resolve(None, &[], "default"), false).is_empty());
     }
 
+    #[tokio::test]
+    async fn done_removes_the_review_worktree_with_its_unsaved_work() {
+        let ctx = Ctx::test();
+        let repo = ctx.root.parent().unwrap().join("done-repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        sh(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+        sh(&repo, &["add", "."]);
+        sh(&repo, &["commit", "-qm", "base"]);
+        policy_fixture_at(&ctx, "standard", None, repo.to_str().unwrap());
+        crate::workspace::init(&ctx).ok();
+        crate::reaper::init(&ctx).ok();
+        let w = crate::workspace::create_worktree(&ctx, "r1", Some("lead"), "lead", None).unwrap();
+        let wt = std::path::PathBuf::from(&w.path);
+        let wts = wt.to_string_lossy().to_string();
+        // The lead left uncommitted work: Done is the person's confirmed discard.
+        std::fs::write(wt.join("a.txt"), "changed\n").unwrap();
+        ctx.db.exec("UPDATE pr_reviews SET state='observed' WHERE id='rv'", []).unwrap();
+        let out = super::call(&ctx, "done", json!({"id":"rv"})).await.unwrap();
+        assert_eq!(out["review"]["state"], "done");
+        assert!(!wt.exists(), "the worktree folder is gone");
+        assert!(!sh(&repo, &["worktree", "list"]).contains(&wts), "git no longer lists it");
+        assert!(sh(&repo, &["branch", "--list"]).lines().all(|b| b.trim().trim_start_matches("* ") == "main"), "its branch is gone");
+        assert_eq!(std::fs::read_to_string(repo.join("a.txt")).unwrap(), "one\n", "the main checkout is untouched");
+        assert!(ctx.db.query("SELECT id FROM resources WHERE state!='released'", []).unwrap().is_empty(), "nothing still tracked");
+        std::fs::remove_dir_all(ctx.root.parent().unwrap()).ok();
+    }
+
     fn policy_fixture(ctx: &Arc<Ctx>, level: &str, budget: Option<i64>) {
         policy_fixture_at(ctx, level, budget, "/tmp/pr-review-policy");
     }

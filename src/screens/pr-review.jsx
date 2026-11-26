@@ -281,6 +281,8 @@ export function PrReviewer(props) {
       const left = out?.cleanup?.left || [];
       toast(`Review done. Removed ${n} agent${n === 1 ? '' : 's'}.`, 'secure');
       if (left.length) toast(`Philium could not stop these safely, so check them yourself: ${left.map((l) => `${l.handle} (${l.agent})`).join('; ')}`, 'danger');
+      const stuck = [...(out?.cleanup?.unsaved || []).map((u) => u.name), ...(out?.cleanup?.kept || [])];
+      if (stuck.length) toast(`Still there: ${stuck.join(', ')}. Remove them from Agents.`, 'danger');
     } catch (e) { toast(String(e), 'danger'); }
   }
 
