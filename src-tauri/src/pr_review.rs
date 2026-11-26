@@ -20,6 +20,8 @@ CREATE TABLE IF NOT EXISTS pr_items(id TEXT PRIMARY KEY, review TEXT NOT NULL RE
   path TEXT, line INTEGER, status TEXT NOT NULL DEFAULT 'open', severity INTEGER, origin TEXT, evidence TEXT,
   agent TEXT, verify TEXT NOT NULL DEFAULT 'none', verifier TEXT, verify_evidence TEXT,
   prev_status TEXT, prev_evidence TEXT, updated INTEGER NOT NULL, UNIQUE(review,key));
+CREATE TABLE IF NOT EXISTS pr_review_agents(review TEXT NOT NULL REFERENCES pr_reviews(id) ON DELETE CASCADE,
+  agent_id TEXT NOT NULL, name TEXT NOT NULL, PRIMARY KEY(review,agent_id));
 CREATE TABLE IF NOT EXISTS pr_notes(id TEXT PRIMARY KEY, repo TEXT NOT NULL, pr INTEGER NOT NULL, text TEXT NOT NULL,
   must INTEGER NOT NULL DEFAULT 0, created INTEGER NOT NULL);
 "#;
@@ -60,6 +62,8 @@ pub fn init(ctx: &Arc<Ctx>) -> Result<(), String> {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(120)).await;
             let Some(ctx) = weak.upgrade() else { break };
+            // Budgets are local and always polled; only the GitHub/network part waits while hidden.
+            check_budgets(&ctx);
             if crate::attention::HIDDEN.load(std::sync::atomic::Ordering::Relaxed) {
                 continue;
             }
@@ -360,9 +364,15 @@ fn tree_of(ctx: &Ctx, lead: &str) -> Result<Vec<(String, String)>, String> {
 
 /// Tokens the review's agent tree spent, from the gateway's per-request ledger (`requests`,
 /// whose agent_id is the agent's name or id), counted from the review's start.
-fn tree_tokens(ctx: &Ctx, lead: &str, since: i64) -> Result<i64, String> {
-    let mut total = 0;
+/// Membership is persisted in `pr_review_agents` as agents are discovered, so a helper that is
+/// later deleted keeps its spend and tokens_used never decreases.
+fn tree_tokens(ctx: &Ctx, review: &str, lead: &str, since: i64) -> Result<i64, String> {
     for (id, name) in tree_of(ctx, lead)? {
+        ctx.db.exec("INSERT OR IGNORE INTO pr_review_agents(review,agent_id,name) VALUES(?1,?2,?3)", params![review, id, name])?;
+    }
+    let mut total = 0;
+    for m in ctx.db.query("SELECT agent_id,name FROM pr_review_agents WHERE review=?1", [review])? {
+        let (id, name) = (m["agent_id"].as_str().unwrap_or(""), m["name"].as_str().unwrap_or(""));
         total += ctx.db.query("SELECT COALESCE(SUM(tokens_in+tokens_out),0) AS n FROM requests WHERE (agent_id=?1 OR agent_id=?2) AND ts>=?3", params![id, name, since])?.first().and_then(|r| r["n"].as_i64()).unwrap_or(0);
     }
     Ok(total)
@@ -373,7 +383,7 @@ fn tree_tokens(ctx: &Ctx, lead: &str, since: i64) -> Result<i64, String> {
 fn enforce_budget(ctx: &Arc<Ctx>, review: &str) -> Result<bool, String> {
     let r = row(ctx, review)?;
     let Some(lead) = r["lead"].as_str().filter(|l| !l.is_empty()) else { return Ok(false) };
-    let used = tree_tokens(ctx, lead, r["started"].as_i64().unwrap_or(0))?;
+    let used = tree_tokens(ctx, review, lead, r["started"].as_i64().unwrap_or(0))?.max(r["tokens_used"].as_i64().unwrap_or(0));
     ctx.db.exec("UPDATE pr_reviews SET tokens_used=?1 WHERE id=?2", params![used, review])?;
     let Some(budget) = r["policy"]["budget_tokens"].as_i64() else { return Ok(false) };
     if used < budget || r["state"].as_str() != Some("running") {
@@ -820,6 +830,9 @@ pub async fn pr_review_submit(ctx: &Arc<Ctx>, agent_row: &Value, summary: &str) 
     }
     let r = review_for_agent(ctx, agent_row)?;
     let id = r["id"].as_str().unwrap_or("").to_string();
+    if enforce_budget(ctx, &id)? {
+        return Err("This review's token budget is spent. Philium stopped the review and is waiting for the person; stop working.".into());
+    }
     let items = items_of(ctx, &id)?;
     let v = verdict(&items);
     match v["verdict"].as_str() {
@@ -1076,13 +1089,16 @@ pub async fn call(ctx: &Arc<Ctx>, m: &str, a: Value) -> Result<Value, String> {
 
 /// Watcher: auto-start reviews for PRs with review requested, rerun reviews whose head moved,
 /// and promote queued reviews up to the cap of 2 running at once.
-async fn tick(ctx: &Arc<Ctx>) -> Result<(), String> {
-    // Budgets first: a review over its token cap stops and waits for the person.
-    for r in ctx.db.query("SELECT id FROM pr_reviews WHERE state='running'", [])? {
+/// A review over its token cap stops and waits for the person. Local only, runs even while hidden.
+fn check_budgets(ctx: &Arc<Ctx>) {
+    for r in ctx.db.query("SELECT id FROM pr_reviews WHERE state='running'", []).unwrap_or_default() {
         if let Err(e) = enforce_budget(ctx, r["id"].as_str().unwrap_or("")) {
             ctx.log_event("pr_review_budget_error", None, &json!({ "error": e }));
         }
     }
+}
+
+async fn tick(ctx: &Arc<Ctx>) -> Result<(), String> {
     let auto = ctx.db.kv_get("pr_review.auto").as_deref() == Some("1");
     let repos = ctx.db.query("SELECT id,remote_url FROM repos", [])?;
     for repo in &repos {
@@ -1577,6 +1593,38 @@ mod tests {
         assert_eq!(note["status"], "blocked");
         assert_eq!(note["title"], "Token budget 1000 reached at 1100");
         assert_eq!(verdict(&items_of(&ctx, "rv").unwrap())["verdict"], "pending", "risk still open");
+    }
+
+    #[test]
+    fn deleted_helper_keeps_its_spend() {
+        let ctx = Ctx::test();
+        policy_fixture(&ctx, "standard", None);
+        ctx.db.exec("INSERT INTO requests(ts,agent_id,provider_id,model,tokens_in,tokens_out) VALUES(?1,'helper','p','m',500,0)", [now()]).unwrap();
+        enforce_budget(&ctx, "rv").unwrap();
+        assert_eq!(row(&ctx, "rv").unwrap()["tokens_used"], 500);
+        ctx.db.exec("DELETE FROM agents WHERE id='h1'", []).unwrap();
+        enforce_budget(&ctx, "rv").unwrap();
+        assert_eq!(row(&ctx, "rv").unwrap()["tokens_used"], 500, "a removed helper's tokens still count");
+    }
+
+    #[tokio::test]
+    async fn submit_checks_the_budget_first() {
+        let ctx = Ctx::test();
+        policy_fixture(&ctx, "standard", Some(100));
+        ctx.db.exec("INSERT INTO requests(ts,agent_id,provider_id,model,tokens_in,tokens_out) VALUES(?1,'lead','p','m',200,0)", [now()]).unwrap();
+        let lead = ctx.db.query("SELECT * FROM agents WHERE id='lead'", []).unwrap().pop().unwrap();
+        let e = pr_review_submit(&ctx, &lead, "a summary that is long enough").await.unwrap_err();
+        assert!(e.contains("budget"), "{e}");
+        assert_eq!(row(&ctx, "rv").unwrap()["state"], "needs_you");
+    }
+
+    #[test]
+    fn budgets_are_checked_without_network() {
+        let ctx = Ctx::test();
+        policy_fixture(&ctx, "standard", Some(100));
+        ctx.db.exec("INSERT INTO requests(ts,agent_id,provider_id,model,tokens_in,tokens_out) VALUES(?1,'lead','p','m',200,0)", [now()]).unwrap();
+        check_budgets(&ctx);
+        assert_eq!(row(&ctx, "rv").unwrap()["state"], "needs_you");
     }
 
     #[tokio::test]
