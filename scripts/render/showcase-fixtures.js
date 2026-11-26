@@ -271,7 +271,7 @@ export const SHOWCASE = {
     ],
   },
   "routing.preview": { model_ref: "chatgpt/gpt-6.1", reason: "Claude at 92%, used ChatGPT" },
-  "routing.set": null,
+  "routing.set": { ok: true },
   "pr_review.settings_get": { auto: true },
   "pr_review.list": [],
   // Repo default branch has an invalid policy file: UI caps the mode at Observe.

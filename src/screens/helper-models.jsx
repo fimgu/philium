@@ -1,6 +1,7 @@
 import { createSignal, createEffect, on, Show, For } from "solid-js";
 import { Field, Input, Select, Toggle, Button, toast } from "../ui/kit.jsx";
 import { rpc } from "../lib/rpc.js";
+import { useVisibleEvent } from "../lib/visibility.js";
 import { JOBS, OFF_LINE, PRIVACY_LINE, normaliseConfig, validateConfig, pickableProviders, scopeLabel, jobModelOptions, previewLine } from "../lib/helper-routing.js";
 
 // Settings > Helper models (docs/helper-routing.md, "Settings UI").
@@ -32,6 +33,7 @@ export function HelperModelsSection(props) {
     setPreviews(out);
   }
   createEffect(on([repoId, () => props.parentModel], load));
+  useVisibleEvent("routing:changed", () => { if (!busy()) load(); }, { debounceMs: 300 });
 
   const providers = () => data()?.providers ?? [];
   const pickable = () => pickableProviders(providers());
