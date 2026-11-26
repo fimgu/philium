@@ -130,3 +130,78 @@ export function coverageLine(coverage, errors) {
   const missing = ['comments', 'reviews', 'threads', 'checks'].some((k) => coverage[k] && coverage[k].fetched < coverage[k].total);
   return { text: `Read ${parts.join(', ')}`, warn: missing || Boolean(errors && errors.length) };
 }
+
+// ---- Review policy (docs/pr-review-policy.md) ----
+
+export const MODES = ['observe', 'comment', 'enforce'];
+export const MODE_LABEL = { observe: 'Observe', comment: 'Comment', enforce: 'Enforce' };
+export const LEVEL_LABEL = { quick: 'Quick', standard: 'Standard', deep: 'Deep' };
+export const WOULD_POST_LABEL = { APPROVE: 'Approve', REQUEST_CHANGES: 'Request changes', COMMENT: 'Comment' };
+
+export function modeLabel(m) { return MODE_LABEL[m] || ''; }
+export function levelLabel(l) { return LEVEL_LABEL[l] || ''; }
+
+/** Stored policy may arrive as a JSON string column or an object. Returns an object or null. */
+export function parsePolicy(p) {
+  if (!p) return null;
+  if (typeof p === 'object') return p;
+  try { return JSON.parse(p); } catch { return null; }
+}
+
+/** policy_get may return {policy, raw, override} or a bare effective policy. Normalise. */
+export function normalisePolicyGet(res) {
+  if (!res) return { policy: null, raw: null, override: null };
+  if (res.policy !== undefined || res.raw !== undefined || res.override !== undefined) {
+    return { policy: parsePolicy(res.policy), raw: res.raw ?? null, override: res.override ?? null };
+  }
+  return { policy: parsePolicy(res), raw: null, override: null };
+}
+
+function rank(m) { const i = MODES.indexOf(m); return i < 0 ? 0 : i; }
+
+/** Highest mode the UI may select. No file: any. Invalid: observe. Otherwise the file's mode. */
+export function modeCeiling(policy) {
+  if (!policy || policy.source === 'default') return 'enforce';
+  if (policy.source === 'invalid' || policy.error) return 'observe';
+  return MODES.includes(policy.mode) ? policy.mode : 'observe';
+}
+
+export function modeAllowed(mode, ceiling) { return rank(mode) <= rank(ceiling); }
+
+/** The override only ever lowers: min(ceiling, override). With no override, the ceiling applies. */
+export function effectiveMode(ceiling, override) {
+  if (!override || !MODES.includes(override)) return ceiling;
+  return rank(override) < rank(ceiling) ? override : ceiling;
+}
+
+/** "Base a1b2c3d", "Defaults (no policy file)", "Invalid policy file". */
+export function policySourceLabel(policy) {
+  const s = policy?.source || 'default';
+  if (s.startsWith('base:')) return `Base ${s.slice(5, 12)}`;
+  if (s === 'invalid') return 'Invalid policy file';
+  return 'Defaults (no policy file)';
+}
+
+export function formatTokens(n) {
+  const v = Number(n) || 0;
+  if (v >= 1e6) return `${+(v / 1e6).toFixed(1)}M`;
+  if (v >= 1e3) return `${+(v / 1e3).toFixed(1)}k`;
+  return String(v);
+}
+
+/** {text, over} for token use vs budget, or null when nothing used and no cap. */
+export function budgetLine(used, budget) {
+  const u = Number(used) || 0;
+  if (budget == null) return u ? { text: `${formatTokens(u)} tokens`, over: false } : null;
+  return { text: `${formatTokens(u)} of ${formatTokens(budget)} tokens`, over: u >= Number(budget) };
+}
+
+export function wouldPostLabel(event) {
+  if (!event) return '';
+  return WOULD_POST_LABEL[String(event).toUpperCase()] || String(event);
+}
+
+export function humansLine(n) {
+  const h = Number(n) || 0;
+  return h ? `${h} human approval${h === 1 ? '' : 's'} required` : 'No human approval required';
+}

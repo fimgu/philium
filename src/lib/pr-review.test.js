@@ -95,3 +95,28 @@ test('coverageLine reports counts per kind and warns when fetched < total or err
   assert.equal(coverageLine(null), null);
   assert.equal(coverageLine({}), null);
 });
+
+import * as P from './pr-review.js';
+test('policy: ceiling, allowed, effective', () => {
+  assert.equal(P.modeCeiling(null), 'enforce');
+  assert.equal(P.modeCeiling({ source: 'default', mode: 'observe' }), 'enforce');
+  assert.equal(P.modeCeiling({ source: 'invalid', mode: 'observe', error: 'x' }), 'observe');
+  assert.equal(P.modeCeiling({ source: 'base:abc', mode: 'comment' }), 'comment');
+  assert.equal(P.modeAllowed('enforce', 'comment'), false);
+  assert.equal(P.modeAllowed('observe', 'comment'), true);
+  assert.equal(P.effectiveMode('comment', 'enforce'), 'comment');
+  assert.equal(P.effectiveMode('enforce', 'observe'), 'observe');
+  assert.equal(P.effectiveMode('comment', null), 'comment');
+});
+test('policy: labels and budget', () => {
+  assert.equal(P.policySourceLabel({ source: 'base:0123456789ab' }), 'Base 0123456');
+  assert.equal(P.policySourceLabel({ source: 'invalid' }), 'Invalid policy file');
+  assert.deepEqual(P.budgetLine(1200000, 2000000), { text: '1.2M of 2M tokens', over: false });
+  assert.equal(P.budgetLine(2000000, 2000000).over, true);
+  assert.equal(P.budgetLine(0, null), null);
+  assert.equal(P.budgetLine(5400, null).text, '5.4k tokens');
+  assert.equal(P.wouldPostLabel('REQUEST_CHANGES'), 'Request changes');
+  assert.equal(P.humansLine(1), '1 human approval required');
+  assert.equal(P.parsePolicy('{"mode":"observe"}').mode, 'observe');
+  assert.equal(P.normalisePolicyGet({ policy: '{"mode":"comment"}', raw: null, override: 'observe' }).policy.mode, 'comment');
+});
