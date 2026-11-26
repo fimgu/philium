@@ -294,10 +294,12 @@ pub fn decide_event(verdict: &str, own: bool, mode: &str, eff: &Value) -> (&'sta
             if today != "APPROVE" {
                 return (today, None);
             }
-            let humans = eff["humans"].as_i64().unwrap_or(0);
-            if eff["philium"].as_str() == Some("comments") || humans > 0 {
+            // Fail closed: approve only on an explicit, parsed policy that allows it.
+            let humans = eff["humans"].as_i64();
+            if eff["philium"].as_str() != Some("approves") || humans != Some(0) {
                 let purposes: Vec<&str> = eff["matched"].as_array().into_iter().flatten().filter_map(|m| m["purpose"].as_str()).filter(|p| !p.is_empty()).collect();
-                return ("COMMENT", Some(format!("Philium found no blockers. Policy needs {humans} human approval(s): {}.", purposes.join(", "))));
+                let need = match humans { Some(n) if n > 0 => format!("{n} human approval(s)"), Some(_) if eff["philium"].as_str() == Some("comments") => "a person to approve (Philium may only comment)".into(), _ => "a person to approve (policy unreadable)".into() };
+                return ("COMMENT", Some(format!("Philium found no blockers. Policy needs {need}: {}.", purposes.join(", "))));
             }
             ("APPROVE", None)
         }
@@ -543,7 +545,7 @@ fn review_for_agent(ctx: &Ctx, agent_row: &Value) -> Result<Value, String> {
         }
     }
     let rows = ctx.db.query("SELECT * FROM pr_reviews WHERE repo=?1 AND state IN ('running','needs_you') ORDER BY started DESC", [repo])?;
-    rows.into_iter().find(|r| roots.contains(&r["lead"].as_str().unwrap_or("").to_string())).ok_or_else(|| "No running review for this repo belongs to your lead tree".into())
+    rows.into_iter().map(parse_json_fields).find(|r| roots.contains(&r["lead"].as_str().unwrap_or("").to_string())).ok_or_else(|| "No running review for this repo belongs to your lead tree".into())
 }
 
 pub fn pr_checklist(ctx: &Ctx, agent_row: &Value) -> Result<Value, String> {
@@ -1383,6 +1385,24 @@ mod tests {
         assert_eq!(decide_event("request_changes", false, "enforce", &humans), ("REQUEST_CHANGES", None));
         assert_eq!(decide_event("approve", true, "enforce", &plain).0, "COMMENT", "own PR stays a comment");
         assert_eq!(decide_event("request_changes", true, "enforce", &plain).0, "COMMENT");
+        // Fail closed: an unparsed (string) or missing policy never approves.
+        let raw = Value::String(humans.to_string());
+        assert_eq!(decide_event("approve", false, "enforce", &raw).0, "COMMENT", "raw TEXT policy must not approve");
+        assert_eq!(decide_event("approve", false, "enforce", &Value::Null).0, "COMMENT", "missing policy must not approve");
+        assert!(decide_event("approve", false, "enforce", &comments).1.unwrap().contains("Philium may only comment"));
+    }
+
+    #[test]
+    fn agent_review_lookup_parses_policy_so_submit_cannot_approve_past_it() {
+        let ctx = Ctx::test();
+        init(&ctx).unwrap();
+        let policy = json!({"mode":"enforce","philium":"approves","humans":1,"matched":[]}).to_string();
+        ctx.db.exec("INSERT INTO repos(id,name,path,remote_url,added_at) VALUES('r1','inv','/tmp/pr-review-lookup','https://github.com/o/inv.git',1)", []).unwrap();
+        ctx.db.exec("INSERT INTO agents(id,name,role,model_ref,parent_id,repo_id,created_at,last_active_at) VALUES('lead1','lead','orchestrator','m',NULL,'r1',1,1)", []).unwrap();
+        ctx.db.exec("INSERT INTO pr_reviews(id,repo,origin,pr,base,head,state,verdict,lead,started,policy,mode) VALUES('rv','r1','o/r',1,'b','h','running','pending','lead1',1,?1,'enforce')", [policy]).unwrap();
+        let r = review_for_agent(&ctx, &json!({"id":"lead1","repo_id":"r1"})).unwrap();
+        assert!(r["policy"].is_object(), "policy must be parsed JSON, got {:?}", r["policy"]);
+        assert_eq!(decide_event("approve", false, "enforce", &r["policy"]).0, "COMMENT");
     }
 
     #[test]
