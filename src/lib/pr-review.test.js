@@ -102,6 +102,7 @@ test('policy: ceiling, allowed, effective', () => {
   assert.equal(P.modeCeiling({ source: 'default', mode: 'observe' }), 'enforce');
   assert.equal(P.modeCeiling({ source: 'invalid', mode: 'observe', error: 'x' }), 'observe');
   assert.equal(P.modeCeiling({ source: 'base:abc', mode: 'comment' }), 'comment');
+  assert.equal(P.modeCeiling({ source: 'base:abc', mode: 'enforce', ceiling: 'comment' }), 'comment');
   assert.equal(P.modeAllowed('enforce', 'comment'), false);
   assert.equal(P.modeAllowed('observe', 'comment'), true);
   assert.equal(P.effectiveMode('comment', 'enforce'), 'comment');

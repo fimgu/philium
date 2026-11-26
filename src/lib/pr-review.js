@@ -161,6 +161,7 @@ function rank(m) { const i = MODES.indexOf(m); return i < 0 ? 0 : i; }
 
 /** Highest mode the UI may select. No file: any. Invalid: observe. Otherwise the file's mode. */
 export function modeCeiling(policy) {
+  if (policy && MODES.includes(policy.ceiling)) return policy.ceiling;
   if (!policy || policy.source === 'default') return 'enforce';
   if (policy.source === 'invalid' || policy.error) return 'observe';
   return MODES.includes(policy.mode) ? policy.mode : 'observe';
