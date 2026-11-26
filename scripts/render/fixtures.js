@@ -1,5 +1,6 @@
 // Fixture sets for the render harness. EMPTY = fresh install, POPULATED = lived-in.
 import { Buffer } from "node:buffer";
+import { SHOWCASE } from "./showcase-fixtures.js";
 const now = Date.now();
 const min = 60000;
 const status = { root: "/Users/demo/Philium", desk: { ok: true }, version: "0.1.0" };
@@ -258,6 +259,8 @@ export const POPULATED = {
   "hal GET /sessions": sessions,
   "hal GET /sessions/s1/events": chatEvents,
   "hal GET /sessions/s2/events": [],
+  // PR reviewer: observed review, enforce-with-humans policy, invalid repo policy file.
+  ...Object.fromEntries(Object.entries(SHOWCASE).filter(([k]) => k.startsWith("pr_review."))),
 };
 
 // ---- robustness sets ----
