@@ -220,7 +220,8 @@ pub fn tool_list() -> Vec<Value> {
           json!({ "to": s, "body": s }), &["to", "body"]),
         t("mail_read", "Read your inbox (marks messages read).", json!({ "unread_only": b }), &[]),
         t("agent_spawn", "Start a helper agent. It gets its own worktree of the same repo and its own session.",
-          json!({ "name": s, "brief": s, "model": s, "role": s, "task_id": s }), &["brief"]),
+          json!({ "name": s, "brief": s, "model": s, "role": s, "task_id": s,
+                  "job": { "type": "string", "enum": ["explore", "code", "verify"], "description": "explore: search, read, run tests. code: write code (default). verify: confirm another agent's finding (default for reviewer/verifier roles). Philium may pick the helper's model from it." } }), &["brief"]),
         t("agent_status", "Status of workspace agents, or agents in a granted external repo (`repo`, requires `communicate` scope), or one by name.", json!({ "name": s, "repo": s }), &[]),
         t("agent_stop", "Stop a helper agent you spawned.", json!({ "name": s }), &["name"]),
         t("shell_run", "Run a command in your persistent interactive shell (bash), visible live to the human. State carries over (cd, exports, venvs). Waits at most 30 seconds, or timeout_secs if shorter, then returns terminal, running, finished, output and exit_code. A running response is NOT failure: do not retry the command. Poll shell_read with the terminal id until finished, and check exit_code. Pass shell to use another shell. Use background=true for builds, test suites, dev servers and watchers to return a terminal id immediately.",
@@ -429,7 +430,17 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
         "mail_read" => crate::board::agent_inbox(ctx,agent,&me,a["unread_only"].as_bool().unwrap_or(true)),
         "agent_spawn" => {
             let strict = row["strict"].as_i64() == Some(1);
-            let model = a["model"].as_str().map(str::to_string).or_else(|| row["model_ref"].as_str().map(str::to_string));
+            let role = a["role"].as_str().map(str::to_string).or(Some("helper".into()));
+            let job = crate::routing::Job::infer(a["job"].as_str(), role.as_deref())?;
+            let parent_model = row["model_ref"].as_str().unwrap_or_default().to_string();
+            let explicit = a["model"].as_str().filter(|m| !m.is_empty());
+            // Routing (docs/helper-routing.md) picks the model unless the parent is Strict.
+            let (model, route_reason) = if strict {
+                (explicit.map(str::to_string).or(Some(parent_model.clone())), None)
+            } else {
+                let r = crate::routing::route(ctx, row["repo_id"].as_str(), &parent_model, false, job, explicit, &[])?;
+                (Some(r.model_ref), Some(r.reason))
+            };
             // A Strict agent's helpers stay on the same untrusted provider, Strict too.
             if strict {
                 let mine = row["model_ref"].as_str().unwrap_or("").split('/').next().unwrap_or("").to_string();
@@ -441,7 +452,7 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
                 ctx,
                 crate::agents::SpawnReq {
                     name: a["name"].as_str().map(str::to_string),
-                    role: a["role"].as_str().map(str::to_string).or(Some("helper".into())),
+                    role,
                     model,
                     repo_id: row["repo_id"].as_str().map(str::to_string),
                     task_id: a["task_id"].as_str().map(str::to_string),
@@ -449,9 +460,13 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
                     parent_id: Some(agent.to_string()),
                     strict,
                     base: None,
+                    route_reason: route_reason.clone(),
                 },
             )?;
-            Ok(json!({ "name": r["name"], "id": r["id"], "state": r["state"] }))
+            if let Some(id) = r["id"].as_str() {
+                let _ = ctx.db.kv_set(&format!("agent.job.{id}"), job.as_str());
+            }
+            Ok(json!({ "name": r["name"], "id": r["id"], "state": r["state"], "model": r["model_ref"], "route_reason": route_reason }))
         }
         "agent_status" => {
             let target_repo = if let Some(ext) = a["repo"].as_str().or_else(|| a["grant_id"].as_str()).filter(|s| !s.trim().is_empty()) {
