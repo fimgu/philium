@@ -56,6 +56,7 @@ Usage source: the last `account_usage` snapshot (no network on spawn) merged wit
 
 - `helper_scope` (agents.rs) keeps workspace, task and Strict checks. The model check becomes: equal to parent, **or** routing is enabled for that workspace and the helper's provider is allowed+trusted+enabled. Provisioning rechecks this, so a config change to disallow a provider stops new provisions of that helper.
 - Agent row gets `route_reason TEXT` (migration, nullable). Shown under the helper's name in the Agents sidebar and returned by `agent_spawn`. It is set only when routing was on for the workspace at spawn; a set `route_reason` is what makes a helper routed (eligible for rate-limit switches).
+- Mail: in the same workspace, agents of one non-Strict helper family (same root lead via `parent_id`) can mail each other even when routing put them on different models. Strict agents and unrelated peers keep the same-model rule.
 
 ## Rate limit while running
 

@@ -612,6 +612,31 @@ pub fn release_agent(ctx: &Arc<Ctx>, agent_id: &str) {
     changed(ctx);
 }
 
+/// Root of an agent's helper family: follow parent_id to the top (bounded against cycles).
+fn family_root(ctx: &Ctx, name: &str) -> Option<(String, Value)> {
+    let mut row = ctx.db.query("SELECT id,parent_id,repo_id,strict FROM agents WHERE name=?1", [name]).ok()?.pop()?;
+    let first = row.clone();
+    for _ in 0..32 {
+        let Some(p) = row["parent_id"].as_str().map(str::to_string) else { break };
+        match ctx.db.query("SELECT id,parent_id,repo_id,strict FROM agents WHERE id=?1", [&p]).ok().and_then(|mut v| v.pop()) {
+            Some(r) => row = r,
+            None => break,
+        }
+    }
+    Some((row["id"].as_str()?.to_string(), first))
+}
+
+/// Two agents in the same workspace and the same non-Strict helper family (same root lead).
+/// Routed helpers can run on other models than their lead, yet still report to it and to siblings.
+pub fn same_helper_family(ctx: &Ctx, a: &str, b: &str) -> bool {
+    let (Some((ra, xa)), Some((rb, xb))) = (family_root(ctx, a), family_root(ctx, b)) else { return false };
+    ra == rb
+        && xa["repo_id"].is_string()
+        && xa["repo_id"] == xb["repo_id"]
+        && xa["strict"].as_i64() != Some(1)
+        && xb["strict"].as_i64() != Some(1)
+}
+
 pub fn send(ctx: &Arc<Ctx>, from: &str, to: &str, body: &str) -> Result<Value, String> {
     if body.trim().is_empty() || to.trim().is_empty() {
         return Err("Recipient and message are required".into());
@@ -634,11 +659,13 @@ pub fn send(ctx: &Arc<Ctx>, from: &str, to: &str, body: &str) -> Result<Value, S
     } else {
         false
     };
+    // Routed helpers may run on other models than their family: let the family reach each other.
+    let direct_ok = cross_repo_allowed || (from != "you" && same_helper_family(ctx, from, to));
     let msg=ctx.db.with(|c|{
         let tx = c.unchecked_transaction()?;
         tx.execute("INSERT INTO messages(from_agent,to_target,body,guard_findings,created_at) VALUES(?1,?2,?3,?4,?5)",rusqlite::params![from,to,text,json!(findings).to_string(),now()])?;
         let id = tx.last_insert_rowid();
-        if cross_repo_allowed {
+        if direct_ok {
             tx.execute("INSERT INTO agent_mail_delivery SELECT ?1,a.id,a.repo_id,a.model_ref FROM agents a JOIN repos r ON r.id=a.repo_id WHERE a.name=?2 AND a.strict=0 AND ?2 NOT IN ('all','you')",rusqlite::params![id,to])?;
         } else {
             tx.execute("INSERT INTO agent_mail_delivery SELECT ?1,a.id,a.repo_id,a.model_ref FROM agents a JOIN repos r ON r.id=a.repo_id WHERE a.name=?2 AND ?2 NOT IN ('all','you') AND (?3='you' OR EXISTS(SELECT 1 FROM agents s WHERE s.name=?3 AND s.repo_id=a.repo_id AND s.model_ref=a.model_ref AND s.strict=a.strict))",rusqlite::params![id,to,from])?;

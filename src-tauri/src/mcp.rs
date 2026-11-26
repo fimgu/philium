@@ -216,7 +216,7 @@ pub fn tool_list() -> Vec<Value> {
           json!({ "id": s, "status": s, "note": s, "step": s, "pr_url": s, "detail": s }), &["id"]),
         t("board_submit", "Submit a claimed task for review with a summary and the PR URL. Playbook checks run.",
           json!({ "id": s, "summary": s, "pr_url": s }), &["id", "summary"]),
-        t("mail_send", "Message a named agent in your workspace (same model and trust level), a Standard agent in another repo you hold a `communicate` grant for, or \"you\" for the human. No broadcasts.",
+        t("mail_send", "Message a named agent in your workspace (same model and trust level, or your own Standard helper family: lead, helpers and their siblings), a Standard agent in another repo you hold a `communicate` grant for, or \"you\" for the human. No broadcasts.",
           json!({ "to": s, "body": s }), &["to", "body"]),
         t("mail_read", "Read your inbox (marks messages read).", json!({ "unread_only": b }), &[]),
         t("agent_spawn", "Start a helper agent. It gets its own worktree of the same repo and its own session.",
@@ -406,7 +406,7 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
                 let same_scope = !ctx.db.query(
                     "SELECT id FROM agents WHERE name=?1 AND repo_id=?2 AND model_ref=?3 AND strict=?4",
                     rusqlite::params![to, repo()?, row["model_ref"].as_str(), row["strict"].as_i64()],
-                )?.is_empty();
+                )?.is_empty() || crate::board::same_helper_family(ctx, &me, to);
                 if !same_scope {
                     let cross_ok = if row["strict"].as_i64() != Some(1) {
                         ctx.db
@@ -924,6 +924,41 @@ mod tests {
         assert_eq!(who(&h).as_deref(), Some("a1"));
         revoke("a1");
         assert_eq!(who(&h), None);
+    }
+
+    #[tokio::test]
+    async fn routed_helper_family_mails_across_models() {
+        let ctx = Ctx::test();
+        crate::board::init(&ctx).unwrap();
+        ctx.db.exec("INSERT INTO repos(id,name,path,added_at) VALUES('ra','ra','/x/ra',0)", []).unwrap();
+        ctx.db.exec(
+            "INSERT INTO agents(id,name,repo_id,model_ref,parent_id,strict,created_at,last_active_at) VALUES
+             ('L','lead','ra','a/m',NULL,0,0,0),('H1','h1','ra','b/m','L',0,0,0),('H2','h2','ra','c/m','H1',0,0,0),
+             ('P','peer','ra','b/m',NULL,0,0,0),('SL','slead','ra','u/m',NULL,1,0,0),('SH','shelp','ra','v/m','SL',1,0,0)",
+            [],
+        ).unwrap();
+        let call = |agent: &'static str, to: &'static str| {
+            let ctx = ctx.clone();
+            async move {
+                let r = dispatch(&ctx, agent, json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"mail_send","arguments":{"to":to,"body":format!("{agent}->{to}")}}})).await.unwrap();
+                r["result"]["isError"] != true
+            }
+        };
+        let read = |agent: &'static str| {
+            let ctx = ctx.clone();
+            async move {
+                let r = dispatch(&ctx, agent, json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"mail_read","arguments":{"unread_only":false}}})).await.unwrap();
+                r["result"]["content"][0]["text"].as_str().unwrap_or("").to_string()
+            }
+        };
+        // Both directions within the family, including a grandchild sibling, despite different models.
+        assert!(call("H1", "lead").await && call("L", "h1").await && call("H2", "h1").await && call("H2", "lead").await);
+        assert!(read("L").await.contains("H1->lead") && read("L").await.contains("H2->lead"));
+        assert!(read("H1").await.contains("L->h1") && read("H1").await.contains("H2->h1"));
+        // Unrelated different-model peer still rejected.
+        assert!(!call("H2", "peer").await && !call("peer", "lead").await);
+        // Strict families keep the exact model rule.
+        assert!(!call("SH", "slead").await && !call("SL", "shelp").await);
     }
 
     #[tokio::test]
