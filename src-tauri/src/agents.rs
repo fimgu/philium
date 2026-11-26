@@ -463,7 +463,7 @@ fn agent_identity_tail(name: &str, role: &str, parent_name: Option<&str>, worktr
             s.push_str(
                 "- You coordinate:\n\
                  1. Read `## Codebase map` and `## Worktrees and branches` above. Use `repo_context` and `session_search` when you need more.\n\
-                 2. Break the goal into board tasks (`board_create`) and spawn focused workers (`agent_spawn` with `role: \"worker\"` or `\"reviewer\"` and `task_id`), 2 to 6 at a time. Give tasks that touch different files to different workers.\n\
+                 2. Break the goal into board tasks (`board_create`) and spawn focused workers (`agent_spawn` with `role: \"worker\"` or `\"reviewer\"`, `task_id`, and `job`: `explore` for searching and running tests, `code` for writing code, `verify` for confirming a finding), 2 to 6 at a time. Give tasks that touch different files to different workers.\n\
                  3. Follow them with `agent_status` and `mail_read`. Before finishing, check each worker's branch with `repo_context {branch}`. `repo_context` also lists clashes between worktrees.\n\
                  4. Send the person one summary.\n",
             );
@@ -493,6 +493,8 @@ pub struct SpawnReq {
     /// The commit or branch the worktree starts from. None: the parent's, else the checkout's
     /// integration or default branch.
     pub base: Option<String>,
+    /// Why helper routing picked this model. None: not routed.
+    pub route_reason: Option<String>,
 }
 
 /// Create the agent row and start provisioning in the background.
@@ -542,8 +544,8 @@ pub fn spawn_adopting(ctx: &Arc<Ctx>, req: SpawnReq, worktree_id: Option<&str>) 
     let id = new_id();
     let t = now();
     ctx.db.exec(
-        "INSERT INTO agents(id,name,role,model_ref,state,parent_id,repo_id,task_id,strict,port_base,created_at,last_active_at,base_ref)
-         VALUES(?1,?2,?3,?4,'provisioning',?5,?6,?7,?8,?9,?10,?10,?11)",
+        "INSERT INTO agents(id,name,role,model_ref,state,parent_id,repo_id,task_id,strict,port_base,created_at,last_active_at,base_ref,route_reason)
+         VALUES(?1,?2,?3,?4,'provisioning',?5,?6,?7,?8,?9,?10,?10,?11,?12)",
         rusqlite::params![
             id,
             name,
@@ -555,7 +557,8 @@ pub fn spawn_adopting(ctx: &Arc<Ctx>, req: SpawnReq, worktree_id: Option<&str>) 
             strict as i64,
             port_base(ctx),
             t,
-            base
+            base,
+            req.route_reason
         ],
     )?;
     // Handing over a task is recorded by Philium at once. It does not depend on the model
@@ -604,7 +607,17 @@ fn task_scope(ctx: &Ctx, repo: Option<&str>, task: Option<&str>) -> Result<(), S
 fn helper_scope(ctx: &Ctx, parent: &str, repo: Option<&str>, model: Option<&str>, task: Option<&str>, strict: bool) -> Result<(), String> {
     let p = ctx.db.query("SELECT a.model_ref,a.strict,r.id AS repo FROM agents a JOIN repos r ON r.id=a.repo_id WHERE a.id=?1", [parent])?
         .into_iter().next().ok_or("Helper needs a parent with a registered workspace")?;
-    if repo != p["repo"].as_str() || model.is_none() || model != p["model_ref"].as_str() || (p["strict"] == 1 && !strict) {
+    let parent_model = p["model_ref"].as_str().unwrap_or_default();
+    let parent_strict = p["strict"] == 1;
+    if repo != p["repo"].as_str() || (parent_strict && !strict) {
+        return Err("Helpers must keep the parent's workspace, model recipient and restrictions".into());
+    }
+    // Same model as the parent, or (routing on, parent not Strict) an allowed, trusted, enabled
+    // provider for this workspace. Rechecked at every provision.
+    let model_ok = model.is_some_and(|m| {
+        m == parent_model || (!parent_strict && !strict && crate::routing::helper_model_ok(ctx, repo, parent_model, m))
+    });
+    if !model_ok {
         return Err("Helpers must keep the parent's workspace, model recipient and restrictions".into());
     }
     if let Some(task) = task {
@@ -1506,6 +1519,50 @@ pub fn stop(ctx: &Arc<Ctx>, id: &str, state: &str) {
     set_state(ctx, id, state);
 }
 
+/// May the routing watcher move this helper to `model`? Only routed, non-Strict helpers, and only
+/// within the workspace's allowed set. The user-facing `set_model` stays closed for helpers.
+pub fn routed_switch_check(ctx: &Ctx, row: &Value, model: &str) -> Result<(), String> {
+    let parent = row["parent_id"].as_str().and_then(|p| get_row(ctx, p)).ok_or("Only helpers are routed")?;
+    if row["strict"].as_i64() == Some(1) || parent["strict"].as_i64() == Some(1) {
+        return Err("Strict agents are never routed".into());
+    }
+    if row["route_reason"].is_null() {
+        return Err("This helper was not routed".into());
+    }
+    let parent_model = parent["model_ref"].as_str().unwrap_or_default();
+    if !crate::routing::helper_model_ok(ctx, row["repo_id"].as_str(), parent_model, model) {
+        return Err(format!("{} is not allowed for helpers in this workspace", model.split('/').next().unwrap_or("")));
+    }
+    Ok(())
+}
+
+/// Routing watcher's switch path: move a routed helper to another allowed model. Its gateway
+/// token and HAL config are pinned to one provider, so a running helper is restarted on it.
+pub async fn routed_switch(ctx: &Arc<Ctx>, id: &str, model: &str, reason: &str) -> Result<(), String> {
+    let row = get_row(ctx, id).ok_or("unknown agent")?;
+    routed_switch_check(ctx, &row, model)?;
+    let (p, m) = providers::resolve(ctx, Some(model))?;
+    if !p.trusted {
+        return Err("switching to an untrusted provider needs a new Strict agent".into());
+    }
+    let r = format!("{}/{}", p.id, m);
+    ctx.db.exec("UPDATE agents SET model_ref=?2, route_reason=?3 WHERE id=?1", rusqlite::params![id, r, reason])?;
+    ctx.log_event("agent_routed_switch", Some(id), &json!({ "from": row["model_ref"], "to": r, "reason": reason }));
+    ctx.emit("agents:changed", json!({ "id": id }));
+    if runtime(id).is_some() {
+        let admission = ProvisionAdmission::acquire(id)?;
+        let (c, id2) = (ctx.clone(), id.to_string());
+        tokio::task::spawn_blocking(move || stop(&c, &id2, "provisioning")).await.map_err(|e| e.to_string())?;
+        let _admission = admission;
+        if let Err(e) = provision(ctx, id, false, None).await {
+            let _ = ctx.db.kv_set(&format!("agent_error.{id}"), &e);
+            set_state(ctx, id, "failed");
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
 /// Called on app exit: stop every agent HAL; containers/worktrees are kept.
 pub fn shutdown(ctx: &Arc<Ctx>) {
     let ids: Vec<String> = runtimes().lk().keys().cloned().collect();
@@ -1869,6 +1926,7 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
                 parent_id: ctx::arg_opt_str(&args, "parent_id"),
                 strict: args["strict"].as_bool().unwrap_or(false),
                 base: ctx::arg_opt_str(&args, "base").filter(|s| !s.is_empty()),
+                route_reason: None,
             },
         ),
         "send" => send_with_images(ctx, &id()?, &ctx::arg_str(&args, "text")?, args.get("images").cloned().unwrap_or(json!([]))).await,
@@ -2821,7 +2879,7 @@ mod tests {
         // No providers configured: resolve fails, nothing is created.
         assert!(spawn(&ctx, SpawnReq {
             name: Some("lion".into()), role: None, model: Some("nope/x".into()), repo_id: None,
-            task_id: None, brief: None, parent_id: None, strict: false, base: None
+            task_id: None, brief: None, parent_id: None, strict: false, base: None, route_reason: None
         })
         .is_err());
         assert!(ctx.db.query("SELECT * FROM agents", []).unwrap().is_empty());
@@ -2925,6 +2983,84 @@ mod tests {
         assert!(q_std.contains("Re-verify offline tests after compaction"), "{q_std}");
         apply_event(&ctx, "str_c", &json!({"type": "context.compacted"}), &mut st, &mut dirty);
         assert!(crate::library::take_agent_reminders("str_c").is_none());
+    }
+
+    fn routing_fixture() -> Arc<Ctx> {
+        let ctx = Ctx::test();
+        for (id, trusted) in [("a", true), ("b", true), ("c", true), ("u", false)] {
+            providers::upsert(&ctx, &providers::Provider {
+                id: id.into(), name: id.into(), kind: providers::Kind::OpenaiChat, base_url: "https://x/v1".into(),
+                trusted, guard: crate::guard::GuardMode::Redact, enabled: true, default_model: Some("m1".into()),
+            }).unwrap();
+        }
+        ctx.db.exec("INSERT INTO repos(id,name,path,added_at) VALUES('r','r','/tmp/r',0)", []).unwrap();
+        ctx.db.exec(
+            "INSERT INTO agents(id,name,repo_id,model_ref,strict,state,created_at,last_active_at)
+             VALUES('lead','lead','r','a/m1',0,'running',0,0),('slead','slead','r','u/m1',1,'running',0,0)",
+            [],
+        ).unwrap();
+        ctx
+    }
+
+    fn set_routing(ctx: &Ctx, allowed: &[&str]) {
+        let c = crate::routing::Config { enabled: true, allowed: allowed.iter().map(|s| s.to_string()).collect(), ..Default::default() };
+        ctx.db.kv_set("routing:r", &serde_json::to_string(&c).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn helper_scope_follows_routing() {
+        let ctx = routing_fixture();
+        // Off: only the parent's model.
+        assert!(helper_scope(&ctx, "lead", Some("r"), Some("a/m1"), None, false).is_ok());
+        assert!(helper_scope(&ctx, "lead", Some("r"), Some("b/m1"), None, false).is_err());
+        set_routing(&ctx, &["b", "u"]);
+        assert!(helper_scope(&ctx, "lead", Some("r"), Some("b/m1"), None, false).is_ok());
+        assert!(helper_scope(&ctx, "lead", Some("r"), Some("c/m1"), None, false).is_err());
+        assert!(helper_scope(&ctx, "lead", Some("r"), Some("u/m1"), None, false).is_err(), "untrusted never allowed");
+        // Strict parents never route.
+        assert!(helper_scope(&ctx, "slead", Some("r"), Some("b/m1"), None, true).is_err());
+        assert!(helper_scope(&ctx, "slead", Some("r"), Some("u/m1"), None, true).is_ok());
+    }
+
+    #[tokio::test]
+    async fn provision_rechecks_routed_provider() {
+        let ctx = routing_fixture();
+        set_routing(&ctx, &["b"]);
+        ctx.db.exec(
+            "INSERT INTO agents(id,name,repo_id,model_ref,parent_id,strict,state,route_reason,created_at,last_active_at)
+             VALUES('h','h','r','b/m1','lead',0,'stopped','Used b',0,0)",
+            [],
+        ).unwrap();
+        set_routing(&ctx, &[]);
+        let e = provision(&ctx, "h", false, None).await.unwrap_err();
+        assert!(e.contains("Helpers must keep"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn routed_switch_stays_inside_allowed_set() {
+        let ctx = routing_fixture();
+        set_routing(&ctx, &["b"]);
+        ctx.db.exec(
+            "INSERT INTO agents(id,name,repo_id,model_ref,parent_id,strict,state,route_reason,created_at,last_active_at)
+             VALUES('h','h','r','a/m1','lead',0,'stopped','Same as parent',0,0),
+                   ('n','n','r','a/m1','lead',0,'stopped',NULL,0,0)",
+            [],
+        ).unwrap();
+        assert!(routed_switch(&ctx, "h", "c/m1", "x").await.is_err());
+        assert!(routed_switch(&ctx, "n", "b/m1", "x").await.is_err(), "unrouted helpers stay");
+        // The watcher's choice: limited provider excluded, allowed alternative picked.
+        let h = get_row(&ctx, "h").unwrap();
+        let lead = get_row(&ctx, "lead").unwrap();
+        let r = crate::routing::switch_target(&ctx, &h, &lead, "a", now()).unwrap();
+        assert_eq!(r.model_ref, "b/m1");
+        routed_switch(&ctx, "h", &r.model_ref, &r.reason).await.unwrap();
+        let h = get_row(&ctx, "h").unwrap();
+        assert_eq!(h["model_ref"], "b/m1");
+        assert_eq!(h["route_reason"], "Switched: a hit its limit");
+        // 10-minute cap.
+        ctx.db.kv_set("routing.switched.h", &now().to_string()).unwrap();
+        assert!(crate::routing::switch_target(&ctx, &h, &lead, "b", now()).is_none());
+        assert!(crate::routing::switch_target(&ctx, &h, &lead, "b", now() + crate::routing::SWITCH_COOLDOWN_MS).is_some());
     }
 
     #[test]

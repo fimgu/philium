@@ -45,7 +45,7 @@ CREATE TABLE IF NOT EXISTS agents (
   repo_id TEXT REFERENCES repos(id) ON DELETE SET NULL,
   task_id TEXT, strict INTEGER NOT NULL DEFAULT 0,
   hal_session_id TEXT, token_hash TEXT, port_base INTEGER,
-  created_at INTEGER NOT NULL, last_active_at INTEGER NOT NULL, base_ref TEXT);
+  created_at INTEGER NOT NULL, last_active_at INTEGER NOT NULL, base_ref TEXT, route_reason TEXT);
 CREATE TABLE IF NOT EXISTS worktrees (
   id TEXT PRIMARY KEY, repo_id TEXT NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
   agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
@@ -156,6 +156,10 @@ impl Db {
         // review starts on the pull request's head, and its helpers with it.
         if !c.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('agents') WHERE name='base_ref')", [], |r| r.get::<_, bool>(0)).map_err(|e| e.to_string())? {
             c.execute_batch("ALTER TABLE agents ADD COLUMN base_ref TEXT").map_err(|e|e.to_string())?;
+        }
+        // Why helper routing picked this helper's model (docs/helper-routing.md). NULL: not routed.
+        if !c.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('agents') WHERE name='route_reason')", [], |r| r.get::<_, bool>(0)).map_err(|e| e.to_string())? {
+            c.execute_batch("ALTER TABLE agents ADD COLUMN route_reason TEXT").map_err(|e|e.to_string())?;
         }
         // A resource keeps its checkout after its agent row is deleted, so every screen that
         // scopes leftovers by checkout (overview, cleanup) agrees about who owns a leak.

@@ -112,7 +112,7 @@ async fn memory_e2e_real_agent_models_recall_and_dream() {
     ctx.db.exec("INSERT INTO repos(id,name,path,default_branch,added_at) VALUES('r1','app',?1,'main',0)", [repo.to_str().unwrap()]).unwrap();
     let id = crate::agents::spawn(&ctx, crate::agents::SpawnReq {
         name: Some("memtest".into()), role: None, model: Some(model_ref.clone()), repo_id: Some("r1".into()),
-        task_id: None, brief: None, parent_id: None, strict: false, base: None,
+        task_id: None, brief: None, parent_id: None, strict: false, base: None, route_reason: None,
     }).unwrap()["id"].as_str().unwrap().to_string();
     for _ in 0..240 {
         if crate::agents::runtime(&id).is_some() { break; }
@@ -144,7 +144,7 @@ async fn memory_e2e_real_agent_models_recall_and_dream() {
     assert!(hits.as_array().unwrap().first().is_some_and(|h| h["content"].as_str().unwrap_or("").contains("zephyr")), "{hits}");
     let id2 = crate::agents::spawn(&ctx, crate::agents::SpawnReq {
         name: Some("memlater".into()), role: None, model: Some(model_ref.clone()), repo_id: Some("r1".into()),
-        task_id: None, brief: None, parent_id: None, strict: false, base: None,
+        task_id: None, brief: None, parent_id: None, strict: false, base: None, route_reason: None,
     }).unwrap()["id"].as_str().unwrap().to_string();
     for _ in 0..240 {
         if crate::agents::runtime(&id2).is_some() { break; }

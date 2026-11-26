@@ -332,6 +332,7 @@ fn spawn_improver(ctx: &Arc<Ctx>, repo_id: &str, task_id: &str, brief: String, m
             parent_id: None,
             strict: false,
             base: None,
+            route_reason: None,
         },
         worktree_id,
     )
