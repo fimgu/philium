@@ -313,6 +313,18 @@ pub fn route(ctx: &Ctx, repo: Option<&str>, parent: &str, parent_strict: bool, j
     choose(cfg.as_ref(), parent, parent_strict, job, explicit, &providers(ctx), &usage(ctx), exclude)
 }
 
+/// Is routing effectively on for this workspace right now?
+pub fn enabled(ctx: &Ctx, repo: Option<&str>) -> bool {
+    load(ctx, repo).0.is_some_and(|c| c.enabled)
+}
+
+/// A non-Strict helper's model, plus its route reason only when routing was on at spawn.
+/// The reason marks the helper as routed, i.e. eligible for rate-limit switches.
+pub fn route_for_spawn(ctx: &Ctx, repo: Option<&str>, parent: &str, job: Job, explicit: Option<&str>) -> Result<(String, Option<String>), String> {
+    let r = route(ctx, repo, parent, false, job, explicit, &[])?;
+    Ok((r.model_ref, enabled(ctx, repo).then_some(r.reason)))
+}
+
 /// Enforcement: may a helper of `parent` in `repo` run on `model`?
 pub fn helper_model_ok(ctx: &Ctx, repo: Option<&str>, parent: &str, model: &str) -> bool {
     if model == parent {
@@ -333,7 +345,8 @@ pub fn switch_target(ctx: &Ctx, helper: &Value, parent: &Value, limited: &str, n
         return None;
     }
     let id = helper["id"].as_str()?;
-    if pid(helper["model_ref"].as_str()?) != limited {
+    let current = helper["model_ref"].as_str()?;
+    if pid(current) != limited || !enabled(ctx, helper["repo_id"].as_str()) {
         return None;
     }
     let last = ctx.db.kv_get(&format!("routing.switched.{id}")).and_then(|v| v.parse().ok());
@@ -343,7 +356,13 @@ pub fn switch_target(ctx: &Ctx, helper: &Value, parent: &Value, limited: &str, n
     let job = Job::infer(ctx.db.kv_get(&format!("agent.job.{id}")).as_deref(), helper["role"].as_str()).unwrap_or(Job::Code);
     let (cfg, _) = load(ctx, helper["repo_id"].as_str());
     let provs = providers(ctx);
-    let r = choose(cfg.as_ref(), parent["model_ref"].as_str()?, false, job, None, &provs, &usage(ctx), &[limited.to_string()]).ok()?;
+    let u = usage(ctx);
+    let r = choose(cfg.as_ref(), parent["model_ref"].as_str()?, false, job, None, &provs, &u, &[limited.to_string()]).ok()?;
+    // Never "switch" onto the same model, the limited provider or another one at its limit.
+    let to = pid(&r.model_ref);
+    if r.model_ref == current || to == limited || u.get(to).is_some_and(|x| x.limit_reached) {
+        return None;
+    }
     let name = provs.iter().find(|p| p.id == limited).map(|p| p.name.clone()).unwrap_or_else(|| limited.into());
     Some(Route { model_ref: r.model_ref, reason: format!("Switched: {name} hit its limit") })
 }

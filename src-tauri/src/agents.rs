@@ -3092,6 +3092,52 @@ mod tests {
         assert!(crate::routing::switch_target(&ctx, &h, &lead, "b", now() + crate::routing::SWITCH_COOLDOWN_MS).is_some());
     }
 
+    fn spawn_helper(ctx: &Ctx, id: &str) {
+        let (m, reason) = crate::routing::route_for_spawn(ctx, Some("r"), "a/m1", crate::routing::Job::Code, None).unwrap();
+        ctx.db.exec(
+            "INSERT INTO agents(id,name,repo_id,model_ref,parent_id,strict,state,route_reason,created_at,last_active_at)
+             VALUES(?1,?1,'r',?2,'lead',0,'stopped',?3,0,0)",
+            rusqlite::params![id, m, reason],
+        ).unwrap();
+    }
+
+    #[test]
+    fn routing_off_helpers_are_never_switched() {
+        let ctx = routing_fixture();
+        let lead = get_row(&ctx, "lead").unwrap();
+        // Off -> 429: nothing.
+        spawn_helper(&ctx, "off1");
+        let h = get_row(&ctx, "off1").unwrap();
+        assert!(h["route_reason"].is_null(), "routing off does not mark helpers routed");
+        assert!(crate::routing::switch_target(&ctx, &h, &lead, "a", now()).is_none());
+        // Spawned off, routing turned on later -> 429: still not routed.
+        set_routing(&ctx, &["b"]);
+        assert!(crate::routing::switch_target(&ctx, &h, &lead, "a", now()).is_none());
+    }
+
+    #[test]
+    fn routing_on_switches_only_to_another_allowed_provider() {
+        let ctx = routing_fixture();
+        let lead = get_row(&ctx, "lead").unwrap();
+        set_routing(&ctx, &["b"]);
+        spawn_helper(&ctx, "on1");
+        let h = get_row(&ctx, "on1").unwrap();
+        assert!(h["route_reason"].is_string());
+        let from = h["model_ref"].as_str().unwrap().split('/').next().unwrap().to_string();
+        let r = crate::routing::switch_target(&ctx, &h, &lead, &from, now()).unwrap();
+        assert_ne!(r.model_ref, h["model_ref"]);
+        assert!(!r.model_ref.starts_with(&format!("{from}/")));
+        // Routing turned off since: no switch.
+        set_routing(&ctx, &[]);
+        ctx.db.kv_set("routing:r", r#"{"enabled":false}"#).unwrap();
+        assert!(crate::routing::switch_target(&ctx, &h, &lead, &from, now()).is_none());
+        // No alternative: only the parent's provider is allowed and it is the limited one.
+        set_routing(&ctx, &[]);
+        ctx.db.exec("UPDATE agents SET model_ref='a/m1' WHERE id='on1'", []).unwrap();
+        let h = get_row(&ctx, "on1").unwrap();
+        assert!(crate::routing::switch_target(&ctx, &h, &lead, "a", now()).is_none());
+    }
+
     /// Fake HAL server recording every request as "METHOD path body".
     async fn fake_hal() -> (String, Arc<Mutex<Vec<String>>>) {
         use axum::{extract::Request, Router};

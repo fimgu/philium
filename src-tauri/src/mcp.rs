@@ -438,8 +438,8 @@ pub async fn call_tool(ctx: &Arc<Ctx>, agent: &str, name: &str, a: Value) -> Res
             let (model, route_reason) = if strict {
                 (explicit.map(str::to_string).or(Some(parent_model.clone())), None)
             } else {
-                let r = crate::routing::route(ctx, row["repo_id"].as_str(), &parent_model, false, job, explicit, &[])?;
-                (Some(r.model_ref), Some(r.reason))
+                let (m, reason) = crate::routing::route_for_spawn(ctx, row["repo_id"].as_str(), &parent_model, job, explicit)?;
+                (Some(m), reason)
             };
             // A Strict agent's helpers stay on the same untrusted provider, Strict too.
             if strict {
