@@ -254,8 +254,10 @@ fn key(repo: Option<&str>) -> String {
     }
 }
 
+/// A present key is a decision, even if empty or garbled: it parses to off and never falls back
+/// to a wider setting. Only a missing key (Reset deletes it) inherits.
 fn stored(ctx: &Ctx, k: &str) -> Option<String> {
-    ctx.db.kv_get(k).filter(|v| !v.is_empty())
+    ctx.db.kv_get(k)
 }
 
 /// Effective config for a workspace and where it came from. Override replaces global; no merge.
@@ -534,6 +536,9 @@ mod tests {
         ctx.db.kv_set("routing:r1", &serde_json::to_string(&w).unwrap()).unwrap();
         assert_eq!(load(&ctx, Some("r1")), (Some(w), "workspace"));
         assert_eq!(load(&ctx, Some("r2")).0.unwrap().allowed, vec!["b", "c"]);
+        ctx.db.kv_set("routing:r1", "").unwrap();
+        let (c, src) = load(&ctx, Some("r1"));
+        assert!(c.is_none() && src == "workspace", "empty override is off, never the wider global");
         ctx.db.kv_set("routing:r1", "{not json").unwrap();
         assert_eq!(load(&ctx, Some("r1")), (None, "workspace"));
         assert!(!helper_model_ok(&ctx, Some("r1"), "a/m1", "b/m1"));
