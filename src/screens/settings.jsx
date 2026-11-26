@@ -7,6 +7,7 @@ import { useVisibleEvent } from "../lib/visibility.js";
 import "../styles/workspace.css";
 import { Storage } from "./storage.jsx";
 import { McpServersSection } from "./mcp-servers.jsx";
+import { HelperModelsSection } from "./helper-models.jsx";
 import { useUpdate, UpdateControls } from "../ui/update.jsx";
 import { modelsSummary, retrievalInUse, customServerFields } from "../lib/memory-format.js";
 
@@ -695,6 +696,7 @@ export default function Settings() {
           />
         </Field>
       </section>
+      <HelperModelsSection repos={store.repos() ?? []} models={models()} parentModel={model()} busy={busy()} />
       <StrictSandboxSection busy={busy()} />
       <PlaybooksSection busy={busy()} />
       <McpServersSection repos={store.repos() ?? []} />
