@@ -51,13 +51,13 @@ Compute `event` as today, then:
 ## Level
 
 Brief changes (`brief`):
-- `quick`: read-only. One orchestrator, no helpers (`agent_spawn` not used), basis `source_trace` acceptable, run only CI already reported plus unit tests touched by the diff.
+- `quick`: read-only. One orchestrator, no helpers (`agent_spawn` not used), basis `source_trace` acceptable, run only CI already reported plus unit tests touched by the diff. There is no independent verifier on a quick review: a result that would need verification (`fail`, `not_addressed`, or dismissing a person's comment as `not_applicable`/`outdated`) is recorded as `blocked` with the finding in its evidence, so a required one puts the review in `needs_you` for the person.
 - `standard`: today's brief.
 - `deep`: up to 6 helpers, every risk item must have `basis` `runtime` or `runtime_and_source` to `pass` (enforce in `pr_item_result`: a `pass` with `source_trace` on a deep review is rejected with a teaching message).
 
 ## Budget
 
-`budget_tokens`: sum the review agent tree's tokens (orchestrator + descendants) from whatever Philium already records per agent; find it, do not add a second meter. Check in `tick` and in `pr_item_result`. When exceeded: stop the agent tree, `state='needs_you'`, add a blocked `note` item "Token budget N reached at M". Never silently stop.
+`budget_tokens`: sum the review agent tree's tokens (orchestrator + descendants) from whatever Philium already records per agent; find it, do not add a second meter. Check in the watcher (every cycle, even while the window is hidden), in `pr_item_result` and at the start of `pr_review_submit`. Review membership is persisted as agents are discovered, so a deleted helper's spend still counts and `tokens_used` never decreases. When exceeded: stop the agent tree, `state='needs_you'`, add a blocked `note` item "Token budget N reached at M". Never silently stop.
 
 ## RPC additions
 - `get`/`list` rows include `mode`, `level`, `policy`, `tokens_used`, `would_post`.

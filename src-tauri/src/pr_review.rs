@@ -500,7 +500,7 @@ fn brief(review: &Value, base: &str, head: &str, origin: &str, pr: i64, size: &s
     let level = review["level"].as_str().unwrap_or("standard");
     let helpers = if level == "deep" { 6 } else { 4 };
     let level_text = match level {
-        "quick" => "Review level: quick (from the repo's review policy). Work alone and read-only: do not use `agent_spawn` for helpers in step 2, verify items yourself; `source_trace` is an acceptable basis. Run only CI already reported plus the unit tests the diff touches. Step 5 still needs an independent verifier for items with `verify: needed`.".to_string(),
+        "quick" => "Review level: quick (from the repo's review policy). Work alone and read-only: skip steps 2 and 5 and never use `agent_spawn`; check every item yourself, `source_trace` is an acceptable basis. Run only CI already reported plus the unit tests the diff touches. There is no second agent: any result that would need verification (a fail, not_addressed, or dismissing a person's comment) is recorded as blocked and goes to the person.".to_string(),
         "deep" => "Review level: deep (from the repo's review policy). Use up to 6 helpers. Every risk item must be exercised: a risk `pass` needs basis `runtime` or `runtime_and_source`; `source_trace` passes are rejected.".to_string(),
         _ => "Review level: standard.".to_string(),
     };
@@ -672,6 +672,12 @@ pub fn pr_item_result(ctx: &Arc<Ctx>, agent_row: &Value, id: &str, status: &str,
     // Anything that could block, or that dismisses a person's comment, gets a second opinion.
     let verify_needed = status == "fail" || status == "not_addressed" || (flag(&item["human"]) && (status == "not_applicable" || status == "outdated"));
     let me = agent_row["name"].as_str().unwrap_or("agent");
+    // A quick review has no second agent: what would need verification goes to the person.
+    let (status, evidence, verify_needed) = if verify_needed && r["level"].as_str() == Some("quick") {
+        ("blocked".to_string(), format!("Quick review, needs a person to verify this {status}: {evidence}"), false)
+    } else {
+        (status, evidence.to_string(), verify_needed)
+    };
     ctx.db.exec(
         "UPDATE pr_items SET status=?1, evidence=?2, severity=?3, origin=?4, agent=?5, path=COALESCE(?6,path), line=COALESCE(?7,line),
          verify=CASE WHEN ?8=1 THEN 'needed' ELSE 'none' END, verifier=NULL, verify_evidence=NULL, basis=COALESCE(?9,basis), updated=?10 WHERE id=?11",
@@ -1593,6 +1599,20 @@ mod tests {
         assert_eq!(note["status"], "blocked");
         assert_eq!(note["title"], "Token budget 1000 reached at 1100");
         assert_eq!(verdict(&items_of(&ctx, "rv").unwrap())["verdict"], "pending", "risk still open");
+    }
+
+    #[tokio::test]
+    async fn quick_review_escalates_unverified_fail_to_needs_you() {
+        let ctx = Ctx::test();
+        policy_fixture(&ctx, "quick", None);
+        let lead = ctx.db.query("SELECT * FROM agents WHERE id='lead'", []).unwrap().pop().unwrap();
+        let out = pr_item_result(&ctx, &lead, "risk1", "fail", "read sync.rs on head h: token logged on retry", Some(1), Some("introduced"), None, None, Some("source_trace")).unwrap();
+        assert_eq!(out["recorded"], "blocked");
+        assert_eq!(out["verify"], "none");
+        let v = verdict(&items_of(&ctx, "rv").unwrap());
+        assert_eq!(v["verdict"], "needs_you", "{v}");
+        let b = brief(&row(&ctx, "rv").unwrap(), "b", "h", "o/inv", 7, "small");
+        assert!(b.contains("skip steps 2 and 5"));
     }
 
     #[test]
