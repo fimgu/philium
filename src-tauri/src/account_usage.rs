@@ -439,6 +439,11 @@ fn last_used(ctx: &Ctx, provider: &str) -> Option<i64> {
     ctx.db.query("SELECT MAX(ts) AS t FROM requests WHERE provider_id=?1", [provider]).ok()?.first()?["t"].as_i64()
 }
 
+/// The last snapshot taken, without any network call. Empty until the first fetch.
+pub fn last_snapshot() -> Vec<Account> {
+    cache().lock().unwrap_or_else(|e| e.into_inner()).last.clone()
+}
+
 pub async fn accounts(ctx: &Arc<Ctx>, force: bool) -> Value {
     let now = now_ms();
     {

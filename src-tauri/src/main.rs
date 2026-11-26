@@ -62,6 +62,7 @@ mod skills;
 mod pipeline;
 mod providers;
 mod reaper;
+mod routing;
 mod sandbox;
 mod secrets;
 mod drafts;
@@ -243,6 +244,7 @@ async fn rpc_inner(app: &App, method: String, args: Option<Value>) -> Result<Val
         "sandbox" => sandbox::call(&ctx, m, args).await,
         "stats" => stats::call(&ctx, m, args).await,
         "usage" => account_usage::call(&ctx, m, args).await,
+        "routing" => routing::call(&ctx, m, args).await,
         "storage" => storage::call(&ctx, m, args).await,
         "reaper" => reaper::call(&ctx, m, args).await,
         "library" => library::call(&ctx, m, args).await,
@@ -466,7 +468,7 @@ fn main() {
             });
 
             // Module init. Failures are logged, never fatal: the UI shows them.
-            let inits: [(&str, fn(&Arc<Ctx>) -> Result<(), String>); 21] = [
+            let inits: [(&str, fn(&Arc<Ctx>) -> Result<(), String>); 22] = [
                 ("workday", workday::init),
                 ("access", access::init),
                 ("library", library::init),
@@ -485,6 +487,7 @@ fn main() {
                 ("codeindex", codeindex::init),
                 ("stats", stats::init),
                 ("usage", account_usage::init),
+                ("routing", routing::init),
                 ("reaper", reaper::init),
                 ("selfdev", selfdev::init),
                 ("pr_review", pr_review::init),
@@ -977,7 +980,7 @@ mod e2e {
         let start = |name: &str, role: &str| {
             agents::spawn(&ctx, agents::SpawnReq {
                 name: Some(name.into()), role: Some(role.into()), model: Some("record/up-model".into()), repo_id: Some("r1".into()),
-                task_id: None, brief: Some("Look around.".into()), parent_id: None, strict: false, base: None,
+                task_id: None, brief: Some("Look around.".into()), parent_id: None, strict: false, base: None, route_reason: None,
             }).unwrap()["id"].as_str().unwrap().to_string()
         };
         let (wid, lid) = (start("wren", "worker"), start("lead", "orchestrator"));
