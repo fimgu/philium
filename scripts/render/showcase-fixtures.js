@@ -12,7 +12,7 @@ const agent = (id, name, state, extra = {}) => ({
 const agents = [
   agent("a1", "lion", "running", { task_id: "t2", title: "Add rate limiting to checkout API" }),
   agent("a2", "otter", "running", { task_id: "t3", model: "chatgpt/gpt-6.1", title: "Migrate pricing page to server components" }),
-  agent("a3", "heron", "waiting", { task_id: "t6", parent_id: "a1", title: "Write load tests for /api/checkout" }),
+  agent("a3", "heron", "waiting", { task_id: "t6", parent_id: "a1", model: "chatgpt/gpt-6.1", route_reason: "Claude at 92%, used ChatGPT", title: "Write load tests for /api/checkout" }),
   agent("a4", "wren", "idle", { repo_id: "r2", title: "Triage flaky e2e suite" }),
   agent("a5", "ibis", "running", { repo_id: "r3", model: "local/qwen3-coder", title: "Generate OpenAPI client" }),
   agent("a6", "crane", "done", { title: "Dark mode tokens" }),
@@ -260,6 +260,18 @@ export const SHOWCASE = {
       { id: "d5", kind: "retire", summary: "Retired note about the old pricing API", reason: "Endpoint removed" },
     ],
   },
+  // Helper routing (docs/helper-routing.md): on, two allowed providers, one busy.
+  "routing.get": {
+    config: { enabled: true, allowed: ["claude", "chatgpt"], jobs: { explore: "claude/claude-sonnet-5-5", code: null, verify: null }, avoid_above_pct: 85, verify_elsewhere: true },
+    source: "global",
+    providers: [
+      { id: "claude", name: "Claude", trusted: true, enabled: true, usage_pct: 92, limit_reached: false },
+      { id: "chatgpt", name: "ChatGPT", trusted: true, enabled: true, usage_pct: 31, limit_reached: false },
+      { id: "openrouter", name: "OpenRouter", trusted: false, enabled: true, usage_pct: null, limit_reached: false },
+    ],
+  },
+  "routing.preview": { model_ref: "chatgpt/gpt-6.1", reason: "Claude at 92%, used ChatGPT" },
+  "routing.set": null,
   "pr_review.settings_get": { auto: true },
   "pr_review.list": [],
   // Repo default branch has an invalid policy file: UI caps the mode at Observe.

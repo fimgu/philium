@@ -31,7 +31,7 @@ const agent = (id, name, state, extra = {}) => ({
 const agents = [
   agent("a1", "lion", "running", { task_id: "t2", repo_id: "r1" }),
   agent("a2", "otter", "waiting", { repo_id: "r1" }),
-  agent("a3", "heron", "idle", { parent_id: "a1" }),
+  agent("a3", "heron", "idle", { parent_id: "a1", model_ref: "chatgpt/gpt-6.1", route_reason: "Explore job: fast model" }),
   agent("a4", "fox", "failed", { model: "local/qwen3-coder" }),
   agent("a5", "moth", "stopped", { strict: true, model: "local/qwen3-coder" }),
   agent("a6", "crane", "done"),
@@ -260,7 +260,7 @@ export const POPULATED = {
   "hal GET /sessions/s1/events": chatEvents,
   "hal GET /sessions/s2/events": [],
   // PR reviewer: observed review, enforce-with-humans policy, invalid repo policy file.
-  ...Object.fromEntries(Object.entries(SHOWCASE).filter(([k]) => k.startsWith("pr_review."))),
+  ...Object.fromEntries(Object.entries(SHOWCASE).filter(([k]) => k.startsWith("pr_review.") || k.startsWith("routing."))),
 };
 
 // ---- robustness sets ----
