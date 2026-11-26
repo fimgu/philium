@@ -45,22 +45,23 @@ fn check(v: Option<&str>, allowed: &[&str], field: &str, default: &str) -> Resul
 }
 
 /// Glob over `/`-separated paths: `**` any depth (including none), `*` within one segment,
-/// `?` one non-separator char.
+/// `?` one non-separator char. Matching is on Unicode scalar values, not bytes.
 pub fn glob(pat: &str, path: &str) -> bool {
-    fn seg(p: &[u8], s: &[u8]) -> bool {
+    fn seg(p: &[char], s: &[char]) -> bool {
         match (p.first(), s.first()) {
             (None, None) => true,
-            (Some(b'*'), _) => seg(&p[1..], s) || (!s.is_empty() && seg(p, &s[1..])),
-            (Some(b'?'), Some(_)) => seg(&p[1..], &s[1..]),
+            (Some('*'), _) => seg(&p[1..], s) || (!s.is_empty() && seg(p, &s[1..])),
+            (Some('?'), Some(_)) => seg(&p[1..], &s[1..]),
             (Some(a), Some(b)) if a == b => seg(&p[1..], &s[1..]),
             _ => false,
         }
     }
+    fn chars(s: &str) -> Vec<char> { s.chars().collect() }
     fn parts(p: &[&str], s: &[&str]) -> bool {
         match p.first() {
             None => s.is_empty(),
             Some(&"**") => (0..=s.len()).any(|i| parts(&p[1..], &s[i..])),
-            Some(first) => !s.is_empty() && seg(first.as_bytes(), s[0].as_bytes()) && parts(&p[1..], &s[1..]),
+            Some(first) => !s.is_empty() && seg(&chars(first), &chars(s[0])) && parts(&p[1..], &s[1..]),
         }
     }
     let p: Vec<&str> = pat.trim_start_matches("./").split('/').collect();
@@ -145,6 +146,15 @@ mod tests {
     use super::*;
 
     fn files(v: &[&str]) -> Vec<String> { v.iter().map(|s| s.to_string()).collect() }
+
+    #[test]
+    fn glob_matches_unicode_scalars() {
+        assert!(glob("src/caf?.rs", "src/café.rs"));
+        assert!(glob("src/*é.rs", "src/café.rs"));
+        assert!(glob("docs/???.md", "docs/日本語.md"));
+        assert!(!glob("docs/??.md", "docs/日本語.md"));
+        assert!(glob("**/*.rs", "a/b/ünï.rs"));
+    }
 
     const SAMPLE: &str = r#"
 version: 1
