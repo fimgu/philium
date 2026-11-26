@@ -868,10 +868,10 @@ pub async fn pr_review_submit(ctx: &Arc<Ctx>, agent_row: &Value, summary: &str) 
         return Err(format!("The pull request moved to a new head while you worked. This review is superseded; a fresh one has started (id {}).", started["id"].as_str().unwrap_or("")));
     }
     let mode = r["mode"].as_str().unwrap_or("observe").to_string();
-    // Your own pull request: Philium keeps the review here and never posts it, whatever the mode.
+    // Your own pull request: never posted by itself, whatever the mode. You can publish it as a comment.
     let own = r["own"].as_i64() == Some(1);
     if mode == "observe" || own {
-        let event = if own { "NONE" } else { decide_event(v["verdict"].as_str().unwrap_or(""), false, "observe", &r["policy"]).0 };
+        let event = decide_event(v["verdict"].as_str().unwrap_or(""), own, "observe", &r["policy"]).0;
         ctx.db.exec(
             "UPDATE pr_reviews SET state='observed', verdict=?1, would_post=?2, summary=?3, finished=?4 WHERE id=?5 AND state='running'",
             params![v["verdict"].as_str(), event, summary, now(), id],
@@ -882,7 +882,7 @@ pub async fn pr_review_submit(ctx: &Arc<Ctx>, agent_row: &Value, summary: &str) 
         ctx.emit("pr_review:changed", json!({ "repo_id": r["repo"], "pr": r["pr"] }));
         crate::attention::announce(ctx);
         if own {
-            return Ok(json!({"observed": true, "would_post": event, "verdict": v["verdict"], "note": "This is the person's own pull request: Philium keeps the review in the app and posts nothing to GitHub. You are done."}));
+            return Ok(json!({"observed": true, "would_post": event, "verdict": v["verdict"], "note": "This is the person's own pull request: Philium keeps the review in the app. The person can publish it as a comment. You are done."}));
         }
         return Ok(json!({"observed": true, "would_post": event, "verdict": v["verdict"]}));
     }
@@ -935,11 +935,14 @@ async fn post_review(ctx: &Arc<Ctx>, r: &Value, items: &[Value], v: &Value, summ
     let id = r["id"].as_str().unwrap_or("").to_string();
     let origin = r["origin"].as_str().unwrap_or("");
     let pr = r["pr"].as_i64().unwrap_or(0);
-    if r["own"].as_i64() == Some(1) {
-        return Err("Philium never posts a review on your own pull request.".into());
-    }
+    let own = r["own"].as_i64() == Some(1);
     claim(ctx, &id, from, "posting")?;
-    let (event, why) = decide_event(v["verdict"].as_str().unwrap_or(""), r["own"].as_i64() == Some(1), mode, &r["policy"]);
+    let (event, why) = decide_event(v["verdict"].as_str().unwrap_or(""), own, mode, &r["policy"]);
+    // Last guard: your own pull request only ever gets a comment.
+    if own && event != "COMMENT" {
+        ctx.db.exec("UPDATE pr_reviews SET state=?1 WHERE id=?2 AND state='posting'", params![from, id])?;
+        return Err("On your own pull request Philium only posts a comment.".into());
+    }
     let (mut body, inline) = build_body(r, items, v, summary);
     if let Some(why) = why {
         body.push_str(&format!("{why}\n\n"));
@@ -984,10 +987,8 @@ async fn publish(ctx: &Arc<Ctx>, id: &str, wanted: &str) -> Result<Value, String
     if r["state"].as_str() != Some("observed") {
         return Err("Only an observed review can be published".into());
     }
-    if r["own"].as_i64() == Some(1) {
-        return Err("This is your own pull request. Philium keeps the review here and does not post it to GitHub.".into());
-    }
-    let mode = publish_mode(&r["policy"], wanted)?;
+    // Your own pull request is only ever published as a comment.
+    let mode = if r["own"].as_i64() == Some(1) { "comment" } else { publish_mode(&r["policy"], wanted)? };
     let origin = r["origin"].as_str().unwrap_or("").to_string();
     let pr = r["pr"].as_i64().unwrap_or(0);
     let login = r["github_login"].as_str().ok_or("Restart this review to bind it to the repository's GitHub account.")?.to_string();
@@ -1494,19 +1495,14 @@ mod tests {
         assert!(item_waive(&ctx, "env", "x").await.is_err());
     }
 
-    #[tokio::test]
-    async fn own_pr_is_never_posted() {
-        let ctx = Ctx::test();
-        policy_fixture(&ctx, "standard", None);
-        ctx.db.exec("UPDATE pr_reviews SET state='observed', own=1, github_login='me' WHERE id='rv'", []).unwrap();
-        let err = publish(&ctx, "rv", "comment").await.unwrap_err();
-        assert!(err.contains("own pull request"), "{err}");
-        let r = row(&ctx, "rv").unwrap();
-        let items = items_of(&ctx, "rv").unwrap();
-        let v = verdict(&items);
-        let err = post_review(&ctx, &r, &items, &v, "summary text", "enforce", "me", "h", "observed").await.unwrap_err();
-        assert!(err.contains("own pull request"), "{err}");
-        assert_eq!(row(&ctx, "rv").unwrap()["state"], "observed", "nothing was claimed for posting");
+    #[test]
+    fn own_pr_only_ever_comments() {
+        let eff = json!({"philium":"approves","humans":0,"matched":[]});
+        for mode in ["observe", "comment", "enforce"] {
+            for v in ["approve", "changes"] {
+                assert_eq!(decide_event(v, true, mode, &eff).0, "COMMENT", "{mode} {v}");
+            }
+        }
     }
 
     #[tokio::test]

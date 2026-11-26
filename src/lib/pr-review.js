@@ -136,7 +136,7 @@ export function coverageLine(coverage, errors) {
 export const MODES = ['observe', 'comment', 'enforce'];
 export const MODE_LABEL = { observe: 'Observe', comment: 'Comment', enforce: 'Enforce' };
 export const LEVEL_LABEL = { quick: 'Quick', standard: 'Standard', deep: 'Deep' };
-export const WOULD_POST_LABEL = { APPROVE: 'Approve', REQUEST_CHANGES: 'Request changes', COMMENT: 'Comment', NONE: 'Nothing (your own pull request)' };
+export const WOULD_POST_LABEL = { APPROVE: 'Approve', REQUEST_CHANGES: 'Request changes', COMMENT: 'Comment' };
 
 export function modeLabel(m) { return MODE_LABEL[m] || ''; }
 export function levelLabel(l) { return LEVEL_LABEL[l] || ''; }

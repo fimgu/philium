@@ -277,7 +277,7 @@ pub fn tool_list() -> Vec<Value> {
           json!({ "id": s, "status": s, "evidence": s, "basis": { "type": "string", "enum": ["runtime", "source_trace", "runtime_and_source"] }, "severity": { "type": "integer", "minimum": 0, "maximum": 5 }, "origin": { "type": "string", "enum": ["introduced", "pre_existing", "unverified"] }, "path": s, "line": i }), &["id", "status", "evidence"]),
         t("pr_item_verify", "Hands-off PR review: independently verify an item awaiting verification (verify=needed). You must not be the agent that recorded it. verdict is confirm (keeps the result; your severity/origin win if sent) or refute (reopens the item for redo with your evidence).",
           json!({ "id": s, "verdict": { "type": "string", "enum": ["confirm", "refute"] }, "evidence": s, "severity": i, "origin": s }), &["id", "verdict", "evidence"]),
-        t("pr_review_submit", "Hands-off PR review, orchestrator only: submit the finished review. Philium recomputes the verdict and, unless pending or needs_you, posts Approve/Request changes to GitHub itself. On the person's own PR it never posts; the result stays in Philium.",
+        t("pr_review_submit", "Hands-off PR review, orchestrator only: submit the finished review. Philium recomputes the verdict and, unless pending or needs_you, posts Approve/Request changes to GitHub itself. On the person's own PR it never posts by itself; the person may publish it as a comment.",
           json!({ "summary": s }), &["summary"]),
         t("session_search", "Search same-repository Philium sessions and bounded raw turn/tool-output excerpts bound to this repository ID. Cross-repo and imported histories are excluded.",
           json!({ "q": s, "repo_only": b, "limit": i }), &[]),

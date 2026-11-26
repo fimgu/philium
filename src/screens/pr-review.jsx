@@ -197,7 +197,10 @@ function ReviewCard(props) {
           </Show>
           <Show when={items().length}><p><small>{tallyLine(items())}</small></p></Show>
           <Show when={r()?.state === 'observed' && ownPr(r())}>
-            <p aria-label="Own pull request"><small>Your own pull request: Philium keeps this review here and does not post it to GitHub.</small></p>
+            <div class="row" style={{ gap: '8px', 'flex-wrap': 'wrap' }} aria-label="Own pull request">
+              <small>Your own pull request: Philium never approves it or requests changes. You can post the review as a comment.</small>
+              <Button size="sm" busy={publishing() === 'comment'} disabled={!!publishing()} onClick={() => publish('comment')}>Post as comment</Button>
+            </div>
           </Show>
           <Show when={r()?.state === 'observed' && !ownPr(r())}>
             <div class="row" style={{ gap: '8px', 'flex-wrap': 'wrap' }} aria-label="Observed review">

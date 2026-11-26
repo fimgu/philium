@@ -49,7 +49,7 @@ pub fn claims(body: &str) -> Vec<Value>;                                 // pure
 - `bot`: GraphQL `__typename == "Bot"` or login ends with `[bot]`.
 - Reviews with empty body are dropped. Comments by the viewer that are Philium verdicts (body starts with `<!-- philium-pr-review -->`) are dropped.
 - `post`: `event` is `APPROVE`, `REQUEST_CHANGES` or `COMMENT`. Body is prefixed with the marker `<!-- philium-pr-review -->`. Uses `POST repos/{o}/pulls/{pr}/reviews` with `commit_id=head` and `comments` (`{path,line,side:"RIGHT",body}`) via `gh api --input -`, `write=true`. On 422 retry once without inline comments, appending them to the body. Returns `{"url": html_url, "id": id, "event": event}`.
-- `own` is `author == viewer`. Philium never posts a review on your own PR: submit stores it as `observed` with `would_post = NONE`, `publish` refuses, and `post_review` refuses as a last guard. The result stays in the app.
+- `own` is `author == viewer`. On your own PR Philium never approves or requests changes, and never posts by itself: submit stores it as `observed` with `would_post = COMMENT`. You can publish it, always as a comment. `post_review` refuses any other event as a last guard.
 
 ## Core (`pr_review.rs`)
 

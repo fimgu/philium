@@ -121,7 +121,6 @@ test('policy: labels and budget', () => {
   assert.equal(P.budgetLine(0, null), null);
   assert.equal(P.budgetLine(5400, null).text, '5.4k tokens');
   assert.equal(P.wouldPostLabel('REQUEST_CHANGES'), 'Request changes');
-  assert.equal(P.wouldPostLabel('NONE'), 'Nothing (your own pull request)');
   assert.equal(P.ownPr({ own: 1 }), true);
   assert.equal(P.ownPr({ own: 0 }), false);
   assert.equal(P.ownPr({ own: '0' }), false);
