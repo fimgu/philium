@@ -850,23 +850,35 @@ pub async fn pr_review_submit(ctx: &Arc<Ctx>, agent_row: &Value, summary: &str) 
     if mode == "observe" {
         let (event, _) = decide_event(v["verdict"].as_str().unwrap_or(""), r["own"].as_i64() == Some(1), "observe", &r["policy"]);
         ctx.db.exec(
-            "UPDATE pr_reviews SET state='observed', verdict=?1, would_post=?2, summary=?3, finished=?4 WHERE id=?5",
+            "UPDATE pr_reviews SET state='observed', verdict=?1, would_post=?2, summary=?3, finished=?4 WHERE id=?5 AND state='running'",
             params![v["verdict"].as_str(), event, summary, now(), id],
         )?;
+        if row(ctx, &id)?["state"].as_str() != Some("observed") {
+            return Err("This review is no longer running (superseded or stopped meanwhile).".into());
+        }
         ctx.emit("pr_review:changed", json!({ "repo_id": r["repo"], "pr": r["pr"] }));
         crate::attention::announce(ctx);
         return Ok(json!({"observed": true, "would_post": event, "verdict": v["verdict"]}));
     }
-    post_review(ctx, &r, &items, &v, summary, &mode, login, &current_head).await
+    post_review(ctx, &r, &items, &v, summary, &mode, login, &current_head, "running").await
+}
+
+/// Atomically move a review from `from` to `to`. Exactly one caller wins; anyone else (a
+/// second publish, a review superseded or stopped meanwhile) is refused before posting.
+fn claim(ctx: &Ctx, id: &str, from: &str, to: &str) -> Result<(), String> {
+    match ctx.db.exec("UPDATE pr_reviews SET state=?1 WHERE id=?2 AND state=?3", params![to, id, from])? {
+        1 => Ok(()),
+        _ => Err(format!("This review is no longer {from} (it was published, superseded, or stopped meanwhile); nothing was posted.")),
+    }
 }
 
 /// Post a finished review under `mode` (comment or enforce) and mark it posted.
 #[allow(clippy::too_many_arguments)]
-async fn post_review(ctx: &Arc<Ctx>, r: &Value, items: &[Value], v: &Value, summary: &str, mode: &str, login: &str, head: &str) -> Result<Value, String> {
+async fn post_review(ctx: &Arc<Ctx>, r: &Value, items: &[Value], v: &Value, summary: &str, mode: &str, login: &str, head: &str, from: &str) -> Result<Value, String> {
     let id = r["id"].as_str().unwrap_or("").to_string();
     let origin = r["origin"].as_str().unwrap_or("");
     let pr = r["pr"].as_i64().unwrap_or(0);
-    ctx.db.exec("UPDATE pr_reviews SET state='posting' WHERE id=?1", [&id])?;
+    claim(ctx, &id, from, "posting")?;
     let (event, why) = decide_event(v["verdict"].as_str().unwrap_or(""), r["own"].as_i64() == Some(1), mode, &r["policy"]);
     let (mut body, inline) = build_body(r, items, v, summary);
     if let Some(why) = why {
@@ -876,12 +888,12 @@ async fn post_review(ctx: &Arc<Ctx>, r: &Value, items: &[Value], v: &Value, summ
     let posted = match pr_github::post(origin, login, pr, head, event, &body, &inline).await {
         Ok(p) => p,
         Err(e) => {
-            ctx.db.exec("UPDATE pr_reviews SET state='failed', error=?1, finished=?2 WHERE id=?3", params![e.clone(), now(), id])?;
+            ctx.db.exec("UPDATE pr_reviews SET state='failed', error=?1, finished=?2 WHERE id=?3 AND state='posting'", params![e.clone(), now(), id])?;
             return Err(e);
         }
     };
     ctx.db.exec(
-        "UPDATE pr_reviews SET state='posted', verdict=?1, posted_url=?2, summary=?3, mode=?4, finished=?5 WHERE id=?6",
+        "UPDATE pr_reviews SET state='posted', verdict=?1, posted_url=?2, summary=?3, mode=?4, finished=?5 WHERE id=?6 AND state='posting'",
         params![v["verdict"].as_str(), posted["url"].as_str(), summary, mode, now(), id],
     )?;
     ctx.emit("pr_review:changed", json!({ "repo_id": r["repo"], "pr": r["pr"] }));
@@ -930,7 +942,7 @@ async fn publish(ctx: &Arc<Ctx>, id: &str, wanted: &str) -> Result<Value, String
     let items = items_of(ctx, id)?;
     let v = verdict(&items);
     let summary = r["summary"].as_str().unwrap_or("").to_string();
-    post_review(ctx, &r, &items, &v, &summary, mode, &login, &current_head).await
+    post_review(ctx, &r, &items, &v, &summary, mode, &login, &current_head, "observed").await
 }
 
 // -------- RPC entry --------
@@ -1388,6 +1400,17 @@ mod tests {
         assert_eq!(got["review"]["coverage"], json!({}));
         assert_eq!(got["notes"].as_array().unwrap().len(), 2);
         assert!(got["items"].as_array().unwrap().iter().any(|i| i["basis"] == "runtime"));
+    }
+
+    #[tokio::test]
+    async fn publish_claim_succeeds_once() {
+        let ctx = Ctx::test();
+        policy_fixture(&ctx, "standard", None);
+        ctx.db.exec("UPDATE pr_reviews SET state='observed' WHERE id='rv'", []).unwrap();
+        assert!(claim(&ctx, "rv", "observed", "posting").is_ok());
+        assert!(claim(&ctx, "rv", "observed", "posting").is_err(), "a second publish must not post");
+        ctx.db.exec("UPDATE pr_reviews SET state='superseded' WHERE id='rv'", []).unwrap();
+        assert!(claim(&ctx, "rv", "running", "posting").is_err(), "a superseded review never posts");
     }
 
     #[test]
