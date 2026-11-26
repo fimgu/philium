@@ -106,7 +106,7 @@ function AgentRow(props) {
           <Show when={(a().warnings ?? []).some((w) => w.kind === "clash")}><Badge tone="strict">Code overlap</Badge></Show>
         </div>
         <div class="xs faint ellipsis">{a().task_title || a().repo_name || a().branch || (a().model_ref ?? "").split("/").pop()}</div>
-        <Show when={a().route_reason}><div class="xs faint ellipsis" data-testid="route-reason" title={`${a().model_ref ?? ""}: ${a().route_reason}`}>{(a().model_ref ?? "").split("/").pop()} · {a().route_reason}</div></Show>
+        <Show when={a().route_reason}><div class="xs faint ellipsis" data-testid="route-reason" title={`${a().model_ref ?? ""}: ${a().route_reason}`}>{(a().task_title || a().repo_name || a().branch) ? `${(a().model_ref ?? "").split("/").pop()} · ` : ""}{a().route_reason}</div></Show>
         <AgentProgressLine agent={a()} />
       </div>
       <span class="xs faint">{fmt.ago(a().last_active_at)}</span>
