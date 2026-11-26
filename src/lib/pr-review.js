@@ -169,10 +169,12 @@ export function modeCeiling(policy) {
 
 export function modeAllowed(mode, ceiling) { return rank(mode) <= rank(ceiling); }
 
-/** The override only ever lowers: min(ceiling, override). With no override, the ceiling applies. */
-export function effectiveMode(ceiling, override) {
-  if (!override || !MODES.includes(override)) return ceiling;
-  return rank(override) < rank(ceiling) ? override : ceiling;
+/** The override only ever lowers: min(ceiling, override). With no override, the backend's resolved
+ *  mode applies (observe by default), capped at the ceiling. Never show more than the backend will do. */
+export function effectiveMode(ceiling, override, resolved = 'observe') {
+  const base = MODES.includes(resolved) ? resolved : 'observe';
+  const want = override && MODES.includes(override) ? override : base;
+  return rank(want) < rank(ceiling) ? want : ceiling;
 }
 
 /** "Base a1b2c3d", "Defaults (no policy file)", "Invalid policy file". */

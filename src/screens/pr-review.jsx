@@ -20,7 +20,7 @@ function PolicyPanel(props) {
   const pg = () => normalisePolicyGet(props.data);
   const pol = () => pg().policy;
   const ceiling = () => modeCeiling(pol());
-  const current = () => effectiveMode(ceiling(), pg().override ?? pol()?.override);
+  const current = () => effectiveMode(ceiling(), pg().override ?? pol()?.override, pol()?.mode);
   return (
     <section aria-label="Review policy">
       <h4>Review policy</h4>

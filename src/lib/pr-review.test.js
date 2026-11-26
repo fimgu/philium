@@ -107,7 +107,11 @@ test('policy: ceiling, allowed, effective', () => {
   assert.equal(P.modeAllowed('observe', 'comment'), true);
   assert.equal(P.effectiveMode('comment', 'enforce'), 'comment');
   assert.equal(P.effectiveMode('enforce', 'observe'), 'observe');
-  assert.equal(P.effectiveMode('comment', null), 'comment');
+  assert.equal(P.effectiveMode('comment', null, 'comment'), 'comment');
+  // No file, no override: the backend runs observe, so the UI must not show Enforce.
+  assert.equal(P.effectiveMode(P.modeCeiling({ source: 'default', mode: 'observe' }), null, 'observe'), 'observe');
+  assert.equal(P.effectiveMode('enforce', null), 'observe', 'unknown resolved mode shows the safe default');
+  assert.equal(P.effectiveMode('comment', null, 'enforce'), 'comment', 'capped at the ceiling');
 });
 test('policy: labels and budget', () => {
   assert.equal(P.policySourceLabel({ source: 'base:0123456789ab' }), 'Base 0123456');
