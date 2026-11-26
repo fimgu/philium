@@ -259,17 +259,39 @@ async fn load_policy(ctx: &Ctx, repo: &str, base: &str, head: &str) -> (Value, b
     let invalid = |e: String| json!({"mode":"observe","level":"standard","philium":"approves","humans":0,"budget_tokens":null,"matched":[],"source":"invalid","error":e});
     let (mut eff, touches) = match repo_path(ctx, repo) {
         Ok(dir) => {
-            let changed: Vec<String> = git(&dir, &["diff", "--name-only", &format!("{base}...{head}")]).await.map(|t| t.lines().map(str::to_string).filter(|l| !l.is_empty()).collect()).unwrap_or_default();
-            let touches = changed.iter().any(|f| f == crate::pr_policy::PATH);
-            match policy_text(&dir, base).await {
-                Ok(text) => (crate::pr_policy::resolve(text.as_deref(), &changed, &format!("base:{base}")), touches),
-                Err(e) => (invalid(e), touches),
+            match changed_files(&dir, base, head).await {
+                // Without the changed files the rules cannot be matched: never resolve on [].
+                Err(e) => (invalid(format!("could not list the PR's changed files: {e}")), false),
+                Ok(changed) => {
+                    let touches = changed.iter().any(|f| f == crate::pr_policy::PATH);
+                    match policy_text(&dir, base).await {
+                        Ok(text) => (crate::pr_policy::resolve(text.as_deref(), &changed, &format!("base:{base}")), touches),
+                        Err(e) => (invalid(e), touches),
+                    }
+                }
             }
         }
         Err(e) => (invalid(e), false),
     };
     crate::pr_policy::apply_override(&mut eff, kv.as_deref());
     (eff, touches)
+}
+
+/// Files changed between the merge base and head, NUL-separated so any path is literal.
+/// A shallow checkout may lack the merge base: fetch more history once and retry.
+async fn changed_files(dir: &std::path::Path, base: &str, head: &str) -> Result<Vec<String>, String> {
+    let range = format!("{base}...{head}");
+    let args = ["-c", "core.quotepath=off", "diff", "--name-only", "-z", range.as_str()];
+    let out = match git(dir, &args).await {
+        Ok(t) => t,
+        Err(_) => {
+            let shallow = git(dir, &["rev-parse", "--is-shallow-repository"]).await.is_ok_and(|s| s.trim() == "true");
+            let fetch: &[&str] = if shallow { &["fetch", "--quiet", "--unshallow", "origin"] } else { &["fetch", "--quiet", "--deepen=1000", "origin"] };
+            let _ = git(dir, fetch).await;
+            git(dir, &args).await?
+        }
+    };
+    Ok(out.split('\0').filter(|l| !l.is_empty()).map(str::to_string).collect())
 }
 
 /// Items the policy itself adds to a fresh review.
@@ -1433,9 +1455,65 @@ mod tests {
     }
 
     fn policy_fixture(ctx: &Arc<Ctx>, level: &str, budget: Option<i64>) {
+        policy_fixture_at(ctx, level, budget, "/tmp/pr-review-policy");
+    }
+
+    fn sh(dir: &std::path::Path, args: &[&str]) -> String {
+        let o = std::process::Command::new("git").args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"]).args(args).current_dir(dir).output().unwrap();
+        assert!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    }
+
+    const ENFORCE_CAFE: &str = "version: 1\nmode: enforce\nrules:\n  - purpose: Cafe\n    paths: [\"src/caf?.rs\"]\n    humans: 1\n";
+
+    /// A repo whose base has an enforce policy and whose head adds src/café.rs.
+    fn policy_repo(name: &str) -> (std::path::PathBuf, String, String) {
+        let dir = std::env::temp_dir().join(format!("{name}-{}", gen_id()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        sh(&dir, &["init", "-q", "-b", "main"]);
+        let pol = dir.join(crate::pr_policy::PATH);
+        std::fs::create_dir_all(pol.parent().unwrap()).unwrap();
+        std::fs::write(&pol, ENFORCE_CAFE).unwrap();
+        sh(&dir, &["add", "-A"]);
+        sh(&dir, &["commit", "-qm", "base"]);
+        let base = sh(&dir, &["rev-parse", "HEAD"]);
+        std::fs::write(dir.join("src/café.rs"), "fn x() {}\n").unwrap();
+        sh(&dir, &["add", "-A"]);
+        sh(&dir, &["commit", "-qm", "head"]);
+        let head = sh(&dir, &["rev-parse", "HEAD"]);
+        (dir, base, head)
+    }
+
+    #[tokio::test]
+    async fn non_ascii_changed_path_matches_its_rule() {
+        let ctx = Ctx::test();
+        let (dir, base, head) = policy_repo("pr-policy-utf8");
+        policy_fixture_at(&ctx, "standard", None, dir.to_str().unwrap());
+        let (eff, touches) = load_policy(&ctx, "r1", &base, &head).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!touches);
+        assert_eq!(eff["source"], format!("base:{base}"), "{eff}");
+        assert_eq!(eff["humans"], 1, "src/café.rs matched the Cafe rule: {eff}");
+    }
+
+    #[tokio::test]
+    async fn unlistable_diff_is_invalid_policy_not_empty_changes() {
+        let ctx = Ctx::test();
+        let (dir, base, _) = policy_repo("pr-policy-nobase");
+        policy_fixture_at(&ctx, "standard", None, dir.to_str().unwrap());
+        // A head the checkout cannot reach (as with a shallow clone missing the merge base).
+        let (eff, _) = load_policy(&ctx, "r1", &base, "0123456789abcdef0123456789abcdef01234567").await;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(eff["source"], "invalid", "{eff}");
+        assert_eq!(eff["mode"], "observe");
+        assert!(eff["error"].as_str().unwrap().contains("changed files"));
+        assert_eq!(policy_items(&eff, false)[0]["key"], "policy:invalid");
+    }
+
+    fn policy_fixture_at(ctx: &Arc<Ctx>, level: &str, budget: Option<i64>, path: &str) {
         init(ctx).unwrap();
         let t = now();
-        ctx.db.exec("INSERT INTO repos(id,name,path,remote_url,added_at) VALUES('r1','inv','/tmp/pr-review-policy','https://github.com/o/inv.git',?1)", [t]).unwrap();
+        ctx.db.exec("INSERT INTO repos(id,name,path,remote_url,added_at) VALUES('r1','inv',?2,'https://github.com/o/inv.git',?1)", params![t, path]).unwrap();
         for (id, name, role, parent) in [("lead", "lead", "orchestrator", None), ("h1", "helper", "worker", Some("lead"))] {
             ctx.db.exec("INSERT INTO agents(id,name,role,model_ref,parent_id,repo_id,created_at,last_active_at) VALUES(?1,?2,?3,'m',?4,'r1',?5,?5)", params![id, name, role, parent, t]).unwrap();
         }
