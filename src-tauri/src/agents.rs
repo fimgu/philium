@@ -3131,6 +3131,10 @@ mod tests {
         set_routing(&ctx, &[]);
         ctx.db.kv_set("routing:r", r#"{"enabled":false}"#).unwrap();
         assert!(crate::routing::switch_target(&ctx, &h, &lead, &from, now()).is_none());
+        // Routed onto b earlier, routing off now, b hits its limit: stay put, do not move back to the parent.
+        ctx.db.exec("UPDATE agents SET model_ref='b/m1' WHERE id='on1'", []).unwrap();
+        let hb = get_row(&ctx, "on1").unwrap();
+        assert!(crate::routing::switch_target(&ctx, &hb, &lead, "b", now()).is_none());
         // No alternative: only the parent's provider is allowed and it is the limited one.
         set_routing(&ctx, &[]);
         ctx.db.exec("UPDATE agents SET model_ref='a/m1' WHERE id='on1'", []).unwrap();
