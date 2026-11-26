@@ -262,8 +262,16 @@ export const SHOWCASE = {
   },
   "pr_review.settings_get": { auto: true },
   "pr_review.list": [],
+  // Repo default branch has an invalid policy file: UI caps the mode at Observe.
+  "pr_review.policy_get": { policy: { mode: "observe", level: "standard", philium: "approves", humans: 0, budget_tokens: null, matched: [], source: "invalid", error: "version 2 is not supported" }, raw: "version: 2\nmode: enforce\n", override: null },
   "pr_review.get": {
-    review: { id: "rv1", pr: 482, state: "done", verdict: "request_changes", coverage: { comments: { fetched: 9, total: 9 }, reviews: { fetched: 2, total: 2 }, threads: { fetched: 4, total: 4 }, checks: { fetched: 7, total: 7 } } },
+    review: {
+      id: "rv1", pr: 482, state: "observed", verdict: "request_changes", would_post: "REQUEST_CHANGES",
+      mode: "observe", level: "deep", tokens_used: 1340000,
+      // Enforce-with-humans policy from the base commit: gateway rule needs a person.
+      policy: JSON.stringify({ mode: "enforce", level: "deep", philium: "comments", humans: 1, budget_tokens: 2000000, source: "base:9f3c2a17e4b0", error: null,
+        matched: [{ purpose: "Gateway and auth need a person", paths: ["src-tauri/src/gateway/**"], files: 3 }, { purpose: "Docs are routine", paths: ["docs/**"], files: 2 }] }),
+      coverage: { comments: { fetched: 9, total: 9 }, reviews: { fetched: 2, total: 2 }, threads: { fetched: 4, total: 4 }, checks: { fetched: 7, total: 7 } } },
     summary: "Adds a Redis rate limiter to `POST /api/checkout`. The approach is sound, but the limiter keys on `x-forwarded-for` without trusting the proxy chain, so clients can spoof it.",
     notes: [{ id: "n1", text: "Make sure 429 responses include Retry-After", must: true }],
     items: [

@@ -12,7 +12,63 @@ import { Button, Toggle, TextArea, toast } from '../ui/kit.jsx';
 import {
   verdictLabel, verdictTone, tally, tallyLine, groupByKind,
   itemMark, verifyLine, originLabel, severityLabel, basisLabel, coverageLine,
+  MODES, modeLabel, levelLabel, parsePolicy, normalisePolicyGet, modeCeiling, modeAllowed,
+  effectiveMode, policySourceLabel, budgetLine, formatTokens, wouldPostLabel, humansLine,
 } from '../lib/pr-review.js';
+
+function PolicyPanel(props) {
+  const pg = () => normalisePolicyGet(props.data);
+  const pol = () => pg().policy;
+  const ceiling = () => modeCeiling(pol());
+  const current = () => effectiveMode(ceiling(), pg().override);
+  return (
+    <section aria-label="Review policy">
+      <h4>Review policy</h4>
+      <div class="row" style={{ 'flex-wrap': 'wrap', gap: '8px' }}>
+        <div class="segmented" role="group" aria-label="Review mode">
+          <For each={MODES}>
+            {(m) => (
+              <button
+                type="button"
+                class={current() === m ? 'on' : ''}
+                aria-pressed={current() === m}
+                disabled={!modeAllowed(m, ceiling())}
+                title={modeAllowed(m, ceiling()) ? '' : `The policy file allows up to ${modeLabel(ceiling())}`}
+                onClick={() => props.onMode?.(m)}
+              >{modeLabel(m)}</button>
+            )}
+          </For>
+        </div>
+        <small class="faint">Ceiling: {modeLabel(ceiling())}</small>
+      </div>
+      <Show when={pol()} fallback={<p class="small faint">Policy unavailable.</p>}>
+        {(p) => (
+          <>
+            <p class="small">
+              <span class={`badge${p().source === 'invalid' ? ' danger' : ''}`}>{policySourceLabel(p())}</span>{' '}
+              <span class="badge">Level: {levelLabel(p().level) || 'Standard'}</span>{' '}
+              <span class={`badge${p().humans ? ' strict' : ''}`}>{humansLine(p().humans)}</span>
+              <Show when={p().budget_tokens != null}>{' '}<span class="badge">Budget {formatTokens(p().budget_tokens)} tokens</span></Show>
+            </p>
+            <Show when={p().error}><p role="alert" class="small">Policy file invalid: {p().error}. Reviews run in Observe.</p></Show>
+            <Show when={(p().matched || []).length}>
+              <table class="ready plan"><tbody>
+                <For each={p().matched}>
+                  {(m) => (
+                    <tr>
+                      <th scope="row">{m.purpose || (m.paths || []).join(', ')}</th>
+                      <td><small>{m.files} {m.files === 1 ? 'file' : 'files'}</small></td>
+                    </tr>
+                  )}
+                </For>
+              </tbody></table>
+            </Show>
+          </>
+        )}
+      </Show>
+    </section>
+  );
+}
 
 function ItemRow(props) {
   const it = props.item;
@@ -97,6 +153,13 @@ function ReviewCard(props) {
   const verdict = () => props.data?.verdict;
   const t = () => tally(items());
   const coverage = () => coverageLine(r()?.coverage, r()?.errors);
+  const policy = () => parsePolicy(r()?.policy);
+  const budget = () => budgetLine(r()?.tokens_used, policy()?.budget_tokens);
+  const [publishing, setPublishing] = createSignal(null);
+  async function publish(as) {
+    setPublishing(as);
+    try { await props.onPublish?.(r().id, as); } finally { setPublishing(null); }
+  }
   return (
     <section aria-label="PR review" class={`decision ${verdictTone(r())}`}>
       <div class="verdict">
@@ -112,10 +175,27 @@ function ReviewCard(props) {
               {' · '}<a href={r().posted_url} target="_blank" rel="noreferrer">Posted review</a>
             </Show>
           </p>
+          <p class="row" style={{ gap: '6px', 'flex-wrap': 'wrap' }}>
+            <Show when={modeLabel(r()?.mode)}><span class="badge accent" title="Review mode">{modeLabel(r().mode)}</span></Show>
+            <Show when={levelLabel(r()?.level)}><span class="badge" title="Review level">{levelLabel(r().level)}</span></Show>
+            <Show when={budget()}>{b => <span class={`badge${b().over ? ' danger' : ''}`} title="Token use">{b().text}</span>}</Show>
+          </p>
+          <Show when={policy()}>
+            {p => <p><small>Policy: {policySourceLabel(p())} · {humansLine(p().humans)}
+              <Show when={(p().matched || []).length}>{' · '}{p().matched.map(m => `${m.purpose || 'rule'} (${m.files})`).join(', ')}</Show>
+              <Show when={p().error}>{' · '}<span class="warn">{p().error}</span></Show></small></p>}
+          </Show>
           <Show when={items().length}><p><small>{tallyLine(items())}</small></p></Show>
+          <Show when={r()?.state === 'observed'}>
+            <div class="row" style={{ gap: '8px', 'flex-wrap': 'wrap' }} aria-label="Observed review">
+              <span>Would post: <strong>{wouldPostLabel(r().would_post)}</strong></span>
+              <Button size="sm" busy={publishing() === 'comment'} disabled={!!publishing()} onClick={() => publish('comment')}>Publish as comment</Button>
+              <Button size="sm" variant="primary" busy={publishing() === 'enforce'} disabled={!!publishing()} onClick={() => publish('enforce')}>Publish</Button>
+            </div>
+          </Show>
           <Show when={coverage()}>{c => <p><small class={c().warn ? 'warn' : ''}>{c().text}</small></p>}</Show>
         </div>
-        <Show when={r() && !['posted', 'superseded', 'stopped'].includes(r().state)}>
+        <Show when={r() && !['posted', 'observed', 'superseded', 'stopped'].includes(r().state)}>
           <Button size="sm" variant="ghost" onClick={() => props.onStop?.(r().id)}>Stop</Button>
         </Show>
         <Show when={r() && ['stopped', 'failed', 'superseded'].includes(r().state)}>
@@ -173,6 +253,23 @@ export function PrReviewer(props) {
     catch (e) { toast(String(e), 'danger'); }
   }
 
+  const [policy, { refetch: reloadPolicy }] = createResource(() => props.repo, (repo) =>
+    rpc('pr_review.policy_get', { repo_id: repo }, { local: true }).catch(() => null));
+
+  async function setMode(mode) {
+    try {
+      await rpc('pr_review.settings_set', { auto: Boolean(settings()?.auto), repo_id: props.repo, mode }, { local: true });
+      await reloadPolicy();
+    } catch (e) { toast(String(e), 'danger'); }
+  }
+  async function publish(id, as) {
+    try {
+      await rpc('pr_review.publish', { id, as }, { local: true });
+      await Promise.all([reloadData(), reloadList()]);
+      toast(as === 'comment' ? 'Published as a comment.' : 'Review published.', 'secure');
+    } catch (e) { toast(String(e), 'danger'); }
+  }
+
   const currentPr = () => pr() ?? data()?.review?.pr ?? null;
   const history = () => (list() || []).filter((r) => r.state === 'superseded' && r.pr === currentPr());
 
@@ -201,11 +298,12 @@ export function PrReviewer(props) {
           onChange={toggleAuto}
         />
       </form>
+      <PolicyPanel data={policy()} onMode={setMode} />
       <Show when={currentPr()}>
         <NotesEditor repo={props.repo} pr={currentPr()} notes={data()?.notes} onChanged={reloadData} />
       </Show>
       <Show when={data()?.review} fallback={<p class="small faint">Paste a pull request URL above to start a review.</p>}>
-        <ReviewCard data={data()} onStop={stop} onRestart={restart} />
+        <ReviewCard data={data()} onStop={stop} onRestart={restart} onPublish={publish} />
       </Show>
       <Show when={history().length}>
         <details aria-label="Earlier heads">
