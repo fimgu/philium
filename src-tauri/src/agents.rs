@@ -2055,6 +2055,9 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
             let busy = |st: &str| matches!(st, "running" | "provisioning" | "tearing_down" | "waiting");
             let mut picked: Vec<String> = match args["scope"].as_str() {
                 Some("finished") => rows.iter().filter(|r| matches!(r["state"].as_str(), Some("stopped" | "failed"))).filter_map(|r| r["id"].as_str().map(str::to_string)).collect(),
+                // Every agent, working or not (narrowed by `ids` to one workspace). An Improve
+                // Philium run in progress is still kept below.
+                Some("all") => rows.iter().filter_map(|r| r["id"].as_str().map(str::to_string)).collect(),
                 Some("tree") => {
                     let root = ctx::arg_str(&args, "root")?;
                     let mut tree = vec![root.clone()];
@@ -2083,7 +2086,7 @@ pub async fn call(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, St
                     }
                     picked
                 }
-                _ => return Err("scope is finished, tree or selected".into()),
+                _ => return Err("scope is finished, all, tree or selected".into()),
             };
             // An Improve Philium run still in progress is not swept up by a bulk clean-up: its
             // worktree is the user's pending change. Discard it from Improve, or pick it explicitly.
@@ -2643,6 +2646,15 @@ mod tests {
         assert_eq!(names(&r, "removed"), vec!["p1h", "p1"], "the picked lead with its helper, helper first");
         assert_eq!(left(), vec!["chat", "p2"], "nothing that was not picked");
         assert!(call(&ctx, "remove_many", json!({"scope": "everything"})).await.is_err());
+        // Remove all: working ones too, limited to the ids given (one workspace).
+        for (id, parent, state) in [("w1", None, "running"), ("w1h", Some("w1"), "waiting"), ("other", None, "running")] {
+            ctx.db.exec("INSERT INTO agents(id,name,model_ref,state,parent_id,created_at,last_active_at) VALUES(?1,?1,'m',?2,?3,0,0)", rusqlite::params![id, state, parent]).unwrap();
+        }
+        let r = call(&ctx, "remove_many", json!({"scope": "all", "ids": ["chat", "p2", "w1", "w1h"]})).await.unwrap();
+        let mut removed = names(&r, "removed");
+        removed.sort();
+        assert_eq!(removed, vec!["chat", "p2", "w1", "w1h"]);
+        assert_eq!(left(), vec!["other"], "an agent outside the given ids stays");
     }
 
     #[test]

@@ -898,6 +898,31 @@ fn claim(ctx: &Ctx, id: &str, from: &str, to: &str) -> Result<(), String> {
     }
 }
 
+/// The person is finished with a review. Its result stays in the app; the lead, its helpers
+/// and everything they made (worktrees, folders, processes) are removed. A done review is not
+/// rerun when the PR moves and is not picked up again by auto review.
+async fn mark_done(ctx: &Arc<Ctx>, id: &str) -> Result<Value, String> {
+    let r = row(ctx, id)?;
+    if r["state"].as_str() == Some("posting") {
+        return Err("This review is being posted to GitHub right now. Try again in a moment.".into());
+    }
+    let mut cleanup = json!({"removed": [], "kept": [], "unsaved": [], "left": []});
+    // This run's lead plus any lead an earlier run of the same PR left behind.
+    let leads: Vec<String> = ctx
+        .db
+        .query("SELECT DISTINCT p.lead AS lead FROM pr_reviews p JOIN agents a ON a.id=p.lead WHERE p.repo=?1 AND p.pr=?2 AND (p.id=?3 OR p.state IN ('superseded','stopped','failed','done'))", params![r["repo"].as_str(), r["pr"].as_i64(), id])?
+        .into_iter()
+        .filter_map(|l| l["lead"].as_str().map(str::to_string))
+        .collect();
+    if !leads.is_empty() {
+        cleanup = agents::call(ctx, "remove_many", json!({"scope":"selected","ids":leads,"force":true})).await?;
+    }
+    ctx.db.exec("UPDATE pr_reviews SET state='done', finished=COALESCE(finished, ?1) WHERE id=?2 AND state!='posting'", params![now(), id])?;
+    ctx.emit("pr_review:changed", json!({ "repo_id": r["repo"], "pr": r["pr"] }));
+    crate::attention::refresh(ctx);
+    Ok(json!({"review": row(ctx, id)?, "cleanup": cleanup}))
+}
+
 /// The person marks a blocked item as not needed. It becomes `not_applicable` with their reason,
 /// needs no verifier, and an idle lead is told to finish the review.
 async fn item_waive(ctx: &Arc<Ctx>, item_id: &str, reason: &str) -> Result<Value, String> {
@@ -1075,6 +1100,10 @@ pub async fn call(ctx: &Arc<Ctx>, m: &str, a: Value) -> Result<Value, String> {
             ctx.db.exec("UPDATE pr_reviews SET state='stopped' WHERE id=?1 AND state!='superseded'", [&id])?;
             row(ctx, &id)
         }
+        "done" => {
+            let id = crate::ctx::arg_str(&a, "id")?;
+            mark_done(ctx, &id).await
+        }
         "restart" => {
             let id = crate::ctx::arg_str(&a, "id")?;
             let r = row(ctx, &id)?;
@@ -1164,7 +1193,7 @@ async fn tick(ctx: &Arc<Ctx>) -> Result<(), String> {
         if auto {
             if let Ok(prs) = pr_github::review_requested(&origin).await {
                 for pr in prs {
-                    let already = ctx.db.query("SELECT id FROM pr_reviews WHERE repo=?1 AND pr=?2 AND github_login=?3 AND state IN ('queued','running','needs_you','posted','observed')", params![id, pr, login])?;
+                    let already = ctx.db.query("SELECT id FROM pr_reviews WHERE repo=?1 AND pr=?2 AND github_login=?3 AND state IN ('queued','running','needs_you','posted','observed','done')", params![id, pr, login])?;
                     if already.is_empty() {
                         let _ = start_review(ctx, id, pr, true).await;
                     }
@@ -1472,6 +1501,24 @@ mod tests {
         assert_eq!(got["review"]["coverage"], json!({}));
         assert_eq!(got["notes"].as_array().unwrap().len(), 2);
         assert!(got["items"].as_array().unwrap().iter().any(|i| i["basis"] == "runtime"));
+    }
+
+    #[tokio::test]
+    async fn done_removes_the_review_agents_and_keeps_the_result() {
+        let ctx = Ctx::test();
+        policy_fixture(&ctx, "standard", None);
+        // An earlier run of the same PR left its lead behind; an unrelated agent must stay.
+        ctx.db.exec("INSERT INTO agents(id,name,role,model_ref,repo_id,created_at,last_active_at) VALUES('oldlead','oldlead','orchestrator','m','r1',0,0),('mine','mine','worker','m','r1',0,0)", []).unwrap();
+        ctx.db.exec("INSERT INTO pr_reviews(id,repo,origin,pr,base,head,state,lead,started,coverage,errors) VALUES('rv0','r1','o/inv',7,'b','h0','superseded','oldlead',1,'{}','[]')", []).unwrap();
+        ctx.db.exec("UPDATE pr_reviews SET state='observed' WHERE id='rv'", []).unwrap();
+        let out = super::call(&ctx, "done", json!({"id":"rv"})).await.unwrap();
+        assert_eq!(out["review"]["state"], "done");
+        let left: Vec<String> = ctx.db.query("SELECT id FROM agents ORDER BY id", []).unwrap().iter().map(|r| r["id"].as_str().unwrap().to_string()).collect();
+        assert_eq!(left, vec!["mine"], "lead, helper and the earlier run's lead are gone");
+        assert_eq!(items_of(&ctx, "rv").unwrap().len(), 1, "the checklist stays");
+        // A review being posted is not touched.
+        ctx.db.exec("UPDATE pr_reviews SET state='posting' WHERE id='rv'", []).unwrap();
+        assert!(super::call(&ctx, "done", json!({"id":"rv"})).await.is_err());
     }
 
     #[tokio::test]

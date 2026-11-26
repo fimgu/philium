@@ -274,6 +274,7 @@ export const SHOWCASE = {
   "routing.set": { ok: true },
   "pr_review.settings_get": { auto: true },
   "pr_review.list": [],
+  "pr_review.done": { review: { id: "rv1", state: "done" }, cleanup: { removed: ["lion", "otter"], kept: [], unsaved: [], left: [] } },
   // Repo default branch has an invalid policy file: UI caps the mode at Observe.
   "pr_review.policy_get": { policy: { mode: "observe", level: "standard", philium: "approves", humans: 0, budget_tokens: null, matched: [], source: "invalid", ceiling: "observe", override: null, error: "version 2 is not supported" }, raw: "version: 2\nmode: enforce\n", override: null },
   "pr_review.get": {

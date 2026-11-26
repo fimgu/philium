@@ -8,7 +8,7 @@ import { useGitHubConnection } from '../ui/github-account.jsx';
 import { useVisibleEvent } from '../lib/visibility.js';
 import { plainError } from '../lib/plain-error.js';
 import { Markdown } from '../ui/markdown.jsx';
-import { Button, Toggle, TextArea, toast } from '../ui/kit.jsx';
+import { Button, Toggle, TextArea, toast, confirm } from '../ui/kit.jsx';
 import {
   verdictLabel, verdictTone, tally, tallyLine, groupByKind,
   itemMark, verifyLine, originLabel, severityLabel, basisLabel, coverageLine,
@@ -211,11 +211,14 @@ function ReviewCard(props) {
           </Show>
           <Show when={coverage()}>{c => <p><small class={c().warn ? 'warn' : ''}>{c().text}</small></p>}</Show>
         </div>
-        <Show when={r() && !['posted', 'observed', 'superseded', 'stopped'].includes(r().state)}>
+        <Show when={r() && !['posted', 'observed', 'superseded', 'stopped', 'done'].includes(r().state)}>
           <Button size="sm" variant="ghost" onClick={() => props.onStop?.(r().id)}>Stop</Button>
         </Show>
-        <Show when={r() && ['stopped', 'failed', 'superseded'].includes(r().state)}>
+        <Show when={r() && ['stopped', 'failed', 'superseded', 'done'].includes(r().state)}>
           <Button size="sm" onClick={() => props.onRestart?.(r().id)}>Restart</Button>
+        </Show>
+        <Show when={r() && r().state !== 'done' && r().state !== 'posting'}>
+          <Button size="sm" variant="ghost" onClick={() => props.onDone?.(r().id)}>Done</Button>
         </Show>
       </div>
       <Show when={r()?.error}><p role="alert">{plainError(r().error).plain}</p></Show>
@@ -267,6 +270,18 @@ export function PrReviewer(props) {
   async function restart(id) {
     try { await rpc('pr_review.restart', { id }, { local: true }); await Promise.all([reloadData(), reloadList()]); }
     catch (e) { toast(String(e), 'danger'); }
+  }
+  // Finish a review: the result stays, its agents and everything they made go.
+  async function done(id) {
+    if (!(await confirm('Mark this review done?', 'The checklist and verdict stay here. The review agents, their worktrees, folders and processes are removed. Nothing is posted to GitHub.', { danger: true, ok: 'Done' }))) return;
+    try {
+      const out = await rpc('pr_review.done', { id }, { local: true });
+      await Promise.all([reloadData(), reloadList()]);
+      const n = out?.cleanup?.removed?.length || 0;
+      const left = out?.cleanup?.left || [];
+      toast(`Review done. Removed ${n} agent${n === 1 ? '' : 's'}.`, 'secure');
+      if (left.length) toast(`Philium could not stop these safely, so check them yourself: ${left.map((l) => `${l.handle} (${l.agent})`).join('; ')}`, 'danger');
+    } catch (e) { toast(String(e), 'danger'); }
   }
 
   const [policy, { refetch: reloadPolicy }] = createResource(() => props.repo, (repo) =>
@@ -326,7 +341,7 @@ export function PrReviewer(props) {
         <NotesEditor repo={props.repo} pr={currentPr()} notes={data()?.notes} onChanged={reloadData} />
       </Show>
       <Show when={data()?.review} fallback={<p class="small faint">Paste a pull request URL above to start a review.</p>}>
-        <ReviewCard data={data()} onStop={stop} onRestart={restart} onPublish={publish} onWaive={waive} />
+        <ReviewCard data={data()} onStop={stop} onRestart={restart} onDone={done} onPublish={publish} onWaive={waive} />
       </Show>
       <Show when={history().length}>
         <details aria-label="Earlier heads">

@@ -1148,6 +1148,14 @@ export default function Agents() {
     if (!(await confirm(`Remove ${names.length} finished agent${names.length === 1 ? "" : "s"}?`, `${names.join(", ")}. Their folders and saved history go; what they found stays in Review and Board. Agents that are working or waiting for you stay.`, { danger: true, ok: "Remove" }))) return;
     await removeAgents("finished", ids);
   }
+  // Everything in this workspace, working or not, with their worktrees, folders and processes.
+  async function removeAll() {
+    const targets = scoped();
+    if (!targets.length) return;
+    const names = targets.map((a) => a.name);
+    if (!(await confirm(`Remove all ${names.length} agent${names.length === 1 ? "" : "s"}?`, `${names.join(", ")}. Working agents are stopped. Their worktrees, folders and processes go; what they found stays in Review and Board. An Improve Philium change still in progress stays.`, { danger: true, ok: "Remove all" }))) return;
+    await removeAgents("all", targets.map((a) => a.id));
+  }
   // Picked in the list with ⌘-click (or Ctrl), a range with Shift: removed together.
   const [picked, setPicked] = createSignal([]);
   let anchor = null;
@@ -1381,6 +1389,9 @@ export default function Agents() {
       actions={<div class="row" style={{ gap: "8px", "flex-wrap": "wrap" }}>
         <Show when={finished().length}>
           <Button size="sm" onClick={removeFinished}>Remove finished ({finished().length})</Button>
+        </Show>
+        <Show when={scoped().length}>
+          <Button size="sm" variant="ghost" onClick={removeAll}>Remove all ({scoped().length})</Button>
         </Show>
         <Show when={scoped().length}>
           <input

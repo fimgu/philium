@@ -132,6 +132,10 @@ For each registered repo with a GitHub origin: if `pr_review.auto` is on, start 
 
 RPC `item_waive {id, reason?}`: the person marks a blocked item **Not needed**. It becomes `not_applicable` with evidence `you: Not needed: <reason>` and no verifier. If nothing else is blocked, the review goes back to `running` and a live lead is told to submit. `pr_review_submit` also moves a `needs_you` review back to `running` once its verdict is no longer `needs_you`.
 
+RPC `done {id}`: the person is finished with a review (**Done** on the card). The checklist, verdict and summary stay. The lead, its helpers, and any lead an earlier run of the same PR left behind are removed with `agents.remove_many {scope:"selected", force:true}`, which takes their worktrees, folders, browser tabs, terminals and processes. State becomes `done`. A `done` review is not rerun when the head moves and auto review does not pick the PR up again. Refused while `posting`. Restart starts a fresh review.
+
+`agents.remove_many {scope:"all", ids}` removes every listed agent, working or not, helpers first. The Agents screen's **Remove all** sends the agents in the current workspace. An Improve Philium change in progress is kept.
+
 ## UI (`pr-review.jsx`)
 In Review, above the release tools: "PR reviewer" section.
 - Paste URL + Review. Toggle "Review PRs requested from me automatically".
