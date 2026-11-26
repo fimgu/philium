@@ -8,7 +8,7 @@ import { useGitHubConnection } from '../ui/github-account.jsx';
 import { useVisibleEvent } from '../lib/visibility.js';
 import { plainError } from '../lib/plain-error.js';
 import { Markdown } from '../ui/markdown.jsx';
-import { Button, Toggle, TextArea, toast, confirm } from '../ui/kit.jsx';
+import { Button, Toggle, TextArea, Modal, toast, confirm } from '../ui/kit.jsx';
 import {
   verdictLabel, verdictTone, tally, tallyLine, groupByKind,
   itemMark, verifyLine, originLabel, severityLabel, basisLabel, coverageLine,
@@ -220,8 +220,11 @@ function ReviewCard(props) {
         <Show when={r() && r().state !== 'done' && r().state !== 'posting'}>
           <Button size="sm" variant="ghost" onClick={() => props.onDone?.(r().id)}>Done</Button>
         </Show>
+        <Show when={r() && r().state === 'done' && props.onClose}>
+          <Button size="sm" variant="ghost" onClick={() => props.onClose?.()}>Close</Button>
+        </Show>
       </div>
-      <Show when={r()?.error}><p role="alert">{plainError(r().error).plain}</p></Show>
+      <Show when={r()?.error && r()?.state !== 'done'}><p role="alert">{plainError(r().error).plain}</p></Show>
       <Show when={props.data?.summary}><Markdown text={props.data.summary} /></Show>
       <Checklist items={items()} onWaive={['running', 'needs_you'].includes(r()?.state) ? props.onWaive : null} />
     </section>
@@ -232,6 +235,9 @@ export function PrReviewer(props) {
   const [url, setUrl] = createSignal('');
   const [busy, setBusy] = createSignal(false);
   const [pr, setPr] = createSignal(null);
+  const [prQuery, setPrQuery] = createSignal('');
+  const [prLimit, setPrLimit] = createSignal(20);
+  const [leftovers, setLeftovers] = createSignal([]);
   const [github] = useGitHubConnection(() => props.repo);
 
   const [settings, { refetch: reloadSettings }] = createResource(() =>
@@ -276,11 +282,12 @@ export function PrReviewer(props) {
     if (!(await confirm('Mark this review done?', 'The checklist and verdict stay here. The review agents, their worktrees, folders and processes are removed. Nothing is posted to GitHub.', { danger: true, ok: 'Done' }))) return;
     try {
       const out = await rpc('pr_review.done', { id }, { local: true });
+      setPr(null);
       await Promise.all([reloadData(), reloadList()]);
       const n = out?.cleanup?.removed?.length || 0;
       const left = out?.cleanup?.left || [];
       toast(`Review done. Removed ${n} agent${n === 1 ? '' : 's'}.`, 'secure');
-      if (left.length) toast(`Philium could not stop these safely, so check them yourself: ${left.map((l) => `${l.handle} (${l.agent})`).join('; ')}`, 'danger');
+      if (left.length) setLeftovers(left);
       const stuck = [...(out?.cleanup?.unsaved || []).map((u) => u.name), ...(out?.cleanup?.kept || [])];
       if (stuck.length) toast(`Still there: ${stuck.join(', ')}. Remove them from Agents.`, 'danger');
     } catch (e) { toast(String(e), 'danger'); }
@@ -310,8 +317,20 @@ export function PrReviewer(props) {
     } catch (e) { toast(String(e), 'danger'); }
   }
 
-  const currentPr = () => pr() ?? data()?.review?.pr ?? null;
+  const currentPr = () => pr() ?? (data()?.review?.state !== 'done' ? data()?.review?.pr : null) ?? null;
   const history = () => (list() || []).filter((r) => r.state === 'superseded' && r.pr === currentPr());
+  const recentPrs = () => {
+    const seen = new Set();
+    const out = [];
+    const q = prQuery().trim().toLowerCase();
+    for (const r of list() || []) {
+      if (seen.has(r.pr)) continue;
+      seen.add(r.pr);
+      if (q && !`#${r.pr} ${r.title || ''}`.toLowerCase().includes(q)) continue;
+      out.push(r);
+    }
+    return out;
+  };
 
   return (
     <section aria-label="PR reviewer">
@@ -342,16 +361,71 @@ export function PrReviewer(props) {
       <Show when={currentPr()}>
         <NotesEditor repo={props.repo} pr={currentPr()} notes={data()?.notes} onChanged={reloadData} />
       </Show>
-      <Show when={data()?.review} fallback={<p class="small faint">Paste a pull request URL above to start a review.</p>}>
-        <ReviewCard data={data()} onStop={stop} onRestart={restart} onDone={done} onPublish={publish} onWaive={waive} />
+      <Show when={data()?.review && (pr() != null || data().review.state !== 'done')} fallback={<p class="small faint">No active review. Paste a pull request URL above to start one, or pick a past review below.</p>}>
+        <ReviewCard data={data()} onStop={stop} onRestart={restart} onDone={done} onPublish={publish} onWaive={waive} onClose={() => setPr(null)} />
       </Show>
       <Show when={history().length}>
         <details aria-label="Earlier heads">
           <summary>Earlier heads ({history().length})</summary>
-          <For each={history()}>
+          <For each={history().slice(0, 20)}>
             {(h) => <div class="checkout-row"><span>{h.title}</span><small>{h.head?.slice(0, 10)} · {verdictLabel(h)}</small></div>}
           </For>
         </details>
+      </Show>
+      <Show when={(list() || []).length > 0}>
+        <details aria-label="Reviewed pull requests">
+          <summary>Reviewed PRs ({recentPrs().length})</summary>
+          <Show when={(list() || []).length > 6}>
+            <input
+              type="search"
+              class="input"
+              style={{ 'margin-bottom': '8px', width: '100%', 'max-width': '340px' }}
+              placeholder="Filter PRs by # or title…"
+              value={prQuery()}
+              onInput={(e) => setPrQuery(e.currentTarget.value)}
+            />
+          </Show>
+          <For each={recentPrs().slice(0, prLimit())}>
+            {(r) => (
+              <div class="checkout-row" style={{ cursor: 'pointer' }} onClick={() => setPr(r.pr)}>
+                <span class="grow ellipsis"><strong>#{r.pr}</strong> {r.title || ''}</span>
+                <small>{r.state === 'done' ? 'Done' : verdictLabel(r)}</small>
+              </div>
+            )}
+          </For>
+          <Show when={recentPrs().length > prLimit()}>
+            <Button size="sm" variant="ghost" onClick={() => setPrLimit((n) => n + 20)}>
+              Show more ({recentPrs().length - prLimit()} remaining)
+            </Button>
+          </Show>
+        </details>
+      </Show>
+      <Show when={leftovers().length > 0}>
+        <Modal
+          title={`${leftovers().length} leftover process${leftovers().length === 1 ? '' : 'es'} to check`}
+          onClose={() => setLeftovers([])}
+          footer={
+            <>
+              <Button variant="ghost" onClick={() => { navigator.clipboard?.writeText(leftovers().map((l) => l.handle).join('\n')); toast('Copied handles', 'good'); }}>Copy list</Button>
+              <Button onClick={() => { setLeftovers([]); go('environments'); }}>Open Environments</Button>
+              <Button variant="primary" onClick={() => setLeftovers([])}>Done</Button>
+            </>
+          }
+        >
+          <p class="small dim" style={{ margin: 0 }}>
+            The review agents were removed, but Philium could not stop these processes safely. Check or stop them yourself, or forget them in Environments.
+          </p>
+          <div class="leftover-list">
+            <For each={leftovers()}>
+              {(l) => (
+                <div class="leftover-item">
+                  <span class="xs faint">{l.agent || 'agent'}</span>
+                  <code>{l.handle}</code>
+                </div>
+              )}
+            </For>
+          </div>
+        </Modal>
       </Show>
     </section>
   );

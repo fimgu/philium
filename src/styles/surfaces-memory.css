@@ -21,10 +21,11 @@
 .ctx-budget {
   display: grid;
   gap: 6px;
-  padding: 10px 12px;
+  padding: 11px 13px;
   background: var(--surface);
   border: 1px solid var(--line);
   border-radius: var(--radius);
+  box-shadow: var(--shadow);
 }
 
 .ctx-section {
@@ -45,15 +46,17 @@
 .mem-card {
   display: grid;
   gap: 6px;
-  padding: 10px 12px;
+  padding: 12px 14px;
   background: var(--surface);
   border: 1px solid var(--line);
   border-radius: var(--radius);
-  transition: border-color 120ms var(--ease), background 120ms var(--ease);
+  box-shadow: 0 1px 0 var(--rim) inset;
+  transition: border-color 120ms var(--ease), background 120ms var(--ease), transform 120ms var(--ease);
 }
 
 .mem-card:hover {
   border-color: var(--line-strong);
+  background: var(--surface-hover);
 }
 
 .mem-card.proposed {
@@ -89,7 +92,7 @@
 }
 
 .mem-key {
-  font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
+  font-family: var(--mono);
   font-size: 11px;
   padding: 1px 6px;
   border-radius: 4px;
@@ -120,14 +123,98 @@
   }
 }
 
-.note-fields {
-  display: grid;
+.note-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
   gap: 8px;
 }
 
-.note-fields .textarea {
-  min-height: 54px;
+.note-summary {
+  display: grid;
+  gap: 0;
+  border-top: 1px solid var(--line);
+}
+
+.note-summary-item {
+  display: grid;
+  gap: 4px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.note-summary-item:last-child {
+  padding-bottom: 2px;
+  border-bottom: 0;
+}
+
+.note-summary-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.note-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex: none;
+  background: var(--text-faint);
+}
+
+.note-dot.accent { background: var(--accent); }
+.note-dot.secure { background: var(--secure); }
+.note-dot.warn { background: var(--warn); }
+.note-dot.danger { background: var(--danger); }
+
+.note-summary-body {
   font-size: var(--fs-s);
+  line-height: 1.5;
+  color: var(--text-dim);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+  display: -webkit-box;
+  -webkit-line-clamp: 4;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.note-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: var(--radius-s);
+  background: var(--bg-sunken);
+  border: 1px dashed var(--line);
+}
+
+.note-fields {
+  display: grid;
+  gap: 10px;
+}
+
+.note-field {
+  display: grid;
+  gap: 4px;
+}
+
+.note-field-label {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-faint);
+  letter-spacing: 0.02em;
+}
+
+.note-fields .textarea {
+  min-height: 76px;
+  padding: 8px 10px;
+  font-size: var(--fs-s);
+  line-height: 1.45;
+  background: var(--bg-sunken);
+  resize: vertical;
 }
 
 /* ---------- Embedded App Surfaces ---------- */

@@ -353,7 +353,7 @@ fn select_excerpts(ctx: &Ctx, memories: &[Value], entries: &[Entry]) -> Vec<Entr
     picked.into_iter().map(|i| entries[i].clone()).collect()
 }
 
-const DREAM_PROMPT: &str = "You are reviewing one repository's engineering memory against the original agent transcripts, like sleep consolidates memory. Fix what is wrong, merge duplicates, retire what is stale or trivially re-readable from the code, and keep the small session index useful.\n\
+const DREAM_PROMPT: &str = "You are reviewing one repository's engineering memory against the original agent transcripts, like sleep consolidates memory. Fix what is wrong, merge duplicates, retire what is stale, noisy, or trivially re-readable from the code, and keep the small session index focused on durable, concrete repo knowledge.\n\
 Return strict JSON only: {\"actions\":[...]} with at most 24 actions of these shapes:\n\
 {\"type\":\"confirm\",\"id\":\"mem_..\",\"evidence\":[\"exact quote\"],\"reason\":\"..\"}\n\
 {\"type\":\"correct\",\"id\":\"mem_..\",\"new_content\":\"1-3 sentences\",\"title\":\"<=80 chars\",\"evidence\":[\"exact quote\"],\"reason\":\"..\"}\n\
@@ -361,7 +361,7 @@ Return strict JSON only: {\"actions\":[...]} with at most 24 actions of these sh
 {\"type\":\"retire\",\"id\":\"mem_..\",\"reason\":\"..\"}\n\
 {\"type\":\"promote\",\"id\":\"mem_..\",\"reason\":\"..\"} / {\"type\":\"demote\",\"id\":\"mem_..\",\"reason\":\"..\"}\n\
 {\"type\":\"new\",\"title\":\"..\",\"content\":\"..\",\"category\":\"..\",\"files\":[],\"fact_key\":null,\"evidence\":[\"quote from session A\",\"quote from session B\"],\"reason\":\"..\"}\n\
-Rules: evidence must be verbatim substrings of the transcript lines below (not of memories); only use ids listed under MEMORIES; `new` only for patterns that span at least two sessions; promote only things every future session should see; never include secrets.";
+Rules: evidence must be verbatim substrings of the transcript lines below (not of memories); only use ids listed under MEMORIES; `new` only for patterns that span at least two sessions; aggressively retire meta-discussion about the agent's own prompt/context/memory/Philium tooling, pasted chat transcripts, and finished one-off PR/task status; merge near-duplicate entries; promote concrete file-backed gotchas, build/test commands, and architectural invariants; never include secrets.";
 
 fn build_prompt(input_memories: &[Value], sessions: &[String], excerpts: &[Entry]) -> String {
     let mut out = String::from("MEMORIES\n");
@@ -480,6 +480,7 @@ pub async fn run(ctx: &Arc<Ctx>, repo_id: &str, manual: bool) -> Result<Value, S
     let mut reply = None;
     let mut used_model = String::new();
     let mut tokens_in = 0;
+    let mut last_err: Option<String> = None;
     for mid in &models {
         if flag.load(Ordering::SeqCst) {
             break;
@@ -503,6 +504,7 @@ pub async fn run(ctx: &Arc<Ctx>, repo_id: &str, manual: bool) -> Result<Value, S
             }
             Some(Err(status)) => {
                 ctx.log_event("memory:dream_llm_failed", None, &json!({ "repo_id": repo_id, "model": mid, "status": status }));
+                last_err = Some(format!("{}/{} ({})", provider.id, mid, status));
                 if used + tokens_in + est_in > budget {
                     break;
                 }
@@ -520,8 +522,12 @@ pub async fn run(ctx: &Arc<Ctx>, repo_id: &str, manual: bool) -> Result<Value, S
         return Ok(json!({ "skipped": true, "reason": "cancelled", "run_id": run_id }));
     }
     let Some(reply) = reply else {
-        finish_run(ctx, &run_id, "failed", "model call failed");
-        return Ok(json!({ "skipped": true, "reason": "model call failed", "run_id": run_id }));
+        let reason = match last_err {
+            Some(err) => format!("Model call failed: {err}"),
+            None => "Model call failed".to_string(),
+        };
+        finish_run(ctx, &run_id, "failed", &reason);
+        return Ok(json!({ "skipped": true, "failed": true, "reason": reason, "run_id": run_id }));
     };
     let actions = crate::library::first_json_object(&reply)
         .and_then(|v| v["actions"].as_array().cloned())

@@ -1,6 +1,6 @@
 // Providers: accounts, trust level, guard mode, live model lists.
 import { For, Show, createResource, createSignal, createMemo, createEffect, on, onCleanup } from "solid-js";
-import { Page, Button, Card, Badge, Empty, Field, Input, Select, Toggle, Modal, Shield, toast, confirm } from "../ui/kit.jsx";
+import { Page, Button, Card, Badge, Empty, Field, Input, Select, Toggle, Modal, Shield, Menu, toast, confirm } from "../ui/kit.jsx";
 import { Icon } from "../ui/icons.jsx";
 import { rpc, useEvent, fmt } from "../lib/rpc.js";
 import { useStore } from "../lib/store.js";
@@ -61,6 +61,9 @@ const SUB_NOTICE = {
 const SUBSCRIPTIONS = [["claude_oauth", "Claude"], ["chatgpt_oauth", "ChatGPT"], ["antigravity_oauth", "Google Antigravity"]];
 const kindLabel = (k) => SUB_LABEL[k] ?? KINDS.find((x) => x.value === k)?.label ?? k;
 const isSub = (k) => k in SUB_LABEL;
+const needsReauth = (p) =>
+  isSub(p?.kind) &&
+  (!p.signed_in || /sign-in|invalid_grant|refresh token|expired|unauthorized|401|re-?auth/i.test(String(p.models_error ?? "")));
 
 function ProviderForm(props) {
   const editing = !!props.provider && !props.provider.preset;
@@ -379,6 +382,7 @@ export default function Providers() {
   const def = () => store.defaultModel();
   const [form, setForm] = createSignal(null);
   const [open, setOpen] = createSignal(null);
+  const [reauthId, setReauthId] = createSignal(null);
   const [busy, setBusy] = createSignal(null);
   const [quotas, { refetch: refetchQuotas }] = createResource(() =>
     rpc("activity.quotas").then((data) => ({ data })).catch(() => ({ error: true })),
@@ -511,10 +515,16 @@ export default function Providers() {
                 <AccountUsagePill account={usageFor(p.id)} />
                 <div style={{ "margin-left": "auto" }} class="row">
                   <Button size="sm" busy={busy() === p.id} onClick={() => refresh(p)}><Icon name="refresh" size={13} /> Refresh models</Button>
-                  <Show when={isSub(p.kind) && p.signed_in}><Button size="sm" busy={busy() === p.id} onClick={() => signOut(p)}>Sign out</Button></Show>
-                  <Button size="sm" variant="ghost" busy={busy() === p.id} onClick={() => toggleEnabled(p)}>{p.enabled === false ? "Enable" : "Disable"}</Button>
                   <Button size="sm" onClick={() => setForm({ provider: p })}>Edit</Button>
-                  <Button size="sm" variant="danger" busy={busy() === p.id} onClick={() => remove(p)}>Remove</Button>
+                  <Menu
+                    title="Provider actions"
+                    items={[
+                      ...(isSub(p.kind) ? [{ label: "Sign in again", disabled: busy() === p.id, onClick: () => setReauthId(p.id) }] : []),
+                      ...(isSub(p.kind) && p.signed_in ? [{ label: "Sign out", disabled: busy() === p.id, onClick: () => signOut(p) }] : []),
+                      { label: p.enabled === false ? "Enable provider" : "Disable provider", disabled: busy() === p.id, onClick: () => toggleEnabled(p) },
+                      { label: "Remove provider", danger: true, disabled: busy() === p.id, onClick: () => remove(p) },
+                    ]}
+                  />
                 </div>
               </div>
               <div class="row" style={{ gap: "10px", "flex-wrap": "wrap" }}>
@@ -531,15 +541,15 @@ export default function Providers() {
                 <Show when={p.models_cached_at}><span class="faint">· updated {fmt.ago(p.models_cached_at)}</span></Show>
                 <Button size="sm" variant="ghost" style={{ "margin-left": "auto" }} onClick={() => setOpen(open() === p.id ? null : p.id)}>{open() === p.id ? "Hide models" : "Show models"}</Button>
               </div>
-              <Show when={isSub(p.kind) && !p.signed_in}>
+              <Show when={p.models_error}><div style={{ "margin-top": "10px" }}><Shield tone="danger">Model discovery failed: {p.models_error}</Shield></div></Show>
+              <Show when={needsReauth(p) || reauthId() === p.id}>
                 <div style={{ "margin-top": "10px" }}>
                   <Show when={SUB_NOTICE[p.kind]}>
                     <div class="small dim" style={{ "margin-bottom": "8px" }} title={SUB_NOTICE[p.kind].detail}>{SUB_NOTICE[p.kind].short}</div>
                   </Show>
-                  <SignIn kind={p.kind} again onDone={syncStore} />
+                  <SignIn kind={p.kind} again onDone={() => { setReauthId(null); syncStore(); }} />
                 </div>
               </Show>
-              <Show when={p.models_error}><div style={{ "margin-top": "10px" }}><Shield tone="danger">Model discovery failed: {p.models_error}</Shield></div></Show>
               <Show when={open() === p.id}><div style={{ "margin-top": "12px" }}><ModelList provider={p} defaultRef={def()} onChange={syncStore} /></div></Show>
             </Card>
           )}

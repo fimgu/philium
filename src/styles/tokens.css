@@ -4,21 +4,24 @@
 @font-face { font-family: "PP Mori"; src: url("/fonts/PPMori-SemiBold.woff2") format("woff2"); font-weight: 600 900; font-style: normal; font-display: swap; }
 
 :root {
-  --bg: #0b0c0e;
-  --bg-raised: #111317;
-  --bg-sunken: #08090b;
-  --surface: #15171c;
-  --surface-hover: #1b1e24;
-  --surface-active: #21252d;
-  --line: #22262e;
-  --line-strong: #2e333d;
+  --bg: #0a0b0e;
+  --bg-raised: #111318;
+  --bg-sunken: #07080a;
+  --surface: #151820;
+  --surface-hover: #1c202a;
+  --surface-active: #232835;
+  --line: rgba(255, 255, 255, 0.08);
+  --line-strong: rgba(255, 255, 255, 0.14);
+  --rim: rgba(255, 255, 255, 0.06);
+  --glass: rgba(17, 19, 24, 0.86);
 
-  --text: #e8eaee;
-  --text-dim: #9aa1ad;
-  --text-faint: #6b7280;
+  --text: #eceef2;
+  --text-dim: #9ba3b2;
+  --text-faint: #677080;
 
   --accent: #8b9cff;
   --accent-dim: rgba(139, 156, 255, 0.14);
+  --accent-glow: rgba(139, 156, 255, 0.28);
   --secure: #4fd1a5;          /* trusted / sandboxed / protected */
   --secure-dim: rgba(79, 209, 165, 0.12);
   --strict: #f5b454;          /* untrusted provider, strict mode */
@@ -26,23 +29,55 @@
   --danger: #ff6b6b;
   --danger-dim: rgba(255, 107, 107, 0.12);
 
-  --radius-s: 6px;
+  --radius-s: 7px;
   --radius: 10px;
   --radius-l: 14px;
-  --shadow: 0 1px 0 rgba(255, 255, 255, 0.03) inset, 0 8px 24px rgba(0, 0, 0, 0.35);
+  --shadow: 0 1px 0 var(--rim) inset, 0 8px 24px rgba(0, 0, 0, 0.36);
+  --shadow-elevated: 0 1px 0 rgba(255, 255, 255, 0.08) inset, 0 24px 64px rgba(0, 0, 0, 0.62), 0 0 0 1px rgba(255, 255, 255, 0.06);
 
   --font: "PP Mori", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
-  /* One typeface everywhere, code included. Only the terminal stays fixed width. */
-  --mono: "PP Mori", -apple-system, system-ui, sans-serif;
+  --mono: "SF Mono", "JetBrains Mono", ui-monospace, "Cascadia Mono", Menlo, Consolas, monospace;
   --fs-xs: 11px;
   --fs-s: 12px;
   --fs: 13px;
   --fs-m: 15px;
   --fs-l: 20px;
 
-  --sidebar-w: 216px;
+  --sidebar-w: 236px;
   --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
+  --ease-spring: cubic-bezier(0.22, 1, 0.36, 1);
   color-scheme: dark;
+}
+
+[data-theme="light"] {
+  --bg: #ffffff;
+  --bg-raised: #f8f9fb;
+  --bg-sunken: #eff1f5;
+  --surface: #ffffff;
+  --surface-hover: #f3f5f9;
+  --surface-active: #e8ecf4;
+  --line: rgba(15, 23, 42, 0.09);
+  --line-strong: rgba(15, 23, 42, 0.16);
+  --rim: rgba(255, 255, 255, 0.8);
+  --glass: rgba(255, 255, 255, 0.88);
+
+  --text: #111827;
+  --text-dim: #4b5563;
+  --text-faint: #6b7280;
+
+  --accent: #4f63e7;
+  --accent-dim: rgba(79, 99, 231, 0.12);
+  --accent-glow: rgba(79, 99, 231, 0.22);
+  --secure: #0d9468;
+  --secure-dim: rgba(13, 148, 104, 0.11);
+  --strict: #c27803;
+  --strict-dim: rgba(194, 120, 3, 0.12);
+  --danger: #dc2626;
+  --danger-dim: rgba(220, 38, 38, 0.1);
+
+  --shadow: 0 1px 2px rgba(15, 23, 42, 0.05), 0 4px 14px rgba(15, 23, 42, 0.04);
+  --shadow-elevated: 0 20px 50px rgba(15, 23, 42, 0.16), 0 0 0 1px rgba(15, 23, 42, 0.08);
+  color-scheme: light;
 }
 
 * { box-sizing: border-box; }
@@ -55,7 +90,7 @@ body {
   overflow: hidden;
   user-select: none;
 }
-input, textarea, [contenteditable], pre, code, .selectable { user-select: text; }
+input, textarea, [contenteditable], pre, code, .selectable, .table td, .table th, .shield, .ws-kv, .ws-path, .checkout-row, .board-task-title, .card p { user-select: text; }
 button, input, textarea, select { font: inherit; color: inherit; }
 ::selection { background: var(--accent-dim); }
 ::-webkit-scrollbar { width: 10px; height: 10px; }

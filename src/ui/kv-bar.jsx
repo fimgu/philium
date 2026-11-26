@@ -39,6 +39,7 @@ export function KvTelemetryBar(props) {
         <div class="grow" />
         <Show when={ttft() != null}>
           <span class="mono xs faint" title="Average Time To First Token">TTFT {Math.round(ttft())}ms</span>
+          <span class="xs faint" aria-hidden="true">·</span>
         </Show>
         <span class="mono xs faint">{reqs()} req{reqs() === 1 ? "" : "s"}{pending() > 0 ? ` · ${pending()} pending` : ""}</span>
       </div>

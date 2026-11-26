@@ -480,6 +480,9 @@ fn destroy(ctx: &Arc<Ctx>, r: &Value, force: bool) -> Result<(), String> {
             }
             command("kind", &["delete", "cluster", "--name", handle])?;
         }
+        "k8s_pod" => {
+            crate::k8s_exec::delete_pod_by_handle(ctx, handle, m["namespace"].as_str())?;
+        }
         "colima" => {
             if m["started_by_philium"] != true
                 || ctx.setting("teardown.stop_colima", "false") != "true"

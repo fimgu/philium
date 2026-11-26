@@ -1,5 +1,5 @@
 import { createSignal, createMemo, onMount, onCleanup, Show, For } from "solid-js";
-import { Page, Button, Field, Input, TextArea, Select, Toggle, Segmented, Badge, VirtualList, confirm, toast } from "../ui/kit.jsx";
+import { Page, Button, Field, Input, TextArea, Select, Toggle, Segmented, Badge, VirtualList, ModelPicker, confirm, toast } from "../ui/kit.jsx";
 import { rpc, fmt } from "../lib/rpc.js";
 import { useStore } from "../lib/store.js";
 import { go } from "../lib/nav.js";
@@ -8,6 +8,7 @@ import "../styles/workspace.css";
 import { Storage } from "./storage.jsx";
 import { McpServersSection } from "./mcp-servers.jsx";
 import { HelperModelsSection } from "./helper-models.jsx";
+import { RemoteExecutionSection } from "./k8s-exec.jsx";
 import { useUpdate, UpdateControls } from "../ui/update.jsx";
 import { modelsSummary, retrievalInUse, customServerFields } from "../lib/memory-format.js";
 
@@ -587,6 +588,7 @@ export default function Settings() {
   const models = () => store.models() ?? [];
   const model = () => store.defaultModel() || "";
   const [settings, setSettings] = createSignal({});
+  const [section, setSection] = createSignal("all");
   const [storageTick, setStorageTick] = createSignal(0);
   const [proposals, setProposals] = createSignal([]);
   const [busy, setBusy] = createSignal(false), [error, setError] = createSignal(""), [loaded, setLoaded] = createSignal(false);
@@ -657,76 +659,123 @@ export default function Settings() {
     () => rpc("app.settings_get", {}, { local: true }).then((s) => setSettings(s ?? {})).catch(() => {}),
     { debounceMs: 150 },
   );
+  const showSec = (id) => section() === "all" || section() === id;
+  const NAV = [
+    ["all", "All settings"],
+    ["general", "General"],
+    ["models", "Models & Helpers"],
+    ["security", "Security & Sandbox"],
+    ["tools", "Playbooks & MCP"],
+    ["memory", "Memory & Search"],
+    ["storage", "Storage & Cleanup"],
+    ["about", "About"],
+  ];
   return <Page title="Settings" sub="Workspace defaults, features, and cleanup policy" actions={<Button busy={busy()} onClick={() => refresh(true)}>Refresh</Button>}>
     <Show when={error()}><div class="ws-alert" role="alert">{error()}</div></Show>
-    <Show when={loaded()} fallback={<p>Loading settings…</p>}><div class="ws-settings">
-      <Storage refreshTick={storageTick()} />
-      <section class="ws-section">
-        <h2>General</h2>
-        <Field label="Philium folder" hint="Managed repos and agent worktrees." title="Managed clones live in repos/. Agent worktrees live in worktrees/. Existing repositories stay where you added them.">
-          <code class="ws-path">{status().root ?? "Unavailable"}</code>
-          <Button disabled={!status().root} onClick={() => act(() => rpc("workspace.open_in", { path: status().root, app: "finder" }))}>Open folder</Button>
-        </Field>
-        <Field label="Default model" hint="Fallback model for new agents.">
-          <Select value={model()} placeholder="Choose a model" options={models().filter(m => m.enabled !== 0).map(m => ({ value: m.ref || `${m.provider_id}/${m.model_id}`, label: `${m.provider_name} / ${m.display || m.model_id}${m.trust === "untrusted" ? " (Strict)" : ""}` }))} disabled={busy()} onValue={v => act(async () => { await rpc("providers.set_default", { ref: v }); await store.refetchDefault(); toast(`Default model: ${v}`, "good"); })} />
-        </Field>
-        <Show when={!models().length}><p class="ws-muted">No models available. Add a provider first.</p></Show>
-        <Field label="Release engineering tools" hint="Show SQL contract checks, local Makefile checks, and offline packet tools in Review.">
-          <Toggle
-            on={value("release_engineering_tools", "false") === "true"}
-            disabled={busy()}
-            label="Enable release engineering tools"
-            onChange={(v) => save("release_engineering_tools", v ? "true" : "false")}
-          />
-        </Field>
-        <Field label="Workday sidebar item" hint="Pin the personal Workday activity log under System (always accessible via ⌘K).">
-          <Toggle
-            on={value("show_workday", "false") === "true"}
-            disabled={busy()}
-            label="Show Workday in sidebar"
-            onChange={(v) => save("show_workday", v ? "true" : "false")}
-          />
-        </Field>
-        <Field label="Notifications" hint="A system notification when an agent finishes, stops with a problem or waits for approval while Philium is in the background. It shows only the agent name, never its output. The first one may ask for permission.">
-          <Toggle
-            on={value("notifications", "false") === "true"}
-            disabled={busy()}
-            label="Notify me in the background"
-            onChange={(v) => save("notifications", v ? "true" : "false")}
-          />
-        </Field>
-      </section>
-      <HelperModelsSection repos={store.repos() ?? []} models={models()} parentModel={model()} busy={busy()} />
-      <StrictSandboxSection busy={busy()} />
-      <PlaybooksSection busy={busy()} />
-      <McpServersSection repos={store.repos() ?? []} />
-      <MemoryEmbeddingsSection providers={store.providers()} busy={busy()} />
-      <section class="ws-section">
-        <h2>Teardown</h2>
-        <Field label="Cleanup mode" hint="Unsaved or unmerged work always requires confirmation." title="Ask is the default. Auto removes eligible idle resources without prompting, except unsaved or unmerged work.">
-          <Segmented value={value("teardown.mode", "ask")} options={[{ value: "ask", label: "Ask" }, { value: "auto", label: "Auto" }]} onChange={v => save("teardown.mode", v)} />
-        </Field>
-        <div class="ws-row">
-          <Field label="Idle timeout (hours)" hint="Flag idle agent resources after this period.">
-            <Input type="number" min="1" max="8760" value={value("teardown.idle_hours", "4")} onChange={e => hours("teardown.idle_hours", e.currentTarget.value)} />
-          </Field>
-          <Field label="Failed worktree retention (hours)" hint="Keep failed or stopped worktrees for inspection.">
-            <Input type="number" min="1" max="8760" value={value("teardown.failed_hours", "24")} onChange={e => hours("teardown.failed_hours", e.currentTarget.value)} />
-          </Field>
+    <Show when={loaded()} fallback={<p>Loading settings…</p>}>
+      <div class="ws-settings-shell">
+        <nav class="ws-settings-nav" aria-label="Settings sections">
+          <For each={NAV}>
+            {([id, label]) => (
+              <button type="button" class={`nav-item ${section() === id ? "on" : ""}`} onClick={() => setSection(id)}>
+                {label}
+              </button>
+            )}
+          </For>
+        </nav>
+        <div class="ws-settings">
+          <Show when={showSec("general")}>
+            <section class="ws-section">
+              <h2>General</h2>
+              <Field label="Philium folder" hint="Managed repos and agent worktrees." title="Managed clones live in repos/. Agent worktrees live in worktrees/. Existing repositories stay where you added them.">
+                <code class="ws-path">{status().root ?? "Unavailable"}</code>
+                <Button disabled={!status().root} onClick={() => act(() => rpc("workspace.open_in", { path: status().root, app: "finder" }))}>Open folder</Button>
+              </Field>
+              <Field label="Default model" hint="Fallback model for new agents.">
+                <ModelPicker
+                  value={model()}
+                  models={models()}
+                  providers={store.providers() ?? []}
+                  allowUntrusted={true}
+                  disabled={busy()}
+                  placeholder="Choose a model"
+                  onValue={v => act(async () => { await rpc("providers.set_default", { ref: v }); await store.refetchDefault(); toast(`Default model: ${v}`, "good"); })}
+                />
+              </Field>
+              <Show when={!models().length}><p class="ws-muted">No models available. Add a provider first.</p></Show>
+              <Field label="Release engineering tools" hint="Show SQL contract checks, local Makefile checks, and offline packet tools in Review.">
+                <Toggle
+                  on={value("release_engineering_tools", "false") === "true"}
+                  disabled={busy()}
+                  label="Enable release engineering tools"
+                  onChange={(v) => save("release_engineering_tools", v ? "true" : "false")}
+                />
+              </Field>
+              <Field label="Workday sidebar item" hint="Pin the personal Workday activity log under System (always accessible via ⌘K).">
+                <Toggle
+                  on={value("show_workday", "false") === "true"}
+                  disabled={busy()}
+                  label="Show Workday in sidebar"
+                  onChange={(v) => save("show_workday", v ? "true" : "false")}
+                />
+              </Field>
+              <Field label="Notifications" hint="A system notification when an agent finishes, stops with a problem or waits for approval while Philium is in the background. It shows only the agent name, never its output. The first one may ask for permission.">
+                <Toggle
+                  on={value("notifications", "false") === "true"}
+                  disabled={busy()}
+                  label="Notify me in the background"
+                  onChange={(v) => save("notifications", v ? "true" : "false")}
+                />
+              </Field>
+            </section>
+          </Show>
+          <Show when={showSec("models")}>
+            <HelperModelsSection repos={store.repos() ?? []} models={models()} parentModel={model()} busy={busy()} />
+          </Show>
+          <Show when={showSec("security")}>
+            <StrictSandboxSection busy={busy()} />
+            <RemoteExecutionSection busy={busy()} />
+          </Show>
+          <Show when={showSec("tools")}>
+            <PlaybooksSection busy={busy()} />
+            <McpServersSection repos={store.repos() ?? []} />
+          </Show>
+          <Show when={showSec("memory")}>
+            <MemoryEmbeddingsSection providers={store.providers()} busy={busy()} />
+          </Show>
+          <Show when={showSec("storage")}>
+            <Storage refreshTick={storageTick()} />
+            <section class="ws-section">
+              <h2>Teardown</h2>
+              <Field label="Cleanup mode" hint="Unsaved or unmerged work always requires confirmation." title="Ask is the default. Auto removes eligible idle resources without prompting, except unsaved or unmerged work.">
+                <Segmented value={value("teardown.mode", "ask")} options={[{ value: "ask", label: "Ask" }, { value: "auto", label: "Auto" }]} onChange={v => save("teardown.mode", v)} />
+              </Field>
+              <div class="ws-row">
+                <Field label="Idle timeout (hours)" hint="Flag idle agent resources after this period.">
+                  <Input type="number" min="1" max="8760" value={value("teardown.idle_hours", "4")} onChange={e => hours("teardown.idle_hours", e.currentTarget.value)} />
+                </Field>
+                <Field label="Failed worktree retention (hours)" hint="Keep failed or stopped worktrees for inspection.">
+                  <Input type="number" min="1" max="8760" value={value("teardown.failed_hours", "24")} onChange={e => hours("teardown.failed_hours", e.currentTarget.value)} />
+                </Field>
+              </div>
+              <Toggle on={value("teardown.stop_colima", "false") === "true"} disabled={busy()} label="Stop Colima when unused (only if started by Philium)" onChange={v => save("teardown.stop_colima", v ? "true" : "false")} />
+              <p class="ws-muted" title="Containers and clusters survive app quit. Review worktrees stay until accepted or discarded. Cleanup deletes resources permanently; agent scratch space is removed with its owner.">
+                Containers survive app quit; cleanup removes resources permanently.
+              </p>
+            </section>
+            <section class="ws-section"><div class="ws-row"><div><h2>Cleanup</h2><p class="ws-muted small">{proposals().length ? `${proposals().length} ready to clean up. ` : ""}What agents left running, and what Philium could not stop, lives in Environments.</p></div><div class="ws-actions"><Show when={!status().pilot}><Button busy={busy()} onClick={() => act(async () => { const result = await rpc("reaper.sweep_now"); await loadCleanup(); if (result.errors?.length) setError(result.errors.map(e => e.error).join("\n")); else toast(`${result.removed.length} removed, ${result.proposals.length} pending confirmation`); })}>Sweep now</Button></Show><Button variant="primary" onClick={() => go("environments")}>Open Environments</Button></div></div></section>
+          </Show>
+          <Show when={showSec("about")}>
+            <section class="ws-section"><h2>About</h2>
+              <div class="ws-kv"><span>Version</span><div class="ws-row update-row"><UpdateControls update={useUpdate()} version={status().version} showCheck /></div></div>
+              <div class="ws-kv"><span>Desk runtime</span><Badge tone={status().desk?.ok ? "secure" : "strict"}>{status().desk?.ok ? "Running" : "Unavailable"}</Badge></div>
+              <Show when={status().desk?.error}><p class="ws-alert">{status().desk.error}</p></Show>
+              <div class="ws-kv"><span>Gateway</span><code class="ws-path">{status().gateway || "Not running"}</code></div>
+              <div class="ws-kv"><span>Application data</span><code class="ws-path" title={status().data_dir}>{status().data_dir || "Unavailable"}</code></div>
+            </section>
+          </Show>
         </div>
-        <Toggle on={value("teardown.stop_colima", "false") === "true"} disabled={busy()} label="Stop Colima when unused (only if started by Philium)" onChange={v => save("teardown.stop_colima", v ? "true" : "false")} />
-        <p class="ws-muted" title="Containers and clusters survive app quit. Review worktrees stay until accepted or discarded. Cleanup deletes resources permanently; agent scratch space is removed with its owner.">
-          Containers survive app quit; cleanup removes resources permanently.
-        </p>
-      </section>
-      <section class="ws-section"><div class="ws-row"><div><h2>Cleanup</h2><p class="ws-muted small">{proposals().length ? `${proposals().length} ready to clean up. ` : ""}What agents left running, and what Philium could not stop, lives in Environments.</p></div><div class="ws-actions"><Show when={!status().pilot}><Button busy={busy()} onClick={() => act(async () => { const result = await rpc("reaper.sweep_now"); await loadCleanup(); if (result.errors?.length) setError(result.errors.map(e => e.error).join("\n")); else toast(`${result.removed.length} removed, ${result.proposals.length} pending confirmation`); })}>Sweep now</Button></Show><Button variant="primary" onClick={() => go("environments")}>Open Environments</Button></div></div></section>
-      <section class="ws-section"><h2>About</h2>
-        <div class="ws-kv"><span>Version</span><div class="ws-row update-row"><UpdateControls update={useUpdate()} version={status().version} showCheck /></div></div>
-        <div class="ws-kv"><span>Desk runtime</span><Badge tone={status().desk?.ok ? "secure" : "strict"}>{status().desk?.ok ? "Running" : "Unavailable"}</Badge></div>
-        <Show when={status().desk?.error}><p class="ws-alert">{status().desk.error}</p></Show>
-        <div class="ws-kv"><span>Gateway</span><code class="ws-path">{status().gateway || "Not running"}</code></div>
-        <div class="ws-kv"><span>Application data</span><code class="ws-path" title={status().data_dir}>{status().data_dir || "Unavailable"}</code></div>
-      </section>
-    </div></Show>
+      </div>
+    </Show>
   </Page>;
 }

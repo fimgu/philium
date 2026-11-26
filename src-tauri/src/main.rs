@@ -34,6 +34,7 @@ mod pr_github;
 mod release_document;
 mod release_stage;
 mod environments;
+mod k8s_exec;
 #[cfg(unix)] mod managed;
 mod browser;
 #[cfg(test)]
@@ -237,6 +238,7 @@ async fn rpc_inner(app: &App, method: String, args: Option<Value>) -> Result<Val
         "release_intake" => release_intake::call(&ctx,m,args).await,
         "pr_review" => pr_review::call(&ctx, m, args).await,
         "environments" => environments::call(m, args).await,
+        "k8s_exec" => k8s_exec::call(&ctx, m, args).await,
         #[cfg(unix)] "managed" => managed::call(&ctx, m, args).await,
         "browser" => browser::call(&ctx, m, args).await,
         "graph" => graph::call(&ctx, m, args).await,

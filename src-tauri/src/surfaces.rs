@@ -119,14 +119,43 @@ pub fn open_shim_path(ctx: &Ctx) -> PathBuf {
 }
 
 /// Write executable `open` and `xdg-open` zero-interference shims into `<data_dir>/bin`.
+const GH_SHIM: &str = r#"#!/bin/sh
+# Philium gh shim: uses the repository's configured GitHub account (PHILIUM_GH_USER)
+# without exposing tokens in the shell environment or requiring `gh auth switch`.
+SELF_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+REAL_GH=""
+OLD_IFS="$IFS"
+IFS=:
+for d in $PATH; do
+  [ -z "$d" ] && continue
+  [ "$d" = "$SELF_DIR" ] && continue
+  if [ -x "$d/gh" ] && [ ! -d "$d/gh" ]; then
+    REAL_GH="$d/gh"
+    break
+  fi
+done
+IFS="$OLD_IFS"
+if [ -z "$REAL_GH" ]; then
+  echo "gh: command not found" >&2
+  exit 127
+fi
+if [ -n "${PHILIUM_GH_USER:-}" ] && [ -z "${GH_TOKEN:-}" ] && [ -z "${GITHUB_TOKEN:-}" ] && [ "${1:-}" != "auth" ]; then
+  TOK="$("$REAL_GH" auth token --hostname github.com --user "$PHILIUM_GH_USER" 2>/dev/null || true)"
+  if [ -n "$TOK" ]; then
+    GH_TOKEN="$TOK" exec "$REAL_GH" "$@"
+  fi
+fi
+exec "$REAL_GH" "$@"
+"#;
+
 pub fn ensure_shims(ctx: &Ctx) -> Result<PathBuf, String> {
     let dir = shim_bin_dir(ctx);
     std::fs::create_dir_all(&dir).map_err(|e| format!("create shim dir: {e}"))?;
-    for name in ["open", "xdg-open"] {
+    for (name, body) in [("open", OPEN_SHIM), ("xdg-open", OPEN_SHIM), ("gh", GH_SHIM)] {
         let p = dir.join(name);
-        let needs_write = std::fs::read_to_string(&p).map(|s| s != OPEN_SHIM).unwrap_or(true);
+        let needs_write = std::fs::read_to_string(&p).map(|s| s != body).unwrap_or(true);
         if needs_write {
-            std::fs::write(&p, OPEN_SHIM).map_err(|e| format!("write {name} shim: {e}"))?;
+            std::fs::write(&p, body).map_err(|e| format!("write {name} shim: {e}"))?;
         }
         #[cfg(unix)]
         {

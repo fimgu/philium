@@ -57,7 +57,28 @@ function GlobalHome() {
   const [clashes, cl] = createResource(() => rpc("codeindex.clashes", {}).then((r) => r?.clashes ?? []).catch(() => []));
   const [libStatus, libSt] = createResource(() => rpc("library.status", {}, { local: true }).catch(() => null));
   const [spawn, setSpawn] = createSignal(false);
-  const [hideSetup, setHideSetup] = createSignal(false);
+  const [quickBrief, setQuickBrief] = createSignal("");
+  const [quickRepo, setQuickRepo] = createSignal("");
+  const [quickBusy, setQuickBusy] = createSignal(false);
+  const quickLaunch = async (e) => {
+    e?.preventDefault();
+    const text = quickBrief().trim();
+    if (!text || quickBusy()) return;
+    setQuickBusy(true);
+    try {
+      const a = await rpc("agents.spawn", { role: "worker", repo_id: quickRepo() || null, brief: text });
+      setQuickBrief("");
+      toast(`${a.name} is starting`, "secure");
+      store.refetchAgents?.();
+      go("agents", { id: a.id });
+    } catch (err) {
+      toast(String(err), "danger");
+    } finally {
+      setQuickBusy(false);
+    }
+  };
+  const [hideSetup, setHideSetupRaw] = createSignal(localStorage.getItem("philium.hideSetup") === "1");
+  const setHideSetup = (v) => { setHideSetupRaw(v); localStorage.setItem("philium.hideSetup", v ? "1" : "0"); };
 
   useVisibleEvent("agents:changed", () => ev.refetch(), { debounceMs: 300 });
   useVisibleEvent("board:changed", () => tk.refetch(), { debounceMs: 200 });
@@ -104,10 +125,32 @@ function GlobalHome() {
 
   return (
     <Page title="Home" actions={<Button variant="primary" onClick={() => setSpawn(true)}><Icon name="plus" size={12} /> New agent</Button>}>
+      <form class="home-launch" onSubmit={quickLaunch}>
+        <Icon name="spark" size={16} />
+        <input
+          type="text"
+          value={quickBrief()}
+          disabled={quickBusy()}
+          onInput={(e) => setQuickBrief(e.currentTarget.value)}
+          placeholder="Start an agent… describe a task, bug, or goal"
+          aria-label="Quick launch agent brief"
+        />
+        <Show when={(repos() ?? []).length > 0}>
+          <select class="select" aria-label="Workspace for quick launch" value={quickRepo()} onChange={(e) => setQuickRepo(e.currentTarget.value)}>
+            <option value="">Scratch (no repo)</option>
+            <For each={repos() ?? []}>{(r) => <option value={r.id}>{r.name}</option>}</For>
+          </select>
+        </Show>
+        <Button variant="primary" type="submit" busy={quickBusy()} disabled={!quickBrief().trim()}>
+          <Icon name="send" size={12} /> Start
+        </Button>
+      </form>
+
       <Show when={showSetup()}>
         <Card class="home-hero home-setup">
           <div class="row" style={{ "margin-bottom": "6px" }}>
             <h2 class="grow" style={{ margin: 0 }}>Get set up</h2>
+            <Badge>{setupRows().filter((r) => !r.optional && r.done).length}/{setupRows().filter((r) => !r.optional).length} required</Badge>
             <Button size="sm" variant="ghost" onClick={() => su.refetch()}>Check again</Button>
             <Button size="sm" variant="ghost" onClick={() => setHideSetup(true)}>Later</Button>
           </div>
@@ -140,7 +183,7 @@ function GlobalHome() {
 
       <Show when={attention()}>
         <Section title="Needs you">
-          <div class="list card" style={{ padding: 0 }}>
+          <div class="list card home-needs-card" style={{ padding: 0 }}>
             <For each={waiting()}>
               {(a) => (
                 <div class="list-item" onClick={() => go("agents", { id: a.id })}>

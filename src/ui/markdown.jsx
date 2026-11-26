@@ -374,8 +374,25 @@ function Tokens(props) {
 }
 
 export function Markdown(props) {
+  const [rendered, setRendered] = createSignal(props.text || "");
+  let raf = 0;
+  createEffect(() => {
+    const next = props.text || "";
+    if (!props.live) {
+      if (raf) { cancelAnimationFrame(raf); raf = 0; }
+      setRendered(next);
+      return;
+    }
+    if (!raf) {
+      raf = requestAnimationFrame(() => {
+        raf = 0;
+        setRendered(props.text || "");
+      });
+    }
+  });
+  onCleanup(() => { if (raf) cancelAnimationFrame(raf); });
   const tokens = createMemo((prev = []) => {
-    const source = props.text || "";
+    const source = rendered();
     const normalized = source.includes("\r") ? source.replace(/\r\n|\r/g, "\n") : source;
     const parsed = marked.lexer(source, marked.defaults);
     let cursor = 0;
@@ -397,7 +414,7 @@ export function Markdown(props) {
     }
     return parsed;
   });
-  return <div class="assistant-markdown"><Tokens tokens={tokens()} source={props.text || ""} live={props.live} /></div>;
+  return <div class="assistant-markdown"><Tokens tokens={tokens()} source={rendered()} live={props.live} /></div>;
 }
 
 export function AssistantReply(props) {

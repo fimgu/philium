@@ -4,7 +4,7 @@ import { workspaceAgents, selectedAgentId, spawnRepoDefault } from "../lib/agent
 import { repoLabels } from "../lib/repo-labels.js";
 import { kindResources } from "../lib/kind-resources.js";
 import { For, Show, createSignal, createResource, createMemo, createEffect, on, onCleanup, Suspense, lazy } from "solid-js";
-import { NotFound, Page, Button, Badge, Dot, Empty, Segmented, ModelPicker, confirm, toast } from "../ui/kit.jsx";
+import { NotFound, Page, Button, Badge, Dot, Empty, Segmented, ModelPicker, Menu, Modal, confirm, toast } from "../ui/kit.jsx";
 import { Icon } from "../ui/icons.jsx";
 import { Conversation, Composer, KvTelemetryBar, speedEffort, effortSpeed, agentAttachmentLoader, PlainError } from "../ui/conversation.jsx";
 import { agentHue, AgentChip, RoleBadge, KvBadge, WarningPills } from "../ui/agent-chip.jsx";
@@ -166,7 +166,7 @@ function Checkpoints(props) {
     try {
       const p = await rpc("agents.checkpoint_preview", { id: props.id, turn });
       if ((p?.conflicts || []).length) return setNote(`Not restored. These files changed since that turn: ${p.conflicts.join(", ")}`);
-      if (!confirm(`Restore ${(p?.paths || []).length} file(s) to how they were before this turn?`)) return;
+      if (!(await confirm(`Restore ${(p?.paths || []).length} file(s)?`, "Files will be restored to how they were before this turn.", { danger: true, ok: "Restore" }))) return;
       await rpc("agents.checkpoint_restore", { id: props.id, turn });
       setNote("Restored.");
       refetch();
@@ -271,19 +271,19 @@ function Details(props) {
   return (
     <div class="page-body agent-details">
       <KvTelemetryBar kv={kv()} />
-      <div class="grid-2" style={{ "margin-top": "12px" }}>
-        <div><div class="xs faint">Role</div><div class="row gap-4"><RoleBadge role={a().role} /><span class="small">{a().parent_name ? `Helper of ${a().parent_name}` : roleLabel(a().role)}</span></div></div>
-        <div><div class="xs faint">Model</div><div class="mono small">{a().model_ref}</div><Show when={a().route_reason}><div class="xs faint">{a().route_reason}</div></Show></div>
-        <div><div class="xs faint">Reasoning Effort</div><div class="mono small">{a().effort ?? "default"}</div></div>
-        <div><div class="xs faint">Security</div>
+      <div class="agent-details-grid" style={{ "margin-top": "12px" }}>
+        <div class="detail-tile"><div class="xs faint">Role</div><div class="row gap-4"><RoleBadge role={a().role} /><span class="small">{a().parent_name ? `Helper of ${a().parent_name}` : roleLabel(a().role)}</span></div></div>
+        <div class="detail-tile"><div class="xs faint">Model</div><div class="mono small">{a().model_ref}</div><Show when={a().route_reason}><div class="xs faint">{a().route_reason}</div></Show></div>
+        <div class="detail-tile"><div class="xs faint">Reasoning Effort</div><div class="mono small">{a().effort ?? "default"}</div></div>
+        <div class="detail-tile"><div class="xs faint">Security</div>
           <Show when={a().strict} fallback={<Badge tone="secure">Standard: trusted provider</Badge>}>
             <Badge tone="strict">Strict: sandboxed, network allowlist</Badge>
           </Show>
         </div>
-        <div><div class="xs faint">Workspace</div><div class="mono xs ellipsis" title={a().cwd ?? a().worktree}>{a().cwd ?? a().worktree ?? "not running"}</div></div>
-        <div><div class="xs faint">Branch</div><div class="mono small">{a().branch ?? "none"}</div></div>
-        <div><div class="xs faint">Ports</div><div class="mono small">{a().port_base}–{a().port_base + 19} (kind HTTP :{a().port_base + 10}, HTTPS :{a().port_base + 11})</div></div>
-        <div><div class="xs faint">Started</div><div class="small">{fmt.ago(a().created_at)}</div></div>
+        <div class="detail-tile"><div class="xs faint">Workspace</div><div class="mono xs ellipsis" title={a().cwd ?? a().worktree}>{a().cwd ?? a().worktree ?? "not running"}</div></div>
+        <div class="detail-tile"><div class="xs faint">Branch</div><div class="mono small">{a().branch ?? "none"}</div></div>
+        <div class="detail-tile"><div class="xs faint">Ports</div><div class="mono small">{a().port_base}–{a().port_base + 19} (kind HTTP :{a().port_base + 10}, HTTPS :{a().port_base + 11})</div></div>
+        <div class="detail-tile"><div class="xs faint">Started</div><div class="small">{fmt.ago(a().created_at)}</div></div>
       </div>
 
       <h3 class="section-title">kind clusters</h3>
@@ -355,10 +355,49 @@ function Details(props) {
   );
 }
 
+// Per-session auto-allow toggle: when enabled for an agent, pending tool approvals
+// are automatically approved for the remainder of that live session (never cross-repo access grants).
+const [sessionAutoAllow, setSessionAutoAllow] = createSignal(new Set());
+const isSessionAutoAllow = (id) => Boolean(id && sessionAutoAllow().has(id));
+const setAgentAutoAllow = (id, on) => {
+  if (!id) return;
+  setSessionAutoAllow((prev) => {
+    const next = new Set(prev);
+    if (on) next.add(id);
+    else next.delete(id);
+    return next;
+  });
+};
+
+const BROWSER_LABELS = {
+  browser_open: ["Open page", "globe"],
+  browser_navigate: ["Navigate", "globe"],
+  browser_snapshot: ["Page snapshot", "camera"],
+  browser_click: ["Click element", "globe"],
+  browser_type: ["Type text", "globe"],
+  browser_screenshot: ["Screenshot page", "camera"],
+  browser_eval: ["Run page script", "globe"],
+};
+
+function formatPerm(request, args) {
+  const raw = String(request.resource || "");
+  const isBrowser = request.action === "mcp" && raw.startsWith("philium/browser_");
+  const shortRes = raw.replace(/^philium\//, "");
+  const [title, icon] = isBrowser
+    ? (BROWSER_LABELS[shortRes] ?? [shortRes.replace(/^browser_/, "Browser ").replace(/_/g, " "), "globe"])
+    : [request.action || "Permission", "shield"];
+  const obj = args && typeof args === "object" && !Array.isArray(args) ? args : null;
+  const keys = obj ? Object.keys(obj) : [];
+  const inlineVal = obj?.url || obj?.command || obj?.path || (keys.length === 1 && typeof obj[keys[0]] === "string" ? obj[keys[0]] : null);
+  const hasExtra = keys.length > (inlineVal ? 1 : 0);
+  return { isBrowser, title, icon, shortRes, inlineVal, hasExtra, hasArgs: keys.length > 0 };
+}
+
 function PendingAgentPermissions(props) {
   const store = useStore();
   const requests = () => store.agentApprovals()?.[props.agent?.id];
   const [deciding, setDeciding] = createSignal(null);
+  const autoApproved = new Set();
   const decide = async (request, decision, scope) => {
     if (deciding()) return;
     const agent = props.agent.id;
@@ -372,31 +411,76 @@ function PendingAgentPermissions(props) {
       setDeciding(null);
     }
   };
+  const alwaysAllowSession = async (request) => {
+    const agentId = props.agent?.id;
+    if (!agentId) return;
+    setAgentAutoAllow(agentId, true);
+    toast(`Always allowing tool calls for ${props.agent?.name ?? "this agent"} for this session`, "info");
+    await decide(request, "approve", "session");
+  };
+  createEffect(() => {
+    const a = props.agent;
+    if (!a?.id) return;
+    if (a.live === false && isSessionAutoAllow(a.id)) {
+      setAgentAutoAllow(a.id, false);
+      return;
+    }
+    if (!isSessionAutoAllow(a.id) || !a.live) return;
+    const list = requests();
+    if (!Array.isArray(list) || !list.length) return;
+    const pending = list.filter((r) => !autoApproved.has(r.request_id));
+    if (!pending.length) return;
+    for (const r of pending) autoApproved.add(r.request_id);
+    Promise.allSettled(
+      pending.map((r) => rpc("agents.permission", { id: a.id, request_id: r.request_id, decision: "approve", scope: "session" }, { local: true })),
+    ).finally(() => store.refetchAgentApprovals());
+  });
   return (
     <Show when={agentNeedsToolApproval(props.agent, store.agentApprovals())}>
       <section class="agent-approvals" aria-label="Pending tool approvals">
         <Show when={Array.isArray(requests())} fallback={
-          <div class="perm" role="status">
-            <span class="grow">This agent is waiting for approval. Its pending requests are temporarily unavailable.</span>
-            <Button size="sm" busy={store.agentApprovals.loading} onClick={store.refetchAgentApprovals}>Retry approvals</Button>
+          <div class="perm perm-card" role="status">
+            <div class="perm-body row">
+              <Icon name="shield" size={14} />
+              <span class="grow small">This agent is waiting for approval. Its pending requests are temporarily unavailable.</span>
+              <Button size="sm" busy={store.agentApprovals.loading} onClick={store.refetchAgentApprovals}>Retry approvals</Button>
+            </div>
           </div>
         }>
           <For each={requests()}>{(request) => {
-            const isBrowser = request.action === "mcp" && request.resource?.startsWith("philium/browser_");
             const args = () => request.call_id && props.events?.find((event) =>
               event.type === "tool.started" && event.call_id === request.call_id
             )?.arguments;
-            return <div class="perm row">
-              <Icon name="shield" size={14} />
-              <div class="grow">
-                <b>{isBrowser ? "Browser permission" : request.action}</b> <code class="mono">{request.resource}</code>
-                <Show when={args()}><pre class="conv-pre">{JSON.stringify(args(), null, 2)}</pre></Show>
-                <Show when={isBrowser}><div class="dim xs">Page content may be sent to this agent’s provider.</div></Show>
+            const meta = () => formatPerm(request, args());
+            return <div class="perm perm-card">
+              <div class="perm-body">
+                <div class="perm-head">
+                  <span class="perm-icon"><Icon name={meta().icon} size={13} /></span>
+                  <span class="perm-title">{meta().title}</span>
+                  <code class="perm-tag">{meta().shortRes}</code>
+                  <Show when={meta().inlineVal}>
+                    <code class="perm-target ellipsis" title={meta().inlineVal}>{meta().inlineVal}</code>
+                  </Show>
+                </div>
+                <Show when={meta().hasExtra}>
+                  <details class="perm-details">
+                    <summary class="xs faint">Arguments</summary>
+                    <pre class="conv-pre">{JSON.stringify(args(), null, 2)}</pre>
+                  </details>
+                </Show>
               </div>
-              <div class="row gap-4">
-                <Button size="sm" disabled={!!deciding()} onClick={() => decide(request, "deny")}>Deny</Button>
-                <Button size="sm" disabled={!!deciding()} onClick={() => decide(request, "approve", "once")}>Allow once</Button>
-                <Button size="sm" disabled={!!deciding()} onClick={() => decide(request, "approve", "session")}>Allow for session</Button>
+              <div class="perm-foot">
+                <span class="xs faint grow">
+                  <Show when={meta().isBrowser} fallback="Tool approval requested">
+                    Page content may be sent to this agent’s provider
+                  </Show>
+                </span>
+                <div class="row gap-4" style={{ "flex-wrap": "wrap" }}>
+                  <Button size="sm" variant="ghost" disabled={!!deciding()} onClick={() => decide(request, "deny")}>Deny</Button>
+                  <Button size="sm" disabled={!!deciding()} onClick={() => decide(request, "approve", "session")}>Allow for session</Button>
+                  <Button size="sm" disabled={!!deciding()} title="Auto-approve all tool calls for this agent until the session ends" onClick={() => alwaysAllowSession(request)}>Always allow for this session</Button>
+                  <Button size="sm" variant="primary" disabled={!!deciding()} onClick={() => decide(request, "approve", "once")}>Allow once</Button>
+                </div>
               </div>
             </div>;
           }}</For>
@@ -418,10 +502,14 @@ function AgentView(props) {
     else if (prev === "browser" && props.id) rpc("browser.hide", { owner: props.id }).catch(() => {});
   }));
   useVisibleEvent("browser:tab", (t) => {
-    if (t?.owner === props.id && aside() !== "browser") setBrowserPing(true);
+    if (t?.owner !== props.id) return;
+    if (aside() === "none") setAside("browser");
+    else if (aside() !== "browser") setBrowserPing(true);
   });
   useVisibleEvent("browser:agent_action", (act) => {
-    if (act?.owner === props.id && aside() !== "browser") setBrowserPing(true);
+    if (act?.owner !== props.id) return;
+    if (aside() === "none") setAside("browser");
+    else if (aside() !== "browser") setBrowserPing(true);
   });
   const drag = (e) => {
     e.preventDefault();
@@ -545,6 +633,20 @@ function AgentView(props) {
   };
 
   const [pickModel, setPickModel] = createSignal(0);
+  const [resuming, setResuming] = createSignal(false);
+  const isProvisioning = () => resuming() || a()?.state === "provisioning";
+  createEffect(() => { props.id; setResuming(false); });
+  createEffect(() => { if (live()) setResuming(false); });
+  const handleResume = async () => {
+    if (isProvisioning()) return;
+    setResuming(true);
+    try {
+      await rpc("agents.resume", { id: props.id }, { action: true });
+    } catch (e) {
+      setResuming(false);
+      toast(String(e), "danger");
+    }
+  };
   // After /model the cursor belongs back in the message box. A model change can redraw or
   // briefly disable that box, so try again while nothing else has taken the focus.
   const backToComposer = () => {
@@ -626,19 +728,49 @@ function AgentView(props) {
     }
   };
 
+  const [removeReview, setRemoveReview] = createSignal(null);
+  const [removingForce, setRemovingForce] = createSignal(false);
+
   const remove = async () => {
     const r = await rpc("agents.remove", { id: props.id }).catch((e) => ({ error: String(e) }));
     if (r?.error) return toast(r.error, "danger");
     if (r?.needs_confirmation) {
-      const ok = await confirm(`Remove ${a().name}?`, `${r.reason || "This agent has unsaved work."} Remove it anyway? Anything Philium cannot stop safely is left running and listed afterwards.`, { danger: true, ok: "Remove anyway" });
-      if (!ok) return;
+      const wtId = a()?.worktree_id;
+      setRemoveReview({
+        name: a()?.name || "agent",
+        reason: r.reason || "This agent has unsaved work in its worktree.",
+        branch: a()?.branch || "",
+        loading: !!wtId,
+        status: null,
+        diff: null,
+      });
+      if (wtId) {
+        const [st, df] = await Promise.all([
+          rpc("workspace.worktree_status", { id: wtId }, { local: true }).catch(() => null),
+          rpc("workspace.diff", { worktree_id: wtId }, { local: true }).catch(() => null),
+        ]);
+        setRemoveReview((prev) => prev ? { ...prev, loading: false, status: st, diff: df } : null);
+      }
+      return;
+    }
+    toast(`${a().name} removed`);
+    go("agents", {});
+  };
+
+  const confirmForceRemove = async () => {
+    if (removingForce()) return;
+    setRemovingForce(true);
+    try {
       const r2 = await rpc("agents.remove", { id: props.id, force: true }).catch((e) => ({ error: String(e) }));
       if (r2?.error) return toast(r2.error, "danger");
       if (r2?.needs_confirmation) return toast(r2.reason || `${a().name} could not be removed`, "danger");
       if (r2?.left?.length) toast(`Philium stopped tracking these but could not stop them safely, so check them yourself: ${r2.left.map((l) => l.handle).join("; ")}`, "danger");
+      setRemoveReview(null);
+      toast(`${a().name} removed`);
+      go("agents", {});
+    } finally {
+      setRemovingForce(false);
     }
-    toast(`${a().name} removed`);
-    go("agents", {});
   };
 
   const toggleAside = (panel) => setAside(aside() === panel ? "none" : panel);
@@ -720,6 +852,39 @@ function AgentView(props) {
       toast(String(e), "danger");
     }
   };
+
+  const handleEditAt = async (seq, newText, mode = "fork") => {
+    if (mode === "resend") {
+      return send(newText, []);
+    }
+    try {
+      const cur = a();
+      const priorSeq = Math.max(0, Number(seq) - 1);
+      let transcript = "";
+      if (priorSeq > 0) {
+        const res = await rpc("agents.fork_context", { id: props.id, seq: priorSeq }, { local: true }).catch(() => null);
+        transcript = (res?.transcript || "").trim();
+      }
+      const brief = transcript
+        ? `Forked from ${cur?.name} right before an edited message. Treat the prior conversation below as context, then execute the updated request at the end.\n\n${transcript}\n\n---\nUpdated request:\n${newText}`
+        : newText;
+      const forked = await rpc("agents.spawn", {
+        role: cur?.role || "worker",
+        repo_id: cur?.repo_id || null,
+        model: cur?.model_ref || null,
+        strict: !!cur?.strict,
+        base: cur?.branch || null,
+        brief,
+      });
+      toast(`Forked with edited message -> ${forked.name}`, "secure");
+      store.refetchAgents?.();
+      go("agents", { id: forked.id });
+      return true;
+    } catch (e) {
+      toast(String(e), "danger");
+      return false;
+    }
+  };
   // Opened from a history search hit: scroll to the closest message at or before it.
   createEffect(() => {
     const seq = Number(params().seq || 0);
@@ -753,6 +918,17 @@ function AgentView(props) {
           onDismiss={backToComposer}
         />
         <Show when={a()?.strict}><Badge tone="strict"><Icon name="shield" size={11} /> Strict</Badge></Show>
+        <Show when={isSessionAutoAllow(props.id)}>
+          <button
+            type="button"
+            class="badge strict"
+            style={{ cursor: "pointer", border: "1px solid rgba(245, 180, 84, 0.35)" }}
+            title="Always allowing tool calls for this session. Click to turn off."
+            onClick={() => { setAgentAutoAllow(props.id, false); toast(`Turned off auto-allow for ${a()?.name ?? "agent"}`, "info"); }}
+          >
+            <Icon name="shield" size={10} /> Auto-allow ×
+          </button>
+        </Show>
         <Show when={a()?.parent_id}>
           <span class="xs faint" style={{ cursor: "pointer" }} onClick={() => go("agents", { id: a().parent_id })}>
             ↳ coordinator: <b>{a()?.parent_name || "parent"}</b>
@@ -778,12 +954,17 @@ function AgentView(props) {
             <span class="row gap-4"><Icon name="brain" size={12} /> Memory<Show when={memoryHint(a())}><span class="xs dim">· {memoryHint(a())}</span></Show></span>
           </button>
         </div>
-        <Show when={live()} fallback={<Button size="sm" onClick={() => rpc("agents.resume", { id: props.id }, { action: true }).catch((e) => toast(String(e), "danger"))}><Icon name="play" size={11} /> Resume</Button>}>
+        <Show when={live()} fallback={
+          <Button size="sm" busy={isProvisioning()} disabled={isProvisioning()} onClick={handleResume}>
+            <Show when={!isProvisioning()}><Icon name="play" size={11} /></Show>
+            {isProvisioning() ? "Starting…" : "Resume"}
+          </Button>
+        }>
           <Button size="sm" onClick={() => rpc("agents.stop", { id: props.id }, { action: true }).catch((e) => toast(String(e), "danger"))}><Icon name="stop" size={11} /> Stop</Button>
         </Show>
         <Button size="sm" variant="ghost" title="Remove agent and clean up" onClick={remove}><Icon name="trash" size={12} /></Button>
       </div>
-      <Show when={tab() === "chat"}>
+      <Show when={tab() === "chat" && ((a()?.kv?.requests ?? 0) > 0 || (a()?.kv?.pending_requests ?? 0) > 0)}>
         <div style={{ padding: "6px 16px 0" }}>
           <KvTelemetryBar kv={a()?.kv} liveTps={tps()} compact />
         </div>
@@ -812,10 +993,16 @@ function AgentView(props) {
       <div class="agent-body">
         <div class="agent-main" ref={agentMain}>
           <Show when={tab() === "chat"}>
+            <Show when={isProvisioning()}>
+              <div class="agent-provisioning-banner" role="status">
+                <Dot state="busy" />
+                <span>Starting sandboxed runtime &amp; loading workspace context…</span>
+              </div>
+            </Show>
             <Show when={historyLoading()}><div class="history-loading small dim" role="status">Loading saved conversation…</div></Show>
             <Show when={historyError()}><div class="history-error shield danger" role="alert">Unable to load saved conversation: {historyError()} <Button size="sm" onClick={() => load(props.id, retryAfter)}>Retry history</Button></div></Show>
             <Show when={historyMore()}><div class="history-more small dim" role="status">More saved history is available. Showing loaded pages only. <Button size="sm" disabled={historyLoading()} onClick={() => load(props.id, historyCursor())}>Load more history</Button></div></Show>
-            <Conversation agent={a()?.name} events={events()} busy={busy()} readOnly={!live()} loadAttachment={agentAttachmentLoader(props.id)} onForkAt={handleForkAt} emptyText={historyLoading() ? "Loading saved conversation…" : historyError() ? "History could not be loaded. Retry above." : live() ? "Send the first message to start." : "No saved messages. This agent is stopped. Resume it to continue."}
+            <Conversation agent={a()?.name} events={events()} busy={busy()} readOnly={!live()} loadAttachment={agentAttachmentLoader(props.id)} onForkAt={handleForkAt} onEditAt={handleEditAt} emptyText={historyLoading() ? "Loading saved conversation…" : historyError() ? "History could not be loaded. Retry above." : isProvisioning() ? "Starting agent…" : live() ? "Send the first message to start." : "No saved messages. This agent is stopped. Resume it to continue."}
               externalApprovals />
             <Composer draftKey={`agent:${props.id}`} mentionTarget={a()?.worktree_id ? { worktree_id: a().worktree_id } : null} dropTarget={() => agentMain} onSend={send} busy={busy()} disabled={!live()}
               onQueue={queue} onSteer={steer} queued={queued() ?? []} queueTarget={a()?.name}
@@ -823,7 +1010,7 @@ function AgentView(props) {
               onRemoveQueued={(q) => rpc("agents.queue_remove", { id: props.id, item: q.id }).catch((e) => toast(String(e), "danger"))} onCancel={() => rpc("agents.cancel", { id: props.id }, { action: true }).catch((e) => toast(String(e), "danger"))}
               effort={effort()} speed={effortSpeed(effort())} effortOptions={activeModel()?.effort_details ?? []} effortPending={effortPending()} onEffort={changeEffort} onSpeed={changeEffort} onSlashModel={handleSlashModel}
               onSlashContext={() => setAside("context")} onSlashRemember={handleSlashRemember} onSlashFork={handleSlashFork} onSlashCompact={(focus) => rpc("agents.compact", { id: props.id, ...(focus ? { focus } : {}) }, { action: true }).then((r) => toast(r?.compacted === 0 ? "Nothing to compact yet." : "Context compacted.", "success")).catch((e) => { toast(String(e), "danger"); return false; })}
-              placeholder={live() ? `Message ${a()?.name ?? ""}…` : "Stopped"} />
+              placeholder={live() ? `Message ${a()?.name ?? ""}… (/ for commands, @ for files)` : isProvisioning() ? "Starting agent…" : "Stopped"} />
           </Show>
           <Show when={tab() === "terms"}><Terminals id={props.id} /></Show>
           <Show when={tab() === "changes"}><Changes id={props.id} agent={a()} onOpenShell={() => setAside("terminal")} /></Show>
@@ -831,6 +1018,15 @@ function AgentView(props) {
         </div>
         <div class="agent-aside" classList={{ hidden: aside() === "none" }} style={{ width: `${asideW()}px` }}>
           <div class="aside-grip" onPointerDown={drag} title="Drag to resize" />
+          <Show when={aside() !== "none"}>
+            <div class="aside-header">
+              <Icon name={aside() === "terminal" ? "terminal" : aside() === "browser" ? "globe" : aside() === "surfaces" ? "layers" : "brain"} size={13} />
+              <span class="grow">{aside() === "terminal" ? "Shell" : aside() === "browser" ? "Browser" : aside() === "surfaces" ? "Apps" : "Memory & Context"}</span>
+              <button type="button" class="icon-btn" onClick={() => setAside("none")} title="Close inspector panel" aria-label="Close inspector panel">
+                <Icon name="x" size={13} />
+              </button>
+            </div>
+          </Show>
           <Show when={aside() === "terminal"}>
             <div class="aside-body">
               <Suspense fallback={<div class="small dim" role="status">Loading terminals…</div>}>
@@ -861,6 +1057,69 @@ function AgentView(props) {
           </Show>
         </div>
       </div>
+      <Show when={removeReview()}>
+        {(rev) => {
+          const patchLines = () => {
+            const raw = rev().diff?.patch || "";
+            if (!raw) return [];
+            return raw.split("\n").slice(0, 260).map((line) => {
+              let kind = "ctx";
+              if (line.startsWith("diff --git") || line.startsWith("+++ ") || line.startsWith("--- ")) kind = "file";
+              else if (line.startsWith("@@")) kind = "hunk";
+              else if (line.startsWith("+")) kind = "add";
+              else if (line.startsWith("-")) kind = "del";
+              return { kind, line };
+            });
+          };
+          const st = () => rev().status;
+          const totalPatchLines = () => (rev().diff?.patch ? rev().diff.patch.split("\n").length : 0);
+          return (
+            <Modal open onClose={() => !removingForce() && setRemoveReview(null)} title={`Discard unsaved changes in ${rev().name}?`} width={720}>
+              <div class="col" style={{ gap: "12px" }}>
+                <div class="row" style={{ "flex-wrap": "wrap", gap: "6px" }}>
+                  <Show when={rev().branch}><Badge>{rev().branch}</Badge></Show>
+                  <Show when={(st()?.dirty_files?.length ?? 0) > 0}>
+                    <Badge tone="strict">{st().dirty_files.length} uncommitted file{st().dirty_files.length === 1 ? "" : "s"}</Badge>
+                  </Show>
+                  <Show when={(st()?.unpushed_commits ?? 0) > 0}>
+                    <Badge tone="danger">{st().unpushed_commits} unpushed commit{st().unpushed_commits === 1 ? "" : "s"}</Badge>
+                  </Show>
+                  <Show when={(st()?.unmerged_commits ?? 0) > 0 && !(st()?.unpushed_commits > 0)}>
+                    <Badge tone="strict">{st().unmerged_commits} unmerged commit{st().unmerged_commits === 1 ? "" : "s"}</Badge>
+                  </Show>
+                </div>
+                <p class="small dim" style={{ margin: 0 }}>
+                  {rev().reason} Deleting will permanently remove this agent's worktree and <code class="mono">philium/*</code> branch.
+                </p>
+                <Show when={rev().loading}>
+                  <div class="xs dim" role="status">Loading git diff…</div>
+                </Show>
+                <Show when={!rev().loading && rev().diff?.stat?.trim()}>
+                  <pre class="remove-diff-stat">{rev().diff.stat.trim()}</pre>
+                </Show>
+                <Show when={!rev().loading && patchLines().length > 0}>
+                  <div class="remove-diff-box">
+                    <div class="diff-lines">
+                      <For each={patchLines()}>
+                        {(r) => <div class={`diff-line diff-line-${r.kind}`}>{r.line || " "}</div>}
+                      </For>
+                    </div>
+                    <Show when={totalPatchLines() > 260 || rev().diff?.truncated}>
+                      <div class="remove-diff-foot xs faint">
+                        Showing first 260 of {totalPatchLines()} diff lines.
+                      </div>
+                    </Show>
+                  </div>
+                </Show>
+                <div class="row" style={{ "justify-content": "flex-end", gap: "8px", "margin-top": "4px" }}>
+                  <Button variant="ghost" disabled={removingForce()} onClick={() => setRemoveReview(null)}>Keep worktree</Button>
+                  <Button variant="danger" busy={removingForce()} onClick={confirmForceRemove}>Discard &amp; delete worktree</Button>
+                </div>
+              </div>
+            </Modal>
+          );
+        }}
+      </Show>
     </div>
   );
 }
@@ -1107,6 +1366,11 @@ export default function Agents() {
   const refetch = store.refetchAgents;
   const screenVisible = typeof useScreenVisible === "function" ? useScreenVisible() : () => true;
   const [spawn, setSpawn] = createSignal(null);
+  const [leftovers, setLeftovers] = createSignal([]);
+  const [bulkReview, setBulkReview] = createSignal(null);
+  const [bulkForceBusy, setBulkForceBusy] = createSignal(false);
+  const [finishedOpen, setFinishedOpen] = createSignal(false);
+  const [listLimit, setListLimit] = createSignal(50);
   const pendingByAgent = createMemo(() => pendingAccessByAgent(store.pendingAccess()));
   const needsToolApproval = (a) => agentNeedsToolApproval(a, store.agentApprovals());
   const needsYou = (a) => agentNeedsUser(a, pendingByAgent(), store.agentApprovals());
@@ -1116,29 +1380,74 @@ export default function Agents() {
   // One bulk removal, shared by "Remove finished" and a picked selection. Agents the backend
   // could not clean up are explained with the real reason, and a confirmed retry also takes
   // the leads their helpers were blocking.
+  async function loadBulkItemDiff(idx, item) {
+    if (!item?.worktree_id || item.loaded || item.loading) return;
+    setBulkReview((prev) => prev ? {
+      ...prev,
+      items: prev.items.map((x, i) => i === idx ? { ...x, loading: true } : x),
+    } : null);
+    const [st, df] = await Promise.all([
+      rpc("workspace.worktree_status", { id: item.worktree_id }, { local: true }).catch(() => null),
+      rpc("workspace.diff", { worktree_id: item.worktree_id }, { local: true }).catch(() => null),
+    ]);
+    setBulkReview((prev) => prev ? {
+      ...prev,
+      items: prev.items.map((x, i) => i === idx ? { ...x, loading: false, loaded: true, status: st, diff: df } : x),
+    } : null);
+  }
+
   async function removeAgents(scope, ids) {
     const r = await rpc("agents.remove_many", { scope, ids }, { action: true }).catch((e) => ({ error: String(e) }));
     if (r.error) { toast(r.error, "bad"); return null; }
     const removed = [...(r.removed ?? [])];
     const left = [...(r.left ?? [])];
-    let kept = r.kept ?? [];
+    const kept = r.kept ?? [];
     if (r.unsaved?.length) {
-      const why = r.unsaved.map((u) => `${u.name}: ${u.reason || "it has changes that were never committed."}`).join("\n");
-      const ok = await confirm(`${r.unsaved.length} of them could not be cleaned up`, `${why}\n\nRemove them anyway? Anything Philium cannot stop safely is left running and listed afterwards.`, { danger: true, ok: "Remove anyway" });
-      if (ok) {
-        const byName = new Map((list() || []).map((a) => [a.name, a.id]));
-        const retry = [...r.unsaved.map((u) => u.id), ...kept.map((n) => byName.get(n)).filter(Boolean)];
-        const r2 = await rpc("agents.remove_many", { scope: "selected", force: true, ids: retry }, { action: true }).catch((e) => ({ error: String(e) }));
-        if (r2.error) toast(r2.error, "bad");
-        removed.push(...(r2.removed ?? []));
-        left.push(...(r2.left ?? []));
-        kept = [...(r2.kept ?? []), ...(r2.unsaved ?? []).map((u) => u.name)];
-      }
+      const byId = new Map((list() || []).map((a) => [a.id, a]));
+      const byName = new Map((list() || []).map((a) => [a.name, a.id]));
+      const retry = [...r.unsaved.map((u) => u.id), ...kept.map((n) => byName.get(n)).filter(Boolean)];
+      const items = r.unsaved.map((u) => {
+        const meta = byId.get(u.id);
+        return {
+          id: u.id,
+          name: u.name,
+          reason: u.reason || "Worktree has unsaved changes.",
+          branch: meta?.branch || "",
+          worktree_id: meta?.worktree_id || null,
+          loading: false,
+          loaded: false,
+          status: null,
+          diff: null,
+        };
+      });
+      setBulkReview({ items, activeIdx: 0, retry, removedCount: removed.length, left });
+      if (items[0]?.worktree_id) loadBulkItemDiff(0, items[0]);
+      if (removed.length) refetch?.();
+      return r;
     }
     toast(`Removed ${removed.length} agent${removed.length === 1 ? "" : "s"}${kept.length ? `; kept ${kept.join(", ")}` : ""}`, removed.length ? "good" : "bad");
-    if (left.length) toast(`Philium stopped tracking these but could not stop them safely, so check them yourself: ${left.map((l) => `${l.handle} (${l.agent})`).join("; ")}`, "danger");
+    if (left.length) setLeftovers(left);
     refetch?.();
     return r;
+  }
+
+  async function confirmBulkForceRemove() {
+    const rev = bulkReview();
+    if (!rev || bulkForceBusy()) return;
+    setBulkForceBusy(true);
+    try {
+      const r2 = await rpc("agents.remove_many", { scope: "selected", force: true, ids: rev.retry }, { action: true }).catch((e) => ({ error: String(e) }));
+      if (r2.error) { toast(r2.error, "bad"); return; }
+      const totalRemoved = rev.removedCount + (r2.removed?.length ?? 0);
+      const allLeft = [...rev.left, ...(r2.left ?? [])];
+      const stillKept = [...(r2.kept ?? []), ...(r2.unsaved ?? []).map((u) => u.name)];
+      setBulkReview(null);
+      toast(`Removed ${totalRemoved} agent${totalRemoved === 1 ? "" : "s"}${stillKept.length ? `; kept ${stillKept.join(", ")}` : ""}`, totalRemoved ? "good" : "bad");
+      if (allLeft.length) setLeftovers(allLeft);
+      refetch?.();
+    } finally {
+      setBulkForceBusy(false);
+    }
   }
   async function removeFinished() {
     const targets = finished();
@@ -1387,25 +1696,21 @@ export default function Agents() {
         </Show>
       }
       actions={<div class="row" style={{ gap: "8px", "flex-wrap": "wrap" }}>
-        <Show when={finished().length}>
-          <Button size="sm" onClick={removeFinished}>Remove finished ({finished().length})</Button>
-        </Show>
         <Show when={scoped().length}>
-          <Button size="sm" variant="ghost" onClick={removeAll}>Remove all ({scoped().length})</Button>
-        </Show>
-        <Show when={scoped().length}>
-          <input
-            ref={searchEl}
-            type="search"
-            class="input fleet-search"
-            placeholder="Filter agents…"
-            value={search()}
-            onInput={(e) => setSearch(e.currentTarget.value)}
-          />
+          <Show when={viewMode() !== "split"}>
+            <input
+              ref={searchEl}
+              type="search"
+              class="input fleet-search"
+              placeholder="Filter agents…"
+              value={search()}
+              onInput={(e) => setSearch(e.currentTarget.value)}
+            />
+          </Show>
           <input
             type="search"
             class="input fleet-search"
-            placeholder="Search all conversations…"
+            placeholder="Search conversations…"
             aria-label="Search all agent conversations"
             value={historyQuery()}
             onInput={(e) => runHistorySearch(e.currentTarget.value)}
@@ -1424,6 +1729,13 @@ export default function Agents() {
             { value: "grid", label: "Grid" },
             { value: "fleet", label: "Fleet" },
           ]} />
+          <Menu
+            title="Manage agents"
+            items={[
+              { label: `Remove finished (${finished().length})`, disabled: !finished().length, onClick: removeFinished },
+              { label: `Remove all (${scoped().length})`, danger: true, disabled: !scoped().length, onClick: removeAll },
+            ]}
+          />
         </Show>
         <Button variant="primary" onClick={() => setSpawn({})}><Icon name="plus" size={12} /> New agent</Button>
       </div>}>
@@ -1462,14 +1774,27 @@ export default function Agents() {
         <Show when={viewMode() !== "split"} fallback={
           <div class="split" style={{ flex: "1", "min-width": "0" }}>
             <div class={`agent-list ${picked().length ? "picking" : ""}`} role="listbox" aria-multiselectable="true" aria-label="Agents">
+              <div class="agent-list-search">
+                <input
+                  ref={searchEl}
+                  type="search"
+                  class="input"
+                  placeholder="Filter agents… (⌘F)"
+                  aria-label="Filter agents"
+                  value={search()}
+                  onInput={(e) => setSearch(e.currentTarget.value)}
+                />
+              </div>
               <Show when={picked().length}>
-                <div class="picked-bar row" role="toolbar" aria-label="Picked agents">
-                  <span class="grow small">{picked().length} picked</span>
+                <div class="picked-bar" role="toolbar" aria-label="Picked agents">
+                  <span class="picked-bar-count">{picked().length} picked</span>
                   <Show when={picked().length < tree().length}>
-                    <Button size="sm" variant="ghost" onClick={() => setPicked(tree().map((x) => x.a.id))}>All {tree().length}</Button>
+                    <Button size="sm" variant="ghost" onClick={() => setPicked(tree().map((x) => x.a.id))}>All</Button>
                   </Show>
                   <Button size="sm" variant="danger" onClick={removePicked}>Remove</Button>
-                  <Button size="sm" variant="ghost" onClick={() => setPicked([])}>Clear</Button>
+                  <button type="button" class="icon-btn" onClick={() => setPicked([])} title="Clear selection" aria-label="Clear selection">
+                    <Icon name="x" size={12} />
+                  </button>
                 </div>
               </Show>
               <Show when={historyHits()}>{(hits) => (
@@ -1485,7 +1810,42 @@ export default function Agents() {
                   </Show>
                 </div>
               )}</Show>
-              <For each={tree()}>{({ a, d }) => <AgentRow agent={a} depth={d} selected={a.id === selected()} picked={picked().includes(a.id)} needsToolApproval={needsToolApproval(a)} pendingAccess={pendingByAgent().get(a.id) ?? 0} onPick={() => pickRow({ metaKey: true }, a.id)} onClick={(e) => pickRow(e, a.id)} />}</For>
+              {(() => {
+                const splitFinished = () => filter() === "all" && !search().trim();
+                const activeRows = () => splitFinished() ? tree().filter(({ a }) => a.live || !["stopped", "failed", "done"].includes(a.state)) : tree();
+                const doneRows = () => splitFinished() ? tree().filter(({ a }) => !a.live && ["stopped", "failed", "done"].includes(a.state)) : [];
+                const showDone = () => finishedOpen() || activeRows().length === 0;
+                const renderRow = ({ a, d }) => (
+                  <AgentRow agent={a} depth={d} selected={a.id === selected()} picked={picked().includes(a.id)} needsToolApproval={needsToolApproval(a)} pendingAccess={pendingByAgent().get(a.id) ?? 0} onPick={() => pickRow({ metaKey: true }, a.id)} onClick={(e) => pickRow(e, a.id)} />
+                );
+                return (
+                  <>
+                    <For each={activeRows().slice(0, listLimit())}>{renderRow}</For>
+                    <Show when={activeRows().length > listLimit()}>
+                      <button type="button" class="agent-load-more" onClick={() => setListLimit((n) => n + 50)}>
+                        Show more ({activeRows().length - listLimit()} remaining)
+                      </button>
+                    </Show>
+                    <Show when={doneRows().length > 0}>
+                      <div class="agent-section-head">
+                        <button type="button" class="agent-section-toggle grow" aria-expanded={showDone()} onClick={() => setFinishedOpen((v) => !v)}>
+                          <Icon name={showDone() ? "chevronDown" : "chevronRight"} size={11} />
+                          <span>Finished ({doneRows().length})</span>
+                        </button>
+                        <Button size="sm" variant="ghost" onClick={removeFinished} title="Remove all finished agents in this workspace">Clear</Button>
+                      </div>
+                      <Show when={showDone()}>
+                        <For each={doneRows().slice(0, listLimit())}>{renderRow}</For>
+                        <Show when={doneRows().length > listLimit()}>
+                          <button type="button" class="agent-load-more" onClick={() => setListLimit((n) => n + 50)}>
+                            Show more finished ({doneRows().length - listLimit()} remaining)
+                          </button>
+                        </Show>
+                      </Show>
+                    </Show>
+                  </>
+                );
+              })()}
             </div>
             <Show when={selected()}>{(id) => (
               <Show when={filtered().some((a) => a.id === id())} fallback={
@@ -1530,6 +1890,115 @@ export default function Agents() {
       </div>
       <Show when={spawn()}>
         <SpawnModal preset={spawn()} onClose={(a) => { setSpawn(null); if (a) { refetch(); go("agents", { id: a.id }); } }} />
+      </Show>
+      <Show when={bulkReview()}>
+        {(rev) => {
+          const curItem = () => rev().items[rev().activeIdx] || rev().items[0];
+          const patchLines = () => {
+            const raw = curItem()?.diff?.patch || "";
+            if (!raw) return [];
+            return raw.split("\n").slice(0, 220).map((line) => {
+              let kind = "ctx";
+              if (line.startsWith("diff --git") || line.startsWith("+++ ") || line.startsWith("--- ")) kind = "file";
+              else if (line.startsWith("@@")) kind = "hunk";
+              else if (line.startsWith("+")) kind = "add";
+              else if (line.startsWith("-")) kind = "del";
+              return { kind, line };
+            });
+          };
+          return (
+            <Modal
+              open
+              width={740}
+              title={`Discard unsaved work in ${rev().items.length} agent${rev().items.length === 1 ? "" : "s"}?`}
+              onClose={() => !bulkForceBusy() && setBulkReview(null)}
+            >
+              <div class="col" style={{ gap: "12px" }}>
+                <Show when={rev().items.length > 1}>
+                  <div class="row" style={{ gap: "6px", "flex-wrap": "wrap" }}>
+                    <For each={rev().items}>
+                      {(it, idx) => (
+                        <Button
+                          size="sm"
+                          variant={rev().activeIdx === idx() ? "primary" : "ghost"}
+                          onClick={() => {
+                            setBulkReview((prev) => prev ? { ...prev, activeIdx: idx() } : null);
+                            loadBulkItemDiff(idx(), it);
+                          }}
+                        >
+                          {it.name}
+                        </Button>
+                      )}
+                    </For>
+                  </div>
+                </Show>
+                <Show when={curItem()}>
+                  {(it) => (
+                    <>
+                      <div class="row" style={{ gap: "6px", "flex-wrap": "wrap" }}>
+                        <strong class="small">{it().name}</strong>
+                        <Show when={it().branch}><Badge>{it().branch}</Badge></Show>
+                        <Show when={(it().status?.dirty_files?.length ?? 0) > 0}>
+                          <Badge tone="strict">{it().status.dirty_files.length} uncommitted</Badge>
+                        </Show>
+                        <Show when={(it().status?.unpushed_commits ?? 0) > 0}>
+                          <Badge tone="danger">{it().status.unpushed_commits} unpushed</Badge>
+                        </Show>
+                      </div>
+                      <p class="small dim" style={{ margin: 0 }}>{it().reason}</p>
+                      <Show when={it().loading}><div class="xs dim" role="status">Loading git diff…</div></Show>
+                      <Show when={!it().loading && it().diff?.stat?.trim()}>
+                        <pre class="remove-diff-stat">{it().diff.stat.trim()}</pre>
+                      </Show>
+                      <Show when={!it().loading && patchLines().length > 0}>
+                        <div class="remove-diff-box">
+                          <div class="diff-lines">
+                            <For each={patchLines()}>
+                              {(r) => <div class={`diff-line diff-line-${r.kind}`}>{r.line || " "}</div>}
+                            </For>
+                          </div>
+                        </div>
+                      </Show>
+                    </>
+                  )}
+                </Show>
+                <div class="row" style={{ "justify-content": "flex-end", gap: "8px", "margin-top": "4px" }}>
+                  <Button variant="ghost" disabled={bulkForceBusy()} onClick={() => setBulkReview(null)}>Keep unsaved</Button>
+                  <Button variant="danger" busy={bulkForceBusy()} onClick={confirmBulkForceRemove}>
+                    Discard &amp; delete {rev().items.length === 1 ? "worktree" : `all (${rev().items.length})`}
+                  </Button>
+                </div>
+              </div>
+            </Modal>
+          );
+        }}
+      </Show>
+      <Show when={leftovers().length > 0}>
+        <Modal
+          title={`${leftovers().length} leftover process${leftovers().length === 1 ? "" : "es"} to check`}
+          onClose={() => setLeftovers([])}
+          footer={
+            <>
+              <Button variant="ghost" onClick={() => { navigator.clipboard?.writeText(leftovers().map((l) => l.handle).join("\n")); toast("Copied handles", "good"); }}>Copy list</Button>
+              <Button onClick={() => { setLeftovers([]); go("environments"); }}>Open Environments</Button>
+              <Button variant="primary" onClick={() => setLeftovers([])}>Done</Button>
+            </>
+          }
+        >
+          <p class="small dim" style={{ margin: 0 }}>
+            The agents were removed, but Philium could not stop these processes safely. Check or stop them yourself, or forget them in Environments.
+          </p>
+          <div class="leftover-list">
+            <For each={leftovers()}>
+              {(l) => (
+                <div class="leftover-item">
+                  <span class="xs faint">{l.agent || "agent"}</span>
+                  <code>{l.handle}</code>
+                </div>
+              )}
+            </For>
+          </div>
+        </Modal>
       </Show>
     </Page>
   );

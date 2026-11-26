@@ -174,63 +174,106 @@ function ForkHere(props) {
   );
 }
 
+function UserMessage(props) {
+  const [editing, setEditing] = createSignal(false);
+  const [draft, setDraft] = createSignal("");
+  const [busy, setBusy] = createSignal(false);
+  const [copied, setCopied] = createSignal(false);
+  let ta;
+
+  const startEdit = () => {
+    setDraft(props.item.text || "");
+    setEditing(true);
+    queueMicrotask(() => {
+      if (ta) {
+        ta.focus({ preventScroll: true });
+        ta.setSelectionRange(ta.value.length, ta.value.length);
+      }
+    });
+  };
+
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(props.item.text || "");
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1200);
+    } catch {}
+  };
+
+  const submit = async (mode) => {
+    const next = draft().trim();
+    if (!next || busy()) return;
+    setBusy(true);
+    try {
+      const ok = await props.onEdit?.(props.item.seq, next, mode);
+      if (ok !== false) setEditing(false);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div class={`msg user ${editing() ? "is-editing" : ""}`} data-seq={props.item.seq}>
+      <SentImages item={props.item} load={props.load} />
+      <Show
+        when={editing()}
+        fallback={
+          <>
+            <div class="user-msg-text">{props.item.text}</div>
+            <div class="user-msg-actions">
+              <Show when={props.onEdit && props.item.seq}>
+                <button type="button" class="link" onClick={startEdit} title="Edit and resend or fork from this message">Edit</button>
+              </Show>
+              <button type="button" class="link" onClick={copy}>{copied() ? "Copied" : "Copy"}</button>
+              <ForkHere item={props.item} onFork={props.onFork} />
+            </div>
+          </>
+        }
+      >
+        <div class="user-msg-editor">
+          <textarea
+            ref={ta}
+            class="textarea user-msg-edit-input"
+            rows={Math.min(8, Math.max(2, (draft().match(/\n/g)?.length ?? 0) + 2))}
+            value={draft()}
+            disabled={busy()}
+            onInput={(e) => setDraft(e.currentTarget.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") { e.preventDefault(); setEditing(false); }
+              else if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); submit("fork"); }
+            }}
+          />
+          <div class="row" style={{ "justify-content": "flex-end", gap: "6px", "flex-wrap": "wrap" }}>
+            <Button size="sm" variant="ghost" type="button" disabled={busy()} onClick={() => setEditing(false)}>Cancel</Button>
+            <Show when={!props.readOnly}>
+              <Button size="sm" variant="ghost" type="button" disabled={busy() || !draft().trim()} onClick={() => submit("resend")} title="Send the edited prompt in this session">Resend here</Button>
+            </Show>
+            <Button size="sm" variant="primary" type="button" busy={busy()} disabled={!draft().trim()} onClick={() => submit("fork")} title="Fork from before this message and run with the edited prompt (⌘↵)">Fork with edit</Button>
+          </div>
+        </div>
+      </Show>
+    </div>
+  );
+}
+
 export function Conversation(props) {
-  let el, timelineEl;
+  let el;
   const [store, setStore] = createStore({ items: [] });
   const [stick, setStick] = createSignal(true);
-  let programmaticScroll = false;
-  let smoothScrolling = false;
-  let scrollRaf = 0;
-  let programmaticTimer = 0;
-  let lastScrollTop = 0;
-  let expectedScrollTop = 0;
-  let expectedScrollHeight = 0;
-  const scrollToBottom = (smooth = false) => {
+  // `.conv` uses native `flex-direction: column-reverse`, so `scrollTop === 0` IS the bottom
+  // of the conversation and the browser compositor anchors streaming content automatically
+  // without JS ResizeObserver fighting or accidental scroll-to-top jumps.
+  const pinBottom = (smooth = false) => {
     if (!el) return;
-    if (programmaticTimer) { clearTimeout(programmaticTimer); programmaticTimer = 0; }
     if (smooth && typeof el.scrollTo === "function") {
-      if (el.scrollHeight - el.scrollTop - el.clientHeight < 2) {
-        programmaticScroll = false;
-        smoothScrolling = false;
-        return;
-      }
-      programmaticScroll = true;
-      smoothScrolling = true;
-      expectedScrollTop = Math.max(0, el.scrollHeight - el.clientHeight);
-      expectedScrollHeight = el.scrollHeight;
-      lastScrollTop = el.scrollTop;
-      el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
-      programmaticTimer = setTimeout(() => {
-        programmaticScroll = false;
-        smoothScrolling = false;
-        programmaticTimer = 0;
-      }, 450);
+      el.scrollTo({ top: 0, behavior: "smooth" });
     } else {
-      const before = el.scrollTop;
-      el.scrollTop = el.scrollHeight;
-      lastScrollTop = el.scrollTop;
-      if (el.scrollTop !== before) {
-        programmaticScroll = true;
-        smoothScrolling = false;
-        expectedScrollTop = el.scrollTop;
-        expectedScrollHeight = el.scrollHeight;
-        programmaticTimer = setTimeout(() => {
-          programmaticScroll = false;
-          smoothScrolling = false;
-          programmaticTimer = 0;
-        }, 40);
-      } else {
-        programmaticScroll = false;
-        smoothScrolling = false;
-      }
+      el.scrollTop = 0;
     }
   };
   const scheduleScrollToBottom = () => {
-    if (!stick() || !el || scrollRaf) return;
-    scrollRaf = requestAnimationFrame(() => {
-      scrollRaf = 0;
-      if (stick()) scrollToBottom(false);
-    });
+    if (!stick() || !el) return;
+    if (Math.abs(el.scrollTop) > 1) el.scrollTop = 0;
   };
   const tools = new Map();
   let streamingIdx = -1;
@@ -490,70 +533,28 @@ export function Conversation(props) {
   });
 
   onMount(() => {
-    if (timelineEl && typeof ResizeObserver !== "undefined") {
-      const ro = new ResizeObserver(() => {
-        if (stick()) scheduleScrollToBottom();
-      });
-      ro.observe(timelineEl);
-      onCleanup(() => ro.disconnect());
-    }
-    if (stick()) scheduleScrollToBottom();
-  });
-  onCleanup(() => {
-    if (scrollRaf) cancelAnimationFrame(scrollRaf);
-    if (programmaticTimer) clearTimeout(programmaticTimer);
+    pinBottom(false);
   });
 
-  createEffect(on(() => {
-    const last = store.items.at(-1);
-    return [store.items.length, last?.text?.length, last?.out?.length, last?.result];
-  }, () => {
-    if (stick()) scheduleScrollToBottom();
-  }));
   return (
-    <div
-      class={`conv conv-${conversationView()}`}
-      style={props.hidden ? { display: "none" } : undefined}
-      ref={el}
-      onWheel={(e) => { if (e.deltaY < 0) { programmaticScroll = false; smoothScrolling = false; } }}
-      onPointerDown={() => { programmaticScroll = false; smoothScrolling = false; }}
-      onScroll={(e) => {
-        const d = e.currentTarget;
-        const atBottom = d.scrollHeight - d.scrollTop - d.clientHeight < 60;
-        const scrolledUp = d.scrollTop < lastScrollTop - 2;
-        if (programmaticScroll) {
-          const layoutGrewAfterSnap = !smoothScrolling && expectedScrollTop > 0 && Math.abs(d.scrollTop - expectedScrollTop) <= 4 && d.scrollHeight > expectedScrollHeight;
-          const userInterrupted = smoothScrolling
-            ? scrolledUp
-            : !atBottom && !layoutGrewAfterSnap;
-          if (userInterrupted) {
-            programmaticScroll = false;
-            smoothScrolling = false;
-            lastScrollTop = d.scrollTop;
-            setStick(false);
-          } else {
-            lastScrollTop = d.scrollTop;
-            if (atBottom) {
-              programmaticScroll = false;
-              smoothScrolling = false;
-            }
-          }
-          return;
-        }
-        lastScrollTop = d.scrollTop;
-        setStick(atBottom);
-      }}
-    >
+    <div class="conv-shell" style={props.hidden ? { display: "none" } : undefined}>
       <ViewToggle />
       <Lightbox />
-      <div class="timeline" ref={timelineEl}>
+      <div
+        class={`conv conv-${conversationView()}`}
+        ref={el}
+        onScroll={(e) => {
+          setStick(Math.abs(e.currentTarget.scrollTop) <= 24);
+        }}
+      >
+        <div class="timeline">
         <Show when={store.items.length === 0}>
           <div class="conv-empty">{props.emptyText ?? "No messages yet."}</div>
         </Show>
         <Index each={store.items}>
           {(it) => (
             <Switch>
-              <Match when={it().kind === "user"}><div class="msg user" data-seq={it().seq}><SentImages item={it()} load={props.loadAttachment} />{it().text}<ForkHere item={it()} onFork={props.onForkAt} /></div></Match>
+              <Match when={it().kind === "user"}><UserMessage item={it()} load={props.loadAttachment} onFork={props.onForkAt} onEdit={props.onEditAt} readOnly={props.readOnly} /></Match>
               <Match when={it().kind === "assistant"}>
                 <div class={`msg assistant ${it().live && props.busy && !props.readOnly ? "live" : ""}`} data-seq={it().seq}>
                   <AssistantReply text={it().text} live={it().live && props.busy && !props.readOnly} />
@@ -590,23 +591,53 @@ export function Conversation(props) {
                 </details>
               </Match>
               <Match when={it().kind === "perm"}>
-                <div class={`perm ${it().open ? "" : "done"}`} style={{ margin: 0, "flex-wrap": "wrap", "align-items": "flex-start" }}>
-                  <Icon name="shield" size={14} />
-                  <div class="grow" style={{ "min-width": 0, "flex-basis": "calc(100% - 28px)" }}>
-                    <Show when={it().action === "mcp" && it().resource?.startsWith("philium/browser_")} fallback={<>Wants to <b>{it().action}</b> <code class="mono">{it().resource}</code></>}>
-                      <b>Browser permission</b>: <code class="mono">{it().resource?.replace("philium/", "")}</code>
-                      <Show when={it().args}><pre class="conv-pre">{JSON.stringify(it().args, null, 2)}</pre></Show>
-                      <span class="dim xs">Page content may be sent to this agent's provider. Session approval applies only to this tool.</span>
-                    </Show>
-                  </div>
-                  <Show when={it().open && !props.readOnly && !props.externalApprovals} fallback={<Badge tone={it().open ? "" : /^(appr|allow)/.test(it().decision ?? "") ? "secure" : "danger"}>{it().open ? (props.readOnly ? "Historical request · agent stopped" : "Requested") : it().decision ?? "resolved"}</Badge>}>
-                    <div class="row" style={{ width: "100%", "justify-content": "flex-end", "flex-wrap": "wrap" }}>
-                      <Button size="sm" onClick={() => props.onDeny?.(it().id)}>Deny</Button>
-                      <Button size="sm" onClick={() => props.onApprove?.(it().id, "once")}>Allow once</Button>
-                      <Button size="sm" variant="primary" onClick={() => props.onApprove?.(it().id, "session")}>Allow for session</Button>
+                {(() => {
+                  const isBrowser = it().action === "mcp" && it().resource?.startsWith("philium/browser_");
+                  const shortRes = (it().resource ?? "").replace(/^philium\//, "");
+                  const obj = it().args && typeof it().args === "object" && !Array.isArray(it().args) ? it().args : null;
+                  const keys = obj ? Object.keys(obj) : [];
+                  const inlineVal = obj?.url || obj?.command || obj?.path || (keys.length === 1 && typeof obj[keys[0]] === "string" ? obj[keys[0]] : null);
+                  const hasExtra = keys.length > (inlineVal ? 1 : 0);
+                  return (
+                    <div class={`perm perm-card ${it().open ? "" : "done"}`}>
+                      <div class="perm-body">
+                        <div class="perm-head">
+                          <span class="perm-icon"><Icon name={isBrowser ? "globe" : "shield"} size={13} /></span>
+                          <span class="perm-title">{isBrowser ? shortRes.replace(/^browser_/, "Browser ").replace(/_/g, " ") : (it().action || "Permission")}</span>
+                          <code class="perm-tag">{shortRes}</code>
+                          <Show when={inlineVal}><code class="perm-target ellipsis" title={inlineVal}>{inlineVal}</code></Show>
+                          <div class="grow" />
+                          <Show when={!(it().open && !props.readOnly && !props.externalApprovals)}>
+                            <Badge tone={it().open ? "" : /^(appr|allow)/.test(it().decision ?? "") ? "secure" : "danger"}>{it().open ? (props.readOnly ? "Historical · stopped" : "Requested") : it().decision ?? "resolved"}</Badge>
+                          </Show>
+                        </div>
+                        <Show when={hasExtra}>
+                          <details class="perm-details">
+                            <summary class="xs faint">Arguments</summary>
+                            <pre class="conv-pre">{JSON.stringify(it().args, null, 2)}</pre>
+                          </details>
+                        </Show>
+                      </div>
+                      <Show when={it().open && !props.readOnly && !props.externalApprovals}>
+                        <div class="perm-foot">
+                          <span class="xs faint grow">
+                            <Show when={isBrowser} fallback="Tool approval requested">
+                              Page content may be sent to this agent’s provider
+                            </Show>
+                          </span>
+                          <div class="row gap-4" style={{ "flex-wrap": "wrap" }}>
+                            <Button size="sm" variant="ghost" onClick={() => props.onDeny?.(it().id)}>Deny</Button>
+                            <Button size="sm" onClick={() => props.onApprove?.(it().id, "session")}>Allow for session</Button>
+                            <Show when={props.onAlwaysAllowSession}>
+                              <Button size="sm" onClick={() => props.onAlwaysAllowSession?.(it().id)}>Always allow for this session</Button>
+                            </Show>
+                            <Button size="sm" variant="primary" onClick={() => props.onApprove?.(it().id, "once")}>Allow once</Button>
+                          </div>
+                        </div>
+                      </Show>
                     </div>
-                  </Show>
-                </div>
+                  );
+                })()}
               </Match>
               <Match when={it().kind === "error"}><div class="msg error"><Show when={String(it().text).includes("philium_guard")} fallback={<PlainError text={it().text} />}><strong>Request blocked by secret guard</strong><p class="small">This conversation contains content the guard identified as a secret. This request was not sent to the provider. Start a fresh conversation without sensitive content.</p><details class="tool-raw"><summary>Error details</summary><pre class="conv-pre">{it().text}</pre></details></Show></div></Match>
               <Match when={it().kind === "note"}><div class="faint xs" style={{ "align-self": "center" }}>{it().text}</div></Match>
@@ -615,9 +646,10 @@ export function Conversation(props) {
         </Index>
         <ConversationActivity agent={props.agent} events={props.events ?? []} busy={props.busy} readOnly={props.readOnly || props.hidden} />
       </div>
+      </div>
       <Show when={!stick() && store.items.length > 0}>
         <div class="conv-jump-wrap">
-          <button type="button" class="conv-jump" onClick={() => { setStick(true); scrollToBottom(true); }}>
+          <button type="button" class="conv-jump" onClick={() => { setStick(true); pinBottom(true); }}>
             ↓ Jump to latest
           </button>
         </div>
@@ -794,16 +826,24 @@ export function Composer(props) {
     }));
     return contextBlock(resolved);
   };
+  let lastTextLen = 0;
   const syncHeight = () => {
     if (!input) return;
-    if (!text()) {
-      input.style.height = "";
+    const val = text();
+    if (!val) {
+      lastTextLen = 0;
+      if (input.style.height) input.style.height = "";
       input.style.overflowY = "hidden";
       return;
     }
-    input.style.height = "auto";
+    const shrinking = val.length < lastTextLen;
+    lastTextLen = val.length;
+    if (shrinking) {
+      input.style.height = "auto";
+    }
     const sh = input.scrollHeight;
-    input.style.height = sh > 0 ? `${Math.min(sh, 200)}px` : "";
+    const nextH = sh > 0 ? `${Math.min(sh, 200)}px` : "";
+    if (input.style.height !== nextH) input.style.height = nextH;
     input.style.overflowY = sh > 200 ? "auto" : "hidden";
   };
   createEffect(on(text, () => syncHeight()));
@@ -833,9 +873,42 @@ export function Composer(props) {
     if (props.onEffort) props.onEffort(val);
     else if (props.onSpeed) props.onSpeed(val);
   };
+  const [slashIdx, setSlashIdx] = createSignal(0);
+  const slashCommands = createMemo(() => {
+    const list = [
+      { cmd: "/model", desc: "Switch model (0 tokens)", immediate: true, show: !!props.onSlashModel },
+      { cmd: "/effort", desc: "Change reasoning effort (0 tokens)", args: true, show: !!(props.onEffort || props.onSpeed) },
+      { cmd: "/context", desc: "Open live Context & Memory inspector", immediate: true, show: !!props.onSlashContext },
+      { cmd: "/remember", desc: "Save a decision to memory (0 tokens)", args: true, show: !!props.onSlashRemember },
+      { cmd: "/fork", desc: "Fork a new agent from this workspace", args: true, show: !!props.onSlashFork },
+      { cmd: "/compact", desc: "Compact conversation context", immediate: true, show: !!props.onSlashCompact },
+      { cmd: "/skill", desc: "Run a saved skill: /skill <name> [task]", args: true, show: true },
+    ];
+    return list.filter((x) => x.show);
+  });
+  const slashMenu = createMemo(() => {
+    const t = text();
+    if (!t.startsWith("/") || /\s/.test(t)) return [];
+    const q = t.toLowerCase();
+    return slashCommands().filter((c) => c.cmd.startsWith(q));
+  });
+  createEffect(() => {
+    slashMenu();
+    setSlashIdx(0);
+  });
+  const pickSlash = (item) => {
+    if (!item) return;
+    if (item.immediate) {
+      setText(item.cmd);
+      queueMicrotask(() => send());
+    } else {
+      setText(`${item.cmd} `);
+      queueMicrotask(() => { input?.focus(); syncHeight(); });
+    }
+  };
   const slashHint = createMemo(() => {
     const t = text().trimStart();
-    if (!t.startsWith("/")) return null;
+    if (!t.startsWith("/") || slashMenu().length > 0) return null;
     if (t.startsWith("/effort")) {
       const opts = effortOptions();
       const summary = opts.length
@@ -844,7 +917,7 @@ export function Composer(props) {
       return { kind: "effort", label: `Zero-token local command: /effort ${summary}` };
     }
     if (t.startsWith("/model")) {
-      return { kind: "model", label: "Press Enter to choose from a list, or type a name: /model sonnet. Switching costs no tokens." };
+      return { kind: "model", label: "Press Enter to choose from a list, or type a name: /model <name>. Switching costs no tokens." };
     }
     if (t.startsWith("/context") && props.onSlashContext) {
       return { kind: "context", label: "Open the live Context Slate Inspector (budget, active facts, working note). 0 tokens." };
@@ -914,7 +987,22 @@ export function Composer(props) {
     el.addEventListener("dragover", enter); el.addEventListener("dragleave", leave); el.addEventListener("drop", drop);
     onCleanup(() => { el.removeEventListener("dragover", enter); el.removeEventListener("dragleave", leave); el.removeEventListener("drop", drop); });
   });
-  createEffect(on(() => props.draftKey, () => { setNotice(""); setMenu(false); }));
+  createEffect(on(() => props.draftKey, () => { setNotice(""); setMenu(false); record().setSending(false); }));
+  onMount(() => {
+    const onType = (e) => {
+      if (!input || input.disabled || input.offsetParent === null) return;
+      if (e.defaultPrevented || e.isComposing || e.metaKey || e.ctrlKey || e.altKey) return;
+      if (e.key.length !== 1) return;
+      if (document.activeElement === input) return;
+      if (document.querySelector(".overlay, .model-picker-pop")) return;
+      if (e.target?.closest?.("input, textarea, select, [contenteditable=true], .xterm")) return;
+      // Don't hijack space/enter on focused buttons/links.
+      if (e.key === " " && e.target?.closest?.("button, a, [role=button], summary")) return;
+      input.focus({ preventScroll: true });
+    };
+    window.addEventListener("keydown", onType);
+    onCleanup(() => window.removeEventListener("keydown", onType));
+  });
   const send = async () => {
     const target = record();
     const draft = target.text(), attached = target.images();
@@ -985,7 +1073,10 @@ export function Composer(props) {
       const accepted = await deliver(out, await sendableImages(attached));
       if (accepted !== false) { clearSentDraft(target, draft, attached); setPicked([]); }
     } catch (e) { toast(String(e), "danger"); }
-    finally { target.setSending(false); }
+    finally {
+      target.setSending(false);
+      queueMicrotask(() => { if (input && !input.disabled && input.offsetParent !== null) input.focus({ preventScroll: true }); });
+    }
   };
   const remove = (image) => { setImages(images().filter((x) => x !== image)); input?.focus(); };
   // A queued message taken back into the box, in front of whatever is being typed.
@@ -1046,6 +1137,19 @@ export function Composer(props) {
           <Show when={adding()}><div class="composer-image pending" role="status" aria-label="Adding image"><span class="spinner" /></div></Show>
         </div>
       </Show>
+      <Show when={slashMenu().length}>
+        <div class="composer-slashes" role="listbox" aria-label="Slash commands">
+          <For each={slashMenu()}>{(c, i) => (
+            <div class="opt" role="option" aria-selected={i() === slashIdx()} classList={{ on: i() === slashIdx() }}
+              onMouseEnter={() => setSlashIdx(i())}
+              onMouseDown={(e) => { e.preventDefault(); pickSlash(c); }}>
+              <span class="mono slash-cmd">{c.cmd}</span>
+              <span class="xs dim grow ellipsis">{c.desc}</span>
+              <span class="kbd">{c.immediate ? "↵" : "Tab"}</span>
+            </div>
+          )}</For>
+        </div>
+      </Show>
       <Show when={suggest().length}>
         <div class="composer-mentions" id="composer-mentions" role="listbox" aria-label="Mention a file or symbol">
           <For each={suggest()}>{(m, i) => (
@@ -1061,14 +1165,20 @@ export function Composer(props) {
         ref={input}
         class="textarea composer-input"
         rows="1"
-        placeholder={props.placeholder ?? "Message (or /effort, /model)"}
+        placeholder={props.placeholder ?? "Message… (/ for commands, @ for files)"}
         value={text()}
         disabled={props.disabled || !record().ready()}
         onInput={(e) => { setText(e.currentTarget.value); syncHeight(); updateMention(); }}
         onBlur={() => setTimeout(() => setSuggest([]), 150)}
         onPaste={(e) => { const f = [...(e.clipboardData?.files ?? [])]; if (f.length) { e.preventDefault(); add(f); } }}
-        role="combobox" aria-expanded={suggest().length > 0} aria-controls="composer-mentions" aria-autocomplete="list"
+        role="combobox" aria-expanded={suggest().length > 0 || slashMenu().length > 0} aria-controls="composer-mentions" aria-autocomplete="list"
         onKeyDown={(e) => {
+          if (slashMenu().length && !e.isComposing) {
+            if (e.key === "ArrowDown") { e.preventDefault(); setSlashIdx((i) => (i + 1) % slashMenu().length); return; }
+            if (e.key === "ArrowUp") { e.preventDefault(); setSlashIdx((i) => (i - 1 + slashMenu().length) % slashMenu().length); return; }
+            if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) { e.preventDefault(); pickSlash(slashMenu()[slashIdx()]); return; }
+            if (e.key === "Escape") { e.preventDefault(); setText(""); return; }
+          }
           if (suggest().length && !e.isComposing) {
             if (e.key === "ArrowDown") { e.preventDefault(); setSuggestIdx((i) => (i + 1) % suggest().length); return; }
             if (e.key === "ArrowUp") { e.preventDefault(); setSuggestIdx((i) => (i - 1 + suggest().length) % suggest().length); return; }

@@ -137,8 +137,10 @@ export default function Memory() {
     setDreamBusy(true);
     try {
       const r = await rpc("library.dream_now", { repo_id: activeRepoId() }, { local: true });
-      if (r?.skipped) toast(r.reason || "Skipped");
-      else toast(`Dream: ${r?.applied?.length || 0} changes`, "good");
+      if (r?.skipped) {
+        const isErr = Boolean(r?.failed || /failed|error/i.test(r?.reason || ""));
+        toast(r.reason || "Skipped", isErr ? "danger" : "warn");
+      } else toast(`Dream: ${r?.applied?.length || 0} changes`, "good");
     } catch (e) { toast(String(e), "danger"); }
     finally { setDreamBusy(false); refreshAll(); }
   }
@@ -366,6 +368,37 @@ export default function Memory() {
     finally { setProcBusy(false); }
   };
 
+  const [wnEditing, setWnEditing] = createSignal(false);
+  const wnHasAny = () => !!(wnReq().trim() || wnDec().trim() || wnFail().trim() || wnNext().trim());
+  const wnSections = () => [
+    { key: "req", label: "Requirements", tone: "accent", text: wnReq().trim() },
+    { key: "dec", label: "Decisions", tone: "secure", text: wnDec().trim() },
+    { key: "fail", label: "Avoid / dead ends", tone: "danger", text: wnFail().trim() },
+    { key: "next", label: "Next step", tone: "warn", text: wnNext().trim() },
+  ].filter((s) => s.text);
+
+  const clearWorkingNote = async () => {
+    if (!wnHasAny()) return;
+    if (!(await confirm("Clear project notes?", "Clears the handoff scratchpad auto-injected into new agents for this workspace.", { danger: true, ok: "Clear" }))) return;
+    setWnSaving(true);
+    try {
+      await rpc("library.working_note_set", {
+        scope: targetScope(),
+        requirements: "",
+        decisions: "",
+        failed_attempts: "",
+        next_steps: "",
+        updated_by: "user",
+      });
+      setWnReq(""); setWnDec(""); setWnFail(""); setWnNext("");
+      setWnEditing(false);
+      toast("Project notes cleared", "secure");
+      refetchNote();
+      refetchSlate();
+    } catch (err) { toast(String(err), "danger"); }
+    finally { setWnSaving(false); }
+  };
+
   const saveWorkingNote = async (e) => {
     e?.preventDefault();
     setWnSaving(true);
@@ -378,6 +411,7 @@ export default function Memory() {
         next_steps: wnNext(),
         updated_by: "user",
       });
+      setWnEditing(false);
       toast("Notes saved", "secure");
       refreshAll();
     } catch (err) { toast(String(err), "danger"); }
@@ -848,20 +882,92 @@ export default function Memory() {
           </div>
 
           <div class="col" style={{ gap: "12px" }}>
-            <div class="card col" style={{ gap: "10px" }}>
-              <div class="row">
-                <strong class="grow">Project notes</strong>
-                <Badge>{activeRepoId() ? activeRepoName() : "Global"}</Badge>
-              </div>
-              <form class="note-fields" onSubmit={saveWorkingNote}>
-                <TextArea rows={2} value={wnReq()} onValue={setWnReq} placeholder="Requirements" />
-                <TextArea rows={2} value={wnDec()} onValue={setWnDec} placeholder="Decisions" />
-                <TextArea rows={2} value={wnFail()} onValue={setWnFail} placeholder="Avoid / dead ends" />
-                <TextArea rows={2} value={wnNext()} onValue={setWnNext} placeholder="Next step" />
-                <div class="row" style={{ "justify-content": "flex-end" }}>
-                  <Button size="sm" variant="primary" type="submit" busy={wnSaving()}>Save</Button>
+            <div class="card col note-card" style={{ gap: "12px" }}>
+              <div class="note-card-head">
+                <div class="col" style={{ gap: "2px", "min-width": 0 }}>
+                  <div class="row" style={{ gap: "6px" }}>
+                    <strong>Project notes</strong>
+                    <Badge>{activeRepoId() ? activeRepoName() : "Global"}</Badge>
+                  </div>
+                  <span class="xs faint">
+                    {wnHasAny() && workingNote()?.updated_at
+                      ? `Handoff scratchpad · updated ${relTime(workingNote().updated_at)}`
+                      : "Auto-updated handoff scratchpad for the current task"}
+                  </span>
                 </div>
-              </form>
+                <Show when={!wnEditing() && wnHasAny()}>
+                  <div class="row" style={{ gap: "4px", flex: "none" }}>
+                    <Button size="sm" variant="ghost" onClick={() => setWnEditing(true)}>Edit</Button>
+                    <Button size="sm" variant="ghost" disabled={wnSaving()} onClick={clearWorkingNote}>Clear</Button>
+                  </div>
+                </Show>
+              </div>
+
+              <Show
+                when={wnEditing()}
+                fallback={
+                  <Show
+                    when={wnHasAny()}
+                    fallback={
+                      <div class="note-empty">
+                        <span class="xs dim">No active handoff notes. Agents update this while working, or you can leave a note for the next session.</span>
+                        <Button size="sm" variant="ghost" onClick={() => setWnEditing(true)}>+ Add note</Button>
+                      </div>
+                    }
+                  >
+                    <div class="note-summary">
+                      <For each={wnSections()}>
+                        {(sec) => (
+                          <div class="note-summary-item">
+                            <div class="note-summary-head">
+                              <span class={`note-dot ${sec.tone}`} />
+                              <span class="note-field-label">{sec.label}</span>
+                            </div>
+                            <div class="note-summary-body">{sec.text}</div>
+                          </div>
+                        )}
+                      </For>
+                    </div>
+                  </Show>
+                }
+              >
+                <form class="note-fields" onSubmit={saveWorkingNote}>
+                  <label class="note-field">
+                    <span class="note-field-label">Requirements</span>
+                    <TextArea rows={3} value={wnReq()} onValue={setWnReq} placeholder="Key constraints or scope for the current task…" />
+                  </label>
+                  <label class="note-field">
+                    <span class="note-field-label">Decisions</span>
+                    <TextArea rows={3} value={wnDec()} onValue={setWnDec} placeholder="Choices made so far…" />
+                  </label>
+                  <label class="note-field">
+                    <span class="note-field-label">Avoid / dead ends</span>
+                    <TextArea rows={3} value={wnFail()} onValue={setWnFail} placeholder="Approaches that failed and shouldn't be repeated…" />
+                  </label>
+                  <label class="note-field">
+                    <span class="note-field-label">Next step</span>
+                    <TextArea rows={3} value={wnNext()} onValue={setWnNext} placeholder="Where the next agent should pick up…" />
+                  </label>
+                  <div class="row" style={{ "justify-content": "flex-end", gap: "6px", "margin-top": "2px" }}>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      type="button"
+                      onClick={() => {
+                        const n = workingNote();
+                        setWnReq(n?.requirements ?? "");
+                        setWnDec(n?.decisions ?? "");
+                        setWnFail(n?.failed_attempts ?? "");
+                        setWnNext(n?.next_steps ?? "");
+                        setWnEditing(false);
+                      }}
+                    >
+                      Cancel
+                    </Button>
+                    <Button size="sm" variant="primary" type="submit" busy={wnSaving()}>Save</Button>
+                  </div>
+                </form>
+              </Show>
             </div>
 
             <details class="card quiet-details">

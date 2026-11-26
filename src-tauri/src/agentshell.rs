@@ -162,6 +162,11 @@ pub async fn open(ctx: &Arc<Ctx>, agent: &str, shell: &str) -> Result<String, St
     ensure(ctx, agent, shell, &mut s).await
 }
 
+/// Best-effort background warm-up of the agent's primary shell so its first `shell_run` has no startup wait.
+pub async fn prewarm(ctx: &Arc<Ctx>, agent: &str) {
+    let _ = open(ctx, agent, MAIN).await;
+}
+
 /// The agent's main shell, opening it if the agent runs. None when stopped.
 pub async fn current(ctx: &Arc<Ctx>, agent: &str, shell: &str, open: bool) -> Option<String> {
     let sl = slot(agent, shell);

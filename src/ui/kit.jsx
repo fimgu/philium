@@ -3,6 +3,7 @@
 import { For, Show, ErrorBoundary, createSignal, createEffect, on, onCleanup, onMount, splitProps, createMemo } from "solid-js";
 import { splitLatest } from "../lib/model-list.js";
 import { Portal } from "solid-js/web";
+import { Icon } from "./icons.jsx";
 
 /** Readable text for any thrown value: strips "Error: " and Rust/Tauri noise. */
 export function cleanError(e) {
@@ -148,7 +149,13 @@ export function Empty(props) {
 }
 
 export function Shield(props) {
-  return <div class={`shield ${props.tone ?? ""}`}>{props.children}</div>;
+  const iconName = () => (props.tone === "danger" || props.tone === "strict" ? "alert" : "shield");
+  return (
+    <div class={`shield ${props.tone ?? ""}`} role={props.tone === "danger" ? "alert" : undefined}>
+      <span class="shield-icon" aria-hidden="true"><Icon name={iconName()} size={14} /></span>
+      <div class="shield-body grow">{props.children}</div>
+    </div>
+  );
 }
 
 export function Page(props) {
@@ -164,16 +171,39 @@ export function Page(props) {
   );
 }
 
+let modalSeq = 0;
 export function Modal(props) {
-  const onKey = (e) => e.key === "Escape" && props.onClose?.();
-  onMount(() => window.addEventListener("keydown", onKey));
-  onCleanup(() => window.removeEventListener("keydown", onKey));
+  const titleId = `modal-title-${++modalSeq}`;
+  let dialogEl;
+  const onKey = (e) => {
+    if (e.key === "Escape") { props.onClose?.(); return; }
+    if (e.key !== "Tab" || !dialogEl) return;
+    const focusables = [...dialogEl.querySelectorAll('button:not(:disabled), [href], input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])')];
+    if (!focusables.length) return;
+    const first = focusables[0], last = focusables[focusables.length - 1];
+    if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+  };
+  onMount(() => {
+    const prev = document.activeElement;
+    window.addEventListener("keydown", onKey);
+    queueMicrotask(() => {
+      if (dialogEl && !dialogEl.contains(document.activeElement)) {
+        const auto = dialogEl.querySelector("[autofocus], textarea, input, select, button");
+        auto?.focus?.();
+      }
+    });
+    onCleanup(() => {
+      window.removeEventListener("keydown", onKey);
+      if (prev && typeof prev.focus === "function" && document.contains(prev)) prev.focus();
+    });
+  });
   return (
     <Portal>
       <div class="overlay" onMouseDown={(e) => e.target === e.currentTarget && props.onClose?.()}>
-        <div class={`modal ${props.wide ? "wide" : ""}`} role="dialog">
+        <div ref={dialogEl} class={`modal ${props.wide ? "wide" : ""}`} role="dialog" aria-modal="true" aria-labelledby={titleId}>
           <div class="modal-head">
-            <h2>{props.title}</h2>
+            <h2 id={titleId}>{props.title}</h2>
             <Show when={props.badge}>{props.badge}</Show>
             <div style={{ "margin-left": "auto" }}>
               <Button variant="ghost" class="icon" onClick={() => props.onClose?.()} aria-label="Close">✕</Button>
@@ -208,33 +238,74 @@ export function ConfirmHost() {
 }
 
 const [toasts, setToasts] = createSignal([]);
+const toastTimers = new Map();
 let toastId = 0;
 export function dismissToast(id) {
+  const tm = toastTimers.get(id);
+  if (tm) { clearTimeout(tm); toastTimers.delete(id); }
   setToasts((t) => t.filter((x) => x.id !== id));
+}
+function scheduleToast(id, ms) {
+  const prev = toastTimers.get(id);
+  if (prev) clearTimeout(prev);
+  toastTimers.set(id, setTimeout(() => dismissToast(id), ms));
 }
 export function toast(text, tone = "") {
   const id = ++toastId;
-  setToasts((t) => [...t, { id, text: cleanError(text), tone }]);
-  setTimeout(() => dismissToast(id), tone === "bad" || tone === "danger" ? 7000 : 3500);
+  const isErr = tone === "bad" || tone === "danger";
+  const isWarn = tone === "warn" || tone === "strict";
+  const ms = isErr ? 8500 : isWarn ? 6000 : 3800;
+  setToasts((t) => [...t.slice(-4), { id, text: cleanError(text), tone, ms }]);
+  scheduleToast(id, ms);
 }
 export function ToastHost() {
+  const toneKind = (tone) => {
+    if (tone === "bad" || tone === "danger") return { cls: "danger", icon: "alert", label: "Something went wrong" };
+    if (tone === "warn" || tone === "strict") return { cls: "warn", icon: "alert", label: "Warning" };
+    if (tone === "good" || tone === "secure" || tone === "success") return { cls: "secure", icon: "check", label: "" };
+    return { cls: "info", icon: "info", label: "" };
+  };
   return (
     <Portal>
-      <div class="toasts">
+      <div class="toasts" aria-live="polite">
         <For each={toasts()}>
-          {(t) => (
-            <div class={`toast ${t.tone}`}>
-              <span class="toast-text">{t.text}</span>
-              <button
-                type="button"
-                class="toast-close"
-                aria-label="Close notification"
-                onClick={() => dismissToast(t.id)}
+          {(t) => {
+            const meta = toneKind(t.tone);
+            const isAlert = meta.cls === "danger" || meta.cls === "warn";
+            return (
+              <div
+                class={`toast ${meta.cls}`}
+                role={isAlert ? "alert" : "status"}
+                onMouseEnter={() => { const tm = toastTimers.get(t.id); if (tm) { clearTimeout(tm); toastTimers.delete(t.id); } }}
+                onMouseLeave={() => scheduleToast(t.id, Math.min(t.ms, 3500))}
               >
-                ×
-              </button>
-            </div>
-          )}
+                <span class="toast-icon" aria-hidden="true"><Icon name={meta.icon} size={14} /></span>
+                <div class="toast-body">
+                  <Show when={meta.label}><div class="toast-title">{meta.label}</div></Show>
+                  <div class="toast-text">{t.text}</div>
+                </div>
+                <Show when={isAlert}>
+                  <button
+                    type="button"
+                    class="toast-action"
+                    title="Copy message"
+                    aria-label="Copy error message"
+                    onClick={() => navigator.clipboard?.writeText(t.text)}
+                  >
+                    Copy
+                  </button>
+                </Show>
+                <button
+                  type="button"
+                  class="toast-close"
+                  aria-label="Close notification"
+                  onClick={() => dismissToast(t.id)}
+                >
+                  ×
+                </button>
+              </div>
+            );
+          }}
         </For>
       </div>
     </Portal>

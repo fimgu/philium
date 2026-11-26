@@ -43,7 +43,8 @@ export function AgentBrowser(props) {
   const [offers, setOffers] = createSignal([]);
   const [covered, setCovered] = createSignal(false);
   const [info, setInfo] = createSignal(null);
-  let view, input, actionT, termsDirty = false;
+  const [viewEl, setViewEl] = createSignal(null);
+  let input, actionT, termsDirty = false;
   const myTerms = new Set();
   const isActive = () => props.active !== false;
   const isVisible = () => isActive() && props.visible !== false;
@@ -79,8 +80,9 @@ export function AgentBrowser(props) {
     const id = props.agent;
     setTabs([]); setActive(null); setOffers([]); setInfo(null); myTerms.clear();
     if (!id) return;
-    // Start clean: no stale native view from a previous mount or app reload stays on screen.
-    rpc("browser.hide", { owner: id }).catch(() => {});
+    // Start clean: await hide BEFORE loading tabs so it can never race with nativeView's show().
+    await rpc("browser.hide", { owner: id }).catch(() => {});
+    if (props.agent !== id) return;
     if (props.name === undefined || props.strict === undefined || props.provider === undefined) {
       rpc("agents.get", { id }).then((r) => props.agent === id && setInfo(r)).catch(() => {});
     }
@@ -148,18 +150,19 @@ export function AgentBrowser(props) {
 
   createEffect(() => { const t = cur(); if (!editing()) setAddr(t && !blank(t.url) ? t.url : ""); });
 
-  createEffect(() => {
-    if (!isVisible()) {
-      setCovered(false);
-      return;
-    }
-    const stop = nativeView(() => view, () => {
-      const t = cur();
-      return t && !blank(t.url) && !t.error ? t.id : null;
-    }, setCovered, (e, id) => { if (/is closed|no such tab/.test(e)) drop(id); });
-    onCleanup(stop);
-  });
-  onCleanup(() => clearTimeout(actionT));
+  const wanted = () => {
+    const t = cur();
+    return isVisible() && t && !blank(t.url) && !t.error ? t.id : null;
+  };
+  const stopNative = nativeView(
+    viewEl,
+    wanted,
+    setCovered,
+    (e, id) => { if (/is closed|no such tab/.test(e)) drop(id); },
+    isVisible,
+  );
+  createEffect(() => { if (!isVisible()) setCovered(false); });
+  onCleanup(() => { stopNative(); clearTimeout(actionT); });
 
   const submit = (e) => {
     e.preventDefault();
@@ -217,7 +220,7 @@ export function AgentBrowser(props) {
         </Show>
         <Show when={err()}><div class="ab-note bad"><Glyph name="warn" size={12} /> {err()}<button aria-label="Dismiss" onClick={() => setErr("")}><Glyph name="x" size={10} /></button></div></Show>
       </div>
-      <div class="ab-view" ref={view} classList={{ live: !!live() && !covered() }}>
+      <div class="ab-view" ref={setViewEl} classList={{ live: !!live() && !covered() }}>
         <Show when={!cur()}>
           <div class="ab-empty">
             <div class="ab-empty-icon"><Icon name="globe" size={22} /></div>

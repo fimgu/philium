@@ -233,7 +233,7 @@ fn shared_instructions(strict: bool) -> String {
          - Code: the `## Codebase map` below lists the most-used files and symbols with line spans. `code_find` locates symbols by name or by words (\"retry backoff\"), `code_symbol` returns one symbol's source with its callers and callees, `code_outline` a file's symbols with line spans, `code_refs` the callers of a symbol. Read a bounded range rather than a whole file. Use grep through `shell_run` for text that is not a symbol name: messages, config keys, comments.\n\
          - Changes: `code_impact` lists what your change touches and who calls it. Philium adds a note to your next tool result when your work overlaps another agent's.\n\
          - Commands: `shell_run` types into your persistent shell. Run builds, test suites and servers with `background=true` and poll `shell_read`. A running result or a transport error does not mean the command stopped: read the terminal before starting it again. Check `exit_code` before reporting a result. `shell_open {name}` gives a second shell.\n\
-         - Web pages: use your browser, not curl. `browser_open`, then `browser_snapshot` for the page and numbered refs, then `browser_click` / `browser_type` / `browser_press`. Snapshot again after each navigation. The person approves browser calls; respect a denial.\n\
+         - Web pages: use your browser, not curl. `browser_open`, then `browser_snapshot` for the page and numbered refs, then `browser_click` / `browser_type` / `browser_press`. Snapshot again after each navigation. The person approves browser calls; respect a denial. For GitHub issues, PRs, and repositories, use `gh` in `shell_run` (pre-authenticated for this repo's GitHub account) instead of `browser_open`.\n\
          - App surfaces: `surface_catalog`, `surface_launch`, `surface_exec`, `surface_screenshot`, `surface_stop` run isolated GUI/CLI apps (KiCad, DBeaver, Chromium) off the host desktop.\n\
          - Memory: `memory_slate`, `memory_search`, `memory_save`, `working_note_get`, `working_note_set` manage repository facts and handoff notes (Standard mode only).\n\
          - External access: call `access_request` to ask the person for read-only access to another repo, folder, or file (docs, images, PDFs, code index, repo context, or cross-repo `communicate` with agents there). Use `access_list`, `fs_list`, `fs_search`, `fs_read` (and `fs_write` only if explicitly granted on a non-repo folder), or pass `repo` to `code_*`, `memory_*`, `working_note_get`, `board_list`, `agent_status`.\n\
@@ -260,7 +260,7 @@ pub(crate) fn prompt_rules(ctx: &Ctx, strict: bool) -> String {
     format!("{}\n{}", shared_instructions(strict), crate::library::rules(ctx))
 }
 
-const MAX_PROJECT_DOCS_BYTES: usize = 4096;
+const MAX_PROJECT_DOCS_BYTES: usize = 16384;
 const PROJECT_DOC_CANDIDATES: &[&str] = &["CLAUDE.md", "AGENTS.md", "README.md"];
 
 fn truncate_utf8_capped(s: &str, max_bytes: usize) -> String {
@@ -287,8 +287,10 @@ fn truncate_utf8_capped(s: &str, max_bytes: usize) -> String {
 
 /// Load up to 2 root-level project documentation files (`CLAUDE.md`, `AGENTS.md`, `README.md` in
 /// priority order), strictly contained within `repo_path` (rejecting symlink escapes and `.env*`
-/// targets) and bounded to 4,096 bytes total so all agents on a repo share one KV-cached prefix.
+/// targets), deduplicated by canonical path and content, and bounded to 12 KiB total so all agents
+/// on a repo share one KV-cached prefix without truncating essential repository layouts.
 fn project_docs_prompt(repo_path: &Path) -> Option<String> {
+    use std::collections::HashSet;
     use std::io::Read;
 
     let canon_root = std::fs::canonicalize(repo_path).ok()?;
@@ -296,8 +298,15 @@ fn project_docs_prompt(repo_path: &Path) -> Option<String> {
         return None;
     }
     let mut docs: Vec<(&str, String)> = Vec::new();
+    let mut seen_paths: HashSet<PathBuf> = HashSet::new();
+    let mut seen_bodies: HashSet<String> = HashSet::new();
     for &name in PROJECT_DOC_CANDIDATES {
         if docs.len() >= 2 {
+            break;
+        }
+        // Only fall back to README.md when neither CLAUDE.md nor AGENTS.md is present,
+        // so README.md never steals half the budget from dedicated agent instructions.
+        if name == "README.md" && !docs.is_empty() {
             break;
         }
         if name.to_ascii_lowercase().starts_with(".env") {
@@ -306,6 +315,9 @@ fn project_docs_prompt(repo_path: &Path) -> Option<String> {
         let candidate = repo_path.join(name);
         let Ok(canon_file) = std::fs::canonicalize(&candidate) else { continue };
         if !canon_file.starts_with(&canon_root) || !canon_file.is_file() {
+            continue;
+        }
+        if !seen_paths.insert(canon_file.clone()) {
             continue;
         }
         let canon_name = canon_file
@@ -324,6 +336,9 @@ fn project_docs_prompt(repo_path: &Path) -> Option<String> {
         let text = String::from_utf8_lossy(&buf);
         let trimmed = text.trim();
         if trimmed.is_empty() {
+            continue;
+        }
+        if !seen_bodies.insert(trimmed.to_string()) {
             continue;
         }
         docs.push((name, trimmed.to_string()));
@@ -700,34 +715,47 @@ async fn provision(ctx: &Arc<Ctx>, id: &str, fresh: bool, brief: Option<String>)
         .and_then(|pid| get_row(ctx, pid))
         .and_then(|pr| pr["name"].as_str().map(str::to_string));
     let mut extra = prompt_rules(ctx, strict);
+    let seed_query = brief.as_deref().unwrap_or("");
     // Personal/imported memories are not standing rules. Agents may query ID-bound memory only.
-    if let Some(repo_id) = row["repo_id"].as_str() {
+    // Run codebase map, project docs, and session memory context concurrently to cut startup latency.
+    let cmap_fut = {
+        let repo_id = row["repo_id"].as_str().map(str::to_string);
         let tokens = crate::codeindex::map_tokens(providers::context_window(ctx, &provider.id, &model_id));
         let coordinates = matches!(role.as_str(), "orchestrator" | "coordinator" | "reviewer");
-        let (c_map, rid, wt) = (ctx.clone(), repo_id.to_string(), worktree.clone());
-        let cmap = tokio::task::spawn_blocking(move || {
-            crate::codeindex::prompt_map(&c_map, &rid, wt.as_deref(), tokens, coordinates)
-        })
-        .await
-        .map_err(|e| e.to_string())?;
-        if let Some(cmap) = cmap {
-            extra.push_str(&cmap);
+        let (c_map, wt) = (ctx.clone(), worktree.clone());
+        async move {
+            let Some(rid) = repo_id else { return Ok::<Option<String>, String>(None); };
+            tokio::task::spawn_blocking(move || {
+                crate::codeindex::prompt_map(&c_map, &rid, wt.as_deref(), tokens, coordinates)
+            })
+            .await
+            .map_err(|e| e.to_string())
         }
-        let doc_root = ctx
-            .db
-            .query("SELECT path FROM repos WHERE id=?1 LIMIT 1", [repo_id])
-            .ok()
-            .and_then(|r| r.into_iter().next())
-            .and_then(|r| r["path"].as_str().map(PathBuf::from))
-            .or_else(|| worktree.clone());
-        if let Some(root) = doc_root {
-            let docs = tokio::task::spawn_blocking(move || project_docs_prompt(&root))
+    };
+    let docs_fut = {
+        let doc_root = worktree.clone().or_else(|| {
+            row["repo_id"].as_str().and_then(|repo_id| {
+                ctx.db
+                    .query("SELECT path FROM repos WHERE id=?1 LIMIT 1", [repo_id])
+                    .ok()
+                    .and_then(|r| r.into_iter().next())
+                    .and_then(|r| r["path"].as_str().map(PathBuf::from))
+            })
+        });
+        async move {
+            let Some(root) = doc_root else { return Ok::<Option<String>, String>(None); };
+            tokio::task::spawn_blocking(move || project_docs_prompt(&root))
                 .await
-                .map_err(|e| e.to_string())?;
-            if let Some(docs) = docs {
-                extra.push_str(&docs);
-            }
+                .map_err(|e| e.to_string())
         }
+    };
+    let mem_fut = agent_session_context_async(ctx, strict, row["repo_id"].as_str(), Some(&model_ref), seed_query);
+    let (cmap_res, docs_res, session_ctx) = tokio::join!(cmap_fut, docs_fut, mem_fut);
+    if let Some(cmap) = cmap_res? {
+        extra.push_str(&cmap);
+    }
+    if let Some(docs) = docs_res? {
+        extra.push_str(&docs);
     }
     extra.push_str("\n<!-- PHILIUM_CACHE_BREAK -->\n");
     extra.push_str(&agent_identity_tail(&name, &role, parent_name.as_deref(), worktree.as_deref()));
@@ -735,8 +763,7 @@ async fn provision(ctx: &Arc<Ctx>, id: &str, fresh: bool, brief: Option<String>)
         extra.push_str("\n## Grill-me mode (enabled)\n");
         extra.push_str(crate::board::GRILL_ME);
     }
-    let seed_query = brief.as_deref().unwrap_or("");
-    extra.push_str(&agent_session_context_async(ctx, strict, row["repo_id"].as_str(), Some(&model_ref), seed_query).await);
+    extra.push_str(&session_ctx);
     if let Some(grants_block) = crate::access::active_grants_prompt(ctx, id) {
         extra.push_str(&grants_block);
     }
@@ -777,6 +804,18 @@ async fn provision(ctx: &Arc<Ctx>, id: &str, fresh: bool, brief: Option<String>)
     }
     if strict {
         env.extend(crate::sandbox::env(ctx, &name));
+    } else if let Some(remote_url) = row["repo_id"]
+        .as_str()
+        .and_then(|rid| crate::workspace::repo(ctx, rid))
+        .and_then(|r| r["remote_url"].as_str().map(str::to_string))
+    {
+        // Pass the repository's selected GitHub account username (not a token) so the Philium `gh`
+        // shim uses that account automatically without leaking secrets into env or requiring `gh auth switch`.
+        if let Ok(origin) = crate::release_intake::origin_of(&remote_url) {
+            if let Some(login) = crate::release_intake::selected_login(&origin) {
+                env.push(("PHILIUM_GH_USER".into(), login));
+            }
+        }
     }
     let mut launch_env = env.clone();
     launch_env.extend(setup.env);
@@ -872,6 +911,13 @@ async fn provision(ctx: &Arc<Ctx>, id: &str, fresh: bool, brief: Option<String>)
     set_state(ctx, id, "idle");
     // Now that it runs, the agent holds the open work that was handed to it (first start and Resume).
     crate::board::reclaim_assigned(ctx, id);
+    // Pre-warm the agent's persistent bash shell in the background so its first command runs immediately.
+    {
+        let (c_sh, id_sh) = (ctx.clone(), id.to_string());
+        tokio::spawn(async move {
+            crate::agentshell::prewarm(&c_sh, &id_sh).await;
+        });
+    }
 
     if let Some(b) = brief.filter(|b| !b.trim().is_empty()) {
         send(ctx, id, &b).await?;
@@ -3226,8 +3272,8 @@ mod tests {
         std::fs::create_dir_all(&repo).unwrap();
         std::fs::write(&outside, "SECRET_OUTSIDE_FILE").unwrap();
 
-        // Priority: CLAUDE.md + AGENTS.md included (max 2), README.md omitted when 2 higher-priority exist.
-        let big_claude = format!("Use cargo nextest.\n{}", "rule detail line\n".repeat(400));
+        // Priority: CLAUDE.md + AGENTS.md included (max 2), README.md omitted when agent docs exist.
+        let big_claude = format!("Use cargo nextest.\n{}", "rule detail line\n".repeat(1400));
         std::fs::write(repo.join("CLAUDE.md"), &big_claude).unwrap();
         std::fs::write(repo.join("AGENTS.md"), "Keep diffs focused and minimal.\n").unwrap();
         std::fs::write(repo.join("README.md"), "README_SHOULD_NOT_LOAD_AS_THIRD").unwrap();
@@ -3240,6 +3286,18 @@ mod tests {
         assert!(prompt.contains("Keep diffs focused and minimal."), "{prompt}");
         assert!(prompt.contains("... [truncated]"), "{prompt}");
         assert!(!prompt.contains("README_SHOULD_NOT_LOAD_AS_THIRD"), "{prompt}");
+
+        // Duplicate content (e.g. identical AGENTS.md & CLAUDE.md) must only be loaded once,
+        // and README.md must NOT be pulled in to steal CLAUDE.md's budget.
+        let repo_dup = base.join("repo-dup");
+        std::fs::create_dir_all(&repo_dup).unwrap();
+        std::fs::write(repo_dup.join("CLAUDE.md"), "Shared repo instructions.\n").unwrap();
+        std::fs::write(repo_dup.join("AGENTS.md"), "Shared repo instructions.\n").unwrap();
+        std::fs::write(repo_dup.join("README.md"), "README_SHOULD_NOT_STEAL_BUDGET").unwrap();
+        let dup_prompt = project_docs_prompt(&repo_dup).expect("should load deduplicated doc");
+        assert!(dup_prompt.contains("### CLAUDE.md"), "{dup_prompt}");
+        assert!(!dup_prompt.contains("### AGENTS.md"), "{dup_prompt}");
+        assert!(!dup_prompt.contains("README_SHOULD_NOT_STEAL_BUDGET"), "{dup_prompt}");
 
         // Symlink escape outside repo AND symlink pointing to .env* inside repo must both be ignored.
         #[cfg(unix)]

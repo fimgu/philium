@@ -1914,7 +1914,13 @@ pub fn working_note_prompt(ctx: &Ctx, repo_id: &str) -> Option<String> {
     if req.is_empty() && dec.is_empty() && fail.is_empty() && next.is_empty() {
         return None;
     }
-    let mut out = String::from("\n## Workspace working note (curated handoff)\n");
+    let updated_at = note["updated_at"].as_str().unwrap_or("").trim();
+    let stamp = if updated_at.is_empty() {
+        "prior handoff; may be stale — verify before treating as current orders".to_string()
+    } else {
+        format!("prior handoff, updated {updated_at} UTC; may be from an earlier task — verify before treating as current orders")
+    };
+    let mut out = format!("\n## Workspace working note ({stamp})\n");
     if !req.is_empty() {
         out.push_str(&format!("- Requirements: {req}\n"));
     }
@@ -2192,7 +2198,9 @@ fn build_context_slate_core(
             wn["failed_attempts"].as_str().unwrap_or(""),
             wn["next_steps"].as_str().unwrap_or("")
         );
-        used += estimate_tokens(&wn_text);
+        // Cap the working note's budget share so a long/stale note can never starve actual repo memories.
+        let wn_cap = (budget / 3).min(450);
+        used += estimate_tokens(&wn_text).min(wn_cap);
     }
 
     let mut excluded: Vec<Value> = vec![];
@@ -2842,6 +2850,19 @@ fn extract_deterministic_observation(entries: &[(i64, String, String, String)]) 
         }
         match role.as_str() {
             "user" => {
+                // Skip automated Philium orchestration/mail/review prompts and meta-chat about
+                // the agent's own memory/context so they don't pollute repo working notes.
+                if low.contains("mail delivered by philium")
+                    || low.contains("hands-off review of pull request")
+                    || low.contains("hands-off review of pr ")
+                    || low.contains("independent verifier for the hands-off review")
+                    || low.contains("loaded memories")
+                    || low.contains("memory system")
+                    || low.contains("context quality")
+                    || low.contains("stateless llm")
+                {
+                    continue;
+                }
                 if low.contains("must ")
                     || low.contains("never ")
                     || low.contains("don't ")
@@ -2869,19 +2890,29 @@ fn extract_deterministic_observation(entries: &[(i64, String, String, String)]) 
                 }
             }
             "error" => {
-                if fails.len() < 3 {
+                if !low.contains("permission denied:") && fails.len() < 3 {
                     fails.push(snippet);
                 }
             }
             "tool_result" | "tool_output" => {
+                // Skip transient permission-denied prompts and strip raw `[shell:err]` prefixes.
+                if low.contains("permission denied:") {
+                    continue;
+                }
                 if low.contains(":err]")
                     || low.contains("enetunreach")
                     || low.contains("error:")
                     || low.contains("failed")
                     || low.contains("exit_code\":") && !low.contains("exit_code\":0") && !low.contains("exit_code\": 0")
                 {
-                    if fails.len() < 3 {
-                        fails.push(snippet);
+                    let cleaned = snippet
+                        .strip_prefix("[shell:err]")
+                        .or_else(|| snippet.strip_prefix("[tool:err]"))
+                        .map(str::trim)
+                        .unwrap_or(&snippet)
+                        .to_string();
+                    if !cleaned.is_empty() && fails.len() < 3 {
+                        fails.push(cleaned);
                     }
                 } else if (low.contains("cargo test") || low.contains("npm test") || low.contains("pytest"))
                     && (low.contains("test result: ok") || low.contains("passed") || low.contains(":ok]"))
@@ -3041,11 +3072,11 @@ pub(crate) fn first_json_object(raw: &str) -> Option<Value> {
     None
 }
 
-const OBSERVE_PROMPT: &str = "You maintain an engineering memory for one repository. From the session transcript, extract only durable knowledge a future agent in this repo would need. Skip chit-chat, transient status and anything already obvious from the code.\n\
+const OBSERVE_PROMPT: &str = "You maintain an engineering memory for one repository. From the session transcript, extract only durable knowledge about the repository's code, architecture, build/test commands, and domain that a future agent would need. Skip chit-chat, transient status, anything already obvious from the code, and ANY meta-discussion about the agent's own prompt, context window, memory system, working note, or Philium tooling.\n\
 Return strict JSON only:\n\
 {\"working_note\":{\"requirements\":null,\"decisions\":null,\"failed_attempts\":null,\"next_steps\":null},\
 \"observations\":[{\"title\":\"<=80 chars\",\"category\":\"decision|bugfix|discovery|architecture|gotcha|preference|correction|procedure|fact|entity\",\"content\":\"1-3 sentences, self-contained\",\"files\":[\"repo/relative/path\"],\"fact_key\":\"optional.dotted.key for facts that can change\",\"trust_tier\":\"agent_inferred|verified_run\"}]}\n\
-Rules: at most 5 observations; use verified_run only when a command in the transcript succeeded and proves it; use fact_key only for a single current value (e.g. tooling.package_manager); working_note fields are one short line each or null; never include secrets, tokens or personal data.";
+Rules: at most 5 observations; use verified_run only when a command in the transcript succeeded and proves it; use fact_key only for a single current value (e.g. tooling.package_manager); working_note fields are one short line each or null (never record meta-instructions about listing memories or chat behavior); never include secrets, tokens or personal data.";
 
 /// Try a single bounded LLM extraction call through Philium's gateway for a trusted Standard agent.
 /// Works with every provider kind the gateway serves (API keys and subscriptions), using a cheap
@@ -4635,6 +4666,23 @@ mod tests {
         assert!(note.len() <= MAX_WORKING_NOTE_PROMPT_BYTES, "len={}", note.len());
         assert!(note.contains("... [truncated]"));
         assert!(working_note_prompt(&ctx, "rb").is_none());
+
+        // Even with a huge working note, actual repo memories must still fit inside the slate budget.
+        save_structured(&ctx, SaveOpts {
+            content: "Run go test -mod vendor for scoped Go package tests.",
+            category: "procedure",
+            scope: "repo:ra",
+            source: "user",
+            trust_tier: "user_direct",
+            fact_key: None,
+            supersedes_id: None,
+            source_event_id: None,
+            provenance: Some("operator"),
+        }).unwrap();
+        let slate = build_context_slate(&ctx, Some("ra"), "go test", 600, false, false).unwrap();
+        let mems = slate["items"].as_array().unwrap();
+        assert!(!mems.is_empty(), "huge working note must not starve repo memories: {slate}");
+        assert!(slate["used_tokens"].as_u64().unwrap() <= 600, "slate={slate}");
 
         intention_add(&ctx, "repo:ra", "on_session_start", "", "Check migration scripts first", "user").unwrap();
         intention_add(&ctx, "repo:rb", "on_session_start", "", "Sibling secret reminder", "user").unwrap();

@@ -420,10 +420,24 @@ pub fn create_worktree(
         &handle,
         json!({"worktree_id":id,"repo_id":repo_id,"branch":branch,"creating":true}),
     );
-    if let Err(e) = git(
-        repo_path,
-        &["worktree", "add", "-b", &branch, &handle, &base_commit],
-    ) {
+    // Try claiming a pre-warmed detached standby worktree at the exact base_commit (~20ms vs 3-6s).
+    let standby = parent.join("_standby");
+    let standby_str = standby.to_string_lossy().to_string();
+    let claimed_standby = standby.is_dir()
+        && git(&standby, &["rev-parse", "HEAD"]).ok().as_deref() == Some(base_commit.as_str())
+        && git(&standby, &["status", "--porcelain"]).ok().is_some_and(|s| s.trim().is_empty())
+        && git(repo_path, &["worktree", "move", &standby_str, &handle]).is_ok()
+        && git(&path, &["checkout", "-b", &branch]).is_ok();
+
+    let created_res = if claimed_standby {
+        Ok(String::new())
+    } else {
+        git(
+            repo_path,
+            &["worktree", "add", "-b", &branch, &handle, &base_commit],
+        )
+    };
+    if let Err(e) = created_res {
         let branch_exists = git(
             repo_path,
             &["show-ref", "--verify", &format!("refs/heads/{branch}")],
@@ -463,8 +477,10 @@ pub fn create_worktree(
     ctx.log_event(
         "workspace:create",
         agent_id,
-        &json!({"id":id,"path":path,"branch":branch}),
+        &json!({"id":id,"path":path,"branch":branch,"standby":claimed_standby}),
     );
+    #[cfg(not(test))]
+    warm_standby_async(ctx.clone(), repo_id.to_string());
     Ok(Worktree {
         id,
         repo_id: repo_id.into(),
@@ -472,6 +488,47 @@ pub fn create_worktree(
         branch,
         base_commit,
     })
+}
+
+/// Best-effort background refill of one detached-HEAD standby worktree per repo so the next
+/// agent spawn can claim it via `git worktree move` (~20ms) instead of a full checkout.
+#[cfg(not(test))]
+fn warm_standby_async(ctx: Arc<Ctx>, repo_id: String) {
+    std::thread::spawn(move || {
+        let lock = repo_lock(&repo_id);
+        let Ok(_guard) = lock.try_lock() else { return; };
+        let Some(r) = repo(&ctx, &repo_id) else { return; };
+        let Ok(repo_dir) = repo_dir(&r) else { return; };
+        let base = r["integration_branch"]
+            .as_str()
+            .or(r["default_branch"].as_str())
+            .unwrap_or("main");
+        let Ok((base_commit, _)) = start_point(&repo_dir, base) else { return; };
+        let folder: String = r["name"]
+            .as_str()
+            .unwrap_or(&repo_id)
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .collect();
+        let parent = ctx
+            .root
+            .join("worktrees")
+            .join(if folder.is_empty() { repo_id.as_str() } else { folder.as_str() });
+        if std::fs::create_dir_all(&parent).is_err() {
+            return;
+        }
+        let standby = parent.join("_standby");
+        let standby_str = standby.to_string_lossy().to_string();
+        if standby.is_dir() {
+            if git(&standby, &["rev-parse", "HEAD"]).ok().as_deref() == Some(base_commit.as_str())
+                && git(&standby, &["status", "--porcelain"]).ok().is_some_and(|s| s.trim().is_empty())
+            {
+                return;
+            }
+            let _ = git(&repo_dir, &["worktree", "remove", "--force", &standby_str]);
+        }
+        let _ = git(&repo_dir, &["worktree", "add", "--detach", &standby_str, &base_commit]);
+    });
 }
 pub fn worktree_status(ctx: &Arc<Ctx>, id: &str) -> Result<Value, String> {
     let w = worktree(ctx, id)?;
@@ -908,7 +965,18 @@ fn dispatch(ctx: &Arc<Ctx>, method: &str, args: Value) -> Result<Value, String> 
             let r = repo(ctx, &id).ok_or_else(|| crate::ctx::not_found("Unknown repository"))?;
             let lock = repo_lock(&id);
             let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-            let remote = refresh_branches(&repo_dir(&r)?, Duration::from_secs(30))?;
+            let dir = repo_dir(&r)?;
+            let remote = refresh_branches(&dir, Duration::from_secs(30))?;
+            // Best-effort sync of `<remote>/HEAD` so worktrees don't stay stuck on a retired default branch.
+            if git(&dir, &["remote", "set-head", &remote, "--auto"]).is_ok() {
+                if let Ok(sym) = git(&dir, &["symbolic-ref", "--quiet", "--short", &format!("refs/remotes/{remote}/HEAD")]) {
+                    let prefix = format!("{remote}/");
+                    let head_branch = sym.strip_prefix(&prefix).unwrap_or(&sym).trim();
+                    if !head_branch.is_empty() && r["default_branch"].as_str() != Some(head_branch) {
+                        let _ = ctx.db.exec("UPDATE repos SET default_branch=?2 WHERE id=?1", params![id, head_branch]);
+                    }
+                }
+            }
             changed(ctx);
             Ok(json!({"remote": remote}))
         }
