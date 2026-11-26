@@ -7,6 +7,8 @@ findings are confirmed by an independent verifier, and Philium itself decides an
 
 Existing release review (`review_run.rs`, `release-intake.jsx`) stays as is. This is a new mode.
 
+What Philium may post and how deep it reviews are set per repo by `.philium/review-policy.yml` (read from the PR's base commit): see [pr-review-policy.md](pr-review-policy.md). The default is **observe**: Philium posts nothing and stores what it would have posted.
+
 ## Files and owners
 
 | File | Owner lane |
@@ -54,10 +56,11 @@ pub fn claims(body: &str) -> Vec<Value>;                                 // pure
 ### Tables
 ```
 pr_reviews(id TEXT PK, repo TEXT, origin TEXT, pr INT, base TEXT, head TEXT,
-  state TEXT,          -- queued | running | needs_you | posting | posted | failed | superseded | stopped
+  state TEXT,          -- queued | running | needs_you | posting | posted | observed | failed | superseded | stopped
   verdict TEXT,        -- pending | needs_you | approve | request_changes
   lead TEXT, own INT, title TEXT, url TEXT, auto INT, started INT, finished INT,
-  posted_url TEXT, summary TEXT, error TEXT, prev TEXT)   -- prev: the review this one reruns
+  posted_url TEXT, summary TEXT, error TEXT, prev TEXT,   -- prev: the review this one reruns
+  policy TEXT, mode TEXT, level TEXT, tokens_used INT, would_post TEXT)   -- see pr-review-policy.md
 pr_items(id TEXT PK, review TEXT, key TEXT, kind TEXT,    -- risk | comment | review | thread | claim | ci | note
   title TEXT, detail TEXT, url TEXT, author TEXT, human INT, required INT, path TEXT, line INT,
   status TEXT,         -- open | doing | pass | fail | blocked | addressed | not_addressed | outdated | not_applicable
@@ -99,7 +102,7 @@ Evaluated in order:
 `needs_you` ids are reported at every step so the app shows blocked items while the rest continues.
 
 ### Posting
-`pr_review_submit {summary}` (orchestrator). Philium recomputes the verdict; if `pending` or `needs_you` returns an error listing the open ids. Otherwise it re-reads the PR head; if it moved, the review is `superseded` and a rerun starts. Else posts via `pr_github::post` (`COMMENT` when `own`) with a body built by Philium: verdict line, summary, blocking items with evidence, tally (`12 items: 10 pass, 1 addressed, 1 P3`), non-blocking findings, pre-existing findings. Inline comments for fails with `path`+`line`. State `posted`, `posted_url` saved, `attention::announce`.
+`pr_review_submit {summary}` (orchestrator). Philium recomputes the verdict; if `pending` or `needs_you` returns an error listing the open ids. Otherwise it re-reads the PR head; if it moved, the review is `superseded` and a rerun starts. Else posts via `pr_github::post` (`COMMENT` when `own`) with a body built by Philium: verdict line, summary, blocking items with evidence, tally (`12 items: 10 pass, 1 addressed, 1 P3`), non-blocking findings, pre-existing findings. Inline comments for fails with `path`+`line`. State `posted`, `posted_url` saved, `attention::announce`. The review's `mode` decides the event (pure `decide_event`): `observe` posts nothing and ends `observed` with `would_post`; `comment` always posts `COMMENT`; `enforce` approves only when the policy lets Philium approve with no human approvals required. The body ends with a Policy line.
 
 ### Rerun
 New head (watcher or manual start on the same PR): mark the old review `superseded`, stop its agent tree, create a new review with `prev`, re-sync GitHub items, copy `risk` items and keep each item's previous status/evidence in `prev_status`/`prev_evidence` with status `open` (agents re-verify; quick when unchanged). Notes are per PR and carry automatically.
@@ -116,11 +119,13 @@ New head (watcher or manual start on the same PR): mark the old review `supersed
 - `list {repo_id}` -> recent reviews (max 30) with tally.
 - `stop {id}`, `restart {id}`.
 - `note_add {repo_id, pr, text, must}`, `note_remove {id}`. A note added to a running review becomes an item immediately.
-- `settings_get/settings_set {auto: bool}` (kv `pr_review.auto`).
+- `settings_get {repo_id?}` -> `{auto, mode?}`; `settings_set {auto?, repo_id?, mode?}` (kv `pr_review.auto`, `pr_review.mode:<repo_id>`; `mode` null clears the override).
+- `policy_get {repo_id}` -> `{policy, raw, override, sha, path}`.
+- `publish {id, as: comment|enforce}` -> posts an `observed` review if the head is unchanged (else supersedes and restarts). Returns `{posted, verdict, event}`.
 - Events: `pr_review:changed {repo_id, pr}`.
 
 ### Watcher (spawned in `main.rs` setup, every 120 s, skipped when `attention::HIDDEN`)
-For each registered repo with a GitHub origin: if `pr_review.auto` is on, start reviews for `review_requested` PRs not yet reviewed at their head. For every review in `posted | running | needs_you` whose PR head moved, rerun. At most 2 reviews run at once; others are `queued` and start when one finishes.
+For each registered repo with a GitHub origin: if `pr_review.auto` is on, start reviews for `review_requested` PRs not yet reviewed at their head. For every review in `posted | observed | running | needs_you` whose PR head moved, rerun. Running reviews over their `budget_tokens` are stopped and moved to `needs_you`. At most 2 reviews run at once; others are `queued` and start when one finishes.
 
 ### Needs you
 `attention::needing_you` adds the count of reviews with state `needs_you`. `checkout-home.jsx` lists them with the blocked items and a link to Review.

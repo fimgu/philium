@@ -29,6 +29,7 @@ mod release_composition;
 mod release_command;
 mod review_run;
 mod pr_review;
+mod pr_policy;
 mod pr_github;
 mod release_document;
 mod release_stage;
