@@ -374,7 +374,6 @@ async fn on_limit(ctx: &Arc<Ctx>, agent: &str, provider: &str) -> Result<(), Str
     let Some(parent) = h["parent_id"].as_str().and_then(|p| crate::agents::get_row(ctx, p)) else { return Ok(()) };
     let Some(r) = switch_target(ctx, &h, &parent, provider, crate::db::now()) else { return Ok(()) };
     let id = h["id"].as_str().unwrap_or_default().to_string();
-    ctx.db.kv_set(&format!("routing.switched.{id}"), &crate::db::now().to_string())?;
     crate::agents::routed_switch(ctx, &id, &r.model_ref, &r.reason).await
 }
 

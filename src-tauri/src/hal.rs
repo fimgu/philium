@@ -215,6 +215,16 @@ impl Hal {
         }
     }
 
+    /// Test-only: a HAL client for a fake server at `base`, backed by a stand-in process.
+    #[cfg(test)]
+    pub fn remote(base: String) -> Hal {
+        // A process that lives until stdin closes stands in for HAL itself.
+        let mut c = Command::new("/bin/cat").stdin(Stdio::piped()).stdout(Stdio::null()).spawn().unwrap();
+        let stdin = c.stdin.take().unwrap();
+        let pid = c.id();
+        Hal::attach(c, stdin, Arc::default(), base, "t".into(), pid, Value::Null)
+    }
+
     pub fn alive(&self) -> bool {
         match self.proc.lk().as_mut() {
             Some((c, _)) => match c.try_wait() {

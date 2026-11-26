@@ -1546,21 +1546,50 @@ pub async fn routed_switch(ctx: &Arc<Ctx>, id: &str, model: &str, reason: &str) 
         return Err("switching to an untrusted provider needs a new Strict agent".into());
     }
     let r = format!("{}/{}", p.id, m);
+    // Admission first, then recheck: another start or switch may have moved this helper meanwhile.
+    let _admission = ProvisionAdmission::acquire(id)?;
+    let row = get_row(ctx, id).ok_or("unknown agent")?;
+    routed_switch_check(ctx, &row, &r)?;
+    if row["model_ref"].as_str() == Some(r.as_str()) {
+        return Err("The helper already runs on this model".into());
+    }
+    let running = runtime(id).is_some();
     ctx.db.exec("UPDATE agents SET model_ref=?2, route_reason=?3 WHERE id=?1", rusqlite::params![id, r, reason])?;
-    ctx.log_event("agent_routed_switch", Some(id), &json!({ "from": row["model_ref"], "to": r, "reason": reason }));
-    ctx.emit("agents:changed", json!({ "id": id }));
-    if runtime(id).is_some() {
-        let admission = ProvisionAdmission::acquire(id)?;
+    if running {
         let (c, id2) = (ctx.clone(), id.to_string());
         tokio::task::spawn_blocking(move || stop(&c, &id2, "provisioning")).await.map_err(|e| e.to_string())?;
-        let _admission = admission;
         if let Err(e) = provision(ctx, id, false, None).await {
+            let _ = ctx.db.exec(
+                "UPDATE agents SET model_ref=?2, route_reason=?3 WHERE id=?1",
+                rusqlite::params![id, row["model_ref"].as_str(), row["route_reason"].as_str()],
+            );
             let _ = ctx.db.kv_set(&format!("agent_error.{id}"), &e);
             set_state(ctx, id, "failed");
+            ctx.emit("agents:changed", json!({ "id": id }));
             return Err(e);
         }
     }
+    ctx.db.kv_set(&format!("routing.switched.{id}"), &now().to_string())?;
+    ctx.log_event("agent_routed_switch", Some(id), &json!({ "from": row["model_ref"], "to": r, "reason": reason }));
+    ctx.emit("agents:changed", json!({ "id": id }));
+    if running {
+        let from = row["model_ref"].as_str().and_then(|m| m.split('/').next()).unwrap_or_default();
+        let from = providers::get(ctx, from).map(|p| p.name).unwrap_or_else(|| from.to_string());
+        resume_after_switch(ctx, id, &r, &from).await?;
+    }
     Ok(())
+}
+
+/// A reused HAL session keeps its old model, which the new provider-pinned token refuses.
+/// Point the session at the new model, then ask the helper to pick its work back up.
+async fn resume_after_switch(ctx: &Arc<Ctx>, id: &str, model: &str, from: &str) -> Result<(), String> {
+    let r = rt(id)?;
+    r.hal.call(reqwest::Method::PATCH, &format!("/sessions/{}", r.session), Some(json!({ "model": model }))).await?;
+    send(ctx, id, &switch_continue_text(from)).await.map(|_| ())
+}
+
+fn switch_continue_text(provider: &str) -> String {
+    format!("Philium: your model was switched because {provider} hit its limit. Continue where you left off. Do not repeat work that is already recorded.")
 }
 
 /// Called on app exit: stop every agent HAL; containers/worktrees are kept.
@@ -3061,6 +3090,70 @@ mod tests {
         ctx.db.kv_set("routing.switched.h", &now().to_string()).unwrap();
         assert!(crate::routing::switch_target(&ctx, &h, &lead, "b", now()).is_none());
         assert!(crate::routing::switch_target(&ctx, &h, &lead, "b", now() + crate::routing::SWITCH_COOLDOWN_MS).is_some());
+    }
+
+    /// Fake HAL server recording every request as "METHOD path body".
+    async fn fake_hal() -> (String, Arc<Mutex<Vec<String>>>) {
+        use axum::{extract::Request, Router};
+        let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+        let s2 = seen.clone();
+        let app = Router::new().fallback(move |req: Request| {
+            let s = s2.clone();
+            async move {
+                let (m, p) = (req.method().to_string(), req.uri().path().to_string());
+                let b = axum::body::to_bytes(req.into_body(), 1 << 20).await.unwrap_or_default();
+                s.lk().push(format!("{m} {p} {}", String::from_utf8_lossy(&b)));
+                axum::Json(json!({ "ok": true }))
+            }
+        });
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", l.local_addr().unwrap());
+        tokio::spawn(async move { let _ = axum::serve(l, app).await; });
+        (base, seen)
+    }
+
+    fn fake_runtime(id: &str, base: String) {
+        let rt = Runtime {
+            hal: Arc::new(Hal::remote(base)), session: "s1".into(), name: id.into(), cwd: PathBuf::from("/tmp"),
+            strict: false, env: vec![], policy: None, pump: tokio::spawn(async {}),
+        };
+        runtimes().lk().insert(id.to_string(), Arc::new(rt));
+    }
+
+    #[tokio::test]
+    async fn routed_switch_patches_session_model_and_asks_to_continue() {
+        let ctx = routing_fixture();
+        let (base, seen) = fake_hal().await;
+        let id = new_id();
+        fake_runtime(&id, base);
+        resume_after_switch(&ctx, &id, "b/m1", "Provider A").await.unwrap();
+        runtimes().lk().remove(&id);
+        let seen = seen.lk().clone();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert!(seen[0].starts_with("PATCH /sessions/s1 ") && seen[0].contains("\"model\":\"b/m1\""), "{seen:?}");
+        assert!(seen[1].starts_with("POST /sessions/s1/messages ") && seen[1].contains("Provider A hit its limit"), "{seen:?}");
+    }
+
+    #[tokio::test]
+    async fn failed_routed_switch_keeps_old_model_and_no_cooldown() {
+        let ctx = routing_fixture();
+        set_routing(&ctx, &["b"]);
+        let id = new_id();
+        ctx.db.exec(
+            "INSERT INTO agents(id,name,repo_id,model_ref,parent_id,strict,state,route_reason,created_at,last_active_at)
+             VALUES(?1,?1,'r','a/m1','lead',0,'running','Same as parent',0,0)",
+            [&id],
+        ).unwrap();
+        let (base, seen) = fake_hal().await;
+        fake_runtime(&id, base);
+        // The repo path does not exist, so the restart fails.
+        assert!(routed_switch(&ctx, &id, "b/m1", "Switched: a hit its limit").await.is_err());
+        runtimes().lk().remove(&id);
+        let h = get_row(&ctx, &id).unwrap();
+        assert_eq!(h["model_ref"], "a/m1");
+        assert_eq!(h["route_reason"], "Same as parent");
+        assert!(ctx.db.kv_get(&format!("routing.switched.{id}")).is_none());
+        assert!(seen.lk().is_empty(), "no continue after a failed restart");
     }
 
     #[test]

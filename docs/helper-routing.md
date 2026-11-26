@@ -59,7 +59,7 @@ Usage source: the last `account_usage` snapshot (no network on spawn) merged wit
 
 ## Rate limit while running
 
-When the gateway records a real rate-limit stop (429 that is not a concurrency retry, or quota `limit_reached`) for a routed helper's provider, the watcher asks the chooser again for that helper's job, excluding the limited provider. If it finds an allowed alternative, it switches the helper with the existing `set_model` path (allowed for routed helpers inside the allowed set) and records `route_reason` like `Switched: Anthropic hit its limit`, plus an activity event. Never switches Strict agents, never to a non-allowed provider. At most one switch per helper per 10 minutes.
+When the gateway records a real rate-limit stop (429 that is not a concurrency retry, or quota `limit_reached`) for a routed helper's provider, the watcher asks the chooser again for that helper's job, excluding the limited provider. If it finds an allowed alternative, it switches the helper (allowed for routed helpers inside the allowed set): a running helper is restarted on the new provider, its HAL session is pointed at the new model, and it gets a short message ("your model was switched because Anthropic hit its limit. Continue where you left off.") so the interrupted work goes on. The new model, `route_reason` like `Switched: Anthropic hit its limit`, the activity event and the 10-minute cooldown are recorded only after the restart succeeds; a failed restart keeps the old model and reason. Never switches Strict agents, never to a non-allowed provider. At most one switch per helper per 10 minutes.
 
 ## RPCs
 
