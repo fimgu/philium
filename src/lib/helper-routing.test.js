@@ -37,12 +37,13 @@ test("labels and options", () => {
   assert.equal(scopeLabel("default", "r1"), "Uses the global setting");
   assert.equal(scopeLabel("global", "r1"), "Uses the global setting");
   assert.equal(scopeLabel("workspace", "r1"), "Workspace setting");
-  assert.equal(scopeLabel("global", null), "All workspaces");
+  assert.match(scopeLabel("global", null), /every workspace/);
   assert.equal(jobLabel("verify"), "Verify");
   const models = [{ provider_id: "a", provider_name: "A", model_id: "m1", ref: "a/m1", enabled: 1 }, { provider_id: "c", provider_name: "C", model_id: "m2", enabled: 1 }];
   const o = jobModelOptions(models, provs, ["a", "c"]);
   assert.deepEqual(o.map((x) => x.value), ["", "a/m1"]);
   assert.equal(o[0].label, "Same as parent");
+  assert.deepEqual(jobModelOptions(models, provs, ["a"], "a/gone").map((x) => x.value), ["", "a/m1", "a/gone"]);
 });
 
 test("preview line", () => {

@@ -60,7 +60,7 @@ export function pickableProviders(providers = []) {
 }
 
 export function scopeLabel(source, repoId) {
-  if (!repoId) return "All workspaces";
+  if (!repoId) return "The default for every workspace without its own setting";
   return source === "workspace" ? "Workspace setting" : GLOBAL_LINE;
 }
 
@@ -69,11 +69,14 @@ export function jobLabel(job) {
 }
 
 // Model options for a job: "Same as parent" first, then models of allowed providers.
-export function jobModelOptions(models = [], providers = [], allowed = []) {
+// A saved ref missing from the list is kept so the select never shows blank.
+export function jobModelOptions(models = [], providers = [], allowed = [], current = null) {
   const ok = new Set(pickableProviders(providers).map((p) => p.id).filter((id) => allowed.includes(id)));
-  return [{ value: "", label: "Same as parent" }, ...models
+  const opts = [{ value: "", label: "Same as parent" }, ...models
     .filter((m) => m.enabled !== 0 && ok.has(m.provider_id))
     .map((m) => ({ value: m.ref || `${m.provider_id}/${m.model_id}`, label: `${m.provider_name} / ${m.display || m.model_id}` }))];
+  if (current && !opts.some((o) => o.value === current)) opts.push({ value: current, label: current });
+  return opts;
 }
 
 export function previewLine(job, result) {
