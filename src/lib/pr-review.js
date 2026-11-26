@@ -136,7 +136,7 @@ export function coverageLine(coverage, errors) {
 export const MODES = ['observe', 'comment', 'enforce'];
 export const MODE_LABEL = { observe: 'Observe', comment: 'Comment', enforce: 'Enforce' };
 export const LEVEL_LABEL = { quick: 'Quick', standard: 'Standard', deep: 'Deep' };
-export const WOULD_POST_LABEL = { APPROVE: 'Approve', REQUEST_CHANGES: 'Request changes', COMMENT: 'Comment' };
+export const WOULD_POST_LABEL = { APPROVE: 'Approve', REQUEST_CHANGES: 'Request changes', COMMENT: 'Comment', NONE: 'Nothing (your own pull request)' };
 
 export function modeLabel(m) { return MODE_LABEL[m] || ''; }
 export function levelLabel(l) { return LEVEL_LABEL[l] || ''; }
@@ -202,6 +202,11 @@ export function budgetLine(used, budget) {
 export function wouldPostLabel(event) {
   if (!event) return '';
   return WOULD_POST_LABEL[String(event).toUpperCase()] || String(event);
+}
+
+/** The person's own pull request. Stored as SQLite 0/1, so read the number, not truthiness of a string. */
+export function ownPr(review) {
+  return Number(review?.own) === 1 || review?.own === true;
 }
 
 export function humansLine(n) {

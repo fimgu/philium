@@ -121,6 +121,11 @@ test('policy: labels and budget', () => {
   assert.equal(P.budgetLine(0, null), null);
   assert.equal(P.budgetLine(5400, null).text, '5.4k tokens');
   assert.equal(P.wouldPostLabel('REQUEST_CHANGES'), 'Request changes');
+  assert.equal(P.wouldPostLabel('NONE'), 'Nothing (your own pull request)');
+  assert.equal(P.ownPr({ own: 1 }), true);
+  assert.equal(P.ownPr({ own: 0 }), false);
+  assert.equal(P.ownPr({ own: '0' }), false);
+  assert.equal(P.ownPr(null), false);
   assert.equal(P.humansLine(1), '1 human approval required');
   assert.equal(P.parsePolicy('{"mode":"observe"}').mode, 'observe');
   assert.equal(P.normalisePolicyGet({ policy: '{"mode":"comment"}', raw: null, override: 'observe' }).policy.mode, 'comment');

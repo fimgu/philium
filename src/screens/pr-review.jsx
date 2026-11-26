@@ -13,7 +13,7 @@ import {
   verdictLabel, verdictTone, tally, tallyLine, groupByKind,
   itemMark, verifyLine, originLabel, severityLabel, basisLabel, coverageLine,
   MODES, modeLabel, levelLabel, parsePolicy, normalisePolicyGet, modeCeiling, modeAllowed,
-  effectiveMode, policySourceLabel, budgetLine, formatTokens, wouldPostLabel, humansLine,
+  effectiveMode, policySourceLabel, budgetLine, formatTokens, wouldPostLabel, humansLine, ownPr,
 } from '../lib/pr-review.js';
 
 function PolicyPanel(props) {
@@ -73,6 +73,11 @@ function PolicyPanel(props) {
 function ItemRow(props) {
   const it = props.item;
   const [tone, glyph, markTitle] = itemMark(it);
+  const [waiving, setWaiving] = createSignal(false);
+  async function waive() {
+    setWaiving(true);
+    try { await props.onWaive?.(it.id); } finally { setWaiving(false); }
+  }
   return (
     <tr data-item={it.id} data-status={it.status} data-kind={it.kind}>
       <td class="mark"><span class={tone} title={markTitle}>{glyph}</span></td>
@@ -86,7 +91,12 @@ function ItemRow(props) {
         {it.detail}
         <Show when={it.evidence}><details><summary>Evidence</summary><p style={{ 'white-space': 'pre-wrap' }}>{it.evidence}</p></details></Show>
         <Show when={verifyLine(it)}><p><small>{verifyLine(it)}</small></p></Show>
-        <Show when={it.status === 'blocked'}><p class="blocked"><small>Needs you: {it.detail || 'see evidence above'}</small></p></Show>
+        <Show when={it.status === 'blocked'}>
+          <p class="blocked"><small>Needs you: {it.detail || 'see evidence above'}</small></p>
+          <Show when={props.onWaive}>
+            <Button size="sm" busy={waiving()} disabled={waiving()} onClick={waive} title="Skip this check for this review. The reason is kept with the review.">Not needed</Button>
+          </Show>
+        </Show>
         <Show when={it.url}><p><a href={it.url} target="_blank" rel="noreferrer">Source</a></p></Show>
       </td>
     </tr>
@@ -101,7 +111,7 @@ function Checklist(props) {
         {(g) => (
           <section aria-label={g.label}>
             <h4>{g.label}</h4>
-            <table class="ready plan"><tbody><For each={g.items}>{(it) => <ItemRow item={it} />}</For></tbody></table>
+            <table class="ready plan"><tbody><For each={g.items}>{(it) => <ItemRow item={it} onWaive={props.onWaive} />}</For></tbody></table>
           </section>
         )}
       </For>
@@ -186,7 +196,10 @@ function ReviewCard(props) {
               <Show when={p().error}>{' · '}<span class="warn">{p().error}</span></Show></small></p>}
           </Show>
           <Show when={items().length}><p><small>{tallyLine(items())}</small></p></Show>
-          <Show when={r()?.state === 'observed'}>
+          <Show when={r()?.state === 'observed' && ownPr(r())}>
+            <p aria-label="Own pull request"><small>Your own pull request: Philium keeps this review here and does not post it to GitHub.</small></p>
+          </Show>
+          <Show when={r()?.state === 'observed' && !ownPr(r())}>
             <div class="row" style={{ gap: '8px', 'flex-wrap': 'wrap' }} aria-label="Observed review">
               <span>Would post: <strong>{wouldPostLabel(r().would_post)}</strong></span>
               <Button size="sm" busy={publishing() === 'comment'} disabled={!!publishing()} onClick={() => publish('comment')}>Publish as comment</Button>
@@ -204,7 +217,7 @@ function ReviewCard(props) {
       </div>
       <Show when={r()?.error}><p role="alert">{plainError(r().error).plain}</p></Show>
       <Show when={props.data?.summary}><Markdown text={props.data.summary} /></Show>
-      <Checklist items={items()} />
+      <Checklist items={items()} onWaive={['running', 'needs_you'].includes(r()?.state) ? props.onWaive : null} />
     </section>
   );
 }
@@ -262,6 +275,13 @@ export function PrReviewer(props) {
       await reloadPolicy();
     } catch (e) { toast(String(e), 'danger'); }
   }
+  async function waive(id) {
+    try {
+      await rpc('pr_review.item_waive', { id }, { local: true });
+      await Promise.all([reloadData(), reloadList()]);
+      toast('Marked not needed.', 'secure');
+    } catch (e) { toast(String(e), 'danger'); }
+  }
   async function publish(id, as) {
     try {
       await rpc('pr_review.publish', { id, as }, { local: true });
@@ -303,7 +323,7 @@ export function PrReviewer(props) {
         <NotesEditor repo={props.repo} pr={currentPr()} notes={data()?.notes} onChanged={reloadData} />
       </Show>
       <Show when={data()?.review} fallback={<p class="small faint">Paste a pull request URL above to start a review.</p>}>
-        <ReviewCard data={data()} onStop={stop} onRestart={restart} onPublish={publish} />
+        <ReviewCard data={data()} onStop={stop} onRestart={restart} onPublish={publish} onWaive={waive} />
       </Show>
       <Show when={history().length}>
         <details aria-label="Earlier heads">

@@ -851,6 +851,8 @@ pub async fn pr_review_submit(ctx: &Arc<Ctx>, agent_row: &Value, summary: &str) 
         }
         _ => {}
     }
+    // The person unblocked what was waiting on them: the review runs again.
+    ctx.db.exec("UPDATE pr_reviews SET state='running' WHERE id=?1 AND state='needs_you'", [&id])?;
     let origin = r["origin"].as_str().unwrap_or("").to_string();
     let pr = r["pr"].as_i64().unwrap_or(0);
     let login = r["github_login"].as_str().ok_or("Restart this review to bind it to the repository's GitHub account.")?;
@@ -866,8 +868,10 @@ pub async fn pr_review_submit(ctx: &Arc<Ctx>, agent_row: &Value, summary: &str) 
         return Err(format!("The pull request moved to a new head while you worked. This review is superseded; a fresh one has started (id {}).", started["id"].as_str().unwrap_or("")));
     }
     let mode = r["mode"].as_str().unwrap_or("observe").to_string();
-    if mode == "observe" {
-        let (event, _) = decide_event(v["verdict"].as_str().unwrap_or(""), r["own"].as_i64() == Some(1), "observe", &r["policy"]);
+    // Your own pull request: Philium keeps the review here and never posts it, whatever the mode.
+    let own = r["own"].as_i64() == Some(1);
+    if mode == "observe" || own {
+        let event = if own { "NONE" } else { decide_event(v["verdict"].as_str().unwrap_or(""), false, "observe", &r["policy"]).0 };
         ctx.db.exec(
             "UPDATE pr_reviews SET state='observed', verdict=?1, would_post=?2, summary=?3, finished=?4 WHERE id=?5 AND state='running'",
             params![v["verdict"].as_str(), event, summary, now(), id],
@@ -877,6 +881,9 @@ pub async fn pr_review_submit(ctx: &Arc<Ctx>, agent_row: &Value, summary: &str) 
         }
         ctx.emit("pr_review:changed", json!({ "repo_id": r["repo"], "pr": r["pr"] }));
         crate::attention::announce(ctx);
+        if own {
+            return Ok(json!({"observed": true, "would_post": event, "verdict": v["verdict"], "note": "This is the person's own pull request: Philium keeps the review in the app and posts nothing to GitHub. You are done."}));
+        }
         return Ok(json!({"observed": true, "would_post": event, "verdict": v["verdict"]}));
     }
     post_review(ctx, &r, &items, &v, summary, &mode, login, &current_head, "running").await
@@ -891,12 +898,46 @@ fn claim(ctx: &Ctx, id: &str, from: &str, to: &str) -> Result<(), String> {
     }
 }
 
+/// The person marks a blocked item as not needed. It becomes `not_applicable` with their reason,
+/// needs no verifier, and an idle lead is told to finish the review.
+async fn item_waive(ctx: &Arc<Ctx>, item_id: &str, reason: &str) -> Result<Value, String> {
+    let item = ctx.db.query("SELECT * FROM pr_items WHERE id=?1", [item_id])?.pop().ok_or("No such item")?;
+    if item["status"].as_str() != Some("blocked") {
+        return Err("Only a blocked item can be marked not needed".into());
+    }
+    let review = item["review"].as_str().unwrap_or("").to_string();
+    let r = row(ctx, &review)?;
+    if !matches!(r["state"].as_str(), Some("running" | "needs_you")) {
+        return Err("This review has finished. Restart it to change its checklist.".into());
+    }
+    let reason: String = reason.chars().take(500).collect();
+    ctx.db.exec(
+        "UPDATE pr_items SET status='not_applicable', evidence=?1, verify='none', verifier=NULL, verify_evidence=NULL, prev_status='blocked', prev_evidence=evidence, updated=?2 WHERE id=?3 AND status='blocked'",
+        params![format!("you: Not needed: {reason}"), now(), item_id],
+    )?;
+    let v = verdict(&items_of(ctx, &review)?);
+    let mut nudged = false;
+    if r["state"].as_str() == Some("needs_you") && v["verdict"].as_str() != Some("needs_you") {
+        ctx.db.exec("UPDATE pr_reviews SET state='running' WHERE id=?1 AND state='needs_you'", [&review])?;
+        if let Some(lead) = r["lead"].as_str().filter(|l| agents::runtime(l).is_some()) {
+            let text = format!("Philium: the person marked \"{}\" as not needed ({reason}). If nothing else is open, call pr_review_submit now.", item["title"].as_str().unwrap_or(""));
+            nudged = agents::send(ctx, lead, &text).await.is_ok();
+        }
+    }
+    ctx.emit("pr_review:changed", json!({ "repo_id": r["repo"], "pr": r["pr"] }));
+    crate::attention::refresh(ctx);
+    Ok(json!({"verdict": v["verdict"], "lead_told": nudged}))
+}
+
 /// Post a finished review under `mode` (comment or enforce) and mark it posted.
 #[allow(clippy::too_many_arguments)]
 async fn post_review(ctx: &Arc<Ctx>, r: &Value, items: &[Value], v: &Value, summary: &str, mode: &str, login: &str, head: &str, from: &str) -> Result<Value, String> {
     let id = r["id"].as_str().unwrap_or("").to_string();
     let origin = r["origin"].as_str().unwrap_or("");
     let pr = r["pr"].as_i64().unwrap_or(0);
+    if r["own"].as_i64() == Some(1) {
+        return Err("Philium never posts a review on your own pull request.".into());
+    }
     claim(ctx, &id, from, "posting")?;
     let (event, why) = decide_event(v["verdict"].as_str().unwrap_or(""), r["own"].as_i64() == Some(1), mode, &r["policy"]);
     let (mut body, inline) = build_body(r, items, v, summary);
@@ -942,6 +983,9 @@ async fn publish(ctx: &Arc<Ctx>, id: &str, wanted: &str) -> Result<Value, String
     let r = row(ctx, id)?;
     if r["state"].as_str() != Some("observed") {
         return Err("Only an observed review can be published".into());
+    }
+    if r["own"].as_i64() == Some(1) {
+        return Err("This is your own pull request. Philium keeps the review here and does not post it to GitHub.".into());
     }
     let mode = publish_mode(&r["policy"], wanted)?;
     let origin = r["origin"].as_str().unwrap_or("").to_string();
@@ -1050,6 +1094,11 @@ pub async fn call(ctx: &Arc<Ctx>, m: &str, a: Value) -> Result<Value, String> {
             }
             ctx.emit("pr_review:changed", json!({ "repo_id": repo, "pr": pr }));
             Ok(json!({"id": id}))
+        }
+        "item_waive" => {
+            let id = crate::ctx::arg_str(&a, "id")?;
+            let reason = a["reason"].as_str().map(str::trim).filter(|t| !t.is_empty()).unwrap_or("not needed for this review");
+            item_waive(ctx, &id, reason).await
         }
         "note_remove" => {
             let id = crate::ctx::arg_str(&a, "id")?;
@@ -1422,6 +1471,42 @@ mod tests {
         assert_eq!(got["review"]["coverage"], json!({}));
         assert_eq!(got["notes"].as_array().unwrap().len(), 2);
         assert!(got["items"].as_array().unwrap().iter().any(|i| i["basis"] == "runtime"));
+    }
+
+    #[tokio::test]
+    async fn waive_unblocks_a_needs_you_review() {
+        let ctx = Ctx::test();
+        policy_fixture(&ctx, "standard", None);
+        ctx.db.exec("UPDATE pr_items SET status='pass', basis='runtime' WHERE id='risk1'", []).unwrap();
+        ctx.db.exec("INSERT INTO pr_items(id,review,key,kind,title,human,required,status,evidence,updated) VALUES('env','rv','claim:env','claim','Confirm on env01',1,1,'blocked','no env01 access',0)", []).unwrap();
+        ctx.db.exec("UPDATE pr_reviews SET state='needs_you', verdict='needs_you' WHERE id='rv'", []).unwrap();
+        assert!(item_waive(&ctx, "risk1", "x").await.is_err(), "only blocked items can be waived");
+        let out = item_waive(&ctx, "env", "local jest coverage is enough").await.unwrap();
+        assert_eq!(out["verdict"], "approve");
+        let it = item_in_review(&ctx, "rv", "env").unwrap();
+        assert_eq!(it["status"], "not_applicable");
+        assert_eq!(it["verify"], "none", "the person's waiver needs no verifier");
+        assert!(it["evidence"].as_str().unwrap().contains("local jest coverage is enough"));
+        assert_eq!(row(&ctx, "rv").unwrap()["state"], "running", "the review can be submitted again");
+        // A finished review keeps its checklist.
+        ctx.db.exec("UPDATE pr_items SET status='blocked' WHERE id='env'", []).unwrap();
+        ctx.db.exec("UPDATE pr_reviews SET state='observed' WHERE id='rv'", []).unwrap();
+        assert!(item_waive(&ctx, "env", "x").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn own_pr_is_never_posted() {
+        let ctx = Ctx::test();
+        policy_fixture(&ctx, "standard", None);
+        ctx.db.exec("UPDATE pr_reviews SET state='observed', own=1, github_login='me' WHERE id='rv'", []).unwrap();
+        let err = publish(&ctx, "rv", "comment").await.unwrap_err();
+        assert!(err.contains("own pull request"), "{err}");
+        let r = row(&ctx, "rv").unwrap();
+        let items = items_of(&ctx, "rv").unwrap();
+        let v = verdict(&items);
+        let err = post_review(&ctx, &r, &items, &v, "summary text", "enforce", "me", "h", "observed").await.unwrap_err();
+        assert!(err.contains("own pull request"), "{err}");
+        assert_eq!(row(&ctx, "rv").unwrap()["state"], "observed", "nothing was claimed for posting");
     }
 
     #[tokio::test]

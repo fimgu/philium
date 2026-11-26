@@ -49,7 +49,7 @@ pub fn claims(body: &str) -> Vec<Value>;                                 // pure
 - `bot`: GraphQL `__typename == "Bot"` or login ends with `[bot]`.
 - Reviews with empty body are dropped. Comments by the viewer that are Philium verdicts (body starts with `<!-- philium-pr-review -->`) are dropped.
 - `post`: `event` is `APPROVE`, `REQUEST_CHANGES` or `COMMENT`. Body is prefixed with the marker `<!-- philium-pr-review -->`. Uses `POST repos/{o}/pulls/{pr}/reviews` with `commit_id=head` and `comments` (`{path,line,side:"RIGHT",body}`) via `gh api --input -`, `write=true`. On 422 retry once without inline comments, appending them to the body. Returns `{"url": html_url, "id": id, "event": event}`.
-- `own` is `author == viewer`. GitHub rejects APPROVE/REQUEST_CHANGES on your own PR, so core posts `COMMENT` then.
+- `own` is `author == viewer`. Philium never posts a review on your own PR: submit stores it as `observed` with `would_post = NONE`, `publish` refuses, and `post_review` refuses as a last guard. The result stays in the app.
 
 ## Core (`pr_review.rs`)
 
@@ -129,6 +129,8 @@ For each registered repo with a GitHub origin: if `pr_review.auto` is on, start 
 
 ### Needs you
 `attention::needing_you` adds the count of reviews with state `needs_you`. `checkout-home.jsx` lists them with the blocked items and a link to Review.
+
+RPC `item_waive {id, reason?}`: the person marks a blocked item **Not needed**. It becomes `not_applicable` with evidence `you: Not needed: <reason>` and no verifier. If nothing else is blocked, the review goes back to `running` and a live lead is told to submit. `pr_review_submit` also moves a `needs_you` review back to `running` once its verdict is no longer `needs_you`.
 
 ## UI (`pr-review.jsx`)
 In Review, above the release tools: "PR reviewer" section.
