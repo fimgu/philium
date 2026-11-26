@@ -2,35 +2,45 @@ import { createSignal, createEffect, on, Show, For } from "solid-js";
 import { Field, Input, Select, Toggle, Button, toast } from "../ui/kit.jsx";
 import { rpc } from "../lib/rpc.js";
 import { useVisibleEvent } from "../lib/visibility.js";
-import { JOBS, OFF_LINE, PRIVACY_LINE, normaliseConfig, validateConfig, pickableProviders, scopeLabel, jobModelOptions, previewLine } from "../lib/helper-routing.js";
+import { JOBS, OFF_LINE, PRIVACY_LINE, normaliseConfig, validateConfig, pickableProviders, scopeLabel, jobModelOptions, previewLine, scopedLoader } from "../lib/helper-routing.js";
 
 // Settings > Helper models (docs/helper-routing.md, "Settings UI").
 export function HelperModelsSection(props) {
   const [repoId, setRepoId] = createSignal("");
   const [data, setData] = createSignal(null);
   const [cfg, setCfg] = createSignal(normaliseConfig(null));
+  // Scope the shown config belongs to. undefined = nothing loaded for the current scope yet.
+  const [loadedFor, setLoadedFor] = createSignal(undefined);
   const [previews, setPreviews] = createSignal({});
   const [busy, setBusy] = createSignal(false);
   const [err, setErr] = createSignal("");
   const rid = () => repoId() || null;
+  const ready = () => loadedFor() === rid();
+  const loader = scopedLoader();
 
+  // A slow answer for workspace A must never show, or be saved, under workspace B.
   async function load() {
+    const ticket = loader.begin(rid());
+    const scope = ticket.scope;
+    setLoadedFor(undefined);
     try {
-      const r = await rpc("routing.get", rid() ? { repo_id: rid() } : {}, { local: true });
+      const r = await rpc("routing.get", scope ? { repo_id: scope } : {}, { local: true });
+      if (!loader.accept(ticket, rid())) return;
       setData(r ?? null);
       setCfg(normaliseConfig(r?.config));
+      setLoadedFor(scope);
       setErr("");
-    } catch (e) { setErr(String(e)); }
-    loadPreviews();
+    } catch (e) { if (ticket.gen === loader.current()) setErr(String(e)); return; }
+    loadPreviews(ticket.gen, scope);
   }
-  async function loadPreviews() {
+  async function loadPreviews(my, scope) {
     const parent = props.parentModel;
     if (!cfg().enabled || !parent) { setPreviews({}); return; }
     const out = {};
     await Promise.all(JOBS.map(async ({ id }) => {
-      out[id] = await rpc("routing.preview", { repo_id: rid(), parent_model: parent, job: id }, { local: true }).catch((e) => ({ error: String(e) }));
+      out[id] = await rpc("routing.preview", { repo_id: scope, parent_model: parent, job: id }, { local: true }).catch((e) => ({ error: String(e) }));
     }));
-    setPreviews(out);
+    if (my === loader.current()) setPreviews(out);
   }
   createEffect(on([repoId, () => props.parentModel], load));
   useVisibleEvent("routing:changed", () => { if (!busy()) load(); }, { debounceMs: 300 });
@@ -39,20 +49,26 @@ export function HelperModelsSection(props) {
   const pickable = () => pickableProviders(providers());
 
   async function save(next) {
+    const t = loader.saveTarget(rid());
+    if (!t.ok) { setErr("Still loading this workspace's setting. Try again."); return; }
+    const scope = t.scope;
     const problem = validateConfig(next, providers());
     if (problem) { setErr(problem); return; }
     setBusy(true);
     try {
-      await rpc("routing.set", { repo_id: rid(), config: next }, { local: true });
+      await rpc("routing.set", { repo_id: scope, config: next }, { local: true });
       toast("Helper models saved", "good");
       await load();
     } catch (e) { setErr(String(e)); toast(String(e), "danger"); }
     finally { setBusy(false); }
   }
   async function reset() {
+    const t = loader.saveTarget(rid());
+    if (!t.ok || !t.scope) return;
+    const scope = t.scope;
     setBusy(true);
     try {
-      await rpc("routing.set", { repo_id: rid(), config: null }, { local: true });
+      await rpc("routing.set", { repo_id: scope, config: null }, { local: true });
       toast("Workspace now uses the global setting", "good");
       await load();
     } catch (e) { setErr(String(e)); }
@@ -60,7 +76,7 @@ export function HelperModelsSection(props) {
   }
   const patch = (p) => save({ ...cfg(), ...p });
   const toggleAllowed = (id, on) => patch({ allowed: on ? [...cfg().allowed, id] : cfg().allowed.filter((x) => x !== id) });
-  const off = () => busy() || props.busy;
+  const off = () => busy() || props.busy || !ready();
 
   return <section class="ws-section" data-section="helper-models">
     <h2>Helper models</h2>

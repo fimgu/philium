@@ -86,3 +86,22 @@ export function previewLine(job, result) {
   const reason = result.reason ? ` (${result.reason})` : "";
   return `${name}: ${result.model_ref || "same as parent"}${reason}`;
 }
+
+/**
+ * Loads tagged with the scope they were asked for. A late answer for another scope, or an older
+ * request for the same scope, is dropped. Saves go only to the scope whose config is shown.
+ */
+export function scopedLoader() {
+  let gen = 0;
+  let loaded;
+  return {
+    begin(scope) { loaded = undefined; return { gen: ++gen, scope }; },
+    accept(ticket, current) {
+      if (ticket.gen !== gen || ticket.scope !== current) return false;
+      loaded = ticket.scope;
+      return true;
+    },
+    current() { return gen; },
+    saveTarget(current) { return loaded !== undefined && loaded === current ? { ok: true, scope: loaded } : { ok: false }; },
+  };
+}

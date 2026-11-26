@@ -51,3 +51,20 @@ test("preview line", () => {
   assert.equal(previewLine("code", { error: "x is not allowed" }), "Code: x is not allowed");
   assert.equal(previewLine("verify", null), "Verify: no preview");
 });
+
+test("scopedLoader: a late answer for workspace A never shows or saves under B", async () => {
+  const { scopedLoader } = await import("./helper-routing.js");
+  const l = scopedLoader();
+  const a = l.begin("A");
+  const b = l.begin("B");
+  assert.equal(l.saveTarget("B").ok, false, "nothing loaded yet: no save");
+  assert.equal(l.accept(a, "B"), false, "A's answer arriving after switching to B is dropped");
+  assert.equal(l.saveTarget("B").ok, false);
+  assert.equal(l.accept(b, "B"), true);
+  assert.deepEqual(l.saveTarget("B"), { ok: true, scope: "B" });
+  assert.equal(l.saveTarget("A").ok, false, "never save B's config to A");
+  const g = l.begin(null);
+  assert.equal(l.saveTarget(null).ok, false);
+  assert.equal(l.accept(g, null), true);
+  assert.deepEqual(l.saveTarget(null), { ok: true, scope: null });
+});
