@@ -106,6 +106,7 @@ function AgentRow(props) {
           <Show when={(a().warnings ?? []).some((w) => w.kind === "clash")}><Badge tone="strict">Code overlap</Badge></Show>
         </div>
         <div class="xs faint ellipsis">{a().task_title || a().repo_name || a().branch || (a().model_ref ?? "").split("/").pop()}</div>
+        <Show when={a().route_reason}><div class="xs faint ellipsis" data-testid="route-reason" title={`${a().model_ref ?? ""}: ${a().route_reason}`}>{(a().model_ref ?? "").split("/").pop()} · {a().route_reason}</div></Show>
         <AgentProgressLine agent={a()} />
       </div>
       <span class="xs faint">{fmt.ago(a().last_active_at)}</span>
@@ -272,7 +273,7 @@ function Details(props) {
       <KvTelemetryBar kv={kv()} />
       <div class="grid-2" style={{ "margin-top": "12px" }}>
         <div><div class="xs faint">Role</div><div class="row gap-4"><RoleBadge role={a().role} /><span class="small">{a().parent_name ? `Helper of ${a().parent_name}` : roleLabel(a().role)}</span></div></div>
-        <div><div class="xs faint">Model</div><div class="mono small">{a().model_ref}</div></div>
+        <div><div class="xs faint">Model</div><div class="mono small">{a().model_ref}</div><Show when={a().route_reason}><div class="xs faint">{a().route_reason}</div></Show></div>
         <div><div class="xs faint">Reasoning Effort</div><div class="mono small">{a().effort ?? "default"}</div></div>
         <div><div class="xs faint">Security</div>
           <Show when={a().strict} fallback={<Badge tone="secure">Standard: trusted provider</Badge>}>
